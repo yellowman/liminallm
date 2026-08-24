@@ -13430,3 +13430,63 @@ Fixed, and the class swept properly this time. `_External` now reports which of
 its two services is missing and why. The four remaining `"needs redis-server"`
 skips were checked and left alone: each is gated on `ScratchRedis().available`
 only, with no Postgres involved, so the message is accurate.
+
+## The race test passed here because it was gating the wrong file
+
+`test_a_source_rooted_above_the_file_still_serializes` failed on CI a third
+time, and this time the instrumentation added for exactly that answered it.
+
+    CI       [('walk', 1.2324), ('neither', 1.4468)]
+    local    [('neither', 1.1999), ('upload', 1.4146)]
+
+The upload's marked commit is **absent** from the failing run. That is a
+different fact from "the walk committed last", and nothing in the previous
+assertion message could have shown it. Recording the source path as well named
+the unlabelled commit at once: `.checksums.json`, an unrelated file the
+directory walk also covers.
+
+Which explains everything. **The gate arms on the walk's first commit,
+whichever file the filesystem hands it first.** On this machine that is
+`.checksums.json`, so the gate holds an *uncontested* file, the upload never
+races anything, and the test passes without exercising its subject. On the CI
+runner the walk reaches `report.md` first, the gate holds the contested file,
+and the race actually happens.
+
+So the test is a vacuous witness here, in the same shape this file has tracked
+all along — passing for a reason unrelated to what it claims, and only
+accidentally, on the ordering `os.scandir` happens to give this filesystem.
+
+### And when the race does happen, the product loses it
+
+Reproduced by arming the gate on `report.md`, which is CI's observed order.
+Three runs, three failures:
+
+    [('neither', '.checksums.json', 1, 0.1915), ('walk', 'report.md', 1, 1.3793)]
+
+The walk's *stale* generation lands last, at 1.38s, and the upload's commit
+never happens at all. Meanwhile the upload returned 200 and the new bytes are
+on disk — the assertion immediately above the failing one checks
+`(files_dir / "report.md").read_bytes() == second` and passes, and
+`waited_for_release` is true, so the upload did block on the walk as intended.
+
+**The file is updated and the index keeps the previous generation.** A search
+against that context then answers out of bytes that are gone, which is the
+exact failure the test was written to prevent and its docstring describes:
+*"the walk reads one generation while the upload publishes the next, and the
+walk's commit lands last. Every step succeeds."*
+
+### Left for a decision rather than fixed
+
+This is a product finding, not a CI one, and two things make it wrong to fold
+into this branch unasked. The subsystem is untouched by the MCP work this pull
+request is about. And the fix has two halves that must land together: the
+gate has to become deterministic — naming `report.md` rather than taking
+whatever comes first — or the test will go on passing here for the wrong
+reason, and making it deterministic without fixing the serialization turns a
+locally-green test into a permanently red one.
+
+Worth stating plainly, because it changes what the earlier entries in this file
+mean: the confinement work made CI able to run these tests for the first time,
+and the first thing it found was a data-correctness bug that had been invisible
+because the only machine that ever ran the test ordered a directory listing
+favourably.
