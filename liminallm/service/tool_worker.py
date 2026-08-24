@@ -407,7 +407,11 @@ def _body_agent_loop(
     stream_final = bool(plan.get("stream_final"))
     tool_rounds = max_rounds - 1 if stream_final else max_rounds
 
-    snippets: List[str] = []
+    # Seeded, not empty: the parent retrieved for an explicitly selected
+    # knowledge context and already put those chunks in the prompt. Returning
+    # them here is what makes the turn report the grounding it actually used,
+    # rather than only what a tool call went and fetched.
+    snippets: List[str] = list(plan.get("context_snippets") or [])
     artifacts: List[str] = []
     findings: List[str] = []
     trace: List[dict] = []

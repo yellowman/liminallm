@@ -2152,8 +2152,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # reach. What crosses is the finished message list.
         message = inputs.get("message") or user_message or ""
         attachments = self._conversation_attachments(conversation_id, user_id)
-        messages, tools, preamble, mcp_tools = self._build_agent_context(
-            message, attachments, history, user_id, conversation_id
+        explicit_ids, grounding = self._explicit_context_grounding(
+            message, context_id, user_id=user_id, tenant_id=tenant_id
+        )
+        messages, tools, preamble, mcp_tools, grounded = self._build_agent_context(
+            message,
+            attachments,
+            history,
+            user_id,
+            conversation_id,
+            explicit_context_ids=explicit_ids,
+            grounding=grounding,
         )
         # On the context, never in the plan: the plan is what the worker reads.
         context.mcp_tools = mcp_tools
@@ -2169,6 +2178,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 "message": message,
                 "max_rounds": self.MAX_AGENT_ROUNDS,
                 "deadline_seconds": self.AGENT_DEADLINE_SECONDS,
+                # What survived budgeting, so it is exactly what is in
+                # `messages` above. Carried so the worker returns it among its
+                # own and the turn reports what actually grounded it, whether
+                # or not the model went looking for more.
+                "context_snippets": list(grounded),
             }
         )
         return worker_tool, plan, context, ""
@@ -2378,6 +2392,38 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         return [ctx_id] if ctx_id else None
 
+    def _explicit_context_grounding(
+        self,
+        message: str,
+        context_id: Optional[str],
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> Tuple[List[str], List[str]]:
+        """What a named knowledge context contributes to an agent turn.
+
+        The same validation and the same retriever `llm.generic` uses, because
+        it is the same question: what has this user authorized this turn to
+        read. The agent path only ever asked it of attachments, so selecting a
+        context and landing on that path — which any of web, an attachment or
+        a published MCP server is enough to do — selected nothing.
+
+        The ids come back beside the snippets rather than folded into them:
+        an empty retrieval is not an absent context, and `file_search` is
+        still worth offering for a context whose top-k missed this phrasing.
+        """
+        if not context_id:
+            return [], []
+        allowed = self._validate_context_scope(
+            [context_id], user_id=user_id, tenant_id=tenant_id
+        )
+        if not allowed:
+            return [], []
+        chunks = self.rag.retrieve(
+            allowed, message, user_id=user_id, tenant_id=tenant_id
+        )
+        return list(allowed), [chunk.content for chunk in chunks]
+
     def _run_file_search(
         self,
         query: str,
@@ -2558,20 +2604,40 @@ class WorkflowEngine(WorkflowStreamingMixin):
         history: List[Any],
         user_id: Optional[str],
         conversation_id: Optional[str] = None,
-    ) -> Tuple[List[dict], List[dict], str, Dict[str, "mcp_client.RemoteTool"]]:
-        """Messages, offered tools, the preamble, and this turn's remote tools.
+        *,
+        explicit_context_ids: Optional[Sequence[str]] = None,
+        grounding: Optional[Sequence[str]] = None,
+    ) -> Tuple[
+        List[dict], List[dict], str, Dict[str, "mcp_client.RemoteTool"], List[str]
+    ]:
+        """Messages, offered tools, the preamble, remote tools, and grounding.
 
         The remote tools come back separately from their specs because the two
         halves go to different places: the specs are part of the plan the
         worker reads, and the tools themselves must not be — see
         `InvocationContext.mcp_tools`.
+
+        `explicit_context_ids` and `grounding` come from
+        `_explicit_context_grounding`, already authorized. Retrieval is the
+        caller's because the same snippets have to reach the turn's reported
+        `context_snippets`, and retrieving twice to tell two callers the same
+        thing is how the two answers start to differ.
+
+        The grounding that comes back is the subset that survived budgeting
+        and is therefore in `messages`, which is not always the subset that
+        was retrieved. A caller reporting the retrieved set would be naming
+        chunks the model never saw.
         """
         fs_root = self.settings.shared_fs_root
         preamble = attachments_service.build_attachment_preamble(
             attachments, fs_root=fs_root, user_id=user_id or ""
         )
         tools: List[dict] = []
-        if any(a.get("searchable") for a in attachments):
+        # A searchable attachment, or a knowledge context the user named. The
+        # second is not a new capability: `_run_file_search` has always
+        # resolved an explicit `context_id`, so the tool was usable and simply
+        # never offered unless the conversation happened to hold a file.
+        if any(a.get("searchable") for a in attachments) or explicit_context_ids:
             tools.append(self.FILE_SEARCH_SCHEMA)
         if any(a.get("analyzable") for a in attachments):
             tools.append(self.RUN_PYTHON_SCHEMA)
@@ -2628,9 +2694,25 @@ class WorkflowEngine(WorkflowStreamingMixin):
         recall = self._recall_snippet(conversation_id, user_id, message, list(history or []))
         if recall:
             system_content += f"\n\n{recall}"
-        _, history = self._apply_prompt_budget(
-            f"{system_content}\n{message}", [], list(history or [])
+        # Budgeted as context, not folded into the system block first. Tool
+        # routing adds capabilities; it does not promote retrieved knowledge
+        # above the ordinary prompt-budget rules. `_apply_prompt_budget` drops
+        # context from the low-priority end before it touches history, so
+        # appending grounding to `system_content` and passing `[]` here would
+        # make the selected chunks indivisible — evicting conversation turns
+        # to keep them, and failing the whole turn once the system block alone
+        # no longer fits.
+        kept, history = self._apply_prompt_budget(
+            f"{system_content}\n{message}",
+            list(grounding or []),
+            list(history or []),
         )
+        # Behind the digest and the recall, matching the order `llm.generic`
+        # assembles: both of those stand in for turns the model can no longer
+        # read, so they survive pruning longest. Same "Context:" shape the
+        # plain path injects, so a model that learned one reads the other.
+        if kept:
+            system_content += "\n\nContext: " + " | ".join(kept)
         messages: List[dict] = [{"role": "system", "content": system_content}]
         for msg in history:
             role = getattr(msg, "role", None)
@@ -2638,7 +2720,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             if role in {"user", "assistant"} and content:
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": message})
-        return messages, tools, preamble, mcp_tools
+        return messages, tools, preamble, mcp_tools, kept
 
     def _execute_agent_tool(
         self,

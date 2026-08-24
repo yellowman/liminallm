@@ -13753,3 +13753,151 @@ spelling. Mutating away either half kills it.
 Three findings in this function now, each from the same family: it answers
 "which lock does this path take", and every wrong answer is some form of
 letting the *spelling* of a path decide instead of its *position*.
+
+## Tool capability was traded for grounding, on every fresh installation
+
+Found by running the product rather than reading it. A file was uploaded into
+a knowledge context through the browser, the context was selected, and the
+question was asked. The model answered that it had not been given any notes.
+
+The retriever was never at fault. Called directly, `rag.retrieve()` returned
+the chunk for all four phrasings tried, and the lexical channel alone returned
+it. What went missing was one layer up.
+
+`_turn_needs_tools()` decides whether a turn takes the tool-agent workflow or
+the plain one. It is a question about *capability* — is there an attachment, a
+web tool, a published MCP server — and it was answered correctly. But the two
+workflows do not differ only in capability:
+
+* `llm.generic` validates `context_id`, retrieves for it, and injects the
+  chunks into the prompt.
+* The agent planner never received `context_id` at all. It offered
+  `file_search` only when the conversation held a searchable attachment.
+
+So a knowledge context the user explicitly selected entered neither the first
+prompt nor the tool list. Choosing the capable path silently removed the
+grounding, and the model was left to infer that a context it could not see
+needed searching.
+
+### Not a web bug, though the shipped web settings make it universal
+
+`web_tools_enabled` ships `True` and `web_search_provider` ships `"none"`, so
+`_turn_needs_tools()` is true on every fresh installation and every turn takes
+the agent path. That is why this reproduced immediately. It is not the cause:
+an attachment or a published MCP server loses the same context on a deployment
+with web off. The witness is parameterized over two triggers for that reason —
+a fix that repaired only the web case would leave an operator with an MCP
+server still losing every selected context.
+
+### The tempting fix, and what it costs
+
+Narrowing the selector to `web_tools_enabled and provider != "none"` also
+turns the reds green, which is what makes it dangerous. `"none"` disables web
+*search*; `web_fetch` needs no provider and is offered whenever web tools are
+on. Measured on the unfixed code, the tool list for that configuration is
+exactly `['web_fetch']` — so that patch would restore grounding by removing
+the turn's only capability, and nothing would have said so.
+
+There is a witness whose whole job is to refuse it: with web enabled and no
+provider, `web_fetch` must be offered and `web_search` must not. It fails
+under that patch and passes under the fix.
+
+### Additive, not alternative
+
+The fix is at agent-context construction, not at routing. `context_id` reaches
+the planner, is authorized by `_validate_context_scope` — the same check
+`llm.generic` uses, so the two paths cannot answer "may this user read this"
+differently — and its chunks go into the system block before the first model
+call. The same snippets ride in the plan so the worker returns them, which is
+what makes the turn *report* the grounding it actually used.
+
+`file_search` is now offered whenever a valid ordinary `context_id` exists.
+That is not a new capability: `_run_file_search()` already resolved an
+explicit `context_id`, so the tool worked the whole time and was simply never
+offered. Iterative search is the additive half. It must not become the only
+half, which is what the model in the witness pins down — it makes no tool call
+on purpose, because a context the user selected must not depend on the model
+guessing it should go looking.
+
+Retrieval lives beside prompt assembly rather than inside it, because the same
+snippets have two destinations: the prompt, and the turn's reported
+`context_snippets`. Retrieving twice to tell two callers the same thing is how
+the two answers begin to differ.
+
+### Mutations
+
+Three, each killed by a different witness:
+
+1. The planner stops propagating the explicit context — both selected-context
+   cases and the `file_search` offer die.
+2. Grounding is dropped from the prompt while `file_search` stays offered —
+   only the selected-context cases die. This is the one worth having: it
+   proves "the model could have searched" is not accepted as equivalent to
+   being grounded.
+3. `web_fetch` is suppressed when the provider is `none` — the
+   capability-preservation witness dies.
+
+Mutation 3 also takes the no-context control with it, for an honest reason:
+with no context and no web tools there are no tools at all, so the turn falls
+back to plain chat and the recording model is never called. The control now
+asserts that precondition itself, so the failure says which of the two things
+broke instead of reporting that the model was never called.
+
+### Measured on the running product
+
+The same live probe, against the shipped configuration and a real model, went
+from three misses to three hits. The control — the same question with no
+context selected — misses in both, which is what makes the hits mean anything.
+
+### Two seams the first pass left, both found by review
+
+**The streaming half was implemented and not witnessed.** The red was six
+cases against `WorkflowEngine.run`. The green also changed
+`_stream_agent_files_node`, which calls `_explicit_context_grounding` itself,
+passes its own arguments into `_build_agent_context`, and seeds its own worker
+plan. Sharing the assembly function does not make any of that shared, so "both
+paths are fixed" rested on reading the code and one live browser run. That is
+the same altitude mistake as the defect itself: a seam above the shared
+function, invisible from below.
+
+One `run_streaming` case now covers it, and two mutations confirm the
+separation — removing the streaming retrieval, or the two arguments it passes
+down, kills that case alone and leaves every batch case green.
+
+**Grounding was exempt from the prompt budget.** `_apply_prompt_budget` drops
+context from its low-priority end *before* it drops any conversation history,
+and then refuses the turn if the prompt still does not fit. Appending the
+retrieved chunks straight onto `system_content` and passing `[]` as the
+context put them inside an indivisible system block, so the pruner reached
+past them:
+
+```text
+llm.generic:  drop lowest-priority context  -> then, if needed, history
+agent (as first written):  grounding cannot be dropped
+                           -> evict history instead
+                           -> reject the turn once the block alone overflows
+```
+
+Tool routing may add capabilities. It does not promote retrieved knowledge
+above the ordinary budget rules. Grounding is now passed as context and
+appended only after budgeting, so it is pruned before history like everything
+else — and `_build_agent_context` returns the surviving subset rather than the
+retrieved one.
+
+That return value is the point of the signature change. `context_snippets` is
+a claim about what the model was shown, so reporting the pre-pruning
+retrieval would name chunks that never reached it — the same class of untruth
+as reporting a context that was never injected, one stage later. The
+four-tuple was worth keeping while it cost only sixteen unpackings; it was not
+worth keeping at the price of recomputing the surviving set or parsing it back
+out of the system prompt.
+
+Two more mutations for that half: folding grounding into the system block
+before budgeting kills both budget cases, and reporting the retrieval instead
+of the survivors kills the reporting case alone.
+
+Seven mutations now, all applied and all killed. Two earlier attempts did not
+apply at all — a stale anchor, and a cooked string that turned a literal
+backslash-n into a newline — and a mutation that does not apply measures
+nothing, so the driver now reports an unmatched anchor as loudly as a
+survivor rather than printing a reassuring "skipped".
