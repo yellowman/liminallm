@@ -1725,7 +1725,14 @@ def _responses_usage(usage: dict) -> dict:
     return {
         "input_tokens": prompt,
         "input_tokens_details": {
-            "cached_tokens": int(usage.get("cached_tokens") or 0)
+            "cached_tokens": int(usage.get("cached_tokens") or 0),
+            # Required by the dialect's own type since openai 3.x, which is
+            # what an unpinned install resolves. Read from the turn's usage
+            # like its sibling rather than hard-coded to zero, so a backend
+            # that starts reporting cache writes needs no change here; today
+            # none does, and the zero is the "present but unknown" the
+            # docstring above describes.
+            "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
         },
         "output_tokens": completion,
         "output_tokens_details": {"reasoning_tokens": reasoning},

@@ -12864,3 +12864,145 @@ reproduced and closed.
 Three findings in this file now, all the same sentence with a different
 subject: **what is declared, what is imported, and what is installed are three
 different sets, and every defect here came from treating two of them as one.**
+
+## The unqualified openai was a real defect, and the uncapped range found it
+
+Recorded above as "still unqualified": CI installs unpinned and resolves
+`openai==3.3.1`, while the dev extra's floor is 2.8.1 and every local
+environment held exactly that. The note said the types all still existed, so
+the conformance suite would at least collect, and that whether the shapes still
+validated was what the run would say.
+
+The run said no. `test (3.10)` on `1030758` failed after fourteen minutes, with
+the other two matrix jobs cancelled by fail-fast rather than failed — so CI
+could not tell whether the defect was version-specific, and the local
+3.11 lane had passed 2823 tests half an hour earlier.
+
+Reproduced by building a 3.10 environment with CI's own two install lines,
+which resolves `openai 3.3.1`:
+
+    5 failed, 37 passed
+
+All five in `tests/test_responses_served.py`, and all five the same event.
+Handing the payload to the concrete type rather than to the fifty-nine-member
+stream union turned a wall of union errors into one line:
+
+    response.usage.input_tokens_details.cache_write_tokens
+      Field required
+
+**openai 3.x made `cache_write_tokens` a required field of
+`input_tokens_details`.** In 2.8.1 that object required only `cached_tokens`.
+The served usage block emitted only `cached_tokens`, so as of 3.x this server
+had stopped conforming to the dialect it claims to speak — in exactly the way
+`_responses_usage`'s own docstring warns about: *"the details objects are
+always present (zeros when unknown) because typed SDKs require the fields."*
+The principle was written down and the field was not added when the SDK added
+it.
+
+`cache_write_tokens` is now read from the turn's usage like its sibling rather
+than hard-coded to zero, so a backend that starts reporting cache writes needs
+no change here. None does today, and the zero is the "present but unknown" the
+docstring already describes.
+
+### Grepping the class rather than the instance
+
+One field being wrong is one sighting. The question is whether 3.x made
+anything *else* required that this server emits, so the fix was checked by
+diffing required-field sets across every model under `openai.types.responses`
+in both SDKs.
+
+The first version of that diff walked only the package's top-level exports and
+reported five changed models — and did not include `InputTokensDetails`, which
+lives in the `response_usage` submodule. It could not see the very field being
+fixed. Walking the submodules too raised the count from 218 models to 390 and
+made the diff worth trusting:
+
+    response_computer_tool_call_output_item.ResponseComputerToolCallOutputItem: +['status']
+    response_function_shell_tool_call_output.ResponseFunctionShellToolCallOutput: +['status']
+    response_function_tool_call_item.ResponseFunctionToolCallItem: +['status']
+    response_function_tool_call_output_item.ResponseFunctionToolCallOutputItem: +['status']
+    response_input_message_item.ResponseInputMessageItem: +['type']
+    response_usage.InputTokensDetails: +['cache_write_tokens']
+
+Six, of which this server emits one. The four `*Item` models are the stored-item
+variants returned by an input-items listing endpoint, which this server does not
+serve; the computer and shell tool outputs are capabilities it does not
+implement. The output items it does emit are `message`, `file_search_call` and
+`web_search_call`, and none of those changed. So the single fix is the whole
+fix, for a checked reason rather than a hopeful one.
+
+### The cap that was not added
+
+The obvious response — pin `openai` below 3 — is the wrong one, and the reason
+is worth keeping. The unpinned range is what surfaced a wire this server had
+genuinely stopped conforming to. A cap would have preserved a green suite over
+a payload no current SDK accepts. The comment in the dev extra now says that
+instead of claiming a lockfile qualifies the snapshot, which was never true of
+CI.
+
+Mutation: removing `cache_write_tokens` reproduces exactly the five failures,
+and restoring it gives 42 passed. Both SDK versions pass with the fix in place
+— 42 on 3.3.1 under 3.10, and 42 on 2.8.1 under 3.11 — so following the newer
+type did not break the older one.
+
+### The lesson, again, one level up
+
+Every defect in this sequence has been the same shape, and this one adds the
+sharpest instance: **the local environment is never the narrowest environment,
+and it is never the newest one either.** The 3.10 job failed on a package
+version no machine here had. The browser lane failed on a package no lane
+except one installed. Where a check is about the environment, the only place
+worth running it is an environment that differs from this one — which is what
+building CI's exact interpreter and install lines locally finally did.
+
+### And a third package no lane installs: Pillow
+
+The same 3.10 run that surfaced the openai defect also failed three tests on
+`ModuleNotFoundError: No module named 'PIL'`:
+
+    tests/test_notes.py::test_decompression_bomb_is_refused_not_allocated
+    tests/test_extract.py::test_an_unreadable_image_says_what_to_install
+    tests/test_extract.py::test_a_decompression_bomb_is_refused_before_it_allocates
+
+Pillow is in the `ocr` extra. No CI lane installs that extra, and every local
+environment had it. Most PIL-using tests skip cleanly because they carry
+`@pytest.mark.skipif(not ocr_available())` — but those three are gated on
+nothing, and correctly so: they are not OCR tests. They exercise the refusal
+paths, where an unreadable image must name the remedy and a decompression bomb
+must be refused before it allocates. So the three tests that most deserve to
+run in CI were the three that could not.
+
+Pillow is declared in the dev extra now, alongside its `ocr` entry, so they
+run rather than skip. Measured: installing Pillow alone into the CI-matching
+3.10 environment turns those three from failing to passing, with no tesseract
+involved.
+
+`importorskip` would have been the wrong fix here. It would have made the lane
+green by ensuring a decompression-bomb refusal was never tested on any machine
+but a developer's.
+
+### The class is wider than the guard, and this is measured
+
+The guard checks module-scope imports, because those abort collection. These
+three were *function-local*, which fails one test rather than the run — a
+milder symptom of the identical cause. Extending the same question to every
+import at any depth in `tests/`, exempting names handed to
+`pytest.importorskip`, flags five more:
+
+    numpy       tests/test_gate_roundtrip.py
+    starlette   tests/mcpfixture.py, tests/test_small_error_paths.py
+    tokenizers  tests/test_local_transformer.py
+    tomli       tests/test_declared_dependencies.py
+    yaml        tests/test_harness_runs_the_real_thing.py
+
+`tomli` is a false positive — it sits inside a `try:`, which is the deliberate
+soft-dependency idiom, so a real check needs that exemption. The rest are the
+genuine article, and `starlette` is precisely the `httpx` shape one directory
+over: imported directly, declared nowhere, present only because `fastapi`
+requires it. `yaml` is declared nowhere at all.
+
+None of them fails CI today, because the test job's install line happens to
+supply all four. That is the same sentence as every other entry here, which is
+why it is written down rather than fixed in passing: **this is a tranche, not a
+carry-over.** Fixing four passing tests while CI is red would mix a speculative
+change into a commit that has to be about the red.
