@@ -163,6 +163,7 @@ from liminallm.service.fs import (
     authorize_path,
     file_digest,
     generate_signed_url,
+    is_internal_path,
     namespace_key,
     path_lock,
     safe_join,
@@ -4368,7 +4369,7 @@ async def list_files(
             if not stat.S_ISREG(info.st_mode):
                 continue
             rel = f.relative_to(files_dir)
-            if any(part.startswith(".") for part in rel.parts):
+            if is_internal_path(rel):
                 continue
             all_files.append({
                 "name": rel.as_posix(),
@@ -4400,8 +4401,13 @@ async def list_files(
 
 
 def _is_hidden_relpath(filename: str) -> bool:
-    """True when any component of a user-supplied relative path is hidden."""
-    return any(part.startswith(".") for part in FilePath(filename).parts)
+    """True when any component of a user-supplied relative path is hidden.
+
+    Kept as a name this module reads well with; the rule itself is
+    `service.fs.is_internal_path`, shared with corpus ingestion so that a
+    path this API treats as absent cannot become a document.
+    """
+    return is_internal_path(filename)
 
 
 @router.get("/files/{filename:path}/url", response_model=Envelope, tags=["files"])

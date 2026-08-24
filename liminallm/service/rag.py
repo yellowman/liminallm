@@ -19,7 +19,7 @@ from typing import (
 from liminallm.logging import get_logger
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.embeddings import deterministic_embedding
-from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.fs import PathTraversalError, is_internal_path, safe_join
 from liminallm.service.late import (
     QUERY_MIN_SEGMENT_WORDS,
     maxsim,
@@ -944,7 +944,16 @@ class RAGService:
         files_processed = 0
 
         if path.is_file():
-            # Single file
+            # Single file. Named outright rather than reached by a walk, which
+            # is a path `authorize_path` allows: authority over the caller's
+            # own directory says nothing about which files in it are content.
+            if is_internal_path(path.name):
+                logger.info(
+                    "ingest_path_internal_skipped",
+                    context_id=context_id,
+                    fs_path=str(path),
+                )
+                return 0
             if not extensions or path.suffix.lower() in extensions:
                 # The guard is outside the catch. That catch exists so one
                 # unreadable document does not abandon a whole tree; failing
@@ -984,9 +993,32 @@ class RAGService:
         # particular path. Being somewhere under the shared root is not
         # authority, so containment is re-established here against the source.
         source_root = path.resolve()
+        # A source rooted at a hidden directory is bookkeeping in its entirety.
+        # Its children look ordinary relative to it, so the question has to be
+        # asked of the root itself before the walk starts.
+        if is_internal_path(path.name):
+            logger.info(
+                "ingest_path_internal_skipped",
+                context_id=context_id,
+                fs_path=str(path),
+            )
+            return 0
         pattern = "**/*" if recursive else "*"
         for file_path in path.glob(pattern):
             if not _within_source(file_path, source_root):
+                continue
+            # Early because it is cheap and reads with the other filters, not
+            # because anything depends on the position: `files_processed` is
+            # incremented only after a successful ingest, so a path that
+            # `continue`s before that leaves the file budget untouched
+            # wherever the test for it sits. What keeps a tree full of
+            # bookkeeping from starving real documents of that budget is that
+            # these entries are refused at all.
+            try:
+                relative = file_path.resolve().relative_to(source_root)
+            except ValueError:  # pragma: no cover - _within_source ruled it out
+                continue
+            if is_internal_path(relative):
                 continue
             if extensions and file_path.suffix.lower() not in extensions:
                 continue

@@ -653,6 +653,16 @@ logical layout (any POSIX-like shared filesystem):
       tmp/                   # temporary scratch (ephemeral)
 ```
 
+**internal paths are never content.** any relative path with a component
+beginning `.` — the `.checksums.json` upload manifest, anything under a
+hidden directory — is the server's bookkeeping. uploads and extraction strip
+leading dots, so a user can never own such a name. one predicate decides it
+(`service.fs.is_internal_path`) and every surface asks the same one: listings
+omit these paths, download and delete treat them as absent, and **corpus
+ingestion refuses them by any route**, whether reached by walking a directory
+or named outright as a context source. authority is a separate question: a
+caller is entitled to read their own manifest, and it is still not a document.
+
 ### 3.2 adapter files
 
 for each LoRA adapter artifact:

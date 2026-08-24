@@ -119,6 +119,32 @@ def safe_join(base: Path, relative: str) -> Path:
     raise PathTraversalError("path traversal detected")
 
 
+def is_internal_path(relative: str | Path) -> bool:
+    """True when a relative path is the server's bookkeeping, not content.
+
+    One rule, asked by everything that has to tell a user's documents from
+    the files the server keeps beside them: the `.checksums.json` upload
+    manifest, and anything under a hidden directory. Uploads and extraction
+    strip leading dots, so a user can never own one of these names.
+
+    Components, not the basename. `bundle/.internal/secret.md` is internal
+    for the same reason the manifest is, and a check that looked only at the
+    last component would index it.
+
+    It lives here rather than in the Files API because two surfaces answer
+    this question and they must not answer it differently: a path the listing
+    omits, and download and delete treat as absent, is a path ingestion must
+    refuse. It was spelled twice inside `routes.py` alone and a third time
+    nowhere — which is how the manifest became a chunk.
+
+    Authorization is a separate question and stays separate. `authorize_path`
+    says whether a caller may read a path; this says whether the path is the
+    user's content. A caller is entitled to their own manifest and it is
+    still not a document.
+    """
+    return any(part.startswith(".") for part in Path(relative).parts)
+
+
 class PathAuthorityError(PermissionError):
     """This caller has nothing that entitles them to this filesystem path."""
 

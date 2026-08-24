@@ -159,6 +159,41 @@ class TestInternalIsAboutComponentsNotBasenames:
         assert not any("Marrowgate" in b for b in chunk_bodies(context.id))
 
 
+class TestInternalEntriesDoNotStarveTheBudget:
+    def test_a_tree_full_of_bookkeeping_still_indexes_the_document(self, corpus):
+        """A property, not a reproduction — and worth stating either way.
+
+        The walk stops after `max_files` documents. If internal entries
+        counted against that, a directory carrying thousands of them would
+        exhaust the budget before reaching anything a user wrote, and the
+        turn would be grounded on nothing with no error to show for it.
+
+        They do not count, and the reason is narrower than where the check
+        sits: `files_processed` is incremented only after a successful
+        ingest, so any path that `continue`s before that leaves the budget
+        untouched wherever the test for it appears. What makes this hold is
+        that the entries are refused at all, which is what the manifest case
+        above already measures.
+        """
+        _headers, user_id, root = corpus
+        for i in range(6):
+            (root / f".bookkeeping-{i}.json").write_text('{"noise": %d}' % i)
+        (root / "wrenfield.md").write_text(
+            "Wrenfield rota: the bearing is seated by the night crew."
+        )
+        context = fresh_context(user_id)
+
+        get_runtime().rag.ingest_path(
+            context.id, str(root), recursive=True, max_files=1
+        )
+
+        paths = chunk_paths(context.id)
+        assert any("wrenfield.md" in p or "ferrothorn.txt" in p for p in paths), (
+            f"bookkeeping consumed the whole file budget: {paths}"
+        )
+        assert not any(".bookkeeping" in p for p in paths), paths
+
+
 class TestTheApiAndTheWalkerAgree:
     def test_what_the_files_api_omits_is_what_ingestion_refuses(
         self, client, corpus
