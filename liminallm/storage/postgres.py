@@ -4853,14 +4853,19 @@ class PostgresStore:
         """
         try:
             with self._connect() as conn:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE ingest_job SET status = 'queued', detail = %s, "
                     "attempts = GREATEST(attempts - 1, 0), "
                     "next_attempt_at = now(), updated_at = now() "
-                    "WHERE id = %s",
+                    # A transition, not an overwrite. Knowing a row's id is
+                    # not authority to revive it: a claim marks a job running
+                    # before it takes the publication lock, and a deletion
+                    # holding that lock supersedes it in that window. Handing
+                    # the job back must not write `queued` over that.
+                    "WHERE id = %s AND status = 'running'",
                     (detail, job_id),
                 )
-            return True
+            return (cursor.rowcount or 0) > 0
         except errors.UniqueViolation:
             return False
 
@@ -4889,13 +4894,18 @@ class PostgresStore:
         """
         try:
             with self._connect() as conn:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE ingest_job SET status = 'queued', detail = %s, "
                     "next_attempt_at = now() + %s::interval, updated_at = now() "
-                    "WHERE id = %s",
+                    # Only a job still running may be put back, for the same
+                    # reason `yield_ingest_job` says so: a deletion is allowed
+                    # to close a claimed job under the publication lock, and
+                    # neither of these may resurrect a terminal row merely
+                    # because it knows the id.
+                    "WHERE id = %s AND status = 'running'",
                     (detail, f"{max(0, int(delay_seconds))} seconds", job_id),
                 )
-            return True
+            return (cursor.rowcount or 0) > 0
         except errors.UniqueViolation:
             return False
 

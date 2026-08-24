@@ -543,3 +543,45 @@ class TestASupersededJobStaysSuperseded:
             "deletion's cancellation was undone by a worker that never "
             "touched the path"
         )
+
+    def test_a_failing_worker_cannot_requeue_a_cancelled_job_either(self, client):
+        """The same rule on the failure path, not only the contention one.
+
+        The deletion does its bookkeeping first and unlinks last — deliberately,
+        so a half-failed delete leaves "nothing was deleted" rather than "the
+        file is gone and still retrievable". That ordering leaves a real window
+        where a job is already superseded and the file is still on disk, so a
+        worker holding a claim gets past its generation check and into the
+        ingest. When that ingest fails, putting the job back must be refused
+        for the same reason standing aside is: knowing a row's id is not
+        authority to revive it.
+        """
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+
+        assert _upload(client, headers, "report.md", BODY).status_code == 200
+        files_dir = _files_dir(runtime, user_id)
+        target = str(files_dir / "report.md")
+        assert _add_source(
+            client, headers, context_id, files_dir, recursive=False
+        ).status_code in (200, 201)
+        runtime.store.enqueue_ingest_job(
+            context_id, target, ingest_queue.generation_of(Path(target))
+        )
+
+        claimed = runtime.store.claim_ingest_jobs(1)
+        assert len(claimed) == 1
+        # The deletion's cancellation, at the moment before its unlink.
+        assert runtime.store.cancel_ingest_jobs_under_path(user_id, target) == 1
+
+        class Unreachable:
+            def ingest_file(self, *args, **kwargs):
+                raise RuntimeError("embedding backend unreachable")
+
+        assert ingest_queue.run_job(
+            runtime.store, Unreachable(), claimed[0], fs_root=_root(runtime)
+        ) == 0
+        assert runtime.store.count_pending_ingest_jobs(target) == 0, (
+            "a failing worker put a cancelled job back in the queue"
+        )

@@ -368,6 +368,16 @@ generated `content_tsv` column (GIN-indexed) for the lexical channel, and
   `publication_key` for an absolute path: keying on a file's own parent takes
   a lock nothing else holds, and a delete then ran straight through a job
   indexing a file inside the tree.
+  the key is read off `fs_root` at a fixed depth, never searched for by
+  shape: a tree may contain any names a user can unpack, `users/` and
+  `files/` included, so the nearest thing *shaped* like the layout is the
+  archive's copy rather than the real root — and a job keyed there while a
+  delete keys on the tree reopens the race.
+  putting a claimed job back is a `running -> queued` **transition**, never
+  an overwrite. a claim marks a job running before it takes the lock, and a
+  deletion holding that lock is entitled to supersede it in that window;
+  neither standing aside nor failing may then revive a terminal row merely
+  because it knows the id.
   the subtree match is separator-bounded on both records, so deleting
   `bundle` takes `bundle/inner.md`'s own source row and its queued job and
   does not take `bundle2`. `ingest_job` is a **required table**: an older

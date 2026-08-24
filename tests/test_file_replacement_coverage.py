@@ -43,7 +43,7 @@ from pathlib import Path
 
 from liminallm.api import routes
 from liminallm.service import ingest_queue
-from liminallm.service.fs import PathLockTimeout, namespace_key, path_lock
+from liminallm.service.fs import PathLockTimeout, path_lock, publication_key
 from liminallm.service.runtime import get_runtime
 
 # Long enough that a slow box does not fail an implementation that is merely
@@ -60,10 +60,14 @@ def _root(runtime) -> str:
 
 
 def _publication_lock(runtime, fs_path: str, *, timeout: float = 0.1):
-    """The same lock, on the same key, that an upload of this path takes."""
-    target = Path(fs_path)
+    """The same lock, on the same key, that an upload of this path takes.
+
+    Through `publication_key`, not a second derivation of it: a test that
+    computes the key its own way can agree with production at one depth and
+    diverge at another, which is exactly the bug this helper is used to catch.
+    """
     return path_lock(
-        _root(runtime), namespace_key(target.parent, target.name), timeout=timeout
+        _root(runtime), publication_key(_root(runtime), fs_path), timeout=timeout
     )
 
 
@@ -795,9 +799,14 @@ class TestTheQueueDoesNotLoseWork:
         runtime, context_id, path, run_the_queue = (
             self._replaced_with_drain_suspended(client, monkeypatch)
         )
-        job_id = _pending_job_id(runtime, path)
-
-        # What a failure leaves behind: the job pushed well into the future.
+        # What a failure leaves behind, reached the way a failure reaches it:
+        # a job is claimed, fails, and is put back with a delay. Requeueing is
+        # a `running -> queued` transition, so the claim is not decoration —
+        # pushing a never-claimed row's due time out would be arranging a
+        # state the system does not produce.
+        claimed = runtime.store.claim_ingest_jobs(1)
+        assert len(claimed) == 1
+        job_id = str(claimed[0]["id"])
         assert runtime.store.requeue_ingest_job(
             job_id, detail="embedding backend unreachable", delay_seconds=3600
         )

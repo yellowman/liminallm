@@ -13682,3 +13682,45 @@ Worth stating as a rule rather than an incident: **a merge can silently
 un-require something.** Nothing about resolving a conflict in a list of table
 names looks like removing a startup guarantee, and no other test referenced
 the entry. The guard is cheap; noticing its absence was not.
+
+### Two more the review found in the queue's state machine
+
+**The lock key was found by shape, and a shape is not an identity.**
+`publication_key` walked upward for the first directory shaped like
+`users/*/files`. An extracted tree may contain exactly those names, so
+`bundle/users/fake/files/inner.md` matched the archive's copy first: a worker
+locked a namespace *inside* the tree while a delete of the tree locked the
+tree, and the race this tranche exists to close was open again — reachable by
+unpacking an archive that mirrors the layout. Measured, the delete returned
+200 mid-ingest and the job then failed on `FileNotFoundError`.
+
+The root is now read off `fs_root` at a fixed depth rather than searched for.
+No `resolve()`: the lock is on the persistent name, which is what every other
+side locks, and resolving would key two names for one file and follow a
+symlink out of the namespace it belongs to.
+
+**Putting a job back was an overwrite rather than a transition.** A claim
+marks a job `running` before it goes for the publication lock, and a deletion
+holding that lock is entitled to supersede it in that window. The worker then
+timed out and wrote `queued` over `superseded`, undoing a cancellation it
+never had the authority to touch.
+
+This does not by itself restore deleted chunks — the revived job finds the
+file missing and supersedes itself. It makes the deletion's cancellation
+guarantee false, and if the same name with the same bytes reappears before
+that job runs, it ingests into a context whose exact source row the deletion
+already removed: derived state recreating itself with no authority behind it.
+Both `yield_ingest_job` and `requeue_ingest_job` now carry
+`AND status = 'running'` and report whether the transition happened.
+
+The failure path needed its own witness, and the schedule for it is not
+contrived: deletion does its bookkeeping first and unlinks last, deliberately,
+so there is a real window where a job is superseded and the file is still on
+disk. A worker holding a claim gets past its generation check and into the
+ingest, and what it does when that ingest fails is the thing under test.
+
+**One test was changed rather than kept.** It reached "a job with a backoff"
+by requeueing a row that had never been claimed. That is no longer a state the
+system can produce, so it now claims the job first — the setup was arranging a
+shape rather than reproducing a history, and the predicate made the difference
+visible.
