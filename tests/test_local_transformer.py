@@ -20,7 +20,6 @@ What is pinned here, and why each one:
 
 import json
 
-import numpy as np
 import pytest
 
 from liminallm.service import transformer
@@ -32,6 +31,14 @@ from liminallm.service import transformer
 pytestmark = pytest.mark.slow
 
 
+# `numpy` guarded alongside `jax` rather than imported plainly above, for the
+# same reason the two below are: it is in the `train` extra, and the only CI
+# lane that installs it does so by naming `jax` on a `pip install` line.
+# Imported at module scope it took down the browser lane — whose install set
+# is the narrowest in CI — at collection, which deselects nothing because
+# collection never finishes. The same defect as the undeclared `httpx`: a
+# module-scope import satisfied by somebody else's requirement.
+np = pytest.importorskip("numpy")
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 save_file = pytest.importorskip("safetensors.numpy").save_file

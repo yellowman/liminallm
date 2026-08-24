@@ -70,6 +70,9 @@ dev = [
   "pytest-xdist>=3.5",
   "ruff>=0.4",
   "bandit>=1.7",
+  # `tests/test_declared_dependencies.py` reads pyproject.toml. `tomllib` is
+  # stdlib from 3.11; 3.10 is this project's floor and needs the backport.
+  "tomli>=2.0; python_version < '3.11'",
   # The arbiter for the served Responses wire (SPEC §16). Those tests hand
   # each payload to the SDK's generated types, which live under
   # `openai.types.responses` and do not exist in the base floor above — so a

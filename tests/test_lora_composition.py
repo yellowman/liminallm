@@ -16,11 +16,13 @@ that was the only input anything tested. So:
 
 import json
 
-import numpy as np
 import pytest
 
 from liminallm.service import transformer
 
+# `numpy` guarded with the rest: it comes from the `train` extra, which no CI
+# lane installs by name. See the note in `test_local_transformer.py`.
+np = pytest.importorskip("numpy")
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 pytest.importorskip("safetensors")

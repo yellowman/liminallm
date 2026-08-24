@@ -12753,3 +12753,82 @@ a regular 48-byte file instead of the character device, so anything dropping
 output as an unprivileged user failed. Restored with `mknod /dev/null c 1 3`.
 Worth writing down only because the symptom — Postgres refusing to initialise
 — points nowhere near the cause.
+
+## The guard against undeclared imports had two of its own
+
+The `httpx` fix above got CI past the conftest for the first time: the 3.10 job
+reached **2701 collected items**, where every previous run had died before
+collecting one. What it then reported were two more instances of the same
+shape, both introduced by the commit that was supposed to close it.
+
+### `tomllib` is not in 3.10
+
+    tests/test_declared_dependencies.py:24: in <module>
+        import tomllib
+    E   ModuleNotFoundError: No module named 'tomllib'
+
+`tomllib` entered the standard library in 3.11. This project's floor is 3.10,
+where it is the `tomli` backport under a different name. So the test written to
+catch a dependency nobody declared was itself a dependency nobody declared —
+on the one interpreter that had to be checked and was not.
+
+The fix is the ordinary conditional import plus `tomli>=2.0; python_version <
+'3.11'` in the dev extra. Two things went with it. `packaging.requirements`
+came out in favour of a small regex over the distribution name, because
+`packaging` is *also* transitively supplied — pytest happens to depend on it —
+and a test about undeclared dependencies should not rest on one. And two
+entries in the name map, `uvicorn[standard]` and `psycopg[binary]`, could never
+match: the regex strips the extra before the lookup, so both fell through to a
+default that happened to produce the same answer. A wrong entry in that shape
+would have been silent, so `test_no_name_mapping_is_unreachable` now requires
+every key to survive the regex unchanged.
+
+Verified on a real 3.10 interpreter rather than by reading the changelog: 4
+passed, and removing the fallback reproduces the collection error exactly.
+
+### The browser lane installs the narrowest set, and found `numpy`
+
+    tests/test_local_transformer.py:23: in <module>
+        import numpy as np
+    E   ModuleNotFoundError: No module named 'numpy'
+    ================ 6 skipped, 2694 deselected, 2 errors ================
+
+Both modules already guard `jax` and `safetensors` with `importorskip`, and
+imported `numpy` plainly beside them — it is ubiquitous wherever `jax` is, and
+that is exactly the assumption that fails. `numpy` is in the `train` extra. No
+CI lane installs that extra; the **test** job gets `numpy` because its install
+line names `jax`, which brings it along. The **browser** job installs only base
+plus dev, so `numpy` is absent there, and a module-scope import in a test file
+is not a failing test — it is a collection error that aborts the run. 2694
+tests it would have deselected never ran.
+
+The same defect as `httpx`, one directory over: a module-scope import satisfied
+by somebody else's install line.
+
+### The guard now covers `tests/`, against a different list
+
+The first version of this check walked `liminallm/` only, which is why it could
+not see either of these. It now walks `tests/` as well, and the rule there is
+measured against the narrowest lane rather than against `[project]
+dependencies`: a test module may import at module scope only what **every** CI
+lane installs — base plus dev — and reaches anything outside that through
+`pytest.importorskip`, which is a call this walk does not see and a skip rather
+than an error when the package is missing. Today `tests/` imports exactly four
+third-party names at module scope: `pytest`, `fastapi`, `httpx`, `pydantic`.
+
+Mutation, run against the real failure rather than a description of it:
+restoring `import numpy as np` and blocking `numpy` on `sys.meta_path` to
+reproduce the browser lane's install set gives `Interrupted: 1 error during
+collection`; with the fix in place the same command collects cleanly. The
+`can_see_something` guard is parametrized over both packages, so neither walk
+can go quietly empty.
+
+### What this cost, and the shape it keeps taking
+
+Three commits to declare one dependency, and each one's fix introduced the
+next. The pattern is the one already named on this branch — the witness stands
+one layer below where the defect lives — with a second edge: **the local
+environment is never the narrowest environment.** Every one of these passed
+locally, on an interpreter with the extras installed, and failed on the lane
+that had least. Where a check is about what is installed, the only meaningful
+place to run it is somewhere with less installed than here.
