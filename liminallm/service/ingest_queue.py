@@ -119,9 +119,7 @@ def run_job(
     budget ran out.
     """
     job_id = str(job["id"])
-    context_id = str(job["context_id"])
-    fs_path = str(job["fs_path"])
-    path = Path(fs_path)
+    path = Path(str(job["fs_path"]))
 
     try:
         with path_lock(
