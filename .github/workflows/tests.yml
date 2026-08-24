@@ -77,23 +77,56 @@ jobs:
       - name: Compile Python files
         run: python -m compileall liminallm
 
+      # The interpreter refuses to run model-written code without a user
+      # namespace, and Ubuntu 24.04 denies unprivileged processes one through
+      # AppArmor: `unshare` succeeds, the process gets no capabilities in the
+      # namespace it just made, and writing /proc/self/setgroups returns
+      # EACCES. Measured on this runner, that failed thirty-one tests.
+      #
+      # Turning the restriction off is what lets those tests exercise the real
+      # boundary here rather than skip. It widens what an unprivileged process
+      # on this throwaway VM may do; it changes nothing about what Liminal
+      # permits, which is the sandbox's own business and is what the tests
+      # below check.
+      #
+      # Not `|| true`: if this stops working the lane must fail here, with
+      # this comment next to it, rather than silently downgrade to skipping
+      # the confinement suite.
+      - name: Permit unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --user --map-root-user true
+          echo "unprivileged user namespaces work on this runner"
+
+      # Runs the deploy command itself rather than reimplementing it, so a
+      # break in scripts/migrate.sh is found here and not by an operator.
       - name: Apply schema
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/liminallm
-        run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d liminallm \
-            -v ON_ERROR_STOP=1 -v embedding_dim=64 -f sql/schema.sql
+          EMBEDDING_VECTOR_DIM: "64"
+        run: bash scripts/migrate.sh
 
       - name: Run tests with coverage
         env:
           TEST_MODE: "true"
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/liminallm
+          # The step above already applied the schema, with the deploy command.
+          # Without this the suite would rebuild the schema itself and pass
+          # over a migrate.sh that did nothing.
+          TEST_SCHEMA_PREPARED: "true"
           EMBEDDING_VECTOR_DIM: "64"
-          ALLOW_REDIS_FALLBACK_DEV: "true"
-          REDIS_URL: redis://localhost:6379/1
-          JWT_SECRET: test-secret-key-for-ci-only
+          # This lane claims to exercise the real confinement boundary, so a
+          # platform that cannot confine has to fail it rather than skip the
+          # suite. See the sysctl step above and
+          # test_a_lane_that_requires_confinement_actually_gets_it.
+          LIMINALLM_REQUIRE_CONFINEMENT: "1"
+        # `-m 'not browser'`: that lane needs a Chromium binary and has its
+        # own job below. ALLOW_REDIS_FALLBACK_DEV is not set here because it
+        # reaches nothing — the setting is admin-managed with no environment
+        # variable, and TEST_MODE above is what actually permits the fallback.
         run: |
-          pytest --cov=liminallm --cov-report=xml --cov-report=term-missing -v
+          pytest -m 'not browser' \
+            --cov=liminallm --cov-report=xml --cov-report=term-missing -v
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.11'
@@ -116,3 +149,68 @@ jobs:
       - name: Run security scan
         # Enforce Bandit findings instead of ignoring failures during development
         run: bandit -r liminallm/ -ll --skip B101
+
+  # The browser lane. Its own job because it needs a Chromium binary, and one
+  # Python version because what it checks — what the SPA persists where
+  # scripts can read it, and what the browser puts on the wire — does not vary
+  # by interpreter. Previous defects at this seam were all invisible to
+  # TestClient, which has no script context and no HttpOnly enforcement.
+  browser:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: liminallm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[dev] || pip install .
+          pip install pytest playwright
+
+      # The browser only. `--with-deps` brings the shared libraries a headless
+      # Chromium needs on a bare runner.
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Apply schema
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/liminallm
+          EMBEDDING_VECTOR_DIM: "64"
+        run: bash scripts/migrate.sh
+
+      - name: Run the browser lane
+        env:
+          TEST_MODE: "true"
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/liminallm
+          TEST_SCHEMA_PREPARED: "true"
+          EMBEDDING_VECTOR_DIM: "64"
+        run: pytest -m browser -v

@@ -48,6 +48,25 @@ def test_remove_tolerates_a_missing_key():
     assert out == {"a": 1}
 
 
+def test_remove_does_not_create_the_containers_it_removes_from():
+    """Walking with the creating walker left the parents behind.
+
+    remove /a/b on {} used to return {"a": {}} — so every model-authored
+    patch that dropped an optional nested key quietly wrote an empty object
+    into the config or artifact schema it was editing.
+    """
+    assert json_patch.apply_ops({}, [{"op": "remove", "path": "/a/b"}]) == {}
+    assert json_patch.apply_ops(
+        {"keep": 1}, [{"op": "remove", "path": "/a/b/c/d"}]
+    ) == {"keep": 1}
+
+
+def test_remove_through_a_missing_list_index_creates_nothing():
+    assert json_patch.apply_ops(
+        {"xs": []}, [{"op": "remove", "path": "/xs/3/name"}]
+    ) == {"xs": []}
+
+
 def test_move_takes_the_value_with_it():
     out = json_patch.apply_ops({"a": {"x": 1}, "b": {}}, [
         {"op": "move", "path": "/b/x", "from": "/a/x"},

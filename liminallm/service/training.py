@@ -8,12 +8,13 @@ from contextlib import suppress
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Sequence
+from typing import Any, Iterable, Iterator, List, Optional, Sequence
 
 from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.logging import get_logger
+from liminallm.service import local_format, transformer
 from liminallm.service.embeddings import deterministic_embedding
-from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.fs import adapter_root, safe_join
 from liminallm.service.tokenizer_utils import (
     DEFAULT_VOCAB_SIZE,
     vocab_size_from_tokenizer,
@@ -32,6 +33,10 @@ DEFAULT_TRAIN_BATCH_SIZE = 2
 DEFAULT_MAX_TOKEN_LENGTH = 512
 DEFAULT_GRAD_ACCUM_STEPS = 4
 DEFAULT_LORA_LEARNING_RATE = 2e-3
+# SPEC §5.4.4: the loss carries an L2 term over the LoRA parameters. Small
+# adapters on small datasets overfit quickly, and the regularizer is what
+# keeps a passing eval gate meaningful rather than memorized.
+LORA_L2_LAMBDA = 1e-4
 # SPEC §5.4: eval gate. Every Nth example is held out once the dataset is big
 # enough, and promotion requires the holdout loss to improve by at least the
 # relative margin below.
@@ -83,9 +88,47 @@ class TrainingService:
         # into cleaner training targets before tokenization.
         self.teacher = teacher
         self.distillation_enabled = distillation_enabled
+        # Resolved lazily: False = not looked at yet, None = looked and absent.
+        self._base_config_state: Any = False
+        self._base_checkpoint_state: Any = False
+
+    def _base_model_dir(self) -> Optional[str]:
+        return self.runtime_base_model
+
+    def _base_config(self):
+        """The frozen base model's config, or None. Cheap and cached."""
+        if self._base_config_state is not False:
+            return self._base_config_state
+        directory = self._base_model_dir()
+        self._base_config_state = (
+            transformer.load_config(directory) if directory else None
+        )
+        return self._base_config_state
+
+    def _base_checkpoint(self):
+        """(config, params) for the frozen base model, or None.
+
+        Loaded once per service: training needs the real weights to compute a
+        real gradient, and re-reading gigabytes per job would dominate the
+        run.
+        """
+        if self._base_checkpoint_state is not False:
+            return self._base_checkpoint_state
+        directory = self._base_model_dir()
+        self._base_checkpoint_state = None
+        if directory and transformer.checkpoint_available(directory):
+            try:
+                self._base_checkpoint_state = transformer.load_checkpoint(directory)
+            except Exception as exc:  # noqa: BLE001 - skip, never train blind
+                logger.error(
+                    "training_base_checkpoint_failed",
+                    base_model=directory,
+                    error=str(exc),
+                )
+        return self._base_checkpoint_state
 
     def _safe_int(self, value: object, default: int, *, context: str) -> int:
-        """Coerce values to int with fallback to avoid ValueError crashes (Issue 39.3)."""
+        """Coerce to int with a fallback; malformed data must not raise."""
 
         try:
             return int(value)
@@ -104,7 +147,7 @@ class TrainingService:
         try:  # pragma: no cover - optional dependency
             from transformers import AutoTokenizer
 
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # nosec B615 - pinning a revision for an operator-chosen base model is an open decision
             self._base_vocab_size = vocab_size_from_tokenizer(
                 self.tokenizer, fallback=self.default_vocab_size
             )
@@ -124,6 +167,12 @@ class TrainingService:
             )
 
     def _vocab_size(self) -> int:
+        config = self._base_config()
+        if config is not None:
+            # Same rule serving follows: the checkpoint's embedding table
+            # defines the only ids that mean anything, so tokenization must
+            # land inside it rather than inside a default.
+            return config.vocab_size
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
             return self._adapter_vocab_size
         return self._base_vocab_size
@@ -141,7 +190,16 @@ class TrainingService:
         stored_base = (
             adapter.schema.get("base_model") if adapter and adapter.schema else None
         )
-        if runtime_base and stored_base and stored_base != runtime_base:
+        # One identity rule for both ends of the ladder (SPEC §5.1). Raw
+        # string inequality made a checkout path and its own directory name
+        # two different models here while serving called them one, so which
+        # spelling a deployment happened to store decided whether an adapter
+        # could be trained at all.
+        if (
+            runtime_base
+            and stored_base
+            and not transformer.same_base_model(stored_base, runtime_base)
+        ):
             migration_plan = {
                 "expected_base": runtime_base,
                 "stored_base": stored_base,
@@ -200,7 +258,11 @@ class TrainingService:
             adapter = existing[0]
             runtime_base = self.runtime_base_model
             stored_base = adapter.schema.get("base_model") if adapter.schema else None
-            if runtime_base and stored_base and stored_base != runtime_base:
+            if (
+                runtime_base
+                and stored_base
+                and not transformer.same_base_model(stored_base, runtime_base)
+            ):
                 migration_plan = {
                     "expected_base": runtime_base,
                     "stored_base": stored_base,
@@ -219,10 +281,6 @@ class TrainingService:
             if runtime_base and not stored_base:
                 updated_schema["base_model"] = runtime_base
                 needs_update = True
-            # Migrate existing adapters to include mode if missing
-            if "mode" not in updated_schema:
-                updated_schema["mode"] = self._infer_adapter_mode(updated_schema)
-                needs_update = True
             if needs_update:
                 self.store.update_artifact(adapter.id, updated_schema)
                 adapter = self.store.get_artifact(adapter.id) or adapter
@@ -233,9 +291,7 @@ class TrainingService:
         _ = adapter_id_override  # Reserved for future use in adapter creation
         adapter_schema = {
             "kind": "adapter.lora",
-            "mode": resolved_mode,  # Explicit adapter mode
-            "backend": self._mode_to_backend(resolved_mode),
-            "provider": self._mode_to_provider(resolved_mode),
+            "mode": resolved_mode,
             "scope": "per-user",
             "user_id": user_id,
             "base_model": self.runtime_base_model or "jax-base",
@@ -255,47 +311,8 @@ class TrainingService:
         if resolved_mode in {AdapterMode.LOCAL, AdapterMode.HYBRID}:
             adapter_fs_dir = self._adapter_dir(user_id, adapter.id, adapter_schema)
             adapter_schema["fs_dir"] = str(adapter_fs_dir)
-            adapter_schema.setdefault("cephfs_dir", str(adapter_fs_dir))
         self.store.update_artifact(adapter.id, adapter_schema)
         return self.store.get_artifact(adapter.id) or adapter
-
-    def _infer_adapter_mode(self, schema: dict) -> str:
-        """Infer adapter mode from legacy schema fields."""
-        backend = (schema.get("backend") or "").lower()
-        provider = (schema.get("provider") or "").lower()
-
-        if backend in {"prompt", "prompt_distill"}:
-            return AdapterMode.PROMPT
-        if backend in {"local", "local_lora"} or provider == "local":
-            # If has prompt_instructions, it's hybrid
-            if schema.get("prompt_instructions") or schema.get("behavior_prompt"):
-                return AdapterMode.HYBRID
-            return AdapterMode.LOCAL
-        if backend in {"api", "remote"} or schema.get("remote_model_id"):
-            return AdapterMode.REMOTE
-        # Default to hybrid for backwards compatibility
-        return AdapterMode.HYBRID
-
-    def _mode_to_backend(self, mode: str) -> str:
-        """Map adapter mode to backend field value."""
-        if mode == AdapterMode.LOCAL:
-            return "local"
-        if mode == AdapterMode.REMOTE:
-            return "api"
-        if mode == AdapterMode.PROMPT:
-            return "prompt"
-        # HYBRID uses local backend with prompt fallback
-        return "hybrid"
-
-    def _mode_to_provider(self, mode: str) -> str:
-        """Map adapter mode to provider field value."""
-        if mode == AdapterMode.LOCAL:
-            return "local"
-        if mode == AdapterMode.REMOTE:
-            return self.backend_mode or "api"
-        if mode == AdapterMode.PROMPT:
-            return "prompt"
-        return "hybrid"
 
     def train_from_preferences(
         self,
@@ -430,7 +447,10 @@ class TrainingService:
                 context="adapter_rank",
             ),
             layers=adapter.schema.get("layers", []),
-            matrices=adapter.schema.get("matrices", []),
+            # SPEC §5.2 restricts LoRA to the attention projections; an
+            # adapter that names none gets the standard Q/V pair rather than
+            # an empty weight set that could only be skipped.
+            matrices=adapter.schema.get("matrices") or ["attn_q", "attn_v"],
         )
         params_path.write_text(json.dumps(weights, indent=2))
         metadata = {
@@ -468,8 +488,6 @@ class TrainingService:
             # with the prompt instructions kept as portable fallback.
             if updated_schema.get("mode") == AdapterMode.PROMPT:
                 updated_schema["mode"] = AdapterMode.HYBRID
-                updated_schema["backend"] = self._mode_to_backend(AdapterMode.HYBRID)
-                updated_schema["provider"] = self._mode_to_provider(AdapterMode.HYBRID)
                 updated_schema.setdefault("lifecycle", {})
                 if isinstance(updated_schema["lifecycle"], dict):
                     updated_schema["lifecycle"]["stage"] = "weights"
@@ -503,19 +521,25 @@ class TrainingService:
                 job_id=job_id,
                 reason=gate["reason"],
             )
-        # Extract actual loss from JAX training instead of using heuristic
-        # Per SPEC §5.4: metrics = loss and preference alignment rate
-        loss = 1.0 / (1 + len(dataset_entries))  # Fallback heuristic
-        if training_trace.get("status") == "ok" and training_trace.get("steps"):
-            # Use actual final loss from training if available
+        # SPEC §5.4: metrics are loss and preference alignment rate. The loss
+        # is the one the loop produced or there is none — there is no
+        # fallback, because `1/(1+len(dataset))` reported that a run went well
+        # because its dataset was large. A trained run always has one: the
+        # loop appends a step per batch, and a run with no batches is skipped
+        # before it starts. What is left is a step whose loss is not a
+        # non-negative number, which a diverged run produces and which is not
+        # a loss either.
+        status = self.terminal_status(training_trace, gate)
+        loss = None
+        if status != "skipped" and training_trace.get("steps"):
             final_step = training_trace["steps"][-1]
-            if isinstance(final_step, dict) and "loss" in final_step:
+            if isinstance(final_step, dict):
                 actual_loss = final_step.get("loss")
                 if isinstance(actual_loss, (int, float)) and actual_loss >= 0:
                     loss = float(actual_loss)
         self.store.update_training_job(
             job_id,
-            status="succeeded",
+            status=status,
             loss=loss,
             new_version=next_version if gate["promoted"] else None,
             meta={
@@ -531,6 +555,7 @@ class TrainingService:
             "job_id": job_id,
             "adapter_id": adapter.id,
             "version_dir": str(version_dir),
+            "status": status,
             "loss": loss,
             "token_batches": token_batches,
             "jax_trace": training_trace,
@@ -746,6 +771,11 @@ class TrainingService:
             "version": version,
             "jax_trace": result.get("jax_trace"),
             "clusters": result.get("clusters"),
+            # The gate decision travels with the summary. Dropping it let the
+            # worker default `promoted` to True (SPEC §5.4.6 requires the
+            # opposite), marking gate-rejected runs succeeded and crediting
+            # the adapter's router state for a rollout that never happened.
+            "eval_gate": result.get("eval_gate"),
         }
 
     def record_training_outcome(
@@ -948,6 +978,26 @@ class TrainingService:
                 train.append(entry)
         return train, holdout
 
+    @staticmethod
+    def terminal_status(trace: Optional[dict], gate: Optional[dict]) -> str:
+        """What a finished job should say happened. One rule, one place.
+
+        `skipped` did not train — no JAX, no base checkpoint, no tokenizer,
+        no LoRA matrices, no batches — so it has no loss to report and cannot
+        have been turned down by an eval it never reached. `gate_rejected`
+        trained and failed the holdout. `succeeded` trained and was promoted.
+
+        The three used to be decided twice. The service wrote `succeeded`
+        unconditionally and the worker overwrote it with
+        `succeeded if promoted else gate_rejected`, so a run that never
+        trained passed through a `succeeded` another replica could read, and
+        settled on a status that blames model quality for a missing
+        checkpoint.
+        """
+        if (trace or {}).get("status") != "ok":
+            return "skipped"
+        return "succeeded" if (gate or {}).get("promoted") else "gate_rejected"
+
     def _promotion_gate(self, trace: dict, *, holdout_count: int) -> dict:
         """Decide whether trained weights may be promoted (SPEC §5.4).
 
@@ -956,8 +1006,8 @@ class TrainingService:
           not become "latest"; prompt-mode adapters stay on the prompt rung).
         - holdout present -> promote only when holdout loss improved by at
           least EVAL_MIN_RELATIVE_IMPROVEMENT.
-        - dataset too small for a holdout -> promote on completed training,
-          recording that the gate ran without an eval.
+        - dataset too small for a holdout -> never promote: improvement
+          cannot be shown, and unevaluated weights now change the model.
         """
         status = trace.get("status")
         if status != "ok":
@@ -985,38 +1035,63 @@ class TrainingService:
                 "eval_after": eval_after,
                 "improvement": improvement,
             }
+        # No holdout means the ≥1% improvement of §5.4.6 cannot be shown, and
+        # "promoted only when it improves" refuses what it cannot measure.
+        # Promoting anyway would let an unevaluated version regress the
+        # model, which is what §5.5's "nothing regresses" forbids. The
+        # adapter stays on the prompt rung until it has data to prove
+        # itself.
         return {
-            "promoted": True,
-            "reason": "no holdout (dataset below eval threshold)",
+            "promoted": False,
+            "reason": "no holdout (dataset below eval threshold); nothing to prove improvement",
             "holdout_examples": holdout_count,
         }
 
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
-        # Issue 18.1: Dedupe by (conversation_id, message_id) per SPEC §18
+        # Dedupe by (conversation_id, message_id) per SPEC §5.4.3.
         seen: set[tuple[str, str]] = set()
         for event in events:
             key = (event.conversation_id or "", event.message_id or "")
             if key in seen:
                 continue
             seen.add(key)
-            messages = self.store.list_messages(
-                event.conversation_id, limit=200, user_id=event.user_id
+            # SPEC §5.4.2: the boundary is the target's sequence number, and
+            # it is resolved from the store rather than searched for inside a
+            # fetch window. Asking for the newest 200 messages and looking for
+            # the target among them silently disabled the bound for any older
+            # event — the target simply was not in the window, and every later
+            # turn became training context.
+            target_message = self.store.get_message(event.message_id or "")
+            if target_message is None:
+                logger.warning(
+                    "sft_example_dropped_unresolvable_target",
+                    conversation_id=event.conversation_id,
+                    message_id=event.message_id,
+                )
+                continue
+            # The query does the bounding, so the prompt cannot contain a turn
+            # written after the answer being taught.
+            messages = self.store.list_messages_before(
+                event.conversation_id, target_message.seq, limit=200
             )
             prompt_chunks: List[str] = []
-            target_text = event.corrected_text
+            target_text = event.corrected_text or target_message.content
             cluster_id = event.cluster_id or self._bucket_embedding(
                 event.context_embedding, event.user_id
             )
-            # Issue 18.2: Exclude target message from prompt (SFT principle)
-            for msg in messages:
-                if msg.id == event.message_id:
-                    # This is the target message - extract for training target, not prompt
-                    if not target_text:
-                        target_text = msg.content
-                    continue  # Don't include target in prompt
-                prompt_chunks.append(f"{msg.role.upper()}: {msg.content}")
+            # Same placement rule serving uses (local_format.place_context):
+            # appending the context after every message put it *after* the
+            # question at training time and *before* it at serving time —
+            # one marker, two token orders, which is two inputs.
+            turns = [
+                {"role": msg.role, "content": msg.content} for msg in messages
+            ]
             if event.context_text:
-                prompt_chunks.append(f"CONTEXT_SNIPPET: {event.context_text}")
+                turns = local_format.place_context(turns, [event.context_text])
+            prompt_chunks = [
+                local_format.format_turn(turn["role"], turn["content"])
+                for turn in turns
+            ]
             if not target_text:
                 target_text = ""
             yield {
@@ -1051,11 +1126,35 @@ class TrainingService:
         self._ensure_tokenizer(base_model)
         vocab_size = max(self._vocab_size(), 1)
 
-        def _encode(text: str) -> List[int]:
+        def _encode(
+            text: str, *, continuation: bool = False, limit: Optional[int] = None
+        ) -> List[int]:
+            """Tokens for one span. ``continuation`` suppresses special tokens.
+
+            The target continues the prompt inside one sequence, so encoding
+            it with specials would splice a second BOS into the middle —
+            training the model on a sequence shape it never sees at serving
+            time.
+
+            ``limit`` is applied by this function, never by the tokenizer's
+            own ``truncation``: tokenizers truncate from the right, keeping
+            the OLDEST tokens. Letting it pre-truncate a long prompt threw
+            away the newest context before the caller could ask to keep it,
+            so the deliberate "trim oldest first" below operated on tokens
+            that had already lost the part it was trying to preserve.
+            """
             if self.tokenizer is not None:
-                return list(
-                    self.tokenizer.encode(text, truncation=True, max_length=max_length)
-                )
+                try:
+                    tokens = list(
+                        self.tokenizer.encode(
+                            text,
+                            truncation=False,
+                            add_special_tokens=not continuation,
+                        )
+                    )
+                except TypeError:  # pragma: no cover - minimal tokenizer objects
+                    tokens = list(self.tokenizer.encode(text))
+                return tokens[:limit] if limit is not None else tokens
             # Use deterministic hashing instead of Python's randomized hash()
             tokens = text.split()
 
@@ -1076,13 +1175,40 @@ class TrainingService:
             # length, which could never broadcast in the loss.)
             seqs: List[tuple[List[int], int]] = []
             for row in batch:
-                prompt_tokens = _encode(row["prompt"])
-                target_tokens = _encode(row["target"]) or [0]
-                full = (prompt_tokens + target_tokens)[: max_length + 1]
-                if len(full) < 2:
-                    full = full + [0] * (2 - len(full))
-                prompt_len = min(len(prompt_tokens), len(full) - 1)
+                budget = max_length + 1
+                # Target first: it is the supervised span, so it claims its
+                # room before the prompt gets any. An empty target is dropped,
+                # not padded to [0] — a zero there is not "no supervision", it
+                # is supervision teaching the model to emit token 0, and it
+                # carries positive mask weight so no later check can catch it.
+                target_tokens = _encode(
+                    row.get("target") or "", continuation=True, limit=budget - 1
+                )
+                if not target_tokens:
+                    logger.warning(
+                        "sft_example_without_target_dropped", reason="empty_target"
+                    )
+                    continue
+                room = budget - len(target_tokens)
+                # Trim the OLDEST prompt context; the newest turn is the one
+                # the target responds to.
+                prompt_tokens = _encode(row.get("prompt") or "")
+                if len(prompt_tokens) > room:
+                    prompt_tokens = prompt_tokens[-room:]
+                if not prompt_tokens:
+                    # Nothing to condition on: give the target one token of
+                    # ground rather than inventing content.
+                    if len(target_tokens) < 2:
+                        logger.warning(
+                            "sft_example_without_target_dropped", reason="no_prompt"
+                        )
+                        continue
+                    prompt_tokens = [target_tokens.pop(0)]
+                full = prompt_tokens + target_tokens
+                prompt_len = len(prompt_tokens)
                 seqs.append((full, prompt_len))
+            if not seqs:
+                continue
             seq_len = max(len(full) - 1 for full, _ in seqs)
             input_ids: List[List[int]] = []
             labels: List[List[int]] = []
@@ -1093,16 +1219,30 @@ class TrainingService:
                 # Label position j predicts token full[j+1]; that token is
                 # part of the target once j+1 >= prompt_len.
                 mask = [1.0 if (j + 1) >= prompt_len else 0.0 for j in range(len(lab))]
+                if sum(mask) <= 0.0:
+                    # Nothing supervised: the example would train on nothing
+                    # while reporting a loss of zero, which reads as a
+                    # perfectly learned example. Construction above prevents
+                    # it; this refuses to emit one if that ever stops holding.
+                    logger.warning(
+                        "sft_example_without_target_dropped", prompt_len=prompt_len
+                    )
+                    continue
                 pad = seq_len - len(inp)
                 input_ids.append(inp + [0] * pad)
                 labels.append(lab + [0] * pad)
                 loss_mask.append(mask + [0.0] * pad)
+            if not input_ids:
+                continue
             yield {
                 "input_ids": input_ids,
                 "labels": labels,
                 "attention_mask": loss_mask,
                 "shape": {
-                    "batch": len(batch),
+                    # The rows actually emitted, not the source slice: the
+                    # shape exists so a consumer can preallocate, and it lied
+                    # by the number of examples dropped for having no target.
+                    "batch": len(input_ids),
                     "seq_len": seq_len,
                 },
             }
@@ -1111,21 +1251,12 @@ class TrainingService:
         self, user_id: str, adapter_id: str, adapter_schema: Optional[dict] = None
     ) -> Path:
         adapter_schema = adapter_schema or {}
-        explicit = adapter_schema.get("cephfs_dir") or adapter_schema.get("fs_dir")
-        if explicit:
-            candidate = Path(explicit)
-            base_root = Path(self.fs_root).resolve()
-            resolved = (
-                candidate
-                if candidate.is_absolute()
-                else safe_join(base_root, str(candidate))
-            )
-            if base_root not in resolved.parents and resolved != base_root:
-                raise PathTraversalError(
-                    "adapter directory must reside under shared_fs_root"
-                )
-            return resolved
-        return safe_join(self.fs_root, f"adapters/{adapter_id}")
+        explicit = adapter_schema.get("fs_dir")
+        # The same identity binding serving uses (§5.5). Containment alone let
+        # an explicit root name *another* adapter's directory, and on this
+        # side that writes A's new version into B's tree — where serving would
+        # then find it under B's own id, with B's promotion authorizing it.
+        return adapter_root(Path(self.fs_root), adapter_id, explicit)
 
     def _job_dir(
         self,
@@ -1147,15 +1278,22 @@ class TrainingService:
             temp.symlink_to(version_dir, target_is_directory=True)
             temp.replace(latest)
         except OSError as exc:
+            # Best-effort, deliberately. `latest` is convenience state that
+            # serving does not consult (SPEC §5.5); `current_version` is the
+            # authority and has already been written by the time this runs.
+            # Re-raising meant a failed symlink aborted the run *after* the
+            # adapter was promoted, so the gate decision §5.4.6 requires for
+            # audit was never recorded — and on the worker path the job then
+            # retried against weights that were already authoritative.
             logger.warning(
                 "update_latest_symlink_failed",
                 adapter_dir=str(adapter_dir),
                 version_dir=str(version_dir),
                 error=str(exc),
+                detail="promotion stands; latest is convenience state only",
             )
             with suppress(FileNotFoundError):
                 temp.unlink(missing_ok=True)  # type: ignore[arg-type]
-            raise
 
     @staticmethod
     def _normalize_feedback_score(
@@ -1186,19 +1324,50 @@ class TrainingService:
     def _init_lora_weights(
         self, rank: int, layers: List[int], matrices: List[str]
     ) -> dict:
+        """Zero-initialized LoRA matrices sized to the base model (SPEC §5.2).
+
+        Three things here are load-bearing:
+
+        * **Shapes come from the checkpoint.** `A ∈ ℝ^{r × d_in}` and
+          `B ∈ ℝ^{d_out × r}` where the projection decides d_in/d_out — k and
+          v are narrower than q under grouped-query attention. Sizing both
+          from a made-up hidden width produced matrices that fit no model.
+        * **B starts at zero.** `B @ A` is then exactly zero, so a freshly
+          created adapter is the identity. That is what lets §5.5 put an
+          adapter on the prompt rung without it perturbing the model before
+          the data has earned any weights.
+        * **No base model, no weights.** LoRA hooks the base model's matrices;
+          without a checkpoint there is nothing to hook, so the adapter stays
+          prompt-only rather than carrying numbers that mean nothing.
+        """
+        config = self._base_config()
+        if config is None:
+            logger.warning(
+                "lora_init_without_base_model",
+                detail="no base checkpoint; adapter stays on the prompt rung",
+            )
+            return {}
         weights: dict[str, list[list[float]]] = {}
-        hidden_dim = max(rank * 4, 8)
         for layer in layers:
+            if not isinstance(layer, int) or not 0 <= layer < config.num_layers:
+                logger.warning(
+                    "lora_init_layer_out_of_range",
+                    layer=layer,
+                    num_layers=config.num_layers,
+                )
+                continue
             for matrix in matrices:
-                key_a = f"layer_{layer}.{matrix}.A"
-                key_b = f"layer_{layer}.{matrix}.B"
-                weights[key_a] = [
-                    [random.uniform(-0.01, 0.01) for _ in range(hidden_dim)]
+                shape = transformer.projection_shape(config, matrix)
+                if shape is None:
+                    logger.warning("lora_init_unknown_target", target=matrix)
+                    continue
+                d_out, d_in = shape
+                weights[f"layers.{layer}.{matrix}.A"] = [
+                    [random.uniform(-0.01, 0.01) for _ in range(d_in)]
                     for _ in range(rank)
                 ]
-                weights[key_b] = [
-                    [random.uniform(-0.01, 0.01) for _ in range(rank)]
-                    for _ in range(hidden_dim)
+                weights[f"layers.{layer}.{matrix}.B"] = [
+                    [0.0 for _ in range(rank)] for _ in range(d_out)
                 ]
         return weights
 
@@ -1218,12 +1387,21 @@ class TrainingService:
         Train a single LoRA adapter with a supervised loss and checkpoints.
 
         The loop mirrors the lightweight JAX forward pass used by the
-        ``LocalJaxLoRABackend``: embeddings are projected through paired
-        ``.A`` / ``.B`` matrices to produce logits and a masked
-        cross-entropy loss. Gradients are accumulated across
-        ``accumulation_steps`` microbatches before each optimizer update and
-        checkpoints are written so the backend can reload trained weights.
+        ``LocalJaxLoRABackend``: the frozen base checkpoint is loaded once,
+        the LoRA matrices are applied inside its attention projections, and
+        the gradient is taken with respect to those matrices alone — the base
+        parameters are closed over, never differentiated, so "only on
+        adapters, never on the base model" is structural rather than a
+        promise. Gradients are accumulated across ``accumulation_steps``
+        microbatches before each optimizer update and checkpoints are written
+        so the backend can reload trained weights.
         """
+        # Before anything else, because "no batches" is not a JAX question.
+        # The loop below is `for batch in batches`, so an empty list took zero
+        # optimizer steps and still returned `ok` with `steps: []` — a run the
+        # gate then judged on an eval it had never moved.
+        if not batches:
+            return {"status": "skipped", "reason": "no training batches"}
 
         try:
             import jax
@@ -1235,33 +1413,119 @@ class TrainingService:
             )
             return {"status": "skipped", "reason": "jax/optax not installed"}
 
-        vocab_size = max(self._vocab_size(), 1)
-        max_token_id = 0
-        for batch in batches:
-            for key in ("input_ids", "labels"):
-                seqs = batch.get(key) or []
-                for seq in seqs:
-                    if seq:
-                        max_token_id = max(max_token_id, max(seq))
-        vocab_size = max(vocab_size, max_token_id + 1)
-        hidden_dim = 0
-        for name, value in params.items():
-            if name.endswith(".A"):
-                hidden_dim = max(hidden_dim, len(value[0]) if value else 0)
-        hidden_dim = hidden_dim or 16
-
-        emb_table = jnp.sin(
-            jnp.arange(vocab_size * hidden_dim, dtype=jnp.float32).reshape(
-                vocab_size, hidden_dim
+        # SPEC §5.4.4: the loss is over `model_apply(params_base, lora_params,
+        # inputs)`. Without a base model there is no such loss to compute, so
+        # the run is *skipped* — and §5.4.6 makes a skipped run unpromotable,
+        # which leaves the adapter on the prompt rung. Training something
+        # else and calling it a success is the failure this branch prevents.
+        checkpoint = self._base_checkpoint()
+        if checkpoint is None:
+            logger.warning(
+                "training_loop_skipped",
+                reason="no_base_checkpoint",
+                base_model=self._base_model_dir(),
             )
-            / float(hidden_dim)
-        )
+            return {"status": "skipped", "reason": "no base checkpoint to train against"}
+        if not params:
+            return {"status": "skipped", "reason": "adapter has no LoRA matrices"}
+        # Resolved here rather than assumed: the invariant must not depend on
+        # whether a caller happened to tokenize through this service first.
+        self._ensure_tokenizer(self._base_model_dir())
+        if self.tokenizer is None:
+            # Gradients through the real transformer are worth nothing if the
+            # text reached it through an invented token space: the adapter
+            # would be fitted to ids that serving never produces, and the
+            # holdout — tokenized the same wrong way — would happily agree.
+            # "Train against the model that will serve it" includes its
+            # tokenizer.
+            logger.warning(
+                "training_loop_skipped",
+                reason="no_real_tokenizer",
+                base_model=self._base_model_dir(),
+                error=self._tokenizer_error,
+            )
+            return {
+                "status": "skipped",
+                "reason": "base checkpoint present but its tokenizer failed to load",
+            }
+        config, base_params = checkpoint
+        vocab_size = config.vocab_size
+
+        # A token the model has no embedding for means the tokenizer and the
+        # checkpoint disagree. Clipping it to vocab_size-1 would train on a
+        # token nobody wrote — the mismatch has to be refused, the same way a
+        # missing checkpoint tensor is.
+        for batch in list(batches) + list(eval_batches):
+            for key in ("input_ids", "labels"):
+                for sequence in batch.get(key) or []:
+                    # Both ends of [0, vocab_size), symmetrically with
+                    # serving: a negative id is as far outside the vocabulary
+                    # as an oversized one, and it does not even fail loudly —
+                    # array indexing reads it from the end of the table, so
+                    # training would fit the adapter to a token nobody wrote.
+                    if sequence and (min(sequence) < 0 or max(sequence) >= vocab_size):
+                        logger.error(
+                            "training_loop_skipped",
+                            reason="tokenizer_vocab_mismatch",
+                            checkpoint_vocab=vocab_size,
+                            observed=[min(sequence), max(sequence)],
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": "tokenizer and checkpoint disagree on vocabulary",
+                        }
+
+        # SPEC §5.2: any malformed or foreign name refuses the whole adapter.
+        # Training skips rather than raises — a skipped run cannot promote, so
+        # the adapter waits on the prompt rung (§5.4.6).
+        try:
+            transformer.validate_lora_weights(config, params)
+        except ValueError as exc:
+            logger.warning("training_loop_skipped", reason="invalid_lora_weights", error=str(exc))
+            return {"status": "skipped", "reason": f"invalid LoRA weights: {exc}"}
+        # Parsed once, out here: the assembly inside the loss must be pure
+        # array plumbing so it stays traceable and differentiable.
+        lora_index = transformer.lora_layer_index(list(params))
+        if not lora_index:
+            return {"status": "skipped", "reason": "no LoRA matrices matched the model"}
+        # α (SPEC §5.2) is a fixed hyperparameter, so it is carried as a
+        # constant rather than handed to the optimizer as something to learn.
+        scale_index = transformer.lora_layer_index(list(params), slots=("scale",))
+        constants = {
+            name: jnp.asarray(params[name], dtype=jnp.float32) for name in scale_index
+        }
+
+        def _assemble(tree: dict) -> List[dict]:
+            layers: List[dict] = [{} for _ in range(config.num_layers)]
+            for name, (layer_index, slot) in lora_index.items():
+                layers[layer_index][slot] = tree[name]
+            for name, (layer_index, slot) in scale_index.items():
+                layers[layer_index][slot] = constants[name]
+            return layers
 
         def _flatten_params(param_dict: dict) -> dict:
-            return {k: jnp.array(v, dtype=jnp.float32) for k, v in param_dict.items()}
+            """Only the trainable matrices enter the optimizer tree.
+
+            Including α here made the "constant" comment above a lie: Optax
+            updated it (the L2 term alone gives it a gradient), so the eval
+            ran with the original α while the file written afterwards carried
+            the modified one — passing a gate under one model and serving
+            another.
+            """
+            return {
+                name: jnp.array(param_dict[name], dtype=jnp.float32)
+                for name in lora_index
+            }
 
         def _to_python(tree: dict) -> dict:
-            return {k: v.tolist() for k, v in tree.items()}
+            # Constants are reattached unchanged on the way out, so the
+            # artifact keeps the α it was trained and evaluated under.
+            serialized = {k: v.tolist() for k, v in tree.items()}
+            for name, value in constants.items():
+                serialized[name] = (
+                    value.tolist() if hasattr(value, "tolist") else value
+                )
+            return serialized
 
         def _checkpoint(step: int, tree: dict) -> None:
             if not checkpoint_dir:
@@ -1270,48 +1534,46 @@ class TrainingService:
             path = checkpoint_dir / f"step_{step:04d}.json"
             path.write_text(json.dumps(_to_python(tree)))
 
-        def _apply_lora(p: dict, embeds: jnp.ndarray) -> jnp.ndarray:
-            acc = jnp.zeros_like(embeds)
-            for name, mat in p.items():
-                if not name.endswith(".A"):
-                    continue
-                b_key = name.replace(".A", ".B")
-                if b_key not in p:
-                    continue
-                base = embeds @ mat.T
-                update = base @ p[b_key].T
-                if update.shape[-1] != embeds.shape[-1]:
-                    width = embeds.shape[-1]
-                    pad = width - update.shape[-1]
-                    if pad > 0:
-                        update = jnp.pad(update, ((0, 0), (0, 0), (0, pad)))
-                    else:
-                        update = update[:, :, :width]
-                acc = acc + update
-            return embeds + acc
+        def cross_entropy(p: dict, batch: dict) -> jnp.ndarray:
+            """Masked token-level CE over the real model (SPEC §5.4.4).
 
-        def forward(p: dict, batch: dict) -> jnp.ndarray:
+            The mask is the target span only, so the adapter learns the
+            answer and not the prompt it was given. Normalized by mask weight
+            rather than by batch, so a long prompt cannot dilute a short
+            correction.
+            """
+            # No clipping: ids are validated against the checkpoint's vocab
+            # before training starts, and a mismatch is refused there rather
+            # than folded into a token the user never wrote.
             input_ids = jnp.array(batch["input_ids"], dtype=jnp.int32)
             labels = jnp.array(batch["labels"], dtype=jnp.int32)
             mask = jnp.array(batch.get("attention_mask") or [[1]], dtype=jnp.float32)
-            clipped_ids = jnp.clip(input_ids, 0, vocab_size - 1)
-            embeds = emb_table[clipped_ids]
-            lora_embeds = _apply_lora(p, embeds)
-            logits = jnp.einsum("bsh,vh->bsv", lora_embeds, emb_table)
-            labels = jnp.clip(labels, 0, vocab_size - 1)
+            logits, _ = transformer.forward(
+                jnp, config, base_params, input_ids, lora=_assemble(p)
+            )
             log_probs = jax.nn.log_softmax(logits, axis=-1)
             nll = -jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(
                 -1
             )
-            masked = nll * mask
             denom = jnp.maximum(jnp.sum(mask), 1.0)
-            return jnp.sum(masked) / denom
+            return jnp.sum(nll * mask) / denom
+
+        def forward(p: dict, batch: dict) -> jnp.ndarray:
+            """The training objective: CE plus the SPEC §5.4.4 L2 term."""
+            l2 = sum(jnp.sum(jnp.square(value)) for value in p.values())
+            return cross_entropy(p, batch) + LORA_L2_LAMBDA * l2
 
         def _eval_loss(p: dict) -> Optional[float]:
-            """Mean forward loss over the holdout batches (no gradients)."""
+            """Holdout cross-entropy, without the regularizer.
+
+            The gate asks whether predictions improved. Including the L2 term
+            would let a shrinking weight norm register as progress, and — since
+            B starts at zero and can only grow — it would count honest learning
+            as a penalty against promotion.
+            """
             if not eval_batches:
                 return None
-            losses = [float(forward(p, batch)) for batch in eval_batches]
+            losses = [float(cross_entropy(p, batch)) for batch in eval_batches]
             return sum(losses) / len(losses)
 
         opt = optax.adam(learning_rate)

@@ -17,13 +17,16 @@ page turns out to be hostile.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Set, Tuple
 
 from liminallm.service import attachments as attachments_service
 from liminallm.service import compaction, interpreter, web
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
+from liminallm.service.invocation import Invocation, commit_guard
 from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 
 PYTHON_TOOL_TIMEOUT = 12.0
@@ -116,21 +119,46 @@ def run_file_search(
     rag: Any,
     user_id: Optional[str],
     tenant_id: Optional[str],
+    attachment_context_ids: Optional[Set[str]] = None,
+    authorized_paths: Optional[Set[str]] = None,
 ) -> Tuple[str, List[str]]:
     """Retrieve excerpts for a model-supplied query. Returns (text, snippets).
 
     Scoping is the caller's job: `context_ids` must already be the set this
     user is allowed to read.
+
+    A conversation's implicit context is scoped once more, by what the
+    conversation still holds. Its rows describe attachment generations, and
+    the conversation's records — not the rows — say which generations that
+    is. Pruning keeps the two in step; this keeps a row that outlives its
+    record from being a capability in the window before it does.
     """
     if not context_ids:
         return ("No searchable files are attached to this conversation.", [])
+    allowed = authorized_paths or set()
     chunks = rag.retrieve(
         context_ids,
         query,
         limit=max(1, min(MAX_FILE_SEARCH_RESULTS, limit or 4)),
         user_id=user_id,
         tenant_id=tenant_id,
+        # Carried into candidate selection, so the ranking never spends a
+        # slot on a generation this conversation no longer holds.
+        path_scope=(
+            {ctx_id: sorted(allowed) for ctx_id in attachment_context_ids}
+            if attachment_context_ids
+            else None
+        ),
     )
+    if attachment_context_ids:
+        # Kept as well, not instead: a retriever that ignores the scope is a
+        # retriever that would otherwise disclose.
+        chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.context_id not in attachment_context_ids
+            or chunk.fs_path in allowed
+        ]
     if not chunks:
         return (f"No excerpts matched '{query}'.", [])
     rendered, snippets = [], []
@@ -143,21 +171,35 @@ def run_file_search(
 
 def run_python(
     code: str,
-    attachment_names: List[str],
+    attachment_sources: List[Tuple[str, str]],
     *,
     settings: Any,
     user_id: Optional[str],
     session: dict,
+    invocation: Optional[Invocation] = None,
+    operation_seq: int = 0,
+    step: str = "",
 ) -> str:
     """Execute model-written Python against the conversation's attachments.
 
     Callers must check service/taint.py first: a turn that has read a possible
     injection does not get here.
+
+    The invocation, when there is one, owns everything this call starts. The
+    scratch is registered as a path so teardown removes it whether the attempt
+    ended or was killed; the sandbox child is registered as it starts, because
+    it is the *parent's* child and killing the worker never reaches it; and the
+    publication — the one durable effect here — happens inside a commit guard,
+    around the copy rather than around this function.
     """
     if not user_id:
         return "Python execution requires an authenticated user."
     fs_root = settings.shared_fs_root
     files_dir = attachments_service.user_files_dir(fs_root, user_id)
+    if invocation is not None:
+        # Before the scratch is prepared, not after: preparing it copies the
+        # user's attachments, which is work a revoked turn must not do.
+        invocation.check_live()
     if session.get("workdir") is None:
         # Node-local, NOT under shared_fs_root: these session directories hold
         # throwaway copies of the attachments (up to 64MB each) and exist only
@@ -168,17 +210,36 @@ def run_python(
             settings.interpreter_scratch_dir or tempfile.gettempdir()
         ) / "liminallm-interpreter"
         scratch.mkdir(parents=True, exist_ok=True)
-        session["workdir"] = interpreter.prepare_workdir(
-            str(scratch), str(files_dir), attachment_names
-        )
+        workdir = interpreter.prepare_workdir(str(scratch), attachment_sources)
+        session["workdir"] = workdir
+        if invocation is not None:
+            invocation.resources.add_path(workdir)
+    if invocation is not None:
+        # Preparation is a window wide enough for a cancel to land inside it,
+        # so liveness is checked again before the child exists.
+        invocation.check_live()
+    # A sibling of the workdir, not a child of it: the workdir is bind-mounted
+    # into the new root, so a mount point inside it would be bound into itself.
+    # Owned here because after `pivot_root` the child cannot reach it again,
+    # and an unowned mount point is one empty directory leaked per call.
+    confine_root = f"{session['workdir']}-root"
+    Path(confine_root).mkdir(parents=True, exist_ok=True)
+    if invocation is not None:
+        invocation.resources.add_path(confine_root)
     result = interpreter.run_python_sandboxed(
-        code, workdir=session["workdir"], timeout=PYTHON_TOOL_TIMEOUT
+        code,
+        workdir=session["workdir"],
+        confine_root=confine_root,
+        timeout=PYTHON_TOOL_TIMEOUT,
+        on_child=None if invocation is None else _register_child(invocation),
     )
-    published = interpreter.publish_artifacts(
+    published = _publish(
         session["workdir"],
         str(files_dir),
         result.get("created_files") or [],
-        allowed_extensions=ALLOWED_UPLOAD_EXTENSIONS,
+        invocation=invocation,
+        operation_seq=operation_seq,
+        step=step,
     )
     parts = []
     if result.get("stdout"):
@@ -193,6 +254,116 @@ def run_python(
     if not parts:
         parts.append("(the code produced no output — remember to print())")
     return "\n\n".join(parts)
+
+
+def _register_child(
+    invocation: Invocation,
+) -> Callable[[int, Callable[[], None]], Callable[[], None]]:
+    """Give the invocation a grip on a sandbox child, and a way to let go.
+
+    Letting go matters as much as taking hold. Once the child has exited and
+    been reaped its pid is only a number, and the kernel reuses numbers — a
+    registration left behind is a standing licence to SIGKILL whoever gets it
+    next, redeemed at teardown.
+    """
+
+    def register(pid: int, reap: Callable[[], None]) -> Callable[[], None]:
+        # `group=True` because the sandbox child leads its own group: it
+        # `setsid`s before it runs anything, so one killpg reaches whatever
+        # the model's code went on to spawn. Killing the pid alone left those
+        # behind, which is the same defect on the revocation path that the
+        # wall-clock kill had on the timeout path. Registration happens before
+        # the child has reached its `setsid`, so the registry re-checks that
+        # the target leads the group before it signals one.
+        invocation.resources.add_child(
+            pid, "sandbox:run_python", group=True, reap=reap
+        )
+        return lambda: invocation.resources.forget_child(pid)
+
+    return register
+
+
+def _durable_identity(workdir: str, created: List[dict]) -> List[dict]:
+    """What makes one publication the same publication as another.
+
+    The filename alone is not it. A retry runs the model's code again, and the
+    same code writing `result.csv` from different input — or from a different
+    branch the model took the second time — produces the same *name* over
+    different *bytes*. Replaying on the name would leave the first attempt's
+    file in the user's area while the second attempt's answer describes the
+    contents it computed, and nothing would report the disagreement.
+    """
+    identity: List[dict] = []
+    for item in sorted(created, key=lambda c: str(c.get("name") or "")):
+        name = str(item.get("name") or "")
+        # Opened the same way the publication opens it, and for the same
+        # reason: hashing a host file the child merely *named* is a read of
+        # that file whether or not anything is published afterwards.
+        fd = interpreter.open_produced_file(workdir, name)
+        if fd is None:
+            # Unreadable here means unpublishable below, but the identity must
+            # still differ from a readable file of the same name.
+            digest = f"unreadable:{name}"
+        else:
+            try:
+                hasher = hashlib.sha256()
+                remaining = interpreter.MAX_ARTIFACT_BYTES
+                with open(fd, "rb", closefd=False) as handle:
+                    # Bounded by what publication would accept: a file
+                    # too large to publish is not worth reading whole
+                    # to decide it is the same one.
+                    while remaining > 0:
+                        block = handle.read(min(remaining, 1024 * 1024))
+                        if not block:
+                            break
+                        remaining -= len(block)
+                        hasher.update(block)
+                digest = hasher.hexdigest()
+            except OSError:
+                digest = f"unreadable:{name}"
+            finally:
+                os.close(fd)
+        identity.append({"name": name, "sha256": digest})
+    return identity
+
+
+def _publish(
+    workdir: str,
+    files_dir: str,
+    created: List[dict],
+    *,
+    invocation: Optional[Invocation],
+    operation_seq: int,
+    step: str,
+) -> List[str]:
+    """Copy what the code produced into the user's files, exactly once.
+
+    The guard is around the copy, not around the call that leads to it: a retry
+    has to be able to tell "the files are in the user's area" from "a worker
+    asked for them to be", and only the first is a fact about the filesystem.
+    Replaying a committed entry returns the earlier attempt's filenames without
+    copying anything a second time — which is why the entry's identity has to
+    include the bytes, not just the names.
+    """
+    if not created:
+        return []
+    if invocation is None:
+        return interpreter.publish_artifacts(
+            workdir, files_dir, created, allowed_extensions=ALLOWED_UPLOAD_EXTENSIONS
+        )
+    with commit_guard(
+        invocation,
+        "publish.artifacts",
+        {"created": _durable_identity(workdir, created)},
+        operation_seq=operation_seq,
+        step=step or "publish",
+    ) as operation:
+        if operation.replayable:
+            return list(operation.result or [])
+        operation.result = interpreter.publish_artifacts(
+            workdir, files_dir, created, allowed_extensions=ALLOWED_UPLOAD_EXTENSIONS
+        )
+    return list(operation.result or [])
 
 
 def run_history_search(

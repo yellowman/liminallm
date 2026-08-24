@@ -27,6 +27,18 @@ end
 return {0, existing}
 """
 
+# Read a key and remove it in one step, for a redis-py client with no `getdel`
+# method. `EVAL` is atomic, so the two calls inside it cannot be interleaved
+# with another client's. Not a fallback for an old *server*: see
+# `consume_identity_token`.
+_GETDEL = """
+local value = redis.call('GET', KEYS[1])
+if value then
+    redis.call('DEL', KEYS[1])
+end
+return value
+"""
+
 
 class RedisCache:
     """Thin Redis wrapper for sessions and rate limits."""
@@ -370,6 +382,15 @@ return {1, tokens, 0}
             f"chat:summary:{conversation_id}", json.dumps(summary), ex=ttl_seconds
         )
 
+    async def delete_conversation_summary(self, conversation_id: str) -> None:
+        """Retire a deleted conversation's cached messages.
+
+        The TTL is an optimization, not a lifetime. Without this, deleting a
+        chat left its recent messages readable here for up to an hour after
+        every trace of it had gone from Postgres.
+        """
+        await self.client.delete(f"chat:summary:{conversation_id}")
+
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
@@ -379,14 +400,50 @@ return {1, tokens, 0}
         )
         await self.client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
 
+    async def consume_identity_token(self, prefix: str, token: str) -> Optional[str]:
+        """Hand out a one-time token's subject, and only once.
+
+        The whole point is that the read and the removal are one step. Reading
+        first and deleting after the work is done leaves the token readable for
+        the length of that work, so two requests holding it both get a subject
+        and both proceed — and for a token that arrives by email, that window
+        is reachable by anyone who has read the message, and by an ordinary
+        double-click.
+
+        `GETDEL`, with an `EVAL` for a redis-py old enough not to have the
+        method — `AttributeError` is a missing client method, not a server
+        that refuses the command. The server side needs Redis 6.2 or newer to
+        answer `GETDEL` at all, and `docker-compose.test.yml` pins Redis 7, so
+        there is nothing here that reaches an older one. Supporting a server
+        that predates `GETDEL` would mean catching the unknown-command
+        `ResponseError` specifically, and blanket-catching `ResponseError`
+        instead would turn an ACL denial into a silent `EVAL` attempt.
+
+        One helper for every token of this shape: OAuth state, password reset,
+        email verification. The version that mattered was written three times,
+        and only one of the three was written this way.
+
+        Returns the stored subject, or None if the token was not there — which
+        includes the case where somebody else has just taken it.
+        """
+        key = f"{prefix}:{token}"
+        try:
+            value = await self.client.getdel(key)
+        except AttributeError:
+            # A redis-py without the method, not a server without the command.
+            value = await self.client.eval(_GETDEL, 1, key)
+        if isinstance(value, bytes):
+            value = value.decode()
+        return value
+
     async def pop_oauth_state(
         self, state: str
     ) -> Optional[tuple[str, datetime, Optional[str]]]:
         """Atomically get and delete OAuth state to prevent replay attacks.
 
-        Uses Redis GETDEL command (Redis 6.2+) or Lua script fallback to ensure
-        atomicity. This prevents race conditions where two concurrent requests
-        could both consume the same OAuth state.
+        This prevents race conditions where two concurrent requests could both
+        consume the same OAuth state. See `consume_identity_token`, which is
+        where that guarantee lives for every token of this shape.
 
         Args:
             state: The OAuth state token to consume
@@ -394,21 +451,7 @@ return {1, tokens, 0}
         Returns:
             Tuple of (provider, expires_at, tenant_id) or None if not found
         """
-        key = f"auth:oauth:{state}"
-
-        # Try GETDEL first (Redis 6.2+) for atomic get-and-delete
-        try:
-            cached = await self.client.getdel(key)
-        except AttributeError:
-            # Fallback for older redis-py versions: use Lua script for atomicity
-            lua_script = """
-            local value = redis.call('GET', KEYS[1])
-            if value then
-                redis.call('DEL', KEYS[1])
-            end
-            return value
-            """
-            cached = await self.client.eval(lua_script, 1, key)
+        cached = await self.consume_identity_token("auth:oauth", state)
 
         if cached is None:
             return None
@@ -493,6 +536,108 @@ return {1, tokens, 0}
             except (json.JSONDecodeError, TypeError):
                 pass
         return (False, None)
+
+    async def _delete_scanned(self, pattern: str, keeps) -> int:
+        """Remove every key matching `pattern` that `keeps` accepts.
+
+        `SCAN`, never `KEYS`: this walks the whole keyspace in bounded slices
+        instead of blocking the server for the length of it. Account deletion
+        is rare, so paying a scan for the key families that carry no index is
+        the right trade — the alternative is maintaining a per-user index for
+        each of them and getting the erasure wrong whenever one expires.
+
+        `keeps` re-checks each key, because a glob cannot express "this exact
+        field equals the user id" and a pattern alone would trust the position
+        of a colon in a route name somebody chooses.
+        """
+        removed = 0
+        async for key in self.client.scan_iter(match=pattern, count=500):
+            if not keeps(key):
+                continue
+            removed += int(await self.client.delete(key) or 0)
+        return removed
+
+    async def _delete_tokens_naming(self, prefix: str, user_id: str) -> int:
+        """Remove short-lived identity tokens whose subject is this account.
+
+        A password reset token and an email verification token each name one
+        account and outlive nothing else about it. They are bounded by their
+        own TTL rather than by anything the erasure controls, so leaving them
+        keeps a usable reference to an account that no longer exists.
+        """
+        removed = 0
+        async for key in self.client.scan_iter(match=f"{prefix}:*", count=500):
+            if await self.client.get(key) != user_id:
+                continue
+            removed += int(await self.client.delete(key) or 0)
+        return removed
+
+    async def purge_user_state(self, erasure) -> Dict[str, int]:
+        """Remove every Redis key this kernel can identify as one account's.
+
+        Called after the deleting transaction commits, and after it on
+        purpose: Postgres is canonical, so a cache that cannot be reached must
+        not be able to prevent an erasure. What it must not do is give up
+        early. Each family is its own attempt, because one unreachable key
+        pattern is not a reason to leave the rest of an erased account's
+        content readable — the first version of this ran every category inside
+        one `try`, so a failure revoking sessions meant no conversation
+        summary was even attempted.
+
+        Deliberately *not* purged: `rate:*` is keyed by a salted digest, so it
+        cannot be addressed and carries no content; `auth:access:denylist:*`
+        and `auth:refresh:revoked:*` are revocations, and removing them would
+        bring the erased account's outstanding tokens back to life.
+
+        Returns how many keys each family gave up, for the log.
+        """
+        user_id = erasure.user_id
+        sessions = list(erasure.session_ids)
+        conversations = list(erasure.conversation_ids)
+        exact = f":{user_id}:"
+
+        families = {
+            "sessions": [f"auth:session:{s}" for s in sessions]
+            + [f"auth:user_sessions:{user_id}"],
+            "session_activity": [f"session:activity:{s}" for s in sessions],
+            "session_rotation": [f"session:rotation:{s}" for s in sessions],
+            "conversation_summaries": [f"chat:summary:{c}" for c in conversations],
+            "mfa": [f"mfa:attempts:{user_id}", f"mfa:lockout:{user_id}"],
+        }
+        purged: Dict[str, int] = {}
+        for name, keys in families.items():
+            if not keys:
+                purged[name] = 0
+                continue
+            try:
+                purged[name] = int(await self.client.delete(*keys) or 0)
+            except Exception:
+                purged[name] = -1
+
+        scans = (
+            # The idempotency record holds a completed API response, which for
+            # a chat turn is the assistant's message. It is the most
+            # content-bearing thing in this cache and it lives for a day.
+            ("idempotency", f"idemp:*{exact}*", lambda k: exact in k),
+            ("router_cache", f"router:last:*{user_id}:*", lambda k: user_id in k),
+            (
+                "concurrency",
+                f"concurrency:*:{user_id}",
+                lambda k: k.endswith(f":{user_id}"),
+            ),
+        )
+        for name, pattern, keeps in scans:
+            try:
+                purged[name] = await self._delete_scanned(pattern, keeps)
+            except Exception:
+                purged[name] = -1
+
+        for name, prefix in (("reset_tokens", "reset"), ("verify_tokens", "verify")):
+            try:
+                purged[name] = await self._delete_tokens_naming(prefix, user_id)
+            except Exception:
+                purged[name] = -1
+        return purged
 
     async def close(self) -> None:
         """Close every per-loop client. Call on shutdown or runtime reset."""

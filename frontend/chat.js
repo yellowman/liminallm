@@ -65,14 +65,18 @@ const updateDraftIndicator = () => {
 // =============================================================================
 
 // conversationId shares the auth session's lifetime so a reload reopens the
-// active thread; logout (resetAuth) clears it along with the tokens.
-const persistedKeys = ['accessToken', 'refreshToken', 'sessionId', 'tenantId', 'role', 'userId', 'conversationId'];
+// active thread; logout (resetAuth) clears it along with the token.
+//
+// The refresh token and the session id are deliberately absent (SPEC §17.10).
+// The server sets both as HttpOnly cookies the page cannot read, so a copy
+// here would be a durable credential any script on the page could take —
+// removing the protection the cookie exists to provide, and outliving the
+// short-lived access token it was meant to replace.
+const persistedKeys = ['accessToken', 'tenantId', 'role', 'userId', 'conversationId'];
 
 const createState = (storage) => {
   const backing = {
     accessToken: storage.read('accessToken'),
-    refreshToken: storage.read('refreshToken'),
-    sessionId: storage.read('sessionId'),
     tenantId: storage.read('tenantId'),
     role: storage.read('role'),
     userId: storage.read('userId'),
@@ -99,6 +103,9 @@ const createState = (storage) => {
         backing[k] = null;
         sync(k, null);
       });
+      // No longer written, but a session that predates the move to cookies
+      // still has them, and signing out is when they should go.
+      ['refreshToken', 'sessionId'].forEach((k) => storage.write(k, null));
       backing.lastAssistant = null;
       backing.conversationId = null;
     },
@@ -358,7 +365,9 @@ const updateAuthUI = () => {
   if (settingUserId) settingUserId.textContent = state.userId || '-';
   if (settingRole) settingRole.textContent = state.role || '-';
   if (settingTenant) settingTenant.textContent = state.tenantId || 'global';
-  if (settingSessionId) settingSessionId.textContent = state.sessionId ? state.sessionId.slice(0, 16) + '...' : '-';
+  // The session id lives in an HttpOnly cookie this page cannot read
+  // (SPEC §17.10), so there is nothing here to show.
+  if (settingSessionId) settingSessionId.textContent = 'held in a secure cookie';
 };
 
 // =============================================================================
@@ -461,9 +470,10 @@ const renderConversationList = () => {
       const isActive = c.id === state.conversationId;
       const title = escapeHtml(c.title || 'Untitled conversation');
       const date = c.updated_at ? new Date(c.updated_at).toLocaleDateString() : '';
+      const apiTag = c.source === 'responses' ? '<span class="source-tag">api</span>' : '';
       return `
         <div class="conversation-item ${isActive ? 'active' : ''}" data-id="${escapeHtml(c.id)}">
-          <div class="title">${title}</div>
+          <div class="title">${title}${apiTag}</div>
           <div class="meta">${date}</div>
         </div>
       `;
@@ -1440,8 +1450,6 @@ const sendMessage = async (event) => {
         // The server rejects dual auth on the socket (fresh_session_required),
         // so send exactly one method — prefer the bearer token.
         access_token: state.accessToken || undefined,
-        session_id: state.accessToken ? undefined : state.sessionId,
-        tenant_id: state.tenantId,
         stream: true,
       }));
     });
@@ -2566,7 +2574,7 @@ const fetchMfaStatus = async () => {
 };
 
 const startMfaSetup = async () => {
-  if (!state.accessToken || !state.sessionId) {
+  if (!state.accessToken) {
     setMfaSetupStatus('Sign in first', true);
     return;
   }
@@ -2577,7 +2585,9 @@ const startMfaSetup = async () => {
       {
         method: 'POST',
         headers: headers(),
-        body: JSON.stringify({ session_id: state.sessionId }),
+        // No session_id: the server reads its own HttpOnly cookie, which is
+        // the only copy of it a browser has.
+        body: JSON.stringify({}),
       },
       'Failed to start MFA setup'
     );
@@ -2634,7 +2644,7 @@ const verifyMfaSetup = async (event) => {
     return;
   }
 
-  if (!state.sessionId) {
+  if (!state.accessToken) {
     setMfaSetupStatus('No session. Please sign in again.', true);
     return;
   }
@@ -2645,7 +2655,7 @@ const verifyMfaSetup = async (event) => {
       {
         method: 'POST',
         headers: headers(),
-        body: JSON.stringify({ session_id: state.sessionId, code }),
+        body: JSON.stringify({ code }),
       },
       'Invalid code. Try again.'
     );
@@ -2730,6 +2740,109 @@ const setMfaDisableStatus = (message, isError = false) => {
   if (!el) return;
   el.textContent = message;
   el.style.color = isError ? '#b00020' : 'inherit';
+};
+
+// =============================================================================
+// API Keys (served Responses API)
+// =============================================================================
+
+const setApiKeyStatus = (message, isError = false) => {
+  const el = $('api-key-status');
+  if (!el) return;
+  el.textContent = message;
+  el.style.color = isError ? '#b00020' : 'inherit';
+};
+
+const loadApiKeys = async () => {
+  const listEl = $('api-key-list');
+  if (!listEl) return;
+  if (!state.accessToken) {
+    listEl.innerHTML = '';
+    return;
+  }
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/api-keys`,
+      { headers: headers() },
+      'Failed to load API keys'
+    );
+    const items = envelope.data?.items || [];
+    if (!items.length) {
+      listEl.innerHTML = '<div class="empty">No API keys yet</div>';
+      return;
+    }
+    listEl.innerHTML = items
+      .map((k) => {
+        const created = k.created_at ? new Date(k.created_at).toLocaleDateString() : '';
+        const lastUsed = k.last_used_at
+          ? `last used ${new Date(k.last_used_at).toLocaleDateString()}`
+          : 'never used';
+        const stateText = k.revoked_at ? 'revoked' : lastUsed;
+        const revokeBtn = k.revoked_at
+          ? ''
+          : `<button type="button" class="ghost api-key-revoke" data-id="${escapeHtml(k.id)}">Revoke</button>`;
+        return `
+          <div class="api-key-item ${k.revoked_at ? 'revoked' : ''}">
+            <div class="api-key-info">
+              <span class="api-key-name">${escapeHtml(k.name || 'unnamed key')}</span>
+              <code class="api-key-prefix">${escapeHtml(k.prefix)}…</code>
+              <div class="meta">created ${created} · ${stateText}</div>
+            </div>
+            ${revokeBtn}
+          </div>`;
+      })
+      .join('');
+    listEl.querySelectorAll('.api-key-revoke').forEach((btn) => {
+      btn.addEventListener('click', () => revokeApiKey(btn.dataset.id));
+    });
+  } catch (err) {
+    setApiKeyStatus(err.message || 'Failed to load API keys', true);
+  }
+};
+
+const createApiKey = async (event) => {
+  event.preventDefault();
+  if (!state.accessToken) {
+    setApiKeyStatus('Sign in first', true);
+    return;
+  }
+  const nameInput = $('api-key-name');
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/api-keys`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ name: nameInput?.value?.trim() || '' }),
+      },
+      'Failed to create API key'
+    );
+    // The one plaintext sighting; after this only the prefix survives.
+    const plainEl = $('api-key-plaintext-value');
+    if (plainEl) plainEl.textContent = envelope.data?.api_key || '';
+    $('api-key-plaintext')?.classList.remove('hidden');
+    if (nameInput) nameInput.value = '';
+    setApiKeyStatus('Key created — copy it before leaving this page');
+    await loadApiKeys();
+  } catch (err) {
+    setApiKeyStatus(err.message || 'Failed to create API key', true);
+  }
+};
+
+const revokeApiKey = async (keyId) => {
+  if (!keyId) return;
+  if (!window.confirm('Revoke this API key? Agents using it stop working immediately.')) return;
+  try {
+    await requestEnvelope(
+      `${apiBase}/auth/api-keys/${encodeURIComponent(keyId)}`,
+      { method: 'DELETE', headers: headers() },
+      'Failed to revoke API key'
+    );
+    setApiKeyStatus('Key revoked');
+    await loadApiKeys();
+  } catch (err) {
+    setApiKeyStatus(err.message || 'Failed to revoke API key', true);
+  }
 };
 
 // =============================================================================
@@ -3504,6 +3617,7 @@ const initEventListeners = () => {
 
   // Password change
   $('password-change-form')?.addEventListener('submit', changePassword);
+  $('api-key-create-form')?.addEventListener('submit', createApiKey);
 
   // User settings (preferences)
   $('user-settings-form')?.addEventListener('submit', saveUserSettings);
@@ -3614,8 +3728,6 @@ const init = async () => {
   if (state.accessToken) {
     persistAuth({
       access_token: state.accessToken,
-      refresh_token: state.refreshToken,
-      session_id: state.sessionId,
       role: state.role,
       tenant_id: state.tenantId,
       user_id: state.userId,
@@ -3631,6 +3743,7 @@ const init = async () => {
       fetchMfaStatus(),
       fetchEmailVerificationStatus(),
       fetchUserSettings(),
+      loadApiKeys(),
     ]);
 
     // Reopen the thread that was active before the reload; if it no longer

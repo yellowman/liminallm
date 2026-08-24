@@ -56,6 +56,31 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
         },
         "required": ["kind", "nodes"],
     },
+    # A remote MCP server. Not a `tool`: a server is not callable, it
+    # discovers zero or more tools, and overloading `tool.spec` would make a
+    # configuration look like a capability before anything has been listed.
+    #
+    # `taint_class` is the operator's classification and the only one that
+    # counts. It is deliberately not inferrable from the server's own
+    # annotations: remote metadata is supplied by the party being classified.
+    # Absent or unrecognized means `egress` (see `mcp_client.server_taint_class`),
+    # so the enum here is what an operator may *attest*, not what is assumed.
+    "mcp": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "kind": {"const": "mcp.server"},
+            "name": {"type": "string", "minLength": 1},
+            # Streamable HTTP only in this tranche. stdio would turn "connect
+            # to a server" into "spawn the executable this row names", which
+            # is a different privilege boundary and belongs to its own review.
+            "url": {"type": "string", "pattern": "^https?://"},
+            "enabled": {"type": "boolean"},
+            "taint_class": {"enum": ["egress", "local_read"]},
+            "description": {"type": "string"},
+        },
+        "required": ["kind", "name", "url"],
+    },
     "tool": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -72,8 +97,16 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
         "type": "object",
         "properties": {
             "kind": {"const": "adapter.lora"},
-            "backend": {"type": "string"},
-            "provider": {"type": "string"},
+            # Pass C: mode is the one execution vocabulary. The old spellings
+            # were normalized by the schema.sql repair; refusing them here is
+            # what keeps them normalized — delete runtime compatibility
+            # without this and the old formats are simply created again
+            # tomorrow.
+            "mode": {"enum": ["local", "remote", "prompt", "hybrid"]},
+            "prompt_instructions": {"type": "string"},
+            "fs_dir": {"type": "string"},
+            "remote_model_id": {"type": "string"},
+            "remote_adapter_id": {"type": "string"},
             "scope": {"type": "string"},
             "user_id": {"type": ["string", "null"]},
             "base_model": {"type": "string"},
@@ -81,8 +114,18 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
             "layers": {"type": "array"},
             "matrices": {"type": "array"},
             "current_version": {"type": "integer", "minimum": 0},
+            # Retired spellings, rejected by name so the error says which.
+            "backend": False,
+            "provider": False,
+            "cephfs_dir": False,
+            "behavior_prompt": False,
+            "system_prompt": False,
+            "instructions": False,
+            "prompt_template": False,
+            "model_id": False,
+            "adapter_id": False,
         },
-        "required": ["kind", "base_model", "current_version"],
+        "required": ["kind", "mode", "base_model", "current_version"],
         "additionalProperties": True,
     },
     # SPEC §6.1 policy.routing / §8.1. The workflow engine already reads these

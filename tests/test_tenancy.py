@@ -64,10 +64,47 @@ def test_unmapped_host_is_refused_once_a_mapping_exists():
         tenancy.tenant_for_host("evil.example.com", s)
 
 
-def test_probes_reach_the_box_by_address_not_by_site():
+def test_a_bare_address_is_not_a_site_either():
+    """No host is exempt once a mapping exists.
+
+    Letting localhost through to the default tenant meant anyone who could
+    reach the port named their own tenant by sending Host: localhost. Probes
+    do not authenticate and never ask for a tenant, so nothing legitimate
+    needed the exemption.
+    """
     s = _settings(tenant_domains={"acme.example.com": "acme"})
-    for host in ("", "localhost", "127.0.0.1"):
+    for host in ("", "localhost", "127.0.0.1", "::1", "testserver"):
+        with pytest.raises(NotFoundError):
+            tenancy.tenant_for_host(host, s)
+
+
+def test_a_bare_address_still_works_on_a_single_tenant_install():
+    """The strictness only applies once an operator maps a domain."""
+    s = _settings()
+    for host in ("", "localhost", "testserver"):
         assert tenancy.tenant_for_host(host, s) == "public"
+
+
+# ---------------------------------------------------------------------------
+# The account half
+# ---------------------------------------------------------------------------
+
+
+def test_both_halves_must_agree():
+    """A session is a bearer credential; it stays valid wherever it is sent."""
+    assert tenancy.user_belongs_to_site("acme", "acme")
+    assert not tenancy.user_belongs_to_site("acme", "globex")
+
+
+def test_a_blank_on_either_side_is_a_mismatch_not_a_pass():
+    """Skipping the comparison when a value is missing is how it goes missing.
+
+    The caller with nothing to compare is the one that resolved no site — the
+    case least safe to wave through.
+    """
+    assert not tenancy.user_belongs_to_site("acme", "")
+    assert not tenancy.user_belongs_to_site("", "acme")
+    assert not tenancy.user_belongs_to_site(None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +269,25 @@ def test_an_unmapped_host_is_not_served_a_tenant(client, two_sites):
     assert resp.json()["error"]["code"] == "not_found"
 
 
+def test_a_bare_host_cannot_reach_the_default_tenant(client, two_sites):
+    """The hole this closed: Host is chosen by whoever reaches the port.
+
+    localhost and the test client's own testserver used to resolve to the
+    default tenant, so a caller who could reach the service directly picked
+    that tenant — and with signup open, registered an account on it.
+    """
+    for host in ("localhost", "testserver", "127.0.0.1"):
+        resp = client.post(
+            "/v1/auth/signup",
+            json={
+                "email": f"t_{uuid.uuid4().hex[:8]}@example.com",
+                "password": "TestPassword123!",
+            },
+            headers={"Host": host},
+        )
+        assert resp.status_code == 404, (host, resp.text)
+
+
 def test_a_client_cannot_name_its_tenant_with_a_forwarded_header(client, two_sites):
     """trust_forwarded_host is off, so this is just a header the caller chose."""
     _, acme = _signup(client, "acme.example.com")
@@ -288,3 +344,76 @@ def test_tenancy_settings_have_a_home_in_the_console():
     groups = {e["name"]: e["group"] for e in managed_settings_schema()}
     for name in ("default_tenant_id", "tenant_domains", "trust_forwarded_host"):
         assert groups[name] == "Tenancy", f"{name} is under {groups.get(name)}"
+
+
+def test_oauth_cannot_sign_an_account_in_at_another_tenants_site(client, two_sites):
+    """The provider proves who you are, not where you belong.
+
+    Email is globally unique, so the lookup finds the account whatever site
+    the flow began at. Without the check, starting Google at globex minted
+    acme's tokens — while the password path refused the same thing.
+    """
+    from liminallm.service.runtime import get_runtime
+
+    auth = get_runtime().auth
+    email, _ = _signup(client, "acme.example.com")
+    user = auth.store.get_user_by_email(email)
+    assert user.tenant_id == "acme"
+
+    assert auth._site_matches(user, "acme") is True
+    assert auth._site_matches(user, "globex") is False
+
+
+def test_login_uses_the_same_rule_as_every_other_entry_point():
+    """login kept a truthy check after the others were converted.
+
+    A blank site tenant short-circuited it to False, so login would admit any
+    user in any tenant while refresh and authenticate rejected the same
+    request. Four entry points, one rule.
+    """
+    from types import SimpleNamespace
+
+    from liminallm.service.auth import AuthService
+
+    matches = AuthService._site_matches
+    user = SimpleNamespace(tenant_id="acme")
+
+    assert matches(None, user, "acme") is True
+    assert matches(None, user, "globex") is False
+    assert matches(None, user, "") is False
+    # None is not "unresolved", it is "not a tenanted decision" — logout
+    # revoking your own session needs no opinion about where you belong.
+    assert matches(None, user, None) is True
+
+
+def test_the_default_tenant_cannot_be_cleared():
+    """Blank-is-mismatch turned an empty default into an unrecoverable lockout.
+
+    Every user's tenant_id would be blank too, so every request 401s —
+    including the admin call that would put the value back.
+    """
+    from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, validate_managed_settings
+
+    errors = validate_managed_settings(
+        {"default_tenant_id": ""}, dict(SYSTEM_SETTINGS_DEFAULTS)
+    )
+    assert "default_tenant_id" in errors
+
+
+def test_an_ipv6_host_can_be_mapped_and_then_matched():
+    """Two normalizers disagreed on brackets, so ::1 was unmappable.
+
+    Settings stripped at the first colon; the request path kept the brackets.
+    Once bare addresses stopped being exempt, that made IPv6 loopback a 404
+    with no spelling an operator could use to fix it.
+    """
+    from liminallm.config import Settings
+
+    # The real model, because the normalization under test is the config
+    # validator's — a SimpleNamespace would skip the very code being checked.
+    s = Settings(default_tenant_id="public", tenant_domains={"::1": "v6"})
+
+    assert s.tenant_domains == {"[::1]": "v6"}, "settings and requests must agree"
+    for spelling in ("[::1]:8000", "::1", "[::1]"):
+        host = tenancy.normalize_host(spelling)
+        assert tenancy.tenant_for_host(host, s) == "v6", spelling

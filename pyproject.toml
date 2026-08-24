@@ -16,7 +16,23 @@ dependencies = [
   "pypdf>=4.0",
   "psycopg-pool>=3.2",
   "redis>=5.0",
+  # Imported at module scope by auth, web, sandbox, voice and the Gemini
+  # backend. It was never declared and arrived only because `openai` depends
+  # on it — a direct import satisfied by somebody else's dependency, which
+  # holds until their dependency changes. CI installed a set without it and
+  # the whole application failed to import.
+  "httpx>=0.27,<1",
   "openai>=1.30",
+  # The MCP wire, and the reason `liminallm/service/mcp_client.py` contains no
+  # protocol code. Version negotiation, Streamable HTTP and the message types
+  # are the SDK's; this repository owns authority, naming, network policy and
+  # the data boundary around it.
+  #
+  # Runtime, not dev: a remote tool server is a product capability, and an
+  # installation that discovers one needs the client at serving time. Capped
+  # below 3 because the client construction and the result shape this depends
+  # on are 2.x API, not a wire format the SDK would carry across a major.
+  "mcp>=2,<3",
   "structlog>=24.4",
   "jsonschema>=4.22"
 ]
@@ -38,13 +54,56 @@ train = [
   "jax>=0.4.30",
   "optax>=0.2",
   "transformers>=4.40",
+  # Reads the base checkpoint's shards framework-neutrally (numpy in, no
+  # torch), which is how serving loads weights without a second runtime.
+  "safetensors>=0.4",
+  # Imported directly by `transformer.py` when it loads those shards. Arrives
+  # with jax and safetensors anyway; named here because the code imports it.
+  "numpy>=1.24",
 ]
 dev = [
   "pytest>=8.0",
   "pytest-cov>=4.1",
   "pytest-asyncio>=0.23",
+  # `make test-fast-xdist` only. Installing it does not make an ordinary
+  # pytest run parallel: xdist does nothing without -n.
+  "pytest-xdist>=3.5",
   "ruff>=0.4",
   "bandit>=1.7",
+  # `tests/test_declared_dependencies.py` reads pyproject.toml. `tomllib` is
+  # stdlib from 3.11; 3.10 is this project's floor and needs the backport.
+  "tomli>=2.0; python_version < '3.11'",
+  # Also in the `ocr` extra, where it is a runtime capability. Here because
+  # three tests need it to build a fixture image, and those three are not OCR
+  # tests: they gate on nothing, because what they exercise is the refusal
+  # path — an unreadable image naming the remedy, and a decompression bomb
+  # refused before it allocates. Declared rather than skipped so they run in
+  # CI. They did not, and every lane there failed them, because the local
+  # environment happened to have Pillow and no CI lane installs the extra.
+  "Pillow>=10.0",
+  # The arbiter for the served Responses wire (SPEC §16). Those tests hand
+  # each payload to the SDK's generated types, which live under
+  # `openai.types.responses` and do not exist in the base floor above — so a
+  # minimum-version environment could not even collect them.
+  #
+  # Deliberately not raised at runtime: the API backend supports SDKs and
+  # providers with no Responses endpoint and falls back to chat completions,
+  # and raising the base floor would contradict that.
+  #
+  # Deliberately uncapped, too, and that is the interesting half. An earlier
+  # note here said the lockfile recorded which schema snapshot was qualified,
+  # which was not true of CI: CI installs unpinned and resolved 3.3.1 while
+  # every local environment held 2.8.1. It found a real defect — 3.x made
+  # `input_tokens_details.cache_write_tokens` required and the served usage
+  # block omitted it — and that is the arrangement working, not failing. A cap
+  # would have hidden a wire this server had genuinely stopped conforming to.
+  # The suite now passes against both 2.8.1 and 3.3.1, measured on each.
+  "openai>=2.8.1",
+  # The browser lane (`make test-browser`). The package alone is not enough:
+  # it needs a Chromium build, from `playwright install chromium` or from
+  # LIMINALLM_CHROMIUM pointing at one. That is why the lane is excluded from
+  # every default target rather than merely marked slow.
+  "playwright>=1.40",
 ]
 
 [tool.setuptools]
@@ -64,8 +123,27 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "strict"
 testpaths = ["tests"]
+# The repository root on sys.path, so `tests.harness` imports.
+#
+# `python -m pytest` puts the working directory there and bare `pytest` does
+# not, so the suite ran locally and failed in CI with
+# `ModuleNotFoundError: No module named 'tests'` the first time CI got as far
+# as running it. Setting it here makes both invocations the same invocation,
+# which is the property that was missing rather than the path itself.
+pythonpath = ["."]
 filterwarnings = [
   "ignore::DeprecationWarning",
+]
+markers = [
+  # A test that spends seconds rather than milliseconds because it runs the
+  # real thing: a training step, a forward pass, a process tree, a wall-clock
+  # timeout. `make test-fast` skips these. `make test` and the pre-commit gate
+  # do not, because nothing else covers what they cover.
+  "slow: runs real model or real wall-clock work",
+  # Drives a real browser against a real server. Not in any default lane:
+  # it needs a Chromium binary, which `uv pip install playwright` alone does
+  # not provide. `make test-browser` and its own CI job run it.
+  "browser: drives a real browser against a real server",
 ]
 
 [tool.coverage.run]

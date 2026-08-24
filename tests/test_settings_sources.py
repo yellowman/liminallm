@@ -8,6 +8,8 @@ restart, and identical across replicas.
 
 import json
 import os
+import pathlib
+import re
 
 import pytest
 
@@ -17,6 +19,36 @@ from liminallm.config import (
     apply_managed_settings,
 )
 from liminallm.service.runtime import get_runtime, reset_runtime_for_tests
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _matching_lines(pattern: str, *, skip: frozenset[str] = frozenset()) -> list[str]:
+    """Every line under `liminallm/` matching `pattern`, as `path:lineno:line`.
+
+    Both callers below used to shell out to `ripgrep`. It is a binary no lane
+    installs, so on the GitHub runner they raised `FileNotFoundError: 'rg'`
+    and passed on every developer machine that happened to have it — the
+    undeclared-dependency shape again, one level out from a Python package.
+
+    Python rather than `grep`, which would only move the problem: its regex
+    dialect is not the one these patterns are written in, and it is still an
+    external process. `re` and `pathlib` are here by definition, because the
+    test is already running in Python.
+
+    The `path:lineno:line` shape is ripgrep's and is kept deliberately: the
+    allowlist below matches against the whole formatted line, so the path is
+    part of what it tests.
+    """
+    found: list[str] = []
+    for path in sorted((REPO / "liminallm").rglob("*.py")):
+        if "__pycache__" in path.parts or path.name in skip:
+            continue
+        relative = path.relative_to(REPO)
+        for number, line in enumerate(path.read_text().splitlines(), start=1):
+            if re.search(pattern, line):
+                found.append(f"{relative}:{number}:{line}")
+    return found
 
 # Env vars are a standing invitation to configure per-container. Each name here
 # is a deliberate exception; adding one should be a decision, not a reflex.
@@ -29,6 +61,12 @@ EXPECTED_ENV_SETTINGS = {
     # The test harness tells the process it is a test before anything else
     # happens, and it must not be flippable from a web form.
     "test_mode",
+    # Where the data lives on this machine. Needed while the Postgres store
+    # is being constructed, so a stored value could not take effect: the store
+    # keeps the root it was built with while every service made afterwards
+    # uses the refreshed one — artifact payloads under one tree, file and
+    # adapter authority under another.
+    "shared_fs_root",
     # A property of the schema that was applied, not of the running app;
     # scripts/migrate.sh needs the same value.
     "embedding_vector_dim",
@@ -158,28 +196,83 @@ class TestFirstBootSeed:
         assert set(stored) == {"jwt_secret"}
 
 
+class TestARetiredSettingIsActuallyDead:
+    """Deleting a field from the model must mean dead everywhere.
+
+    `apply_managed_settings` already ignored unknown stored keys, so the
+    runtime's settings were safe — but the store handed the raw blob to
+    everything else. A database written by an older build that once stored
+    `rag_mode` then (a) counted as "an operator configured this instance" and
+    refused a first-boot seed, and (b) echoed the deleted key from the admin
+    settings API forever, because every write merged the raw blob back.
+
+    The filter is generic — keys not in SYSTEM_SETTINGS_DEFAULTS — so the next
+    deletion tranche gets this behaviour for free rather than per-field.
+    """
+
+    RETIRED = "rag_mode"  # really retired, so the fixture is the real case
+
+    def _store_with_retired_key(self):
+        reset_runtime_for_tests()
+        runtime = get_runtime()
+        runtime.store.merge_instance_config(
+            "system_settings", {self.RETIRED: "memory"}
+        )
+        return runtime
+
+    def test_a_retired_persisted_setting_is_absent_from_every_reader(self):
+        runtime = self._store_with_retired_key()
+        assert self.RETIRED not in runtime.store.get_system_settings_overrides()
+        assert self.RETIRED not in runtime.store.get_system_settings_raw()
+        assert self.RETIRED not in runtime.store.get_system_settings()
+
+    def test_an_orphaned_retired_setting_does_not_block_the_seed(self, monkeypatch):
+        """jwt_secret is generated and excluded; a retired key must be too.
+
+        Together they are exactly the state of an old database whose only
+        history is "booted once, under a build that had rag_mode".
+        """
+        runtime = self._store_with_retired_key()
+        assert "jwt_secret" in runtime.store.get_instance_config("system_settings")
+
+        monkeypatch.setenv(
+            "INSTANCE_SETTINGS_JSON", json.dumps({"model_path": "seeded-model"})
+        )
+        reset_runtime_for_tests()
+        runtime = get_runtime()
+        assert runtime.settings.model_path == "seeded-model", (
+            "a setting this build retired still counted as an operator's "
+            "choice and refused the declarative seed"
+        )
+
+    def test_the_next_write_physically_prunes_retired_keys(self):
+        runtime = self._store_with_retired_key()
+        runtime.store.set_system_settings({"default_page_size": 120})
+
+        blob = runtime.store.get_instance_config("system_settings")
+        assert blob.get("default_page_size") == 120
+        assert self.RETIRED not in blob, (
+            "the write merged the raw blob back, so the retired key is "
+            "persisted forever instead of pruned on the next save"
+        )
+
+
 def test_no_stray_env_var_reads_outside_config(monkeypatch):
     """Settings should be the only thing reading configuration from os.environ.
 
     A direct getenv elsewhere is a setting that escaped the classification.
     """
-    import subprocess
-    import sys
-
-    out = subprocess.run(
-        [
-            "rg", "-n", r"os\.(getenv|environ)",
-            "--glob", "!**/config.py",
-            "--glob", "!**/logging.py",
-            "liminallm/",
-        ],
-        capture_output=True, text=True,
+    # A *read* is the escaped setting. The sandbox child clears and rewrites
+    # its own environment on the way into confinement — that is the opposite
+    # move, and matching it here would push a security control into an
+    # allowlist of exceptions.
+    hits = _matching_lines(
+        r"os\.getenv\(|os\.environ\.get\(|os\.environ\[",
+        skip=frozenset({"config.py", "logging.py"}),
     )
     allowed = (
         # The one declarative-deploy seam, read once at boot.
         "INSTANCE_SETTINGS_JSON",
-        # A constructor default that every real caller passes explicitly.
-        "RAG_MODE",
         # Per-provider credentials, looked up by name so a Zhipu backend reads
         # ZHIPU_API_KEY rather than OPENAI_API_KEY. Secrets belong in env.
         "api_key_env",
@@ -193,10 +286,7 @@ def test_no_stray_env_var_reads_outside_config(monkeypatch):
         # have remote code execution, so it stays env-only. See config.py.
         "EXTRACT_READER_PLUGINS",
     )
-    offenders = [
-        line for line in out.stdout.splitlines()
-        if not any(x in line for x in allowed)
-    ]
+    offenders = [line for line in hits if not any(x in line for x in allowed)]
     assert offenders == [], "\n".join(offenders)
 
 
@@ -210,15 +300,10 @@ def test_no_setting_default_is_restated_outside_config():
     True, and history_budget_fraction was clamped in code to bounds the field
     did not state.
     """
-    import subprocess
-
-    out = subprocess.run(
-        # getattr with a third argument — the fallback is the problem, not the
-        # dynamic lookup.
-        ["rg", "-n", r"getattr\((self\.|runtime\.)?settings, [^)]+,", "liminallm/"],
-        capture_output=True, text=True,
-    )
-    assert out.stdout.strip() == "", out.stdout
+    # getattr with a third argument — the fallback is the problem, not the
+    # dynamic lookup.
+    hits = _matching_lines(r"getattr\((self\.|runtime\.)?settings, [^)]+,")
+    assert hits == [], "\n".join(hits)
 
 
 def test_bounds_are_declared_not_clamped():

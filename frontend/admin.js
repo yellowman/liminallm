@@ -29,8 +29,6 @@ const writeSession = (key, value) => {
 
 const state = {
   accessToken: readSession('accessToken'),
-  refreshToken: readSession('refreshToken'),
-  sessionId: readSession('sessionId'),
   tenantId: readSession('tenantId'),
   role: readSession('role'),
 };
@@ -53,15 +51,28 @@ const showFeedback = (msg) => {
 
 const requireAdmin = () => state.role === 'admin';
 
+// Everything the console shows on arrival. One list, called from both ways in
+// — a page opened with a live session, and an interactive sign-in — so the two
+// cannot drift into showing different things.
+const loadConsole = () => {
+  fetchPatches();
+  fetchRuntimeConfig();
+  fetchSystemSettings();
+  fetchUsers();
+  fetchAdapters();
+  fetchMcpServers();
+};
+
+// The refresh token and the session id are deliberately not kept here
+// (SPEC §17.10). The server sets both as HttpOnly cookies the console cannot
+// read, so a copy in sessionStorage would be a durable credential any script
+// on the page could take, outliving the short-lived access token it was
+// meant to replace. The chat SPA holds the same line.
 const persistAuth = (payload) => {
   state.accessToken = payload.access_token;
-  state.refreshToken = payload.refresh_token;
-  state.sessionId = payload.session_id;
   state.role = payload.role;
   state.tenantId = payload.tenant_id;
   writeSession('accessToken', state.accessToken);
-  writeSession('refreshToken', state.refreshToken);
-  writeSession('sessionId', state.sessionId);
   writeSession('role', state.role);
   writeSession('tenantId', state.tenantId);
 };
@@ -129,6 +140,11 @@ const handleLogin = async (event) => {
     }
     persistAuth(envelope.data);
     if (!gatekeep()) throw new Error('Admin role required');
+    // Same load a page opened with a live session already does. Without it,
+    // signing in interactively left every table on the console empty until
+    // its own Refresh button was clicked, which reads as an installation
+    // with no users, no adapters and no servers.
+    loadConsole();
     showFeedback('Authenticated');
   } catch (err) {
     showError(err.message);
@@ -432,6 +448,105 @@ const renderAdapters = (adapters) => {
     </table>`;
 };
 
+const mcpTableWrapper = document.getElementById('mcp-table-wrapper');
+
+const renderMcpServers = (servers) => {
+  if (!mcpTableWrapper) return;
+  if (!servers.length) {
+    mcpTableWrapper.innerHTML = '<div class="empty">No MCP servers published</div>';
+    return;
+  }
+  const rows = servers
+    .map((s) => {
+      const schema = s.schema || {};
+      // Three states, because the resolver has three answers. `enabled`
+      // defaults to true when absent, the same way the resolver reads it — a
+      // blank cell would say "off" for a server that is on. And a row with no
+      // owner is offered to nobody however `enabled` reads: the admin
+      // attestation is what made it a capability, so a server whose publisher
+      // was deleted is inert until an admin publishes it again. Showing that
+      // as "enabled" tells an operator the opposite of what is true.
+      let enabled;
+      if (!s.owner_user_id) {
+        enabled = 'inert — publisher removed';
+      } else if (schema.enabled === false) {
+        enabled = 'disabled';
+      } else {
+        enabled = 'enabled';
+      }
+      // Unrecognized is egress there, so it must read as egress here too.
+      const taint = schema.taint_class === 'local_read' ? 'local_read' : 'egress';
+      return `
+        <tr>
+          <td>${escapeHtml(s.id)}</td>
+          <td>${escapeHtml(schema.name || s.name)}</td>
+          <td>${escapeHtml(schema.url || '')}</td>
+          <td>${escapeHtml(taint)}</td>
+          <td>${escapeHtml(enabled)}</td>
+        </tr>`;
+    })
+    .join('');
+  mcpTableWrapper.innerHTML = `
+    <table class="table">
+      <thead><tr><th>Artifact ID</th><th>Name</th><th>URL</th><th>Class</th><th>State</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+};
+
+const fetchMcpServers = async () => {
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/artifacts?type=mcp&visibility=global`,
+      { headers: headers() },
+      'Unable to load MCP servers'
+    );
+    renderMcpServers(envelope.data.items || []);
+  } catch (err) {
+    showError(err.message);
+  }
+};
+
+const createMcpServer = async () => {
+  const name = document.getElementById('new-mcp-name')?.value.trim();
+  const url = document.getElementById('new-mcp-url')?.value.trim();
+  const taintClass = document.getElementById('new-mcp-taint')?.value;
+  const description = document.getElementById('new-mcp-description')?.value.trim();
+  if (!name || !url) {
+    showError('Server name and URL are required');
+    return;
+  }
+  try {
+    await requestEnvelope(
+      `${apiBase}/artifacts`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({
+          type: 'mcp',
+          name,
+          description: description || '',
+          // Global is the whole point: a private row is this account's
+          // configuration and never reaches a turn.
+          visibility: 'global',
+          schema: {
+            kind: 'mcp.server',
+            name,
+            url,
+            enabled: true,
+            taint_class: taintClass,
+            description: description || '',
+          },
+        }),
+      },
+      'Unable to publish MCP server'
+    );
+    showFeedback(`Published ${name}`);
+    fetchMcpServers();
+  } catch (err) {
+    showError(err.message);
+  }
+};
+
 const fetchAdapters = async () => {
   try {
     const envelope = await requestEnvelope(
@@ -658,6 +773,17 @@ const renderField = (field) => {
     : defaultText;
   row.appendChild(help);
 
+  if (field.warning) {
+    // A runtime fact the server attached, not schema: the setting is in a
+    // state the operator should change. Rendered like an error but visible
+    // without interaction, because it arrives already true.
+    const warning = document.createElement('div');
+    warning.className = 'field-error';
+    warning.setAttribute('role', 'alert');
+    warning.textContent = `\u26a0 ${field.warning}`;
+    row.appendChild(warning);
+  }
+
   const error = document.createElement('div');
   error.className = 'field-error';
   error.style.display = 'none';
@@ -819,7 +945,9 @@ const logout = async () => {
   };
 
   await tryRevoke();
-  ['accessToken', 'refreshToken', 'sessionId', 'role', 'tenantId'].forEach((k) =>
+  // The last two are no longer written; clearing them anyway removes what a
+  // session predating this change left behind.
+  ['accessToken', 'role', 'tenantId', 'refreshToken', 'sessionId'].forEach((k) =>
     sessionStorage.removeItem(sessionStorageKey(k))
   );
   window.location.href = '/';
@@ -858,6 +986,10 @@ const deleteUserBtn = document.getElementById('delete-user');
 if (deleteUserBtn) deleteUserBtn.addEventListener('click', deleteUser);
 const refreshAdaptersBtn = document.getElementById('refresh-adapters');
 if (refreshAdaptersBtn) refreshAdaptersBtn.addEventListener('click', fetchAdapters);
+const refreshMcpBtn = document.getElementById('refresh-mcp-servers');
+if (refreshMcpBtn) refreshMcpBtn.addEventListener('click', fetchMcpServers);
+const createMcpBtn = document.getElementById('create-mcp-server');
+if (createMcpBtn) createMcpBtn.addEventListener('click', createMcpServer);
 const runInspectBtn = document.getElementById('run-inspect');
 if (runInspectBtn) runInspectBtn.addEventListener('click', runInspect);
 const refreshConfigBtn = document.getElementById('refresh-config');
@@ -881,13 +1013,7 @@ window.addEventListener('beforeunload', (event) => {
 
 // Bootstrap existing session
 if (state.accessToken) {
-  if (gatekeep()) {
-    fetchPatches();
-    fetchRuntimeConfig();
-    fetchSystemSettings();
-    fetchUsers();
-    fetchAdapters();
-  }
+  if (gatekeep()) loadConsole();
 } else {
   gatekeep();
 }

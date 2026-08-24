@@ -5,6 +5,8 @@ import importlib.util
 import json
 import os
 import re
+import struct
+import threading
 import time
 from enum import Enum
 from pathlib import Path
@@ -16,8 +18,8 @@ from liminallm.config import (
     get_provider_capabilities,
 )
 from liminallm.logging import get_logger
-from liminallm.service import responses_compat
-from liminallm.service.fs import safe_join
+from liminallm.service import local_format, responses_compat, transformer
+from liminallm.service.fs import adapter_dir_owner, safe_join
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
     DEFAULT_VOCAB_SIZE,
@@ -29,62 +31,30 @@ logger = get_logger(__name__)
 
 
 def get_adapter_mode(adapter: dict) -> str:
-    """Extract adapter mode from schema, inferring from legacy fields if needed.
+    """The adapter's stated mode (SPEC §5.0.1): local, remote, prompt, hybrid.
 
-    Per SPEC §5.0.1, adapter modes determine how adapters are applied during inference:
+    Stated, not inferred. Every stored adapter carries an explicit mode — the
+    schema.sql repair normalized old artifacts and the validator refuses new
+    ones without it — so inference is not a runtime responsibility. The dict
+    arrives in two shapes (an artifact row with nested schema, or the
+    flattened candidate the router builds), hence the two reads.
 
-    - LOCAL: Adapter has trained LoRA weights stored locally (fs_dir).
-      Requires local JAX/transformer backend. Best for fine-tuned behavior.
+    An absent adapter is weightless and promptless: prompt mode.
 
-    - REMOTE: Adapter is hosted by external provider (Together, LoRAX, etc.).
-      Uses remote_model_id or remote_adapter_id. Supports provider scaling.
-
-    - PROMPT: Adapter contributes only prompt/system instructions.
-      No LoRA weights needed. Useful for behavior modification via prompting.
-
-    - HYBRID: Combines LOCAL weights with PROMPT fallback.
-      Uses LoRA when available, prompt instructions otherwise.
-      DEFAULT for backwards compatibility: existing adapters without explicit
-      mode may have both weights and prompts, so HYBRID ensures both are used.
-
-    Mode selection priority:
-    1. Explicit 'mode' field in adapter or schema
-    2. Inference from 'backend' or 'provider' fields
-    3. Default to HYBRID (safest for legacy adapters)
-
-    Args:
-        adapter: Adapter dict with mode, backend, provider fields
-
-    Returns:
-        AdapterMode string (local, remote, prompt, hybrid)
+    An absent mode fails closed — "" matches no compatibility matrix, so the
+    adapter is filtered out rather than served. Defaulting it to hybrid was
+    the deleted compatibility behaviour wearing a shorter spelling: it would
+    let anything that slipped past the validator be interpreted, which is the
+    hole the validator exists to close.
     """
     if not adapter:
         return AdapterMode.PROMPT
-
-    # Check explicit mode field first
-    mode = adapter.get("mode") or adapter.get("schema", {}).get("mode")
-    if mode:
-        return mode
-
-    # Infer from legacy backend/provider fields
-    backend = (adapter.get("backend") or "").lower()
-    provider = (adapter.get("provider") or "").lower()
-
-    if backend in {"prompt", "prompt_distill"}:
-        return AdapterMode.PROMPT
-    if backend in {"local", "local_lora"} or provider == "local":
-        if adapter.get("prompt_instructions") or adapter.get("behavior_prompt"):
-            return AdapterMode.HYBRID
-        return AdapterMode.LOCAL
-    if backend in {"api", "remote"} or adapter.get("remote_model_id"):
-        return AdapterMode.REMOTE
-    if backend == "hybrid":
-        return AdapterMode.HYBRID
-
-    # Default to HYBRID for backwards compatibility:
-    # Legacy adapters may have both LoRA weights and prompt instructions,
-    # so HYBRID ensures both mechanisms are available during inference.
-    return AdapterMode.HYBRID
+    schema = adapter.get("schema")
+    return (
+        adapter.get("mode")
+        or (schema.get("mode") if isinstance(schema, dict) else None)
+        or ""
+    )
 
 
 def filter_adapters_by_mode(adapters: List[dict], compatible_modes: set) -> List[dict]:
@@ -104,125 +74,6 @@ def filter_adapters_by_mode(adapters: List[dict], compatible_modes: set) -> List
     return result
 
 
-def validate_adapter_base_model(
-    adapter: dict,
-    backend_base_model: str,
-    *,
-    strict: bool = False,
-) -> Tuple[bool, Optional[str]]:
-    """Validate that adapter was trained on a compatible base model.
-
-    Per SPEC §5.1, LoRA adapters are tied to specific base models. Using an adapter
-    with an incompatible base model can produce incorrect or degraded outputs.
-
-    Args:
-        adapter: Adapter dict with optional base_model field
-        backend_base_model: The base model the inference backend is using
-        strict: If True, reject adapters with missing base_model field
-
-    Returns:
-        Tuple of (is_valid, warning_message)
-        - is_valid: True if adapter is compatible or validation can't be determined
-        - warning_message: Human-readable warning if validation failed or uncertain
-    """
-    if not adapter:
-        return True, None
-
-    adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
-    schema = adapter.get("schema", {})
-
-    # Extract adapter's base model
-    adapter_base = (
-        adapter.get("base_model")
-        or schema.get("base_model")
-        or adapter.get("model")
-        or schema.get("model")
-    )
-
-    if not adapter_base:
-        if strict:
-            return (
-                False,
-                f"Adapter '{adapter_id}' missing base_model field (strict mode)",
-            )
-        logger.warning(
-            "adapter_base_model_missing",
-            adapter_id=adapter_id,
-            backend_base_model=backend_base_model,
-            message="Adapter has no base_model field; compatibility cannot be verified",
-        )
-        return (
-            True,
-            f"Adapter '{adapter_id}' has no base_model; compatibility unverified",
-        )
-
-    # Normalize model names for comparison
-    def normalize_model_name(name: str) -> str:
-        """Normalize model name for fuzzy matching."""
-        name = name.lower().strip()
-        # Remove common prefixes/suffixes
-        for prefix in ("models/", "model/", "hf://", "huggingface/"):
-            if name.startswith(prefix):
-                name = name[len(prefix) :]
-        # Remove version suffixes for family comparison
-        # e.g., "llama-7b-v1.0" -> "llama-7b"
-        for suffix in ("-v1", "-v2", "-v1.0", "-v2.0", ".0", ".1"):
-            if name.endswith(suffix):
-                name = name[: -len(suffix)]
-        return name
-
-    adapter_normalized = normalize_model_name(adapter_base)
-    backend_normalized = normalize_model_name(backend_base_model)
-
-    # Check for exact match (after normalization)
-    if adapter_normalized == backend_normalized:
-        return True, None
-
-    # Check for model family compatibility (e.g., llama-7b adapter on llama-7b-chat)
-    # Extract base family name (first part before version/variant)
-    def extract_family(name: str) -> str:
-        # Split on common separators and take base
-        for sep in ("-chat", "-instruct", "-base", "-hf", "-gguf"):
-            if sep in name:
-                name = name.split(sep)[0]
-        return name
-
-    adapter_family = extract_family(adapter_normalized)
-    backend_family = extract_family(backend_normalized)
-
-    if adapter_family == backend_family:
-        # Same family but different variant - likely compatible but warn
-        logger.info(
-            "adapter_base_model_variant_match",
-            adapter_id=adapter_id,
-            adapter_base_model=adapter_base,
-            backend_base_model=backend_base_model,
-            message="Adapter base model is variant of backend model; proceeding with caution",
-        )
-        return (
-            True,
-            f"Adapter '{adapter_id}' trained on '{adapter_base}' (variant of '{backend_base_model}')",
-        )
-
-    # Incompatible base models
-    logger.warning(
-        "adapter_base_model_mismatch",
-        adapter_id=adapter_id,
-        adapter_base_model=adapter_base,
-        backend_base_model=backend_base_model,
-        message="Adapter was trained on different base model; outputs may be degraded",
-    )
-    if strict:
-        return (
-            False,
-            f"Adapter '{adapter_id}' incompatible: trained on '{adapter_base}', backend uses '{backend_base_model}'",
-        )
-    return (
-        True,
-        f"Adapter '{adapter_id}' trained on '{adapter_base}' but backend uses '{backend_base_model}'",
-    )
-
-
 _OPENAI_SPEC = importlib.util.find_spec("openai")
 if _OPENAI_SPEC:
     from openai import OpenAI as _OpenAIClient  # pragma: no cover
@@ -234,16 +85,102 @@ def _safe_weight(value: Any, default: float = 1.0, *, context: str = "") -> floa
     """Coerce adapter weights to float with defensive fallback.
 
     Router artifacts may carry user-authored weights that fail `float()`
-    coercion. Issue 39.3 requires gracefully handling these cases to avoid
-    request crashes. Shared by every backend (the JAX blending path used to
-    call a method that only existed on ApiAdapterBackend - dead code until
-    jax was actually installed).
+    coercion, which must not crash a request. Shared by every backend.
     """
     try:
         return float(value)
     except (TypeError, ValueError):
         logger.warning("adapter_weight_parse_failed", context=context, value=value)
         return default
+
+
+def mode_value(mode) -> str:
+    """An adapter mode as its comparable string, enum member or not.
+
+    `get_adapter_mode` returns the raw string when an artifact states a mode
+    and an `AdapterMode` member when it infers one — and `AdapterMode` is a
+    `str` Enum whose `str()` is "AdapterMode.HYBRID". Normalizing with a bare
+    `str()` therefore produced a value matching nothing, so every comparison
+    against the mode constants silently failed for adapters that stated no
+    mode. That is the documented default for legacy adapters: it dropped
+    their prompts in the service, and here it let a legacy `backend: prompt`
+    adapter load weights, which is the one thing §5.5 says the prompt rung
+    can never do.
+    """
+    return str(getattr(mode, "value", mode) or "").strip().lower()
+
+
+def effective_mode(adapter: dict) -> str:
+    """The adapter's authoritative mode (SPEC §5.0.1), stated or inferred.
+
+    `mode` wins over the legacy `backend`/`provider` inference, in the
+    adapter or in its schema.
+    """
+    schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+    merged = {**(schema or {}), **{k: v for k, v in adapter.items() if k != "schema"}}
+    return mode_value(get_adapter_mode(merged))
+
+
+def effective_gate(adapter: dict) -> float:
+    """The gate that actually applies to an adapter (SPEC §5.0.1).
+
+        g = clamp(g_router, 0, 1)
+
+    One definition, because every consumer — LoRA weights, prompt injection,
+    remote passthrough, the KV signature, inference accounting — has to agree
+    on which adapters are in the effective request. Where the weight lives is
+    not an `or` chain: 0.0 is a meaningful gate and also falsy.
+    """
+    if not isinstance(adapter, dict):
+        return 1.0
+    gate = adapter.get("weight")
+    if gate is None:
+        gate = adapter.get("gate_weight")
+    if gate is None:
+        schema = adapter.get("schema")
+        gate = schema.get("weight") if isinstance(schema, dict) else None
+    if gate is None:
+        gate = 1.0
+    return max(0.0, min(1.0, _safe_weight(gate, default=1.0, context="effective_gate")))
+
+
+def active_adapters(adapters: Optional[List[dict]]) -> List[dict]:
+    """The effective adapter set: those the router left with `g > 0`, each
+    carrying its canonical `g` as `weight`.
+
+    SPEC §5.0.1 gives the gate two meanings, in order — activation, then
+    intensity — and this function answers **both**. `g == 0` (including any
+    negative weight, which §8.1 clamps) means the adapter is absent from the
+    request, so it is removed here, once, before anything mechanism-specific
+    happens to it. Everything that survives carries the clamped, precedence-
+    resolved number, so a consumer reading `adapter["weight"]` reads the same
+    value composition scales by.
+
+    Answering only membership was not enough. The remote formatter re-derived
+    the magnitude from the raw dict and so sent `5.0` for an adapter this
+    function had already clamped to `1.0`, sent `1.0` for one held in
+    `schema.weight`, and raised on a weight this function reads as `1.0`.
+    Members are shallow copies for that reason: the canonical value has to be
+    on the adapter without editing the caller's dict.
+
+    Routing traces are built from the router's own output, not from this
+    list, so a zero-gated adapter stays auditable — "the router assigned this
+    a zero gate" is not the same fact as "this adapter affected inference".
+    """
+    result: List[dict] = []
+    for adapter in adapters or []:
+        if not isinstance(adapter, dict):
+            result.append(adapter)
+            continue
+        gate = effective_gate(adapter)
+        if gate == 0.0:
+            logger.debug(
+                "adapter_gate_closed_skipped",
+                adapter_id=adapter.get("id") or adapter.get("name"),
+            )
+            continue
+        result.append({**adapter, "weight": gate})
+    return result
 
 
 class ModelBackend(Protocol):
@@ -686,6 +623,73 @@ def _longest_prefix(lowered: str, table: List[Tuple[str, int]]) -> Optional[int]
     return best[1] if best else None
 
 
+# Families a listwise rerank can reasonably be asked of. The evidence for
+# reranking as a fix for embedding's limits comes from a large hosted model
+# reading a whole shortlist in one pass; nothing establishes that a small
+# local model does the same job, and this stage can drop the user's context.
+# So the list is an allowlist of the tested shape, not a survey — an
+# unrecognized model reads as "no evidence" and reranking stays off.
+RERANK_CAPABLE_PREFIXES: Tuple[str, ...] = (
+    "gpt-4o", "gpt-4.1", "gpt-5", "o1", "o3", "o4",
+    "claude-3-5-sonnet", "claude-3-7", "claude-4", "claude-opus", "claude-sonnet",
+    "gemini-1.5-pro", "gemini-2", "gemini-3",
+    "deepseek-r", "deepseek-v3", "glm-4.5", "glm-4.6", "grok-3", "grok-4",
+    "kimi-k2", "qwen3-max", "mistral-large", "llama-4-maverick",
+)
+
+# Open-weight models name their size, and below this the instruction-following
+# a listwise rank needs is not reliable. Crude, deliberately conservative, and
+# only ever consulted for a model no prefix above recognized. A mixture-of-
+# experts name reads as its per-expert size ("8x22b" is 22), which understates
+# the model and so lands on the safe side of the bar; an operator who knows
+# better sets rag_rerank=on.
+RERANK_MIN_PARAMS_B = 30.0
+_PARAM_SIZE = re.compile(r"(?:^|[-_/x:])(\d+(?:\.\d+)?)b(?:$|[-_./:])", re.IGNORECASE)
+
+
+# A prefix match cannot tell a flagship from the distilled sibling that
+# shares its name, and the difference is the whole point of the list: the
+# evidence is about large models. "gpt-4o" would otherwise admit
+# "gpt-4o-mini", which is the *default* model_path — so an out-of-the-box
+# install would turn reranking on for the smallest model in the family.
+#
+# Matched as whole name parts, never as substrings: "mini" is inside
+# "gemini", and a naive `in` check rejected every Gemini model there is.
+RERANK_SMALL_VARIANTS: frozenset[str] = frozenset(
+    {"mini", "nano", "lite", "small", "tiny", "micro"}
+)
+
+# ":" belongs here: an Ollama tag ("deepseek-r1:1.5b") and an OpenRouter
+# variant suffix ("openai/gpt-4o-mini:online") both hide the part that
+# decides. Without it the size floor found no size and the small-variant
+# guard found no "mini", so auto turned reranking on for a 1.5B.
+_NAME_PARTS = re.compile(r"[-_./:]+")
+
+
+def model_can_rerank(model_id: str) -> bool:
+    """Whether `auto` should turn reranking on for this model.
+
+    A heuristic, and it says so: it answers "is there positive evidence this
+    model can judge a shortlist", never "is this model good". Unknown is a no.
+    """
+    lowered = (model_id or "").strip().lower()
+    if not lowered:
+        return False
+    # Strip a provider route like "openai/gpt-4o" or "vertex/gemini-2.5-pro".
+    tail = lowered.rsplit("/", 1)[-1]
+    if RERANK_SMALL_VARIANTS & set(_NAME_PARTS.split(tail)):
+        return False
+
+    # A declared size beats family membership in both directions. A name that
+    # says it is small is small whatever family it belongs to — otherwise the
+    # allowlist would admit "gemini-2.0-flash-8b" on the strength of the
+    # prefix and never reach the size at all.
+    sizes = [float(match) for match in _PARAM_SIZE.findall(tail)]
+    if sizes:
+        return max(sizes) >= RERANK_MIN_PARAMS_B
+    return any(tail.startswith(prefix) for prefix in RERANK_CAPABLE_PREFIXES)
+
+
 def context_window_from_table(
     model_id: str, provider: Optional[str] = None
 ) -> Optional[int]:
@@ -1002,10 +1006,10 @@ class ApiAdapterBackend:
         processed = self._process_adapters_for_provider(adapter_list)
         target_model = processed["model"]
         extra_body = processed["extra_body"]
-        prompt_injections = processed["prompt_injections"]
-
-        # Inject adapter prompts if any hybrid/prompt adapters
-        augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+        # Messages arrive materialized: LLMService places adapter
+        # instructions once, on every path into a backend (SPEC §5.0.1).
+        # Injecting here as well put them in twice.
+        augmented_messages = list(messages or [])
         extra_body = self._with_reasoning_effort(extra_body)
 
         if self.client and self._responses_available():
@@ -1041,11 +1045,7 @@ class ApiAdapterBackend:
                 content = ""
             else:
                 content = first_choice.message.content or ""
-            usage = {
-                "prompt_tokens": getattr(completion.usage, "prompt_tokens", 0),
-                "completion_tokens": getattr(completion.usage, "completion_tokens", 0),
-                "total_tokens": getattr(completion.usage, "total_tokens", 0),
-            }
+            usage = self._chat_usage(getattr(completion, "usage", None))
             return {
                 "content": content,
                 "usage": usage,
@@ -1113,6 +1113,40 @@ class ApiAdapterBackend:
             kwargs["extra_body"] = extra_body
         return kwargs
 
+    @staticmethod
+    def _chat_usage(usage_obj: Any) -> Dict[str, int]:
+        """chat.completions usage in the internal shape, rich keys included.
+
+        The chat transport names its details differently from Responses
+        (prompt_tokens_details / completion_tokens_details), and both OpenAI
+        and vLLM's prefix caching report cached_tokens there — dropping them
+        silenced exactly the servers the self-hosted lane runs. Same
+        convention as responses_compat.usage_dict: the rich keys ride as
+        flat ints, so the agent loop aggregates them and the served usage
+        details fill themselves in.
+        """
+        prompt = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage_obj, "completion_tokens", 0) or 0)
+        usage = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0)
+            or (prompt + completion),
+        }
+        cached = getattr(
+            getattr(usage_obj, "prompt_tokens_details", None), "cached_tokens", 0
+        )
+        if cached:
+            usage["cached_tokens"] = int(cached)
+        reasoning = getattr(
+            getattr(usage_obj, "completion_tokens_details", None),
+            "reasoning_tokens",
+            0,
+        )
+        if reasoning:
+            usage["reasoning_tokens"] = int(reasoning)
+        return usage
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -1132,9 +1166,10 @@ class ApiAdapterBackend:
             raise RuntimeError("tool calling requires a configured API client")
 
         processed = self._process_adapters_for_provider(adapters or [])
-        augmented = self._inject_adapter_prompts(
-            messages, processed["prompt_injections"]
-        )
+        # Messages arrive materialized: LLMService places adapter
+        # instructions once, on every path into a backend (SPEC §5.0.1).
+        # Injecting here as well put them in twice.
+        augmented = list(messages or [])
         if self._responses_available():
             kwargs = self._responses_kwargs(processed["model"], processed["extra_body"])
             if tools:
@@ -1202,16 +1237,11 @@ class ApiAdapterBackend:
                     for tc in tool_calls
                 ]
         assistant_message.setdefault("role", "assistant")
-        usage_obj = getattr(completion, "usage", None)
         return {
             "content": (getattr(message, "content", None) if message else None) or "",
             "tool_calls": tool_calls,
             "assistant_message": assistant_message,
-            "usage": {
-                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
-                "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
-                "total_tokens": getattr(usage_obj, "total_tokens", 0),
-            },
+            "usage": self._chat_usage(getattr(completion, "usage", None)),
         }
 
     def _stream_via_responses(
@@ -1279,7 +1309,7 @@ class ApiAdapterBackend:
         *,
         user_id: Optional[str] = None,
     ) -> Iterator[dict]:
-        """Stream tokens from the model per SPEC §18.
+        """Stream tokens from the model per SPEC §13.7.
 
         Yields events:
         - {"event": "token", "data": "token_text"}
@@ -1292,8 +1322,10 @@ class ApiAdapterBackend:
         processed = self._process_adapters_for_provider(adapter_list)
         target_model = processed["model"]
         extra_body = processed["extra_body"]
-        prompt_injections = processed["prompt_injections"]
-        augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+        # Messages arrive materialized: LLMService places adapter
+        # instructions once, on every path into a backend (SPEC §5.0.1).
+        # Injecting here as well put them in twice.
+        augmented_messages = list(messages or [])
         extra_body = self._with_reasoning_effort(extra_body)
 
         if self.client and self._responses_available():
@@ -1315,6 +1347,7 @@ class ApiAdapterBackend:
                 full_content = ""
                 prompt_tokens = 0
                 completion_tokens = 0
+                usage_details: Dict[str, int] = {}
 
                 for chunk in stream:
                     choices = getattr(chunk, "choices", None) or []
@@ -1331,6 +1364,11 @@ class ApiAdapterBackend:
                     if hasattr(chunk, "usage") and chunk.usage:
                         prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0)
                         completion_tokens = getattr(chunk.usage, "completion_tokens", completion_tokens)
+                        usage_details = {
+                            key: value
+                            for key, value in self._chat_usage(chunk.usage).items()
+                            if key in ("cached_tokens", "reasoning_tokens")
+                        }
 
                 yield {
                     "event": "message_done",
@@ -1340,6 +1378,7 @@ class ApiAdapterBackend:
                             "prompt_tokens": prompt_tokens,
                             "completion_tokens": completion_tokens,
                             "total_tokens": prompt_tokens + completion_tokens,
+                            **usage_details,
                         },
                         "adapters_applied": processed["applied"],
                     },
@@ -1377,16 +1416,18 @@ class ApiAdapterBackend:
         Returns dict with:
         - model: Target model ID
         - extra_body: Additional request body parameters
-        - prompt_injections: List of prompt strings to inject
         - applied: List of adapter IDs that were applied
         - dropped: List of adapter IDs that were dropped
         """
-        prompt_injections: List[str] = []
         remote_adapters: List[dict] = []
         applied: List[str] = []
         dropped: List[str] = []
 
-        for adapter in adapters:
+        # §5.0.1: a zero-gated adapter is absent from the request, so it
+        # reaches neither the prompt, nor the provider, nor `applied`. It is
+        # not "dropped" either — dropping records an adapter the backend
+        # could not honour, and this one was never asked for.
+        for adapter in active_adapters(adapters):
             mode = get_adapter_mode(adapter)
             adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
 
@@ -1401,25 +1442,40 @@ class ApiAdapterBackend:
                 dropped.append(adapter_id)
                 continue
 
-            if mode == AdapterMode.PROMPT:
-                # Pure prompt adapter
-                prompt = self._extract_prompt_instructions(adapter)
-                if prompt:
-                    prompt_injections.append(prompt)
+            if mode in (AdapterMode.PROMPT, AdapterMode.HYBRID):
+                # `applied` is a claim that the adapter affected inference
+                # (§5.0.1), so it is built from the mechanisms actually
+                # present, one entry each — never from the mode alone. A
+                # hybrid carrying neither instructions nor a remote id
+                # changed nothing and must not appear here.
+                #
+                # The text itself is already in the messages — LLMService
+                # materializes it (§5.0.1) — so extracting it here only
+                # answers whether there was anything to materialize.
+                has_prompt = bool(self._extract_prompt_instructions(adapter))
+                has_remote = bool(
+                    mode == AdapterMode.HYBRID
+                    and (
+                        adapter.get("remote_model_id")
+                        or adapter.get("remote_adapter_id")
+                    )
+                )
+                if has_prompt:
                     applied.append(f"{adapter_id}:prompt")
-                continue
-
-            if mode == AdapterMode.HYBRID:
-                # Hybrid: always extract prompt, optionally add to remote
-                prompt = self._extract_prompt_instructions(adapter)
-                if prompt:
-                    prompt_injections.append(prompt)
-                # Check if has remote component
-                if adapter.get("remote_model_id") or adapter.get("remote_adapter_id"):
+                if has_remote:
+                    # Whether the provider actually selects it is
+                    # `_format_remote_adapters`' answer, and it reports its
+                    # own mechanism; claiming it here would pre-empt a
+                    # decision this backend has not made yet.
                     remote_adapters.append(adapter)
-                    applied.append(f"{adapter_id}:hybrid")
-                else:
-                    applied.append(f"{adapter_id}:prompt")
+                if not has_prompt and not has_remote:
+                    logger.debug(
+                        "adapter_carries_no_usable_representation",
+                        adapter_id=adapter_id,
+                        mode=str(mode),
+                        provider=self.provider,
+                    )
+                    dropped.append(adapter_id)
                 continue
 
             if mode == AdapterMode.REMOTE:
@@ -1436,7 +1492,6 @@ class ApiAdapterBackend:
         return {
             "model": model,
             "extra_body": extra_body,
-            "prompt_injections": prompt_injections,
             "applied": applied,
             "dropped": dropped,
         }
@@ -1465,7 +1520,7 @@ class ApiAdapterBackend:
                 else None
             )
             if selected:
-                model_id = selected.get("remote_model_id") or selected.get("model_id")
+                model_id = selected.get("remote_model_id")
                 if model_id:
                     applied.append(f"{selected.get('id', 'unknown')}:model_id")
                     # Drop other adapters
@@ -1490,25 +1545,18 @@ class ApiAdapterBackend:
             gate_weights: List[float] = []
 
             for adapter in selected:
-                aid = (
-                    adapter.get("remote_adapter_id")
-                    or adapter.get("adapter_id")
-                    or adapter.get("id")
-                )
+                aid = adapter.get("remote_adapter_id") or adapter.get("id")
                 if aid:
                     adapter_ids.append(aid)
                     applied.append(f"{adapter.get('id', 'unknown')}:adapter_param")
                     if caps.gate_weights:
-                        # Use explicit None checks to handle weight=0.0 correctly
-                        # (0.0 is falsy in Python but is a valid weight for disabling adapters)
-                        weight = adapter.get("weight")
-                        if weight is None:
-                            weight = adapter.get("gate_weight")
-                        if weight is None:
-                            weight = 1.0
-                        gate_weights.append(
-                            self._safe_float(weight, context="adapter_param_gate_weight")
-                        )
+                        # §5.0.1: a multi-LoRA provider that accepts weights
+                        # applies `g` exactly, so it must be sent the same `g`
+                        # the rest of the kernel used — clamped, and resolved
+                        # through the same precedence. Re-reading the raw dict
+                        # here sent 5.0 for an adapter this kernel treats as
+                        # 1.0, and 1.0 for one whose gate lived in its schema.
+                        gate_weights.append(effective_gate(adapter))
 
             # Mark dropped adapters
             for a in adapters:
@@ -1549,22 +1597,15 @@ class ApiAdapterBackend:
             return self.base_model, None, [], dropped
 
     def _select_best_adapter(self, adapters: List[dict], max_count: int) -> List[dict]:
-        """Select best adapters up to max_count, sorted by weight descending."""
+        """Select best adapters up to max_count, ranked by the canonical gate.
+
+        Through `effective_gate`, never a bare `float()`: that reads
+        `schema.weight`, clamps out-of-range values rather than ranking them
+        first, and defaults a malformed weight to 1.0 instead of raising.
+        """
         if not adapters:
             return []
-
-        # Sort by weight/gate_weight descending
-        # Use explicit None checks to handle weight=0.0 correctly
-        def get_weight(a: dict) -> float:
-            weight = a.get("weight")
-            if weight is None:
-                weight = a.get("gate_weight")
-            if weight is None:
-                weight = 1.0
-            return float(weight)
-
-        sorted_adapters = sorted(adapters, key=get_weight, reverse=True)
-        return sorted_adapters[:max_count]
+        return sorted(adapters, key=effective_gate, reverse=True)[:max_count]
 
     def _extract_prompt_instructions(self, adapter: dict) -> Optional[str]:
         """Extract prompt instructions from adapter for system prompt injection.
@@ -1592,40 +1633,90 @@ class ApiAdapterBackend:
 
         return result
 
-    def _inject_adapter_prompts(
-        self, messages: List[dict], prompts: List[str]
-    ) -> List[dict]:
-        """Inject adapter prompt instructions into message list."""
-        if not prompts:
-            return messages
+# The local tool channel. A raw checkpoint has no second wire, so the channel
+# is a contract the backend enforces: tools are advertised in the prompt, the
+# model emits a <tool_call>{json}</tool_call> block (the de-facto local
+# standard — Qwen and Hermes templates emit exactly this tag), and the backend
+# parses that block out of MODEL OUTPUT ONLY. Input text is never parsed,
+# which is the same property that makes the channel unforgeable by documents
+# at an API provider: a document can spell the tag, but it lands in input,
+# and only the model writes to the output stream.
+TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_CLOSE = "</tool_call>"
+_TOOL_CALL_BLOCK = re.compile(
+    r"<\s*tool_call\s*>\s*(\{.*?\})\s*<\s*/\s*tool_call\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+# One call per turn is the norm; a handful is a loop being decisive. More is a
+# model looping, and each block is bounded before json.loads sees it.
+MAX_TOOL_CALLS_PER_REPLY = 4
+MAX_TOOL_CALL_CHARS = 10_000
 
-        prompt_text = "\n".join(f"- {p}" for p in prompts)
-        system_addition = f"\n\nAdapter guidance:\n{prompt_text}"
 
-        # Find and augment system message, or prepend new one
-        augmented = [dict(m) for m in messages]
-        for i, msg in enumerate(augmented):
-            if msg.get("role") == "system":
-                augmented[i] = {
-                    **msg,
-                    "content": msg.get("content", "") + system_addition,
-                }
-                return augmented
+def extract_tool_calls(completion: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Split a completion into (content, tool_calls) per the local contract.
 
-        # No system message found, prepend one
-        augmented.insert(
-            0, {"role": "system", "content": f"Adapter guidance:\n{prompt_text}"}
+    Only well-formed blocks become calls — a JSON object with a string name
+    and a dict of arguments, inside the size bound. A malformed block stays in
+    the content as ordinary text, where downstream treats it as prose; turning
+    almost-JSON into a guessed call would be the reranker's digit-harvesting
+    mistake wearing a new tag. Calls keep the provider dict shape (id, name,
+    arguments as a JSON string) so consumers cannot tell the transports apart.
+    """
+    calls: List[Dict[str, str]] = []
+
+    def swallow(match: re.Match) -> str:
+        raw = match.group(1)
+        if len(calls) >= MAX_TOOL_CALLS_PER_REPLY or len(raw) > MAX_TOOL_CALL_CHARS:
+            return match.group(0)
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return match.group(0)
+        if not isinstance(payload, dict):
+            return match.group(0)
+        name = payload.get("name")
+        arguments = payload.get("arguments")
+        if not isinstance(name, str) or not name or not isinstance(arguments, dict):
+            return match.group(0)
+        calls.append(
+            {
+                "id": f"local-{len(calls) + 1}",
+                "name": name,
+                "arguments": json.dumps(arguments),
+            }
         )
-        return augmented
+        return " "
+
+    content = _TOOL_CALL_BLOCK.sub(swallow, completion or "")
+    return content.strip(), calls
+
+
+def _is_prefix(shorter: Tuple[int, ...], longer: Tuple[int, ...]) -> bool:
+    """Whether ``shorter`` is a leading run of ``longer`` (superseded entry)."""
+    return len(shorter) <= len(longer) and transformer.prefix_length(
+        shorter, longer
+    ) == len(shorter)
 
 
 class LocalJaxLoRABackend:
     """Backend for local JAX generation with filesystem-backed LoRA adapters.
 
-    Supports SPEC §5 dual-mode operation:
-    - LOCAL adapters: Load weights from filesystem, apply LoRA math
-    - HYBRID adapters: Load local weights, with prompt fallback
-    - PROMPT adapters: Inject behavior via system prompt (no weights)
+    **This backend materializes weights, not prompts.** It accepts the modes
+    of SPEC §5 so the router may route them here, and it applies exactly one
+    of the two representations:
+
+    - LOCAL, and HYBRID with a promoted version: LoRA matrices from
+      ``fs_root``, composed per §5.2 and scaled by the router's gate.
+    - PROMPT, and HYBRID with nothing promoted: **no weights**, and no
+      instructions either — those are already in ``messages``.
+
+    ``prompt_instructions`` are placed by ``LLMService._build_adapter_prompts``
+    before any backend is called: the choice of representation is a §5.0.1
+    rule about the *pair* (mode, backend) rather than a backend's decision,
+    and one materializer is what keeps a prompt from being injected twice. A
+    prompt-rung adapter passed straight to this class therefore changes
+    nothing — the messages it would have changed were the caller's to prepare.
 
     The backend keeps a tokenizer and (optional) Flax model resident, reads
     LoRA matrices from ``fs_root`` paths, and runs a lightweight JAX forward
@@ -1637,6 +1728,11 @@ class LocalJaxLoRABackend:
     # Modes compatible with this backend
     COMPATIBLE_MODES = {AdapterMode.LOCAL, AdapterMode.HYBRID, AdapterMode.PROMPT}
 
+    #: This backend loads LoRA weights itself, so a promoted hybrid adapter
+    #: is carried by its weights here and by its prompt on API backends
+    #: (SPEC §5.0.1). LLMService reads this to decide which.
+    applies_lora_weights = True
+
     def __init__(
         self,
         base_model: str,
@@ -1644,12 +1740,34 @@ class LocalJaxLoRABackend:
         *,
         max_seq_len: int = 512,
         max_batch_size: int = 4,
+        max_new_tokens: int = 256,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        max_cached_tokens: int = 8192,
     ) -> None:
         self.base_model = base_model
         self.fs_root = Path(fs_root)
         self.mode = "local_lora"
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.max_new_tokens = max_new_tokens
+        # Greedy by default: a kernel that cannot reproduce its own output is
+        # one nobody can debug. Operators opt into sampling explicitly.
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_cached_tokens = max_cached_tokens
+        self._model_state: Optional[Tuple[Any, Dict[str, Any]]] = None
+        #: None = not resolved yet; "absent" | "valid" | "broken" thereafter.
+        #: Distinct from _model_state so "no real model" cannot be confused
+        #: with "no checkpoint configured" (see _ensure_model).
+        self._checkpoint_state: Optional[str] = None
+        self._model_error: Optional[str] = None
+        self._vocab_mismatch_logged = False
+        # Content-addressed KV prefix cache: entries are (adapter signature,
+        # token tuple, kv cache). A conversation's next turn re-sends this
+        # turn verbatim, so the reusable prefix is usually the whole history.
+        self._prefix_cache: List[Tuple[str, Tuple[int, ...], Any]] = []
+        self._prefix_lock = threading.Lock()
         # The checkpoint's config states its trained positions; max_seq_len is
         # the serving cap. The window is whichever is smaller and known.
         discovered = context_window_from_model_dir(base_model)
@@ -1695,7 +1813,7 @@ class LocalJaxLoRABackend:
         try:  # pragma: no cover - optional dependency
             from transformers import AutoTokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(self.base_model)
+            self._tokenizer = AutoTokenizer.from_pretrained(self.base_model)  # nosec B615 - pinning a revision for an operator-chosen base model is an open decision
             self._base_vocab_size = vocab_size_from_tokenizer(
                 self._tokenizer, fallback=self.default_vocab_size
             )
@@ -1708,17 +1826,22 @@ class LocalJaxLoRABackend:
             )
 
     def _vocab_size(self) -> int:
+        if self._model_state is not None:
+            # A loaded checkpoint is authoritative: its embedding table
+            # defines the only ids that mean anything, and the tokenizer
+            # fallback must land inside it. Deriving this from the default
+            # instead let every out-of-range word clamp to the same id, so
+            # different prompts became identical input to the model.
+            return self._model_state[0].vocab_size
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
             return self._adapter_vocab_size
         self._ensure_tokenizer()
         return self._base_vocab_size
 
     def _normalize_messages(self, messages: List[dict]) -> str:
-        if not messages:
-            return ""
-        return "\n".join(
-            [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages]
-        )
+        # Shared with training (service/local_format.py): the role labels are
+        # tokens to a raw decoder, so both paths must write the same ones.
+        return local_format.format_conversation(messages or [])
 
     def _apply_adapter_vocab_size(self, adapter: dict) -> None:
         self._adapter_vocab_size = None
@@ -1760,14 +1883,18 @@ class LocalJaxLoRABackend:
         """
         self._ensure_tokenizer()
         if self._tokenizer:
-            encoded = self._tokenizer(
-                text,
-                truncation=True,
-                max_length=self.max_seq_len,
-                return_tensors="np",
+            # truncation=False deliberately: the tokenizer would keep the
+            # OLDEST tokens, discarding the newest turn before this method
+            # could choose. Training keeps the tail (SPEC §5.4.3); serving has
+            # to make the same choice or the adapter is fitted to one input
+            # distribution and asked to serve another.
+            encoded = self._tokenizer(text, truncation=False, return_tensors="np")
+            ids = local_format.keep_newest(
+                encoded["input_ids"][0].tolist(), self.max_seq_len
             )
-            ids = encoded["input_ids"][0].tolist()
-            attention = encoded["attention_mask"][0].tolist()
+            attention = local_format.keep_newest(
+                encoded["attention_mask"][0].tolist(), self.max_seq_len
+            )
             return ids, attention
 
         # Fallback: deterministic whitespace tokenization with FNV-1a hash
@@ -1792,62 +1919,123 @@ class LocalJaxLoRABackend:
             attention = [0]
         return ids, attention
 
+    #: The modes whose representation on this backend is weights (§5.0.1's
+    #: compatibility matrix). Stated positively, because "not PROMPT" also
+    #: admitted REMOTE — an adapter this class advertises as incompatible.
+    WEIGHT_BEARING_MODES = frozenset({AdapterMode.LOCAL, AdapterMode.HYBRID})
+
+    @staticmethod
+    def _weight_bearing(adapters: List[dict]) -> List[dict]:
+        """Those of `adapters` that carry weights on this backend.
+
+        Past the gate (§5.0.1), a mode whose local representation is weights,
+        and promoted (§5.5). Anything else applies no mechanism here, so it
+        must not size the tokenizer, name itself in usage, key the KV cache,
+        or otherwise leave a trace of having done something.
+        """
+        return [
+            adapter
+            for adapter in adapters or []
+            if isinstance(adapter, dict)
+            and effective_mode(adapter) in LocalJaxLoRABackend.WEIGHT_BEARING_MODES
+            and LocalJaxLoRABackend._promoted_version_of(adapter) > 0
+        ]
+
+    @staticmethod
+    def _applied_adapter_ids(adapters: List[dict]) -> Optional[str]:
+        ids = [str(a.get("id")) for a in adapters or [] if a.get("id")]
+        return ",".join(ids) if ids else None
+
     def _load_adapter_weights(
         self,
         adapter: dict,
         *,
         user_id: Optional[str] = None,
-        strict_base_model: bool = False,
     ) -> dict:
         """Load adapter weights from filesystem with checksum and base model verification.
 
         Per SPEC §18, checksum of params is verified against schema.checksum before activation.
-        Per SPEC §5.1, base model compatibility is validated to prevent degraded outputs.
+        Per SPEC §5.1, the declared base must be the serving base, exactly.
 
         Args:
             adapter: Adapter dict with weights path and metadata
             user_id: User context for ownership validation
-            strict_base_model: If True, reject adapters with incompatible base model
 
         Returns:
             Weight dict with LoRA matrices as JAX arrays
 
         Raises:
-            ValueError: If checksum mismatch or base model incompatible (in strict mode)
+            ValueError: If the checksum mismatches or the base model is not ours
         """
         if not adapter:
             return {}
         adapter_id = adapter.get("id", "unknown")
 
-        # Validate base model compatibility before loading weights
-        is_compatible, warning = validate_adapter_base_model(
-            adapter, self.base_model, strict=strict_base_model
-        )
-        if not is_compatible:
+        # SPEC §5.5: a prompt-rung adapter carries instructions, never
+        # weights. Defense in depth alongside the version pin — the ladder
+        # says weights arrive only on graduation to hybrid/local, so files
+        # that happen to exist on disk must not change that.
+        mode = self._adapter_mode_of(adapter)
+        if mode == AdapterMode.PROMPT:
+            logger.debug("adapter_prompt_mode_carries_no_weights", adapter_id=adapter_id)
+            return {}
+        if mode not in self.WEIGHT_BEARING_MODES:
+            # §5.0.1's matrix says `remote` is incompatible with this backend,
+            # and the router filters on it before policy evaluation — so an
+            # incompatible adapter arriving here is a broken hand-off, not a
+            # transient state like "nothing promoted yet". Refusing visibly
+            # rather than treating it as weightless: the alternative was
+            # applying a provider-hosted adapter's id as local LoRA weights
+            # because a `params.json` happened to sit under its directory.
             raise ValueError(
-                warning or f"Adapter '{adapter_id}' incompatible with base model"
-            )
-        if warning:
-            # Log warning but continue - adapter may still work
-            logger.info(
-                "adapter_base_model_warning",
-                adapter_id=adapter_id,
-                warning=warning,
+                f"adapter {adapter_id!r} has mode {mode!r}, which this backend "
+                f"does not serve (accepts {sorted(self.WEIGHT_BEARING_MODES)} "
+                "for weights, and prompt-rung adapters weightlessly); the "
+                "router should not have routed it here"
             )
 
+        # SPEC §5.4.6/§5.5: only a promoted version may be served, and that
+        # decision comes BEFORE the filesystem is touched. `_adapter_path`
+        # is not inert — it raises for a missing user context, an owner
+        # mismatch, or a path outside fs_root — so resolving first turned an
+        # adapter that authorizes no weights at all into a failed request.
+        # An unpromoted hybrid is prompt fallback; whatever its `fs_dir` says
+        # is irrelevant, because nothing will read it. Same inert-state ->
+        # outage shape as the gate, base and identity rules before it.
+        current_version = self._promoted_version_of(adapter)
+        if current_version <= 0:
+            logger.debug(
+                "adapter_has_no_promoted_version", adapter_id=adapter_id
+            )
+            return {}
+
         path = Path(self._adapter_path(adapter, requested_user_id=user_id))
-        # SPEC §5.4.6: only the promoted version may be served. current_version
-        # is authoritative - without it, resolution would fall back to "newest
-        # directory on disk", which serves weights the eval gate rejected.
-        schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
-        current_version = adapter.get("current_version")
-        if current_version is None:
-            current_version = (schema or {}).get("current_version")
         params_path = self._resolve_params_path(path, current_version=current_version)
         if not params_path:
             return {}
+
+        # SPEC §5.1: an adapter is fitted to the model that serves it, and
+        # training refuses to run when the bases disagree. Serving holds the
+        # same line — B·A was optimized against one particular frozen W, and
+        # passing the eval gate on that W says nothing about W'.
+        #
+        # After resolution and before the cache, so it guards exactly what it
+        # is about: weights that are about to be applied. Checking earlier
+        # also refuses adapters contributing no weights at all (nothing
+        # promoted, gate closed), which turns a no-op into an outage. This is
+        # the only base check on the weight path.
+        self._assert_exact_base_model(adapter, adapter_id)
+        self._assert_version_belongs_to_adapter(
+            params_path, adapter_id, current_version
+        )
+
         mtime = params_path.stat().st_mtime
-        cached = self._adapter_cache.get(adapter_id)
+        # Keyed by (adapter_id, version) as SPEC §5.3 declares, not by id
+        # alone: two versions of one adapter are different weights, and an id
+        # -only key made the mtime check the sole thing keeping a promotion
+        # from serving its predecessor's tensors.
+        cache_key = f"{adapter_id}:{current_version if current_version is not None else ''}"
+        cached = self._adapter_cache.get(cache_key)
         if cached and cached[0] == mtime:
             return cached[1]
         payload = params_path.read_bytes()
@@ -1874,7 +2062,6 @@ class LocalJaxLoRABackend:
                 path=str(params_path),
                 message="Adapter loaded without checksum verification - add schema.checksum for production use",
             )
-        # Issue 39.1: Add error handling for JSON deserialization
         try:
             weights_raw = json.loads(payload.decode())
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -1890,52 +2077,55 @@ class LocalJaxLoRABackend:
             k: self._jnp.array(v, dtype=self._jnp.float32)
             for k, v in weights_raw.items()
         }
-        self._adapter_cache[adapter_id] = (mtime, weights)
+        self._adapter_cache[cache_key] = (mtime, weights)
+        # Reaching here means these weights were read from disk rather than
+        # served from the cache, so any KV state computed under the previous
+        # copy is stale. This is what makes the id+version cache key safe
+        # against an in-place edit that never bumped a version.
+        self._invalidate_prefix_cache()
         return weights
 
     def _resolve_params_path(
         self, path: Path, *, current_version: Optional[int] = None
     ) -> Optional[Path]:
-        if path.is_file() and path.name == "params.json":
-            return path
-        # When the artifact records a promoted version, serve exactly that
-        # version (or the `latest` pointer maintained alongside it). Never fall
-        # back to scanning for the newest directory: an un-promoted version
-        # left on disk by a gate-rejected training run would win that scan.
-        if current_version:
-            try:
-                pinned = int(current_version)
-            except (TypeError, ValueError):
-                pinned = 0
-            if pinned > 0:
-                exact = path / f"v{pinned:04d}" / "params.json"
-                if exact.exists():
-                    return exact
-                latest_pinned = path / "latest" / "params.json"
-                if latest_pinned.exists():
-                    return latest_pinned
-                logger.warning(
-                    "adapter_promoted_version_missing",
-                    adapter_path=str(path),
-                    current_version=pinned,
-                )
-                return None
-        candidates: list[Path] = []
-        direct = path / "params.json"
-        if direct.exists():
-            candidates.append(direct)
-        latest = path / "latest" / "params.json"
-        if latest.exists():
-            candidates.append(latest)
-        versioned = [p for p in path.glob("v*/params.json") if p.parent.is_dir()]
-        versioned.sort(key=lambda p: self._version_sort_key(p.parent.name))
-        candidates.extend(versioned)
-        wildcard = [p for p in path.glob("*/params.json") if p.parent.is_dir()]
-        wildcard.sort(key=lambda p: p.stat().st_mtime)
-        candidates.extend(wildcard)
-        for candidate in reversed(candidates):
-            if candidate.exists():
-                return candidate
+        """The one `params.json` a promoted version authorizes, or None.
+
+        SPEC §5.5, entire: `current_version <= 0` (or absent) authorizes no
+        weights; `N > 0` authorizes exactly this adapter's
+        `vNNNN/params.json`. Nothing else is authoritative — not a direct
+        `params.json`, not `latest`, not a directory scan, not the mere
+        presence of a file.
+
+        There is no lane for an artifact with no `current_version`: serving a
+        directory scan reopens every hole this method closes — `latest` aimed
+        elsewhere serves another adapter's weights, a bare `vNNNN` serves what
+        a gate-rejected run leaves
+        behind, and a versionless *hybrid* got weights from the file while the
+        service, reading only metadata, injected its prompt fallback — the two
+        voices §5.0.1 forbids. The lane existed for artifacts the adapter
+        schema has required `current_version` from for some time, so it was
+        compatibility code for state that cannot be created. Deleting it is
+        what makes the resolver agree with the data model.
+        """
+        try:
+            pinned = int(current_version) if current_version is not None else 0
+        except (TypeError, ValueError):
+            pinned = 0
+        if pinned <= 0:
+            # Nothing promoted. Never scan: a training job writes its version
+            # directory *before* the eval gate runs, so a scan finds weights
+            # the gate never approved, and a crash between writing and
+            # quarantine would make that permanent.
+            logger.debug("adapter_has_no_promoted_version", adapter_path=str(path))
+            return None
+        exact = path / f"v{pinned:04d}" / "params.json"
+        if exact.exists():
+            return exact
+        logger.warning(
+            "adapter_promoted_version_missing",
+            adapter_path=str(path),
+            current_version=pinned,
+        )
         return None
 
     def _version_sort_key(self, name: str) -> Tuple[int, str]:
@@ -2008,6 +2198,276 @@ class LocalJaxLoRABackend:
                 )
         return " ".join([f"tok-{tid}" for tid in token_ids])
 
+    def _ensure_model(self) -> None:
+        """Resolve the base checkpoint into one of three states.
+
+        The distinction is the whole point:
+
+        ``ABSENT``  no checkpoint on disk — a dev box or CI. The synthetic
+                    stand-in is allowed, and logged, because it exercises the
+                    plumbing and answers nothing.
+        ``VALID``   loaded; the real model serves.
+        ``BROKEN``  a checkpoint exists but cannot be served — its tokenizer
+                    will not load, the weights will not read, or the
+                    tokenizer disagrees with its vocabulary. This is a
+                    production configuration failure, and it must fail
+                    closed.
+
+        Using ``_model_state is None`` to mean both "dev fallback" and
+        "misconfigured" meant a broken checkpoint quietly answered from the
+        stand-in on the very next request — the opposite of the refusal this
+        was supposed to implement.
+        """
+        if self._model_state is not None or self._checkpoint_state is not None:
+            return
+        if not transformer.checkpoint_available(self.base_model):
+            self._checkpoint_state = "absent"
+            self._model_error = "no checkpoint at base_model path"
+            logger.warning(
+                "local_checkpoint_absent",
+                base_model=self.base_model,
+                detail="serving the synthetic stand-in; answers are not model output",
+            )
+            return
+        self._ensure_tokenizer()
+        if self._tokenizer is None:
+            # A real checkpoint without its own tokenizer cannot be served:
+            # the id-hash fallback invents a token space this model was never
+            # trained on, so every embedding lookup would be arbitrary. Refuse
+            # the real path rather than produce confident nonsense from it.
+            self._mark_broken("checkpoint present but its tokenizer failed to load")
+            logger.error(
+                "local_checkpoint_tokenizer_missing",
+                base_model=self.base_model,
+                error=self._tokenizer_error,
+                detail="refusing the real model; a hashed token space is not this model's",
+            )
+            return
+        try:
+            config, params = transformer.load_checkpoint(self.base_model)
+            self._ensure_jax()
+            self._model_state = (config, self._jax.device_put(params, self._device))
+            self._checkpoint_state = "valid"
+        except Exception as exc:  # noqa: BLE001 - present but unusable
+            self._mark_broken(str(exc))
+            logger.error(
+                "local_checkpoint_load_failed",
+                base_model=self.base_model,
+                error=str(exc),
+            )
+
+    def _mark_broken(self, reason: str) -> None:
+        """A present-but-unusable checkpoint. Every request fails from here."""
+        self._model_state = None
+        self._checkpoint_state = "broken"
+        self._model_error = reason
+        self._invalidate_prefix_cache()
+
+    def _refuse_if_broken(self) -> None:
+        if self._checkpoint_state == "broken":
+            raise ValueError(
+                f"local model refused: {self._model_error}. The checkpoint is "
+                "present but unusable; this is a configuration error, not a "
+                "reason to answer from the synthetic stand-in."
+            )
+
+    def _adapter_signature(self, adapters: List[dict]) -> str:
+        """Identity of the *effective* LoRA stack, for keying cached KV state.
+
+        Version dirs are immutable (SPEC §5.2), so id+version identifies the
+        weights; an in-place edit is caught separately, by clearing the cache
+        whenever adapter weights actually reload.
+
+        The gate belongs in the key too, and did not use to be: gates are
+        per-request (§5.3), so the same adapter at 0.2 and at 0.8 is a
+        different effective model, and every cached K/V tensor was computed
+        under one of them. Keying on id+version alone would let a 0.2 request
+        continue a prefix computed at 0.8 — the cheapest possible way to
+        serve a model nobody asked for.
+
+        Zero-gated adapters are excluded, because §5.0.1 says they are not in
+        the effective request at all: `[X @ 0]` and `[]` are the same model,
+        so they must be the same key. Hashing them was safe in the sense that
+        it only ever cost a reuse — but it made this function disagree with
+        composition about what "the effective stack" means, and the value of
+        one canonical answer is that there is nowhere for the two to drift.
+        """
+        parts = sorted(
+            "{}:{}:{}".format(
+                a.get("id"),
+                a.get("current_version") or a.get("version") or "",
+                # The exact bits, not six decimal places: two gates that
+                # round to the same string are still two different models,
+                # and this key is the only thing keeping their KV apart.
+                struct.pack("<f", self._gate_weight_of(a)).hex(),
+            )
+            for a in self._weight_bearing(active_adapters(adapters))
+        )
+        return "|".join(parts) or "base"
+
+    def _invalidate_prefix_cache(self) -> None:
+        with self._prefix_lock:
+            self._prefix_cache.clear()
+
+    def _truncate_cache(self, cache, length: int):
+        return [(k[:, :length], v[:, :length]) for k, v in cache]
+
+    def _reuse_prefix(self, signature: str, ids: List[int]):
+        """The longest cached KV state that is a strict prefix of ``ids``.
+
+        Strict prefix, not "close enough": reusing keys computed for
+        different tokens would silently answer from a history the user never
+        wrote. Returns (cache, reused_token_count).
+        """
+        best_cache, best_length = None, 0
+        with self._prefix_lock:
+            for index, (sig, tokens, cache) in enumerate(self._prefix_cache):
+                if sig != signature:
+                    continue
+                shared = transformer.prefix_length(tokens, ids)
+                # The cache must correspond exactly to the tokens it covers,
+                # so only a whole stored entry (or a prefix of one) is usable.
+                if shared > best_length:
+                    best_cache, best_length = cache, shared
+                    self._prefix_cache.append(self._prefix_cache.pop(index))
+            if best_cache is not None and best_length < int(
+                best_cache[0][0].shape[1]
+            ):
+                best_cache = self._truncate_cache(best_cache, best_length)
+        return best_cache, best_length
+
+    def _store_prefix(self, signature: str, tokens: List[int], cache) -> None:
+        """Keep this turn's KV for the next one, within a token budget."""
+        entry = (signature, tuple(tokens), cache)
+        with self._prefix_lock:
+            self._prefix_cache = [
+                item
+                for item in self._prefix_cache
+                if not (item[0] == signature and _is_prefix(item[1], entry[1]))
+            ]
+            self._prefix_cache.append(entry)
+            total = sum(len(item[1]) for item in self._prefix_cache)
+            while total > self.max_cached_tokens and len(self._prefix_cache) > 1:
+                total -= len(self._prefix_cache.pop(0)[1])
+
+    def _eos_token_id(self) -> Optional[int]:
+        self._ensure_tokenizer()
+        value = getattr(self._tokenizer, "eos_token_id", None)
+        return int(value) if isinstance(value, int) else None
+
+    def _generate_real(
+        self, ids: List[int], adapters: List[dict], *, user_id: Optional[str]
+    ) -> dict:
+        """Prefill and decode against the real forward pass, with KV reuse."""
+        # This turn applies weights and nothing else, so accounting names the
+        # adapters that could carry them (§5.0.1, §5.5).
+        weight_bearing = self._weight_bearing(adapters)
+        config, params = self._model_state
+        jnp, jax = self._jnp, self._jax
+        weights = (
+            self._blend_adapter_weights(adapters, user_id=user_id, config=config)
+            if adapters
+            else {}
+        )
+        # Defensive second look: each adapter was validated before composition
+        # (that is the check that can see per-adapter rank disagreement), and
+        # the composed pair must still describe this model.
+        transformer.validate_lora_weights(config, weights)
+        lora = transformer.lora_by_layer(jnp, weights, config.num_layers)
+        signature = self._adapter_signature(adapters)
+
+        window = max(2, min(self.context_window, self.max_seq_len))
+        if len(ids) > window - 1:
+            # Keep the tail: the newest turn matters more than the oldest.
+            ids = ids[-(window - 1) :]
+
+        if ids and (max(ids) >= config.vocab_size or min(ids) < 0):
+            # The tokenizer and the checkpoint disagree — a configuration
+            # error, not a request error. Clamping the id into range is the
+            # same "fold it into a token the user never wrote" that training
+            # refuses, and answering from an arbitrary embedding is worse
+            # than not answering. Refuse the real model
+            # for the rest of this process and log it once: the documented
+            # stand-in path is at least honest about what it is.
+            if not self._vocab_mismatch_logged:
+                self._vocab_mismatch_logged = True
+                logger.error(
+                    "local_tokenizer_vocab_mismatch",
+                    base_model=self.base_model,
+                    tokenizer_vocab=self._vocab_size(),
+                    checkpoint_vocab=config.vocab_size,
+                    observed=[min(ids), max(ids)],
+                )
+            self._mark_broken(
+                "tokenizer produced ids outside the checkpoint vocabulary "
+                f"({config.vocab_size})"
+            )
+            self._refuse_if_broken()
+
+        start = time.perf_counter()
+        cache, cached_tokens = self._reuse_prefix(signature, ids)
+        if cached_tokens >= len(ids):
+            # Fully cached: step back one token so there is something to run
+            # and therefore logits to sample from.
+            cached_tokens = len(ids) - 1
+            cache = self._truncate_cache(cache, cached_tokens)
+        if cached_tokens <= 0:
+            cache, cached_tokens = None, 0
+
+        logits, cache = transformer.forward(
+            jnp,
+            config,
+            params,
+            jnp.array([ids[cached_tokens:]], dtype=jnp.int32),
+            cache=cache,
+            lora=lora,
+        )
+        eos = self._eos_token_id()
+        budget = max(0, min(self.max_new_tokens, window - len(ids)))
+        generated: List[int] = []
+        sequence = list(ids)
+        for _ in range(budget):
+            if self.temperature > 0.0:
+                self._rng, key = jax.random.split(self._rng)
+            else:
+                key = self._rng
+            token = transformer.sample_token(
+                jax,
+                jnp,
+                logits[0, -1],
+                key,
+                temperature=self.temperature,
+                top_p=self.top_p,
+            )
+            if eos is not None and token == eos:
+                break
+            generated.append(token)
+            sequence.append(token)
+            logits, cache = transformer.forward(
+                jnp,
+                config,
+                params,
+                jnp.array([[token]], dtype=jnp.int32),
+                cache=cache,
+                lora=lora,
+            )
+        self._store_prefix(signature, sequence, cache)
+        duration = time.perf_counter() - start
+        usage = {
+            "prompt_tokens": len(ids),
+            "completion_tokens": len(generated),
+            "total_tokens": len(ids) + len(generated),
+            "model": self.base_model,
+            "adapter_id": self._applied_adapter_ids(weight_bearing),
+            "latency_ms": round(duration * 1000, 2),
+        }
+        if cached_tokens:
+            # Reused prefill, reported the way every other transport reports
+            # it — so input_tokens_details.cached_tokens fills in on the
+            # served surface with no consumer change.
+            usage["cached_tokens"] = cached_tokens
+        return {"content": self._decode(generated), "usage": usage}
+
     def _sample_tokens(self, lora_scores, seed_token: int) -> List[int]:
         vocab = self._vocab_size()
         score = float(self._jnp.mean(lora_scores)) if lora_scores.size else 0.0
@@ -2027,8 +2487,30 @@ class LocalJaxLoRABackend:
         user_id: Optional[str] = None,
     ) -> dict:
         prompt = self._normalize_messages(messages)
-        adapter = adapters[0] if adapters else {}
-        self._apply_adapter_vocab_size(adapter)
+        # §5.0.1, before anything reads the list: a zero-gated adapter is
+        # absent from the request, so it must not be the adapter whose vocab
+        # size configures the tokenizer, and must not be the id this turn
+        # reports as applied. Composition and the KV signature already knew
+        # that; usage accounting and `adapters[0]` did not, so a closed gate
+        # produced a turn that hashed as the base model and still claimed the
+        # adapter. Filtering here makes the backend correct when called
+        # directly, not only downstream of LLMService.
+        adapters = active_adapters(adapters)
+        # Weights are the only mechanism this backend performs — prompts are
+        # materialized by LLMService (§5.0.1) — so weight-specific state and
+        # this turn's accounting both come from the adapters that can
+        # actually carry weights: past the gate, not the prompt rung, and
+        # promoted. An open-gated `local` adapter with nothing promoted
+        # applies no mechanism, so it must neither size the tokenizer's
+        # vocabulary nor be named in `usage.adapter_id`.
+        weight_bearing = self._weight_bearing(adapters)
+        self._apply_adapter_vocab_size(weight_bearing[0] if weight_bearing else {})
+        # Before tokenizing, not after: the checkpoint's vocabulary governs
+        # what a token id may be, including in the hash fallback.
+        self._ensure_model()
+        # A present-but-unusable checkpoint fails every request rather than
+        # letting the next one slide into the synthetic path.
+        self._refuse_if_broken()
         ids, attention = self._tokenize(prompt)
 
         # Handle empty prompts gracefully
@@ -2043,6 +2525,12 @@ class LocalJaxLoRABackend:
                     "latency_ms": 0.0,
                 },
             }
+
+        if self._model_state is not None:
+            # The real forward pass takes the tokens as they are: padding
+            # would feed the model tokens the user never wrote, and the
+            # causal mask here covers one unpadded sequence.
+            return self._generate_real(ids, adapters, user_id=user_id)
 
         ids, attention = self._pad_batch(ids, attention)
         if len(ids) > self.max_seq_len:
@@ -2078,12 +2566,12 @@ class LocalJaxLoRABackend:
             "usage": {
                 "prompt_tokens": len(ids),
                 "completion_tokens": len(generated_ids),
+                # Counted by our own tokenizer; total included so every
+                # consumer (chat envelope, the served Responses usage) sees a
+                # real total on the local path, not a zero.
+                "total_tokens": len(ids) + len(generated_ids),
                 "model": self.base_model,
-                "adapter_id": (
-                    ",".join(str(a.get("id")) for a in adapters if a.get("id"))
-                    if adapters
-                    else None
-                ),
+                "adapter_id": self._applied_adapter_ids(weight_bearing),
                 "latency_ms": round(duration * 1000, 2),
             },
         }
@@ -2095,7 +2583,7 @@ class LocalJaxLoRABackend:
         *,
         user_id: Optional[str] = None,
     ) -> Iterator[dict]:
-        """Stream tokens from local LoRA model per SPEC §18.
+        """Stream tokens from local LoRA model per SPEC §13.7.
 
         For local models, we simulate streaming by yielding tokens one at a time
         from the generated response.
@@ -2120,90 +2608,348 @@ class LocalJaxLoRABackend:
                 "data": {"code": "server_error", "message": str(exc)},
             }
 
-    def _blend_adapter_weights(
-        self, adapters: List[dict], user_id: Optional[str]
+    @property
+    def supports_tools(self) -> bool:
+        """True: the channel is this backend's contract, not the checkpoint's habit.
+
+        Advertise-then-parse works for any checkpoint; whether a given model
+        actually emits the block is behaviour, and behaviour is visible where
+        it belongs — consumers log transport="text" when a verdict arrived as
+        prose. Side-effect free on purpose: reading a capability flag must not
+        load a tokenizer or touch JAX.
+        """
+        return True
+
+    def _tool_contract(self, tools: List[dict]) -> str:
+        """The system block that advertises tools and names the emission format."""
+        specs = []
+        for tool in tools or []:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if isinstance(function, dict):
+                specs.append(
+                    json.dumps(
+                        {
+                            "name": function.get("name"),
+                            "description": function.get("description"),
+                            "parameters": function.get("parameters"),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+        return (
+            "You can call tools. Tools available (JSON Schema):\n"
+            + "\n".join(specs)
+            + "\nTo call one, reply with exactly one line:\n"
+            + TOOL_CALL_OPEN
+            + '{"name": "<tool name>", "arguments": {<parameters>}}'
+            + TOOL_CALL_CLOSE
+            + "\nOnly that block is a call. Never invent tool names. "
+            "Otherwise answer normally."
+        )
+
+    def generate_with_tools(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
     ) -> dict:
-        """Blend multiple adapter weights using router-assigned gate weights.
+        """One tool-calling turn over the local forward pass.
 
-        Per SPEC §5.2, effective weight composition is:
-            W_eff = W_base + Σ_j (g_j * α_j * B_j @ A_j)
+        Same dict shape as the API backend — content, tool_calls with
+        arguments as a JSON string, assistant_message, usage — so nothing
+        downstream can tell the transports apart. The contract that keeps the
+        channel honest lives in one line: ``extract_tool_calls`` reads the
+        COMPLETION and never the prompt, so input text — a chunk, a fetched
+        page, a pasted document — cannot write to the tool channel. Only the
+        model's own output tokens can.
+        """
+        augmented = list(messages or [])
+        if tools:
+            augmented = [
+                {"role": "system", "content": self._tool_contract(tools)}
+            ] + augmented
+        result = self.generate(augmented, adapters, user_id=user_id)
+        content, tool_calls = extract_tool_calls(str(result.get("content") or ""))
+        assistant_message: Dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": call["arguments"],
+                    },
+                }
+                for call in tool_calls
+            ]
+        return {
+            "content": content,
+            "tool_calls": tool_calls,
+            "assistant_message": assistant_message,
+            "usage": result.get("usage", {}),
+        }
 
-        Where g_j is the gate weight from the router. This implementation
-        respects per-adapter weights rather than simple averaging.
+    @staticmethod
+    def _adapter_mode_of(adapter: dict) -> str:
+        """The adapter's authoritative mode (SPEC §5.0.1), stated or inferred."""
+        return effective_mode(adapter)
 
-        Args:
-            adapters: List of adapter dicts, each may have 'weight' or 'gate_weight'
-            user_id: User context for path resolution and ownership checks
+    @staticmethod
+    def _promoted_version_of(adapter: dict) -> int:
+        schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+        version = adapter.get("current_version")
+        if version is None:
+            version = (schema or {}).get("current_version")
+        try:
+            return int(version or 0)
+        except (TypeError, ValueError):
+            return 0
 
-        Returns:
-            Combined weight dict with properly weighted LoRA matrices
+    @staticmethod
+    def _assert_version_belongs_to_adapter(
+        params_path: Path, adapter_id: str, current_version: Optional[int]
+    ) -> None:
+        """Check that these weights are this adapter's (SPEC §5.5), two ways.
+
+        **Layout.** The directory holding a `params.json` is named for the
+        adapter that owns it. Containment under `fs_root` proved only that a
+        path was inside the shared root — which every adapter's directory is —
+        so an artifact whose schema said `fs_dir: adapters/B` had B's
+        `v0001/params.json` served as A's version 1. That is the
+        `A/latest → B/v0001` substitution one level earlier, and reachable
+        through ordinary artifact creation, since the adapter schema accepts
+        additional properties.
+
+        **Provenance.** Training writes `adapter_id` and `version` into each
+        version's `metadata.json`, which catches what layout cannot: a
+        directory renamed to A holding B's run. Verified when present rather
+        than required, so a hand-written version fails closed on
+        disagreement rather than on absence.
+
+        Checked where a params path has resolved and weights are about to be
+        read, so an adapter contributing nothing stays a no-op.
+        """
+        owner = adapter_dir_owner(params_path)
+        if owner != str(adapter_id):
+            raise ValueError(
+                f"adapter {adapter_id!r} resolved to weights under {owner!r}; "
+                "an explicit root may relocate an adapter, never rename one "
+                "adapter's weights to another's"
+            )
+        metadata_path = params_path.parent / "metadata.json"
+        if not metadata_path.is_file():
+            return
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return  # unreadable convenience metadata proves nothing either way
+        if not isinstance(metadata, dict):
+            return
+        recorded_id = metadata.get("adapter_id")
+        if recorded_id and str(recorded_id) != str(adapter_id):
+            raise ValueError(
+                f"adapter {adapter_id!r} resolved to weights whose metadata "
+                f"records adapter {recorded_id!r}; refusing to serve one "
+                "adapter's training run as another's"
+            )
+        recorded_version = metadata.get("version")
+        if (
+            current_version is not None
+            and recorded_version is not None
+            and str(recorded_version) != str(current_version)
+        ):
+            raise ValueError(
+                f"adapter {adapter_id!r} pins version {current_version} but "
+                f"these weights record version {recorded_version}; the "
+                "promotion authorized a different run"
+            )
+
+    def _assert_exact_base_model(self, adapter: dict, adapter_id: str) -> None:
+        """Refuse weights whose declared base is not the serving base.
+
+        Identity comes from `transformer.same_base_model`, the same rule
+        training applies before it fits anything (SPEC §5.1). Fails closed on
+        a missing declaration too: an adapter that does not say what it was
+        trained against cannot demonstrate it was trained against this.
+        """
+        schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+        declared = (
+            adapter.get("base_model")
+            or (schema or {}).get("base_model")
+            or adapter.get("model")
+            or (schema or {}).get("model")
+        )
+        if transformer.same_base_model(declared, self.base_model):
+            return
+        raise ValueError(
+            f"adapter {adapter_id!r} declares base model {declared!r}, but this "
+            f"backend serves {self.base_model!r}; LoRA weights are fitted to one "
+            "frozen base and refusing is the only safe reading of a mismatch"
+        )
+
+    def _refuse_if_weights_expected(self, adapter: dict) -> None:
+        """Raise when a selected adapter that should carry weights has none."""
+        mode = self._adapter_mode_of(adapter)
+        if mode == AdapterMode.PROMPT:
+            return  # §5.5: the prompt rung is weightless by design.
+        if self._promoted_version_of(adapter) <= 0:
+            return  # nothing promoted yet; also weightless by design.
+        if self._gate_weight_of(adapter) == 0.0:
+            # Redundant by construction now — composition skips closed gates
+            # before it loads anything — but kept so the helper states the
+            # whole rule for any future caller rather than half of it.
+            return  # a closed gate contributes nothing anyway.
+        raise ValueError(
+            f"adapter {adapter.get('id')!r} is promoted (version "
+            f"{self._promoted_version_of(adapter)}) and routed, but its weights "
+            "could not be loaded; refusing the adapter stack rather than "
+            "serving one the router did not select"
+        )
+
+    def _validate_adapter_weights(
+        self, adapter: dict, weights: dict, config: Any
+    ) -> None:
+        """SPEC §5.2 validation of ONE adapter's raw matrices.
+
+        The same validator with or without a model: it checks everything
+        knowable from the weights alone and adds the model-dependent checks
+        when a config exists. A separate reduced checker for the no-model
+        lane is how two validators drift into disagreeing.
+        """
+        try:
+            transformer.validate_lora_weights(config, weights)
+        except ValueError as exc:
+            raise ValueError(
+                f"adapter {adapter.get('id')!r}: {exc}; refusing the adapter stack"
+            ) from exc
+
+    @staticmethod
+    def _gate_weight_of(adapter: dict) -> float:
+        # The module-level rule (SPEC §5.0.1), not a second copy of it: the
+        # gate that composition scales by must be the same number that
+        # decided whether the adapter is in the request at all.
+        return effective_gate(adapter)
+
+    def _blend_adapter_weights(
+        self, adapters: List[dict], user_id: Optional[str], config: Any = None
+    ) -> dict:
+        """Compose several adapters into one equivalent LoRA pair (SPEC §5.2).
+
+            W_eff = W_base + Σ_j g_j · α_j · B_j A_j
+
+        Composition is by **concatenation along the rank axis**, not by
+        averaging the matrices:
+
+            A* = [A_1 ; A_2 ; …]                 (stacked rows, rank axis)
+            B* = [g_1α_1B_1 , g_2α_2B_2 , …]     (stacked columns)
+            ⇒  B*A* = Σ_j g_j α_j B_j A_j        exactly, no cross terms.
+
+        Gate-weighting A and B separately, summing, and dividing by the total
+        weight is wrong twice over. For
+        one adapter it computed (gA)/g = A, so the router's gate cancelled
+        itself and 0.2 behaved identically to 1.0. For two it formed B̄Ā,
+        whose expansion contains B_1A_2 and B_2A_1 — products of one
+        adapter's up-projection with another's down-projection, which the
+        SPEC sum contains no term for. Ranks may differ between adapters;
+        concatenation handles that without any padding.
         """
         if not adapters:
             return {}
 
-        combined: dict[str, Any] = {}
-        total_weight: dict[str, float] = {}
-
+        # target key -> list of (A, B) contributions in adapter order.
+        stacks: dict[str, list] = {}
         for adapter in adapters:
-            weights = self._load_adapter_weights(adapter, user_id=user_id)
-            if not weights:
-                continue
-
-            # Extract gate weight from adapter (router-assigned or default 1.0)
-            # Note: Can't use `or` chain because 0.0 is falsy in Python
-            gate_weight = adapter.get("weight")
-            if gate_weight is None:
-                gate_weight = adapter.get("gate_weight")
-            if gate_weight is None:
-                gate_weight = adapter.get("schema", {}).get("weight")
-            if gate_weight is None:
-                gate_weight = 1.0
-            gate_weight = _safe_weight(
-                gate_weight, default=1.0, context="blend_gate_weight"
-            )
-
-            # Clamp gate weight to [0, 1] per SPEC §8.1 guardrails
-            gate_weight = max(0.0, min(1.0, gate_weight))
-
-            if gate_weight == 0.0:
+            # The gate decides FIRST. In `W_eff = W + Σ_j g_j α_j B_j A_j` a
+            # term with g_j = 0 is not in the sum, so a closed-gate adapter is
+            # not part of the effective model and nothing about its weights
+            # can matter — not the base they declare, not their checksum, not
+            # whether the file parses at all. Reading the gate after the load
+            # made "a closed gate is unaffected" (§5.1) true only when the
+            # file happened to be missing: a zero-gated adapter with a
+            # promoted version on disk was refused for a mismatched base it
+            # was never going to contribute.
+            gate = self._gate_weight_of(adapter)
+            if gate == 0.0:
                 logger.debug(
-                    "adapter_zero_weight_skipped",
-                    adapter_id=adapter.get("id"),
+                    "adapter_zero_weight_skipped", adapter_id=adapter.get("id")
                 )
                 continue
-
+            weights = self._load_adapter_weights(adapter, user_id=user_id)
+            if not weights:
+                # An adapter the router selected must not vanish from the
+                # stack. Weightless is legitimate only where §5.5 says so —
+                # the prompt rung, or nothing promoted yet; a promoted
+                # local/hybrid adapter with an open gate whose file will not
+                # resolve means serving a stack the router did not choose.
+                self._refuse_if_weights_expected(adapter)
+                continue
+            # Per adapter, BEFORE anything is concatenated. Validating only
+            # the composed result cannot see a single adapter whose own A and
+            # B disagree on rank: concatenation adds the ranks up, so two
+            # adapters that are each internally inconsistent can produce a
+            # combined pair whose totals agree while every row pairs with the
+            # wrong column.
+            self._validate_adapter_weights(adapter, weights, config)
+            # Both orphans, not just one: the loop is A-driven, so a lone
+            # `.B` is invisible without this.
+            for name in weights:
+                if name.endswith(".B") and f"{name[: -len('.B')]}.A" not in weights:
+                    raise ValueError(
+                        f"adapter {adapter.get('id')!r} has {name} without its "
+                        f"matching {name[: -len('.B')]}.A; refusing the adapter stack"
+                    )
             for name, tensor in weights.items():
-                if name in combined:
-                    if combined[name].shape != tensor.shape:
-                        logger.warning(
-                            "adapter_shape_mismatch",
-                            adapter_id=adapter.get("id"),
-                            name=name,
-                            expected_shape=combined[name].shape,
-                            actual_shape=tensor.shape,
-                        )
-                        continue
-                    # Weighted accumulation: W += g_j * W_j
-                    combined[name] = combined[name] + (gate_weight * tensor)
-                    total_weight[name] += gate_weight
-                else:
-                    combined[name] = gate_weight * tensor
-                    total_weight[name] = gate_weight
+                if not name.endswith(".A"):
+                    continue
+                key = name[: -len(".A")]
+                b_tensor = weights.get(f"{key}.B")
+                if b_tensor is None:
+                    # Half a LoRA pair is not a smaller LoRA, it is a broken
+                    # one. SPEC §5.2 refuses partial application, so the whole
+                    # stack is refused rather than the rest quietly applied.
+                    raise ValueError(
+                        f"adapter {adapter.get('id')!r} has {name} without its "
+                        f"matching {key}.B; refusing the adapter stack"
+                    )
+                # α from the adapter's own params (SPEC §5.2 allows a
+                # per-matrix scale); folded into B together with the gate so
+                # the concatenation identity above holds exactly.
+                scale = weights.get(f"{key}.scale")
+                alpha = float(scale) if scale is not None else 1.0
+                stacks.setdefault(key, []).append(
+                    (tensor, b_tensor * (gate * alpha))
+                )
 
-        # Normalize by total weight to maintain scale
-        # If weights sum to 1.0, this is a no-op; otherwise it prevents
-        # over-amplification when sum > 1 or under-representation when sum < 1
-        for name, tensor in combined.items():
-            w = total_weight.get(name, 1.0)
-            if w > 0.0 and w != 1.0:
-                combined[name] = tensor / w
-
+        combined: dict[str, Any] = {}
+        for key, parts in stacks.items():
+            if len(parts) == 1:
+                a_matrix, b_matrix = parts[0]
+            else:
+                # Concatenation needs every contribution to project the same
+                # space. Dropping the odd one out and applying the rest is
+                # precisely the partial application SPEC §5.2 forbids — the
+                # request would be served by a stack the router never chose.
+                in_widths = {a.shape[1] for a, _ in parts}
+                out_widths = {b.shape[0] for _, b in parts}
+                if len(in_widths) > 1 or len(out_widths) > 1:
+                    raise ValueError(
+                        f"adapters disagree on the shape of {key}: inputs "
+                        f"{sorted(in_widths)}, outputs {sorted(out_widths)}; "
+                        "refusing the adapter stack"
+                    )
+                a_matrix = self._jnp.concatenate([a for a, _ in parts], axis=0)
+                b_matrix = self._jnp.concatenate([b for _, b in parts], axis=1)
+            combined[f"{key}.A"] = a_matrix
+            combined[f"{key}.B"] = b_matrix
         return combined
 
     def _adapter_path(self, adapter: dict, *, requested_user_id: Optional[str]) -> str:
         if not adapter:
             return str(self.fs_root / "adapters")
-        explicit = adapter.get("cephfs_dir") or adapter.get("fs_dir")
+        explicit = adapter.get("fs_dir")
         if explicit:
             if not requested_user_id:
                 raise ValueError(
@@ -2221,6 +2967,12 @@ class LocalJaxLoRABackend:
                 and visibility not in {"shared", "global"}
             ):
                 raise ValueError("adapter owner mismatch")
+            # Containment only, here. The identity half of §5.5 is checked on
+            # the *resolved* params path, beside the base-model rule, so an
+            # adapter that will contribute no weights — nothing promoted, a
+            # closed gate, a directory that does not exist — stays a no-op
+            # instead of raising. Refusing at path-computation time makes a
+            # malformed-but-inert artifact fail every turn it is routed into.
             base = self.fs_root.resolve()
             candidate = (
                 Path(str(explicit)) if isinstance(explicit, (str, Path)) else Path("")
@@ -2228,13 +2980,14 @@ class LocalJaxLoRABackend:
             resolved = (
                 candidate if candidate.is_absolute() else base / candidate
             ).resolve()
-            # Path must be within fs_root: base must be a parent of resolved, or they must be equal
             if not (base in resolved.parents or resolved == base):
                 raise ValueError("adapter path must reside within fs_root")
             return str(resolved)
         adapter_id = adapter.get("id", "unknown")
-        candidate = safe_join(self.fs_root, f"adapters/{adapter_id}")
-        latest = candidate / "latest"
-        if latest.exists():
-            return str(latest)
-        return str(candidate)
+        # The adapter ROOT. Returning `latest` when it existed handed version
+        # resolution a directory that has no vNNNN inside it, so a promoted
+        # artifact with adapters/A/v0001 became unservable merely because
+        # A/latest also existed — and it contradicted §5.5, which says
+        # serving does not consult that pointer. Version resolution alone
+        # chooses the directory.
+        return str(safe_join(self.fs_root, f"adapters/{adapter_id}"))

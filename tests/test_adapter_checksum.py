@@ -10,31 +10,43 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+BASE = "test-model"
+"""The base these adapters declare, and the one the backend below serves.
+
+SPEC §5.1 refuses LoRA weights whose declared base is not the serving base,
+so an adapter fixture without one loads nothing and the checksum path under
+test is never reached.
+"""
+
 
 class TestAdapterChecksumValidation:
     """Tests for _load_adapter_weights checksum validation."""
 
     @pytest.fixture
     def mock_backend(self, tmp_path):
-        """Create a LocalJaxLoRABackend for testing."""
+        """A real LocalJaxLoRABackend.
+
+        This used to be built with ``__new__`` and hand-set attributes, which
+        made it a record of what the test believed the backend held. It fell
+        over the moment the class gained state (the KV prefix cache and its
+        lock) — the exact failure mode a real construction cannot have.
+        """
         from liminallm.service.model_backend import LocalJaxLoRABackend
 
-        backend = LocalJaxLoRABackend.__new__(LocalJaxLoRABackend)
-        backend._fs_root = str(tmp_path)
-        backend.base_model = "test-model"
-        backend._adapter_cache = {}
-        backend._jnp = None
-        backend._jax = None
-        backend._vocab_size = 32000
-        return backend
+        return LocalJaxLoRABackend("test-model", str(tmp_path))
 
     @pytest.fixture
     def valid_weights(self):
         """Create valid adapter weights JSON."""
         return {"layer1": [1.0, 2.0, 3.0], "layer2": [4.0, 5.0, 6.0]}
 
-    def create_adapter_file(self, tmp_path, weights, subdir="test_adapter"):
-        """Create adapter params.json file and return its path and checksum."""
+    def create_adapter_file(self, tmp_path, weights, subdir="test-adapter"):
+        """Create adapter params.json file and return its path and checksum.
+
+        The directory is named for the adapter (SPEC §5.5): weights belong
+        to the adapter whose directory holds them, so a fixture that names
+        it something else describes weights this adapter may not serve.
+        """
         adapter_dir = tmp_path / subdir
         adapter_dir.mkdir(parents=True, exist_ok=True)
 
@@ -51,6 +63,12 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
+            "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": checksum,
         }
 
@@ -80,6 +98,12 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
+            "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": "invalid_checksum_that_wont_match",
         }
 
@@ -100,6 +124,12 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
+            "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": "wrong_checksum",
         }
 
@@ -128,6 +158,12 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
+            "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             # No checksum provided
         }
 
@@ -166,6 +202,12 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
+            "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "schema": {"checksum": checksum},
         }
 
@@ -193,6 +235,12 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
+            "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": correct_checksum,
             "schema": {"checksum": "wrong_in_schema"},
         }
@@ -224,30 +272,37 @@ class TestAdapterChecksumValidation:
         assert weights == {}
 
     def test_cache_hit_skips_checksum(self, mock_backend, tmp_path, valid_weights):
-        """Cached weights skip checksum verification."""
+        """A cache hit serves without re-verifying the checksum.
+
+        This used to hand-write the cache key, which encoded the internal key
+        format into the test — and broke when the key became
+        (adapter_id, version) as SPEC §5.3 declares. It now warms the cache
+        through the real load path and proves the hit by rewriting the file
+        with content that would fail verification: if the second call read
+        from disk it would raise.
+        """
+        import os
+
         adapter_dir, checksum = self.create_adapter_file(tmp_path, valid_weights)
         params_path = adapter_dir / "params.json"
-
-        adapter = {
-            "id": "test-adapter",
-            "checksum": checksum,
-        }
-
-        # Pre-populate cache
-        cached_weights = {"cached": True}
-        mock_backend._adapter_cache["test-adapter"] = (
-            params_path.stat().st_mtime,
-            cached_weights,
-        )
+        adapter = {"id": "test-adapter", "mode": "local", "base_model": BASE,
+                   "current_version": 1, "checksum": checksum}
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
             with patch.object(
                 mock_backend, "_resolve_params_path", return_value=params_path
             ):
-                weights = mock_backend._load_adapter_weights(adapter)
+                first = mock_backend._load_adapter_weights(adapter)
+                assert first, "the first load should have populated the cache"
 
-                # Should return cached weights
-                assert weights == cached_weights
+                # Same mtime, different bytes: only a cache hit can survive it.
+                stat = params_path.stat()
+                params_path.write_bytes(json.dumps({"tampered": [[9.0]]}).encode())
+                os.utime(params_path, (stat.st_atime, stat.st_mtime))
+
+                second = mock_backend._load_adapter_weights(adapter)
+                assert set(second) == set(first)
+                assert "tampered" not in second
 
     def test_modified_file_invalidates_cache(
         self, mock_backend, tmp_path, valid_weights
@@ -258,6 +313,12 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
+            "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": checksum,
         }
 

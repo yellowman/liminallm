@@ -49,9 +49,17 @@ DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_RATIO = 100
 MAX_PATH_DEPTH = 16
 _CHUNK = 64 * 1024
-# Tiny archives may legitimately expand far past the ratio cap (an empty-file
-# tar is mostly header), so the ratio check only kicks in past this floor.
-_RATIO_FLOOR_BYTES = 1024 * 1024
+
+# A skip report quotes the member name the archive gave, which the archive
+# chose and nothing else bounds — the extracted names are held to
+# MAX_PATH_DEPTH components of 255 characters, but a rejected one never went
+# through that. Held to the same budget so the manifest a caller receives is
+# bounded by the entry count, and so is the frame carrying it.
+_MAX_REPORT_NAME_CHARS = MAX_PATH_DEPTH * 256
+
+
+def _report_name(name: str) -> str:
+    return name[:_MAX_REPORT_NAME_CHARS]
 
 
 def is_archive_filename(name: str) -> bool:
@@ -117,8 +125,17 @@ class _Budget:
                 f"archive expands past the total size limit "
                 f"({self.max_total // (1024 * 1024)}MB)"
             )
-        ratio_cap = max(_RATIO_FLOOR_BYTES, self.archive_bytes * self.max_ratio)
-        if self.total > ratio_cap:
+        # No small-archive exemption. This used to be
+        # `max(1 MiB, archive_bytes * max_ratio)`, which meant the configured
+        # 100:1 cap was not a cap below a megabyte: measured, a 726-byte zip
+        # expanded to 600 KiB — about 846:1 — and extracted. §21.3 states the
+        # ratio cap with no floor in it.
+        #
+        # The floor's own justification was backwards. It read "an empty-file
+        # tar is mostly header" and so expands past the ratio; measured, an
+        # empty-file tar is 10240 bytes on disk and expands to 0 — a ratio of
+        # zero, which no cap could trouble.
+        if self.total > self.archive_bytes * self.max_ratio:
             raise ArchiveExtractionError(
                 f"compression ratio exceeds {self.max_ratio}:1 — refusing to "
                 "extract (archive bomb suspected)"
@@ -183,11 +200,17 @@ def _extract_zip(
             # permission bits with no type bits at all.
             mode = info.external_attr >> 16
             if stat.S_IFMT(mode) and not stat.S_ISREG(mode):
-                skipped.append({"name": info.filename, "reason": "not a regular file"})
+                skipped.append(
+                    {"name": _report_name(info.filename),
+                     "reason": "not a regular file"}
+                )
                 continue
             target, rel, reason = _resolve_target(dest, info.filename, allowed)
             if target is None:
-                skipped.append({"name": info.filename, "reason": reason or "skipped"})
+                skipped.append(
+                    {"name": _report_name(info.filename),
+                     "reason": reason or "skipped"}
+                )
                 continue
             with zf.open(info) as src:
                 _write_member(src, target, budget)
@@ -207,16 +230,19 @@ def _extract_tar(
                 continue
             if not member.isreg():
                 skipped.append(
-                    {"name": member.name, "reason": "not a regular file"}
+                    {"name": _report_name(member.name), "reason": "not a regular file"}
                 )
                 continue
             target, rel, reason = _resolve_target(dest, member.name, allowed)
             if target is None:
-                skipped.append({"name": member.name, "reason": reason or "skipped"})
+                skipped.append(
+                    {"name": _report_name(member.name),
+                     "reason": reason or "skipped"}
+                )
                 continue
             src = tf.extractfile(member)
             if src is None:
-                skipped.append({"name": member.name, "reason": "unreadable entry"})
+                skipped.append({"name": _report_name(member.name), "reason": "unreadable entry"})
                 continue
             with src:
                 _write_member(src, target, budget)
@@ -309,6 +335,14 @@ def extract_archive_sandboxed(
         max_file_size_mb=member_bytes // (1024 * 1024) + 8,
         scratch_dir=Path(dest_dir),
     )
+    # The manifest is one record per entry and the entry count is capped, so
+    # its size is `max_entries` times a bounded record: a path of at most
+    # MAX_PATH_DEPTH 255-character components, plus a short skip reason. JSON
+    # escapes at worst six bytes a character, so a record is under 25KB and
+    # the default 1000-entry cap puts the manifest under 25MB. The child has
+    # 512MB of its own; without this it could spend all of it in the parent.
+    max_entries = int((limits or {}).get("max_entries", DEFAULT_MAX_ENTRIES))
+    manifest_bytes = max(1, max_entries) * 25 * 1024
     try:
         return run_in_sandbox(
             extract_archive,
@@ -317,6 +351,11 @@ def extract_archive_sandboxed(
             limits,
             config=config,
             timeout=timeout,
+            max_result_bytes=manifest_bytes,
+            # Callers distinguish "this archive is bad" from "the sandbox
+            # failed" and clean up differently, so the type has to survive as
+            # data. The parent supplies the class; the child only names it.
+            error_types={"ArchiveExtractionError": ArchiveExtractionError},
         )
     except SandboxError:
         # The child may have died mid-write; never leave partial output.

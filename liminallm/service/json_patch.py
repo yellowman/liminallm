@@ -110,6 +110,33 @@ def _walk_create(doc: Any, segments: List[str], path: str) -> Any:
     return parent
 
 
+def _walk_existing(doc: Any, segments: List[str], path: str) -> Any:
+    """Walk to the parent of the last segment, creating nothing.
+
+    Returns None when the parent is not there. ``remove`` needs this: walking
+    with ``_walk_create`` would conjure the very containers it is about to
+    remove from, so ``remove /a/b`` on ``{}`` left ``{"a": {}}`` behind. A
+    removal that finds nothing has nothing to do — but it must also leave
+    nothing behind.
+    """
+    parent = doc
+    for depth, seg in enumerate(segments[:-1]):
+        if isinstance(parent, list):
+            idx = _read_index(seg, path)
+            if not 0 <= idx < len(parent):
+                return None
+            parent = parent[idx]
+        elif isinstance(parent, dict):
+            if seg not in parent:
+                return None
+            parent = parent[seg]
+        else:
+            raise _non_container(path, segments[: depth + 1], parent)
+    if not isinstance(parent, (dict, list)):
+        raise _non_container(path, segments[:-1], parent)
+    return parent
+
+
 def _read_index(seg: str, path: str) -> int:
     """RFC 6902 array indices are non-negative digit runs. Python's list[-1]
     would otherwise quietly serve `/xs/-1` on the read paths (move/copy/test)
@@ -207,7 +234,9 @@ def apply_op(doc: dict, op: Dict[str, Any]) -> None:
         _set_at(parent, key, value, path, insert=(action == "add"))
 
     elif action == "remove":
-        parent = _walk_create(doc, segments, path)
+        parent = _walk_existing(doc, segments, path)
+        if parent is None:
+            return
         if isinstance(parent, list):
             try:
                 idx = int(key)

@@ -2,17 +2,19 @@
 
 ## Development Philosophy
 
-### ASD-STE100 Simplified Technical English
-Always respond using ASD-STE100 Simplified Technical English. It is a controlled writing standard. Aerospace and defense groups made it. It helps people write clear technical text.
+### Writing style
+Follow the `writing-style` skill (`.claude/skills/writing-style/SKILL.md`) for
+conversation, explanations, technical writing, and documentation. It is the
+single writing standard for this repository.
 
-Key rules:
-- **Use approved words only.** The standard gives a word list. Each word has one meaning.
-- **Use one word for one idea.** Do not use two words for the same thing.
-- **Write short sentences.** Use 20 words or less for instructions.
-- **Use active voice.** Write "Turn the switch", not "The switch must be turned".
-- **Write short paragraphs.** Keep one topic in each paragraph.
+Read it before writing prose the reader acts on: chat replies, files under
+`docs/`, README content, commit and pull request bodies, code comments, and
+error or log messages.
 
-The goal is easy reading. Many readers are not native English speakers. Clear text helps them do the work in a safe and correct way.
+The goal is that a reader can act correctly on the first pass. Many readers
+are not native English speakers, so the skill requires literal,
+culturally neutral language, one idea per sentence, and consistent
+terminology.
 
 ### Code Quality Over Quantity
 Lines of code is a metric that correlates with more bugs. We don't boast about lines of code—we boast about clean architecture and using the right tools. When discussing the project, mention language choices and the components implemented in each language and/or framework.
@@ -25,6 +27,77 @@ Planning and careful use of resources is of the utmost importance. Use constrain
 
 ### Prompt Budget
 Model-facing prompt text is paid on every call — keep the wording tight. But this app exists to make weak local models perform well, and weak models drop a rule stated once: safety-critical rules (the untrusted-data/injection rule especially) are deliberately repeated across the system prompt, the tool descriptions, and the payload envelope. Tighten phrasing, never the repetition. No boilerplate; no copyright language.
+
+### Which tests to run
+
+Pick the smallest lane that covers what changed.
+
+* **Normal change:** `make test-fast-xdist`. The default and usually the only
+  run — about two minutes.
+* **The change touches a slow-marked subsystem:** `make test-xdist`, which is
+  the same lane with nothing deselected. The slow set is not a separate lane
+  and needs no separate one: the per-worker Postgres, Redis database and
+  filesystem root that make the fast lane safe in parallel are not specific to
+  a marker.
+* **Full serial suite (`make test`):** only when the thing under test is
+  inherently about single-process or global behaviour, or when a broad harness
+  change could alter serial semantics. Not as a release gate — `test-xdist`
+  covers the same tests — and not every commit.
+
+Parallelism buys more on the slow set than on the fast one, because what makes
+a test slow is usually waiting. Measured on a 4-core box: the 110 slow-marked
+tests alone take 5m37s serially and 1m43s at `-n 4`, and the whole non-browser
+suite — 2,814 tests — takes 3m37s. Running the fast lane and then the full one
+as a routine pair still buys nothing, but the full one is now cheap enough to
+be the local gate whenever there is any doubt, and it is what `make qa` runs.
+CI is a separate signal and runs the same selection serially on each supported
+Python version — a green lane here does not answer whether the suite passes on
+an interpreter this machine does not have.
+
+`pytest tests/ -m slow --collect-only -q` lists the slow set and which files
+own it. The browser lane stays out of both (`make test-browser`) because it
+needs a Chromium binary the dev extra does not install.
+
+### Verification
+
+Three rules, each earned by a bug this project shipped and a review had to find.
+
+**Execute before claiming.** Run the code on a real input before you say it
+works. Parsers, heuristics and anything with a threshold are the worst
+offenders: reading them confirms what you meant, running them shows what they
+do. `"mini"` is a substring of `"gemini"`, and no amount of re-reading the
+line said so.
+
+**Build test doubles from the real object.** A stub you construct from your own
+belief about an interface encodes that belief, so the test passes and the code
+is still wrong. If a service resolves a value from its backend, the double must
+have a backend. Prefer the real class with a test backend over a hand-made
+stand-in.
+
+**Grep the class when you fix the instance.** A reported bug is one sighting of
+a shape. Before calling it fixed, search for the same shape elsewhere — the
+other retrieval path, the second copy of the list, the unclosed form of the tag
+you just handled. Fixes that stop at the reported line leave siblings behind.
+
+A related discipline, because it caused as much damage as the three above: a
+comment or a spec line is not evidence. Writing why the code is correct and
+writing the code both come from the same intent, so neither one checks the
+other. Verify first, then describe what you verified.
+
+### Code Review Runs Its Verification Pass
+
+The owner has authorized multi-agent orchestration for code review. Run every
+review as a fan-out of finders across distinct angles, then verify each finding
+with **independent adversarial verifiers** before reporting it — one that must
+reproduce the failure by running code, one that argues the finding is wrong and
+defaults to rejecting it when uncertain. A finding survives only if both agree.
+
+This standing authorization covers code review. It does not extend to
+orchestrating other work; ask for that separately.
+
+The reason is measured, not stylistic. Five single-pass reviews of one branch
+each missed defects the next pass found, and several of those were bugs the
+previous pass's *fix* introduced. Reading alone converged on nothing.
 
 ## Security Guidelines
 

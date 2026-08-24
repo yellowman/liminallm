@@ -193,6 +193,52 @@
           <div class="divider"></div>
 
           <div class="section-header">
+            <h3>MCP tool servers</h3>
+            <button class="minor" id="refresh-mcp-servers">Refresh servers</button>
+          </div>
+          <div class="subtext">
+            Remote servers whose tools every turn in this installation can
+            call. Publishing one is what makes it a capability, so it is
+            admin-only. Results come back as untrusted data.
+          </div>
+          <div id="mcp-table-wrapper" class="table-wrapper"></div>
+
+          <div class="stack">
+            <div class="field">
+              <label for="new-mcp-name">Server name</label>
+              <input type="text" id="new-mcp-name" placeholder="inventory" />
+            </div>
+            <div class="field">
+              <label for="new-mcp-url">Server URL</label>
+              <input type="url" id="new-mcp-url" placeholder="https://tools.example.com/mcp" />
+            </div>
+            <div class="field">
+              <label for="new-mcp-taint">Classification</label>
+              <select id="new-mcp-taint">
+                <option value="egress">Egress — can carry data off this installation</option>
+                <option value="local_read">Local read — cannot send anything out</option>
+              </select>
+              <div class="subtext">
+                Your attestation, not the server's. An egress server stops
+                being callable for the rest of any turn that reads a suspected
+                prompt injection; a local-read one keeps working. Choose
+                local read only if you know the server has no outbound channel.
+              </div>
+            </div>
+            <div class="field">
+              <label for="new-mcp-description">Description</label>
+              <input type="text" id="new-mcp-description" placeholder="what this server is for" />
+            </div>
+            <button class="primary" id="create-mcp-server">Publish server</button>
+            <div class="subtext">
+              A published server is retired or disabled through a config patch
+              above, not from here.
+            </div>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="section-header">
             <h3>Deep database view</h3>
             <button class="minor" id="run-inspect">Inspect</button>
           </div>

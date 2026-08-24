@@ -3,13 +3,17 @@ from __future__ import annotations
 import os
 from typing import Any, Iterator, List, Optional
 
-from liminallm.config import resolve_provider_endpoint
+from liminallm.config import AdapterMode, resolve_provider_endpoint
 from liminallm.logging import get_logger
+from liminallm.service import local_format
 from liminallm.service.model_backend import (
     ApiAdapterBackend,
     LocalJaxLoRABackend,
     ModelBackend,
     StubBackend,
+    active_adapters,
+    get_adapter_mode,
+    mode_value,
 )
 from liminallm.storage.models import Message
 
@@ -45,6 +49,39 @@ class LLMService:
             fs_root=fs_root,
         )
 
+    def _prepare_backend_messages(
+        self, messages: List[dict], adapters: Optional[List[dict]]
+    ) -> tuple[List[dict], List[dict]]:
+        """Messages and adapters ready for any backend (SPEC §5.0.1).
+
+        The single materialization point. It canonicalizes the adapter set
+        (gate first, §5.0.1) and places `prompt_instructions` exactly once,
+        into a copy of the caller's list, choosing the representation from
+        (mode, backend) — weights on a local backend, prompt on an API one.
+
+        Every path into a backend goes through here, which is the whole
+        point. When only `generate`/`generate_stream` materialized, the API
+        backends materialized too "to be safe", so those two paths sent the
+        instructions twice while `generate_with_tools` and `stream_messages`
+        — which never passed through the service's message builder — sent
+        them once. Removing the backend copy alone would have taken the
+        latter pair to zero; giving the service one primitive that every
+        entry point uses is what makes one copy true everywhere.
+
+        Guidance goes after any leading system messages, so it sits with the
+        rest of the system content rather than ahead of the caller's own
+        framing.
+        """
+        normalized_adapters = self._normalize_adapters(adapters or [])
+        guidance = self._build_adapter_prompts(normalized_adapters)
+        prepared = list(messages or [])
+        if guidance:
+            index = 0
+            while index < len(prepared) and prepared[index].get("role") == "system":
+                index += 1
+            prepared[index:index] = guidance
+        return prepared, normalized_adapters
+
     def _prepare_generation(
         self,
         prompt: str,
@@ -57,13 +94,14 @@ class LLMService:
         Returns:
             Tuple of (messages, normalized_adapters) ready for the backend.
         """
-        normalized_adapters = self._normalize_adapters(adapters)
         messages = [{"role": "system", "content": "You are a concise assistant."}]
-        messages.extend(self._build_adapter_prompts(normalized_adapters))
         if history:
             for msg in history:
                 messages.append({"role": msg.role, "content": msg.content})
         messages.append({"role": "user", "content": self._format_user(prompt)})
+        messages, normalized_adapters = self._prepare_backend_messages(
+            messages, adapters
+        )
         messages = self._inject_context(messages, context_snippets)
         return messages, normalized_adapters
 
@@ -108,10 +146,13 @@ class LLMService:
         """
         if not self.supports_tools:
             raise RuntimeError("active backend does not support tool calling")
+        prepared, normalized_adapters = self._prepare_backend_messages(
+            messages, adapters
+        )
         return self.backend.generate_with_tools(
-            messages,
+            prepared,
             tools,
-            self._normalize_adapters(adapters or []),
+            normalized_adapters,
             user_id=user_id,
         )
 
@@ -127,19 +168,38 @@ class LLMService:
         Used by the attachment agent to stream its final answer after the
         tool-calling rounds have assembled the message history.
         """
+        prepared, normalized_adapters = self._prepare_backend_messages(
+            messages, adapters
+        )
         return self.backend.generate_stream(
-            messages, self._normalize_adapters(adapters or []), user_id=user_id
+            prepared, normalized_adapters, user_id=user_id
+        )
+
+    @property
+    def serving_model(self) -> str:
+        """The model that will actually answer, not the one configured.
+
+        An adapter server overrides the base model, and both live on the
+        backend rather than here. Anything deciding by model identity — the
+        tokenizer, the context window, whether a listwise rerank is a
+        reasonable ask — has to resolve the pair the same way, so it resolves
+        it here once. Read off ``self`` it silently returned nothing, and the
+        caller fell back to the configured base model without noticing.
+        """
+        return str(
+            getattr(self.backend, "adapter_server_model", None)
+            or getattr(self.backend, "base_model", None)
+            # Last resort: not every backend carries the pair (the stub does
+            # not), and the configured base is a better answer than nothing.
+            or self.base_model
+            or ""
         )
 
     def token_counter(self):
         """Counter for the serving model: exact when we own its tokenizer."""
         from liminallm.service.token_counting import counter_for
 
-        model = (
-            getattr(self.backend, "adapter_server_model", None)
-            or getattr(self.backend, "base_model", None)
-            or ""
-        )
+        model = self.serving_model
         # Local backends load their tokenizer lazily; force it, or the first
         # turn would resolve to the heuristic and cache that decision.
         tokenizer = None
@@ -215,7 +275,7 @@ class LLMService:
         *,
         user_id: Optional[str] = None,
     ) -> Iterator[dict]:
-        """Stream tokens from the LLM per SPEC §18.
+        """Stream tokens from the LLM per SPEC §13.7.
 
         Yields events:
         - {"event": "token", "data": "token_text"}
@@ -235,6 +295,13 @@ class LLMService:
     ) -> List[dict]:
         if not context_snippets:
             return list(messages)
+        if self._backend_applies_lora_weights:
+            # SPEC §5.1: the local decoder gets ONE representation, the same
+            # one training wrote — marker AND placement, since token order is
+            # part of the input for a raw decoder.
+            return local_format.place_context(
+                [dict(msg) for msg in messages], context_snippets
+            )
         updated: List[dict] = [dict(msg) for msg in messages]
         for idx in range(len(updated) - 1, -1, -1):
             msg = updated[idx]
@@ -252,21 +319,67 @@ class LLMService:
         return updated
 
     def _normalize_adapters(self, adapters: List[dict]) -> List[dict]:
+        """The effective adapter set, built once for every path (§5.0.1).
+
+        Gate first, mechanism second: `g == 0` means the adapter is absent
+        from the request, so it is dropped here — before prompt injection,
+        weight loading, remote passthrough, KV hashing or accounting can see
+        it. This is the only funnel into a backend (generate, generate_stream,
+        chat and complete all pass through it), which is what keeps those
+        five surfaces from disagreeing about which adapters are active.
+        """
         normalized = []
         for adapter in adapters or []:
             if isinstance(adapter, str):
                 normalized.append({"id": adapter})
             elif isinstance(adapter, dict):
                 normalized.append(adapter)
-        return normalized
+        return active_adapters(normalized)
+
+    @property
+    def _backend_applies_lora_weights(self) -> bool:
+        """Whether the active backend loads LoRA weights itself."""
+        return bool(getattr(self.backend, "applies_lora_weights", False))
 
     def _build_adapter_prompts(self, adapters: List[dict]) -> List[dict]:
-        prompt_backends = {"prompt", "prompt_distill", "hybrid"}
         lines: List[str] = []
         for adapter in adapters:
-            backend = (adapter.get("backend") or "").lower()
-            if backend not in prompt_backends:
+            # `mode` is authoritative (SPEC §5.0.1); the legacy backend field
+            # is only an inference source when mode is absent. Deciding from
+            # `backend` directly let `mode: hybrid, backend: prompt` receive
+            # both the weights and the prompt after promotion, and
+            # `mode: prompt, backend: local` receive neither.
+            # Compared as the value, not as `str()` of it. `get_adapter_mode`
+            # returns the raw string when the artifact states one and an
+            # `AdapterMode` member when it infers, and `str(AdapterMode.HYBRID)`
+            # is "AdapterMode.HYBRID" — which matches nothing, so every adapter
+            # that did not state a mode was silently skipped here. That is the
+            # documented default for legacy adapters, and it went unnoticed
+            # because the API backends were injecting the prompt themselves;
+            # with materialization now solely the service's (§5.0.1), the same
+            # bug would drop those adapters' instructions entirely.
+            mode = mode_value(get_adapter_mode(adapter))
+            if mode not in {AdapterMode.PROMPT, AdapterMode.HYBRID}:
                 continue
+            if mode == AdapterMode.HYBRID and self._backend_applies_lora_weights:
+                # SPEC §5.0.1: for a hybrid adapter the prompt is the
+                # *portable fallback* — it carries the behaviour on API
+                # backends, while a local backend applies the trained
+                # weights. Injecting both meant a graduated skill served its
+                # weights AND the instructions they were distilled from, so
+                # the model saw an input the eval gate never scored.
+                schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+                version = adapter.get("current_version")
+                if version is None:
+                    version = (schema or {}).get("current_version")
+                try:
+                    promoted = int(version or 0) > 0
+                except (TypeError, ValueError):
+                    promoted = False
+                if promoted:
+                    continue
+                # Hybrid but nothing promoted yet: no weights will load, so
+                # the fallback is all there is.
             name = (
                 adapter.get("name")
                 or adapter.get("id")

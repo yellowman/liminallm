@@ -20,10 +20,9 @@ def extract_prompt_instructions(adapter: dict, *, log_source: str = "adapter") -
     Both LLMService and model backends should use this function for consistency.
 
     Priority order per SPEC §5.0.1:
-    1. Explicit prompt fields (prompt_instructions, behavior_prompt, system_prompt, etc.)
-    2. Schema-nested versions of the above fields
-    3. Applicability natural language description (designed for LLM context)
-    4. Description field ONLY if use_description_as_prompt is explicitly True
+    1. prompt_instructions — the one prompt field, top-level or schema-nested
+    2. Applicability natural language description (designed for LLM context)
+    3. Description field ONLY if use_description_as_prompt is explicitly True
 
     Args:
         adapter: Adapter dict with prompt/behavior fields
@@ -35,41 +34,27 @@ def extract_prompt_instructions(adapter: dict, *, log_source: str = "adapter") -
     if not adapter or not isinstance(adapter, dict):
         return None
 
-    # Priority 1: Check explicit prompt fields at top level
-    prompt_fields = (
-        "prompt_instructions",
-        "behavior_prompt",
-        "system_prompt",
-        "instructions",
-        "prompt_template",
-    )
-
-    for key in prompt_fields:
-        value = adapter.get(key)
+    # The canonical field, in either shape the dict arrives in. The alias
+    # spellings (behavior_prompt, system_prompt, instructions,
+    # prompt_template) were collapsed into prompt_instructions by the
+    # schema.sql repair and are refused by the validator since.
+    schema = adapter.get("schema", {})
+    if not isinstance(schema, dict):
+        schema = {}
+    for source, value in (
+        ("prompt_instructions", adapter.get("prompt_instructions")),
+        ("schema.prompt_instructions", schema.get("prompt_instructions")),
+    ):
         if isinstance(value, str) and value.strip():
             logger.debug(
                 "prompt_extracted",
                 source=log_source,
-                field=key,
+                field=source,
                 length=len(value.strip()),
             )
             return value.strip()
 
-    # Priority 2: Check schema dict for nested prompt fields
-    schema = adapter.get("schema", {})
-    if isinstance(schema, dict):
-        for key in prompt_fields:
-            value = schema.get(key)
-            if isinstance(value, str) and value.strip():
-                logger.debug(
-                    "prompt_extracted_from_schema",
-                    source=log_source,
-                    field=f"schema.{key}",
-                    length=len(value.strip()),
-                )
-                return value.strip()
-
-    # Priority 3: Applicability natural language (explicitly for LLM context)
+    # Applicability natural language (explicitly for LLM context)
     applicability = adapter.get("applicability") or schema.get("applicability")
     if isinstance(applicability, dict):
         natural = applicability.get("natural_language")
@@ -81,7 +66,7 @@ def extract_prompt_instructions(adapter: dict, *, log_source: str = "adapter") -
             )
             return natural.strip()
 
-    # Priority 4: Description ONLY with explicit opt-in flag
+    # Description ONLY with explicit opt-in flag
     # This prevents generic descriptions from being injected as behavioral prompts
     use_desc = adapter.get("use_description_as_prompt") or schema.get(
         "use_description_as_prompt"

@@ -303,26 +303,35 @@ class GeminiBackend:
     def _headers(self) -> dict:
         return {"x-goog-api-key": self._api_key, "Content-Type": "application/json"}
 
-    def _prompt_injections(self, adapters: List[dict]) -> Tuple[List[str], List[str]]:
-        """Prompt-rung adapters apply; weight-bearing modes cannot reach a
-        hosted Gemini model and are dropped with their ids logged."""
-        from liminallm.service.model_backend import AdapterMode, get_adapter_mode
+    def _applied_prompt_adapters(self, adapters: List[dict]) -> List[str]:
+        """Which prompt-rung adapters this turn carries, for accounting.
 
-        injections: List[str] = []
+        It reports; it does not materialize. SPEC §5.0.1 gives prompt
+        materialization to LLMService, which every path into a backend passes
+        through — this method used to extract the text and `_request_body`
+        prepended a second guidance block on top of the one already there.
+        Weight-bearing modes cannot reach a hosted Gemini model and are
+        dropped with their ids logged.
+        """
+        from liminallm.service.model_backend import (
+            AdapterMode,
+            active_adapters,
+            get_adapter_mode,
+        )
+
         applied: List[str] = []
-        for adapter in adapters or []:
+        # §5.0.1: `g == 0` is absent, not dropped — it was never requested.
+        for adapter in active_adapters(adapters):
             adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
             mode = get_adapter_mode(adapter)
             if mode in (AdapterMode.PROMPT, AdapterMode.HYBRID):
-                prompt = extract_prompt_instructions(adapter, log_source=adapter_id)
-                if prompt:
-                    injections.append(prompt)
+                if extract_prompt_instructions(adapter, log_source=adapter_id):
                     applied.append(f"{adapter_id}:prompt")
             else:
                 logger.info(
                     "adapter_dropped_gemini_native", adapter_id=adapter_id, mode=str(mode)
                 )
-        return injections, applied
+        return applied
 
     def _request_body(
         self,
@@ -330,12 +339,10 @@ class GeminiBackend:
         adapters: List[dict],
         tools: Optional[List[dict]] = None,
     ) -> Tuple[dict, List[str]]:
-        injections, applied = self._prompt_injections(adapters)
-        augmented = list(messages or [])
-        if injections:
-            guidance = "Adapter guidance:\n" + "\n\n".join(injections)
-            augmented = [{"role": "system", "content": guidance}] + augmented
-        system, contents = to_contents(augmented)
+        applied = self._applied_prompt_adapters(adapters)
+        # Messages arrive materialized (SPEC §5.0.1); prepending guidance
+        # here put the adapter's instructions in the request twice.
+        system, contents = to_contents(list(messages or []))
         body: Dict[str, Any] = {"contents": contents}
         if system:
             body["systemInstruction"] = system

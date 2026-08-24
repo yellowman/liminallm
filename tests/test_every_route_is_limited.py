@@ -26,6 +26,10 @@ EXEMPT = {
     "serve_index", "serve_admin", "serve_share", "openapi_json",
     # The version stamp: a constant.
     "version_info",
+    # MCP's GET half: a constant 405 (this server offers no server-initiated
+    # stream), the same class as version_info. The POST half, where all the
+    # work happens, authenticates and limits.
+    "mcp_get",
     # Delegates to update_system_settings, which limits. Limiting here as well
     # would charge one request against the bucket twice.
     "patch_system_settings",

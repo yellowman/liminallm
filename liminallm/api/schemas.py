@@ -115,7 +115,7 @@ class ErrorBody(BaseModel):
 
     code: str = Field(
         ...,
-        description="Stable error code per SPEC §18",
+        description="Stable error code per SPEC §13.0",
     )
     message: str
     details: Optional[Any] = None  # object, array, or null
@@ -260,7 +260,11 @@ class LoginRequest(BaseModel):
 
 
 class TokenRefreshRequest(BaseModel):
-    refresh_token: str = Field(..., max_length=2048)
+    #: Optional because a browser does not have one to send. §17.10 puts the
+    #: refresh token in an `HttpOnly` cookie precisely so the page cannot read
+    #: it, and a field the SPA must fill would undo that. API and mobile
+    #: clients, which have no cookie jar, still send it here.
+    refresh_token: Optional[str] = Field(default=None, max_length=2048)
 
 
 class OAuthStartRequest(BaseModel):
@@ -283,11 +287,14 @@ class OAuthStartResponse(BaseModel):
 
 
 class MFARequest(BaseModel):
-    session_id: str = Field(..., max_length=128)
+    #: Optional for the same reason as `TokenRefreshRequest.refresh_token`:
+    #: the browser's session id is an `HttpOnly` cookie it cannot read, and a
+    #: field the SPA must fill would require keeping a readable copy.
+    session_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class MFAVerifyRequest(BaseModel):
-    session_id: str = Field(..., max_length=128)
+    session_id: Optional[str] = Field(default=None, max_length=128)
     code: str = Field(..., max_length=10)
 
 
@@ -298,6 +305,33 @@ class MFADisableRequest(BaseModel):
 class MFAStatusResponse(BaseModel):
     enabled: bool = Field(..., description="Whether MFA is currently enabled")
     configured: bool = Field(..., description="Whether MFA secret is configured (pending verification)")
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(default="", max_length=100, description="Label for the key")
+
+
+class ApiKeySummary(BaseModel):
+    id: str
+    name: str
+    #: Enough of the key to recognize it, never enough to use it.
+    prefix: str
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+class ApiKeyCreatedResponse(ApiKeySummary):
+    #: The plaintext, present only in this one response.
+    api_key: str
+
+
+class ApiKeyListResponse(BaseModel):
+    items: list[ApiKeySummary]
+
+
+class ApiKeyRevokeResponse(BaseModel):
+    revoked: bool
 
 
 class UserSettingsRequest(BaseModel):
@@ -446,6 +480,14 @@ class ArtifactRequest(_SchemaPayload):
     type: str = Field(..., max_length=64)
     name: str = Field(..., max_length=256)
     description: Optional[str] = Field("", max_length=4096)
+    #: Who this artifact is for. `private` — the default, and what every
+    #: caller that omits the field keeps getting — is the owner's own. The
+    #: other two publish, and the route admits them only for an admin: a
+    #: globally visible `tool` or `mcp` artifact is a capability of every
+    #: turn in the installation, not a preference of the account that wrote
+    #: it. Constrained here rather than in the route so an unknown value is a
+    #: 422 naming the field, not a 500 from the store's enum.
+    visibility: Literal["private", "shared", "global"] = "private"
 
 
 class ArtifactPatchRequest(BaseModel):
@@ -636,6 +678,26 @@ class ConversationSummary(BaseModel):
     active_context_id: Optional[str]
     # Sharing state (SPEC §18): conversations are private by default.
     public: bool = False
+    #: "chat" for the native surface, "responses" when an agent made it via
+    #: the served Responses API — the UI badges the latter.
+    source: str = "chat"
+
+
+class ConversationUpdateRequest(BaseModel):
+    """The fields a user may edit on their own conversation.
+
+    Deliberately two. `meta` carries the public-share flag and the attachment
+    records, and `active_context_id` names a knowledge context whose ownership
+    is checked where contexts are chosen — so accepting either here would let
+    a rename request publish a chat, rewrite its attachment list, or point it
+    at a context the caller does not own. Sharing has its own endpoint that
+    says what it does.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = Field(default=None, max_length=500)
+    status: Optional[Literal["open", "archived"]] = None
 
 
 class ConversationShareRequest(BaseModel):
@@ -668,6 +730,23 @@ class KnowledgeContextRequest(BaseModel):
     description: str = Field(..., max_length=2000)
     text: Optional[str] = Field(default=None, max_length=10_000_000)  # 10MB max
     chunk_size: Optional[int] = Field(default=None, ge=64, le=4000)
+
+
+class KnowledgeContextUpdateRequest(BaseModel):
+    """The fields a user may edit on a context they own.
+
+    Deliberately two. `meta` and `conversation_id` are how a row would claim
+    to be a conversation's implicit index, which has a different lifetime and
+    a different authorization rule; `fs_path` and `text` are ingestion, which
+    is a separate mutation with its own path authority. Unknown fields are
+    refused rather than dropped, so a caller is never told an edit succeeded
+    when part of it did not happen.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=2000)
 
 
 class KnowledgeContextResponse(BaseModel):
@@ -802,7 +881,7 @@ class AutoPatchRequest(BaseModel):
 
 
 class ChatCancelRequest(BaseModel):
-    """Request to cancel an in-progress chat request per SPEC §18."""
+    """Request to cancel an in-progress chat request per SPEC §13.1."""
     request_id: str = Field(..., max_length=128, description="The request_id of the chat request to cancel")
 
 

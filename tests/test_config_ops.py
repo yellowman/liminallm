@@ -379,3 +379,163 @@ def test_a_malformed_routing_policy_is_refused(schema, why):
     with pytest.raises(ArtifactValidationError) as caught:
         validate_artifact("policy", schema)
     assert any(why in err for err in caught.value.errors)
+
+
+# ---------------------------------------------------------------------------
+# The validator is on the write path, not only on the API
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def canonical_adapter(store):
+    user = store.create_user(email=f"ca_{uuid.uuid4().hex[:8]}@example.com")
+    return store.create_artifact(
+        type_="adapter",
+        name=f"ad-{uuid.uuid4().hex[:6]}",
+        schema={
+            "kind": "adapter.lora",
+            "mode": "prompt",
+            "base_model": "test-base",
+            "current_version": 0,
+            "prompt_instructions": "be terse",
+        },
+        owner_user_id=user.id,
+    )
+
+
+class TestAnApprovedPatchCannotReopenARetiredFormat:
+    """ConfigOps is a write path, so the door has to be on it.
+
+    Pass C's validator refuses an adapter without `mode` and refuses the nine
+    retired spellings — but `apply_config_patch` persisted whatever schema the
+    service handed it, so an approved, model-authored patch could remove
+    `mode` or add `backend` and put the old format back. The runtime then read
+    the missing mode as hybrid, which is precisely the compatibility this
+    tranche deleted.
+
+    Asserted on all four consequences, because "it raised" is not the
+    guarantee — the artifact, its history and the patch's own status must all
+    be untouched.
+    """
+
+    def _versions(self, store, artifact_id):
+        with store._connect() as conn:
+            row = conn.execute(
+                "SELECT count(*) AS n FROM artifact_version WHERE artifact_id = %s",
+                (artifact_id,),
+            ).fetchone()
+        return row["n"]
+
+    @pytest.mark.parametrize(
+        "patch_ops,label",
+        [
+            ([{"op": "remove", "path": "/mode"}], "removing mode"),
+            ([{"op": "add", "path": "/backend", "value": "prompt"}], "adding backend"),
+            (
+                [{"op": "add", "path": "/behavior_prompt", "value": "x"}],
+                "adding a retired prompt alias",
+            ),
+            ([{"op": "replace", "path": "/mode", "value": "clever"}], "an invalid mode"),
+        ],
+    )
+    def test_the_patch_is_refused_and_nothing_moves(
+        self, ops, store, canonical_adapter, patch_ops, label
+    ):
+        before = store.get_artifact(canonical_adapter.id).schema
+        before_versions = self._versions(store, canonical_adapter.id)
+
+        patch = _propose(store, canonical_adapter, {"ops": patch_ops})
+        ops.decide_patch(patch.id, "approve")
+        with pytest.raises(Exception) as caught:
+            ops.apply_patch(patch.id)
+        assert "validation" in str(caught.value).lower(), (
+            f"{label} failed for the wrong reason: {caught.value}"
+        )
+
+        assert store.get_artifact(canonical_adapter.id).schema == before, (
+            f"{label} changed the artifact anyway"
+        )
+        assert self._versions(store, canonical_adapter.id) == before_versions, (
+            f"{label} wrote a historical version of an invalid schema"
+        )
+        assert store.get_config_patch(patch.id).status == "approved", (
+            f"{label} was marked applied despite failing"
+        )
+
+    def test_a_legitimate_adapter_patch_still_applies(
+        self, ops, store, canonical_adapter
+    ):
+        """The door must not be a wall: canonical edits go through."""
+        patch = _propose(
+            store,
+            canonical_adapter,
+            {"ops": [{"op": "replace", "path": "/prompt_instructions", "value": "be kind"}]},
+        )
+        ops.decide_patch(patch.id, "approve")
+        ops.apply_patch(patch.id)
+
+        schema = store.get_artifact(canonical_adapter.id).schema
+        assert schema["prompt_instructions"] == "be kind"
+        assert schema["mode"] == "prompt"
+
+
+class TestValidationIsAnchoredToTheArtifactsOwnType:
+    """Which door gets checked is the row's business, not the patch's.
+
+    The boundary helper chose its validator from the *incoming* schema's
+    `kind`, so a patch could change which rules it would be judged by. An
+    adapter row whose schema was rewritten as `kind: tool.spec` — with the
+    two fields the tool schema requires — passed the tool validator, and the
+    row stayed `type='adapter'` because only `schema` is updated. The door was
+    still there; the patch walked to a different one.
+
+    `artifact.type` is immutable through every mutation path, which is exactly
+    what makes it the right anchor: an adapter row must remain a valid adapter.
+    """
+
+    def _versions(self, store, artifact_id):
+        with store._connect() as conn:
+            return conn.execute(
+                "SELECT count(*) AS n FROM artifact_version WHERE artifact_id = %s",
+                (artifact_id,),
+            ).fetchone()["n"]
+
+    def test_a_patch_cannot_choose_a_different_validator(
+        self, ops, store, canonical_adapter
+    ):
+        before = store.get_artifact(canonical_adapter.id).schema
+        before_versions = self._versions(store, canonical_adapter.id)
+
+        patch = _propose(
+            store,
+            canonical_adapter,
+            {"ops": [
+                {"op": "replace", "path": "/kind", "value": "tool.spec"},
+                {"op": "add", "path": "/name", "value": "x"},
+                {"op": "add", "path": "/handler", "value": "x"},
+            ]},
+        )
+        ops.decide_patch(patch.id, "approve")
+        with pytest.raises(Exception) as caught:
+            ops.apply_patch(patch.id)
+        assert "validation" in str(caught.value).lower(), caught.value
+
+        assert store.get_artifact(canonical_adapter.id).schema == before
+        assert self._versions(store, canonical_adapter.id) == before_versions
+        assert store.get_config_patch(patch.id).status == "approved"
+        with store._connect() as conn:
+            row = conn.execute(
+                "SELECT type FROM artifact WHERE id = %s", (canonical_adapter.id,)
+            ).fetchone()
+        assert row["type"] == "adapter"
+
+    def test_update_artifact_is_anchored_the_same_way(self, store, canonical_adapter):
+        """The other mutation surface, which had the same smell."""
+        from liminallm.service.artifact_validation import ArtifactValidationError
+
+        with pytest.raises(ArtifactValidationError):
+            store.update_artifact(
+                canonical_adapter.id,
+                {"kind": "tool.spec", "name": "x", "handler": "x"},
+            )
+        assert store.get_artifact(canonical_adapter.id).schema["kind"] == "adapter.lora"

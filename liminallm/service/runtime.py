@@ -7,8 +7,11 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, Union
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from liminallm.config import (
+    MODEL_AFFECTING_SETTINGS as _MODEL_AFFECTING,
+)
 from liminallm.config import (
     SYSTEM_SETTINGS_DEFAULTS,
     apply_managed_settings,
@@ -22,10 +25,15 @@ from liminallm.service.auth import AuthService
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.email import EmailService
-from liminallm.service.embeddings import EmbeddingsService, make_provider_encoder
+from liminallm.service.embeddings import (
+    EmbeddingsService,
+    make_provider_batch_encoder,
+    make_provider_encoder,
+)
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.replication import AdvisoryLock, ClusterBus
+from liminallm.service.rerank import make_llm_reranker
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
 from liminallm.service.training_worker import TrainingWorker
@@ -36,38 +44,95 @@ from liminallm.storage.redis_cache import RedisCache
 
 logger = get_logger(__name__)
 
+#: Sorted so the signature tuple has a stable shape; config.py owns the set,
+#: because the admin console labels settings from the same one.
+MODEL_AFFECTING_SETTINGS: Tuple[str, ...] = tuple(sorted(_MODEL_AFFECTING))
+
+
+#: Query keys that carry a password. Both drivers read connection keywords
+#: from the query string — `?password=` for redis-py and libpq alike, plus
+#: libpq's `sslpassword` — so a mask that rewrites only the userinfo
+#: publishes the same secret through the other spelling.
+_PASSWORD_QUERY_KEYS = frozenset({"password", "sslpassword"})
+
 
 def _mask_url_password(url: Optional[str]) -> Optional[str]:
-    """Mask password in URL for safe logging (Issue 29.1).
+    """Mask passwords in a URL for safe logging (Issue 29.1).
 
-    Replaces password component with '***' to prevent sensitive data leakage in logs.
-    Example: redis://:mypassword@localhost:6379 -> redis://:***@localhost:6379
+    Both places a URL can carry one: the userinfo
+    (redis://:secret@host -> redis://:***@host) and the query string
+    (postgresql://host/db?password=secret -> ...?password=***), which
+    redis-py and libpq honour just as they do the userinfo.
     """
     if not url:
         return url
     try:
         parsed = urlparse(url)
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        query_masked = any(
+            key.lower() in _PASSWORD_QUERY_KEYS and value for key, value in query_pairs
+        )
+        if not parsed.password and not query_masked:
+            return url
+        netloc = parsed.netloc
         if parsed.password:
-            # Reconstruct URL with masked password
             netloc = parsed.hostname or ""
             if parsed.port:
                 netloc = f"{netloc}:{parsed.port}"
             if parsed.username:
                 netloc = f"{parsed.username}:***@{netloc}"
-            elif parsed.password:
+            else:
                 netloc = f":***@{netloc}"
-            return urlunparse((
-                parsed.scheme,
-                netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment,
-            ))
-        return url
+        query = parsed.query
+        if query_masked:
+            query = urlencode(
+                [
+                    (key, "***" if key.lower() in _PASSWORD_QUERY_KEYS else value)
+                    for key, value in query_pairs
+                ],
+                # `*` is not special in a query string, and percent-encoding
+                # the replacement turned every masked value into `%2A%2A%2A`.
+                # The secret was gone either way; this is about the log line
+                # being readable, and about the function producing the `***`
+                # its own docstring promises.
+                safe="*",
+            )
+        return urlunparse((
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            query,
+            parsed.fragment,
+        ))
     except Exception:
         # If parsing fails, return masked placeholder
         return "***url_parse_error***"
+
+
+#: A store for `Runtime` to adopt instead of building its own. Only the test
+#: harness sets it, and only in TEST_MODE.
+#:
+#: The suite rebuilds the runtime before and after every test for state
+#: isolation, and building one used to mean a new connection pool and a full
+#: re-run of the schema verification each time. Measured at 2636 tests: 38.5ms
+#: per `Runtime()`, twice per test, about a quarter of the suite's wall clock
+#: spent proving the same schema over and over against the same database.
+#:
+#: The store is the one thing in the runtime with no per-test state to
+#: isolate — it holds a pool and a fs_root — so sharing one across the session
+#: costs nothing that the reset was buying. Tests that need a store built from
+#: scratch, such as the startup-verification reds, construct `PostgresStore`
+#: directly and are unaffected.
+_shared_store = None
+
+
+def use_shared_store(store) -> None:
+    """Have `Runtime` adopt `store` rather than construct one. Test-mode only."""
+    global _shared_store
+    if not get_settings().test_mode:
+        raise RuntimeError("a shared store is only allowed in TEST_MODE")
+    _shared_store = store
 
 
 class Runtime:
@@ -81,7 +146,7 @@ class Runtime:
         )
 
         try:
-            self.store = PostgresStore(
+            self.store = _shared_store or PostgresStore(
                 self.settings.database_url, fs_root=self.settings.shared_fs_root
             )
             logger.info(
@@ -190,6 +255,10 @@ class Runtime:
             # Lets the worker re-embed vectors left behind by a previous
             # encoder; a hash encoder makes the sweep a no-op.
             embeddings=self.embeddings,
+            # Lets the worker re-index files whose bytes were replaced, which
+            # is what makes that queue durable rather than best-effort.
+            rag=self.rag,
+            fs_root=self.settings.shared_fs_root,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
@@ -209,7 +278,6 @@ class Runtime:
             "runtime_initialized",
             model_path=self.resolved_base_model,
             model_backend=str(self.backend_mode),
-            rag_mode=str(self.rag_mode),
             adapter_mode=str(self.default_adapter_mode),
             redis_enabled=self.cache is not None,
             email_configured=self.email.is_configured,
@@ -396,7 +464,6 @@ class Runtime:
         self.resolved_base_model = self.settings.model_path
         self.backend_mode = self.settings.model_backend
         self.default_adapter_mode = self.settings.default_adapter_mode
-        self.rag_mode = self.settings.rag_mode
         embedding_model_id = self.settings.embedding_model_id
         rag_chunk_size = self.settings.rag_chunk_size
         adapter_configs = {
@@ -431,6 +498,9 @@ class Runtime:
             self.embeddings = EmbeddingsService(
                 embedding_model_id,
                 encoder=make_provider_encoder(embed_client, embedding_model_id),
+                batch_encoder=make_provider_batch_encoder(
+                    embed_client, embedding_model_id
+                ),
                 semantic=True,
             )
         else:
@@ -443,9 +513,16 @@ class Runtime:
         self.rag = RAGService(
             self.store,
             default_chunk_size=rag_chunk_size,
-            rag_mode=self.rag_mode,
             embed=self.embeddings.embed,
+            embed_many=self.embeddings.embed_many,
             embedding_model_id=embedding_model_id,
+            semantic=self.embeddings.is_semantic,
+            # A live reader, not a captured value: the reranker asks
+            # self.settings on every retrieval, so its two settings take
+            # effect on the next turn without rebuilding this stack.
+            rerank=make_llm_reranker(self.llm, lambda: self.settings),
+            late_interaction=self.settings.rag_late_interaction,
+            late_segments=self.settings.rag_late_segments,
         )
         self.training = TrainingService(
             self.store,
@@ -481,13 +558,8 @@ class Runtime:
         effective = apply_managed_settings(
             get_settings(), self._system_settings_overrides()
         )
-        return (
-            effective.model_path,
-            str(effective.model_backend),
-            str(effective.default_adapter_mode),
-            str(effective.rag_mode),
-            effective.embedding_model_id,
-            effective.rag_chunk_size,
+        return tuple(
+            str(getattr(effective, name)) for name in MODEL_AFFECTING_SETTINGS
         )
 
     def _read_settings_version(self) -> Optional[str]:
@@ -527,7 +599,6 @@ class Runtime:
         "resolved_base_model",
         "backend_mode",
         "default_adapter_mode",
-        "rag_mode",
         "router",
         "embeddings",
         "llm",
@@ -573,8 +644,13 @@ class Runtime:
             # Mark this version applied so the watcher doesn't reload again.
             self._applied_settings_version = version
             if getattr(self, "training_worker", None):
+                # Every rebuilt service the worker holds, or it keeps running
+                # the old stack: a re-embed sweep on the previous encoder, or
+                # a re-index writing vectors nothing else compares against.
                 self.training_worker.training = self.training
                 self.training_worker.clusterer = self.clusterer
+                self.training_worker.embeddings = self.embeddings
+                self.training_worker.rag = self.rag
             if old_workflow is not None and old_workflow is not self.workflow:
                 with contextlib.suppress(Exception):
                     old_workflow.shutdown(wait=False)
@@ -582,7 +658,6 @@ class Runtime:
             "runtime_model_services_reloaded",
             model_path=self.resolved_base_model,
             model_backend=str(self.backend_mode),
-            rag_mode=str(self.rag_mode),
         )
 
     async def close(self) -> None:
@@ -608,7 +683,10 @@ class Runtime:
             with contextlib.suppress(Exception):
                 await self.cache.close()
 
-        if getattr(self, "store", None):
+        # A runtime closes what it built. Under test the store is shared
+        # across the session, and the app's lifespan shutdown runs whenever a
+        # test exercises it — which closed the pool every later test needed.
+        if getattr(self, "store", None) and self.store is not _shared_store:
             with contextlib.suppress(Exception):
                 await self.store.close()
 
@@ -657,7 +735,13 @@ def reset_runtime_for_tests() -> Runtime:
         # Close the store's connection pool too. Replacing the runtime without
         # this leaks a pool per reset — invisible while the store was in-memory,
         # and it exhausts Postgres connections the moment it is not.
-        if runtime is not None and getattr(runtime, "store", None) is not None:
+        # Not the shared one: it outlives every reset by design, and closing
+        # its pool here would make the next test pay to rebuild it.
+        if (
+            runtime is not None
+            and getattr(runtime, "store", None) is not None
+            and runtime.store is not _shared_store
+        ):
             runtime.store.close_pool()
 
         reset_settings_cache()
@@ -712,17 +796,28 @@ async def _set_cached_idempotency_record(
     tenant_id: Optional[str] = None,
 ) -> None:
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
-    if runtime.cache:
-        # Issue 22.2: Pass tenant_id for multi-tenant isolation
-        await runtime.cache.set_idempotency_record(
-            route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
-        )
-        return
-    async with runtime._local_idempotency_lock:
-        # Include tenant_id in in-memory key for multi-tenant isolation
-        cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
-        _cleanup_local_idempotency(runtime, datetime.now(timezone.utc))
-        runtime._local_idempotency[cache_key] = {**record, "expires_at": expires_at}
+    # Under the account's lifetime lock, because this record holds a completed
+    # API response and lives for a day. A request authorized before an erasure
+    # is allowed to finish, and finishing here after the erasure's purge put
+    # the account's own content back under a key naming the account. See
+    # `PostgresStore.hold_live_user`; the whole write is inside the guard, not
+    # after a question asked before it.
+    with runtime.store.hold_live_user(user_id) as live:
+        if not live:
+            return
+        if runtime.cache:
+            # Issue 22.2: Pass tenant_id for multi-tenant isolation
+            await runtime.cache.set_idempotency_record(
+                route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
+            )
+            return
+        async with runtime._local_idempotency_lock:
+            # Include tenant_id in in-memory key for multi-tenant isolation
+            cache_key = (
+                (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
+            )
+            _cleanup_local_idempotency(runtime, datetime.now(timezone.utc))
+            runtime._local_idempotency[cache_key] = {**record, "expires_at": expires_at}
 
 
 async def _acquire_idempotency_slot(
@@ -754,43 +849,58 @@ async def _acquire_idempotency_slot(
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=ttl_seconds)
 
-    if runtime.cache:
-        # Issue 22.2: Pass tenant_id for multi-tenant isolation
-        return await runtime.cache.acquire_idempotency_slot(
-            route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
-        )
+    # Same guard as storing the result, and for the same reason: this claim is
+    # also a key naming the account, kept for a day. Reporting the slot as
+    # acquired lets a request whose account has just gone still finish; it
+    # simply records nothing, here or when its result comes back.
+    #
+    # The whole claim is inside the guard, not a question asked before it. An
+    # answer released before the write is a check-then-act across the
+    # deletion — the erasure commits and purges in the gap, and the claim
+    # lands afterwards under a key the purge has already been past.
+    with runtime.store.hold_live_user(user_id) as live:
+        if not live:
+            return (True, None)
 
-    # In-memory fallback with atomic check-and-set within lock
-    async with runtime._local_idempotency_lock:
-        # Include tenant_id in in-memory key for multi-tenant isolation
-        cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
-        expired, evicted = _cleanup_local_idempotency(runtime, now)
-        if expired or evicted:
-            logger.info(
-                "idempotency_local_cleanup",
-                expired=expired,
-                evicted=evicted,
-                remaining=len(runtime._local_idempotency),
+        if runtime.cache:
+            # Issue 22.2: Pass tenant_id for multi-tenant isolation
+            return await runtime.cache.acquire_idempotency_slot(
+                route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
             )
-        existing = runtime._local_idempotency.get(cache_key)
 
-        if existing:
-            is_expired = existing.get("expires_at") and existing["expires_at"] < now
-            # Reclaim a prior failed attempt atomically (within this lock) so a
-            # retry proceeds without a separate racy overwrite.
-            is_failed = existing.get("status") == "failed"
-            if is_expired or is_failed:
-                runtime._local_idempotency.pop(cache_key, None)
-            else:
-                # Live in-progress/completed record: return it.
-                return (False, existing)
+        # In-memory fallback with atomic check-and-set within lock
+        async with runtime._local_idempotency_lock:
+            # Include tenant_id in in-memory key for multi-tenant isolation
+            cache_key = (
+                (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
+            )
+            expired, evicted = _cleanup_local_idempotency(runtime, now)
+            if expired or evicted:
+                logger.info(
+                    "idempotency_local_cleanup",
+                    expired=expired,
+                    evicted=evicted,
+                    remaining=len(runtime._local_idempotency),
+                )
+            existing = runtime._local_idempotency.get(cache_key)
 
-        # No existing record or it was expired, claim the slot
-        runtime._local_idempotency[cache_key] = {
-            **record,
-            "expires_at": expires_at,
-        }
-        return (True, None)
+            if existing:
+                is_expired = existing.get("expires_at") and existing["expires_at"] < now
+                # Reclaim a prior failed attempt atomically (within this lock)
+                # so a retry proceeds without a separate racy overwrite.
+                is_failed = existing.get("status") == "failed"
+                if is_expired or is_failed:
+                    runtime._local_idempotency.pop(cache_key, None)
+                else:
+                    # Live in-progress/completed record: return it.
+                    return (False, existing)
+
+            # No existing record or it was expired, claim the slot
+            runtime._local_idempotency[cache_key] = {
+                **record,
+                "expires_at": expires_at,
+            }
+            return (True, None)
 
 
 async def check_rate_limit(
@@ -826,7 +936,7 @@ async def check_rate_limit(
             window_seconds=window_seconds,
             message="Invalid rate limit window_seconds; defaulting to 60 seconds",
         )
-        window_seconds = 60  # Default to 1 minute if invalid window per SPEC §18
+        window_seconds = 60  # Default to 1 minute if the configured window is invalid
     now = datetime.now(timezone.utc)
     if runtime.cache:
         result = await runtime.cache.check_rate_limit(

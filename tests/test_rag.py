@@ -1,8 +1,11 @@
 import uuid
 
+import pytest
+
+from liminallm.service.embeddings import EMBEDDING_DIM
 from liminallm.service.rag import RAGService
+from liminallm.storage.models import KnowledgeChunk
 from tests.harness import get_test_store
-from liminallm.storage.models import KnowledgeChunk, KnowledgeContext, User
 
 
 def _setup_store() -> tuple[RAGService, str, str, str, str]:
@@ -54,98 +57,158 @@ def test_pgvector_retrieve_requires_auth_scope():
     assert blocked == []
 
 
-class LegacyOnlyStore:
-    def __init__(self):
-        self.contexts = {}
-        self.users = {}
-        self.chunks = {}
-        self._chunk_id_seq = 1
+def _hybrid_fixture(store, *, encoder="hybrid-encoder"):
+    """Two chunks: one matches the query's words, one matches its vector.
 
-    def add_user(self, tenant_id: str) -> User:
-        user = User(
-            id=str(uuid.uuid4()),
-            email=f"user-{tenant_id}@example.com",
-            tenant_id=tenant_id,
-        )
-        self.users[user.id] = user
-        return user
+    Vectors are orthogonal unit vectors so the semantic channel is decisive
+    when it is allowed to speak and provably absent when it is not.
+    """
+    from liminallm.service.embeddings import EMBEDDING_DIM
 
-    def upsert_context(
-        self, owner_user_id: str, name: str, description: str
-    ) -> KnowledgeContext:
-        ctx = KnowledgeContext(
-            id=str(uuid.uuid4()),
-            owner_user_id=owner_user_id,
-            name=name,
-            description=description,
-        )
-        self.contexts[ctx.id] = ctx
-        return ctx
+    user = store.create_user(email=f"hy_{uuid.uuid4().hex[:8]}@example.com")
+    ctx = store.upsert_context(user.id, f"hy-{uuid.uuid4().hex[:6]}", "fixture")
 
-    def get_context(self, context_id: str) -> KnowledgeContext | None:
-        return self.contexts.get(context_id)
-
-    def get_user(self, user_id: str) -> User | None:
-        return self.users.get(user_id)
-
-    def add_chunks(self, context_id: str, chunks: list[KnowledgeChunk]) -> None:
-        bucket = self.chunks.setdefault(context_id, [])
-        for chunk in chunks:
-            if not chunk.id:
-                chunk.id = self._chunk_id_seq
-                self._chunk_id_seq += 1
-            bucket.append(chunk)
-
-    def search_chunks(
-        self,
-        context_id: str | None,
-        query: str,
-        query_embedding: list[float] | None,
-        limit: int = 4,
-    ) -> list[KnowledgeChunk]:
-        return list(self.chunks.get(context_id or "", []))[:limit]
+    near = [0.0] * EMBEDDING_DIM
+    near[3] = 1.0
+    far = [0.0] * EMBEDDING_DIM
+    far[9] = 1.0
+    store.add_chunks(ctx.id, [
+        KnowledgeChunk(
+            context_id=ctx.id, fs_path="/vector", chunk_index=0, embedding=near,
+            content="marsupials of western australia and their grazing habits",
+            meta={"embedding_model_id": encoder},
+        ),
+        KnowledgeChunk(
+            context_id=ctx.id, fs_path="/keyword", chunk_index=1, embedding=far,
+            content="the quokka population census for rottnest island",
+            meta={"embedding_model_id": encoder},
+        ),
+    ])
+    return user, ctx, near
 
 
-def test_local_hybrid_without_pgvector():
-    store = LegacyOnlyStore()
-    owner = store.add_user("tenant_legacy")
-    ctx = store.upsert_context(owner.id, "legacy", "local hybrid")
+def test_pgvector_retrieval_finds_the_keyword_match_without_an_encoder(store):
+    """The default encoder is the hash fallback, so keywords must carry it.
 
+    Before hybrid retrieval this path was ORDER BY embedding <-> query and
+    nothing else, so the ranking of a user's own files was decided by hash
+    distance — the SPEC's own definition of noise.
+    """
+    user, ctx, near = _hybrid_fixture(store)
     rag = RAGService(
-        store, rag_mode="local_hybrid", embedding_model_id="legacy-embedding"
-    )
-    # Use longer content to ensure chunks have >= 10 tokens (min_token_count filter)
-    rag.ingest_text(ctx.id, "This is legacy search path content with enough tokens to pass the minimum token count filter")
-    existing_chunks = store.chunks.get(ctx.id, [])
-    store.add_chunks(
-        ctx.id,
-        [
-            KnowledgeChunk(
-                id=None,
-                context_id=ctx.id,
-                fs_path="inline",
-                content="This is other model content with enough tokens to pass the minimum token count filter",
-                embedding=[],
-                chunk_index=len(existing_chunks),
-                meta={"embedding_model_id": "other"},
-            )
-        ],
+        store, embed=lambda _text: near, embedding_model_id="hybrid-encoder"
     )
 
-    allowed = rag.retrieve(
-        [ctx.id], "legacy", user_id=owner.id, tenant_id="tenant_legacy"
-    )
-    assert allowed
-    assert all(
-        (chunk.meta or {}).get("embedding_model_id") == "legacy-embedding"
-        for chunk in allowed
+    hits = rag.retrieve(
+        [ctx.id], "quokka census", limit=2, user_id=user.id, min_token_count=0
     )
 
-    blocked_user = store.add_user("other")
-    denied = rag.retrieve(
-        [ctx.id], "legacy", user_id=blocked_user.id, tenant_id="other"
+    assert hits and hits[0].fs_path == "/keyword"
+
+
+def test_pgvector_retrieval_returns_nothing_rather_than_noise(store):
+    """No encoder and no keyword overlap is a miss, not four arbitrary chunks.
+
+    Returning the nearest hash vectors would hand the model text it has no
+    reason to trust and every reason to cite.
+    """
+    user, ctx, near = _hybrid_fixture(store)
+    rag = RAGService(
+        store, embed=lambda _text: near, embedding_model_id="hybrid-encoder"
     )
-    assert denied == []
+
+    hits = rag.retrieve(
+        [ctx.id], "unrelated zzzqqq", limit=2, user_id=user.id, min_token_count=0
+    )
+
+    assert hits == []
+
+
+def test_a_real_encoder_finds_what_shares_no_words(store):
+    """The semantic channel earns its place: no lexical overlap, still found."""
+    user, ctx, near = _hybrid_fixture(store)
+    rag = RAGService(
+        store,
+        embed=lambda _text: near,
+        embedding_model_id="hybrid-encoder",
+        semantic=True,
+    )
+
+    hits = rag.retrieve(
+        [ctx.id], "unrelated zzzqqq", limit=2, user_id=user.id, min_token_count=0
+    )
+
+    assert hits and hits[0].fs_path == "/vector"
+
+
+def test_a_real_encoder_still_keeps_exact_terms_in_play(store):
+    """bm25 stays in the score so an exact term is not lost to a near vector.
+
+    The keyword chunk is orthogonal to the query vector, so a dense-only
+    ranking puts it last. It should win anyway: it is the one that says the
+    word the user typed.
+    """
+    user, ctx, near = _hybrid_fixture(store)
+    rag = RAGService(
+        store,
+        embed=lambda _text: near,
+        embedding_model_id="hybrid-encoder",
+        semantic=True,
+    )
+
+    hits = rag.retrieve(
+        [ctx.id], "quokka census", limit=2, user_id=user.id, min_token_count=0
+    )
+
+    assert [hit.fs_path for hit in hits] == ["/keyword", "/vector"]
+
+
+def test_lexical_search_enforces_user_isolation(store):
+    """SPEC §12.2 applies to the new channel exactly as it does to the old."""
+    user, ctx, _ = _hybrid_fixture(store)
+    intruder = store.create_user(email=f"ix_{uuid.uuid4().hex[:8]}@example.com")
+
+    mine = store.search_chunks_lexical([ctx.id], "quokka", 4, user_id=user.id)
+    theirs = store.search_chunks_lexical([ctx.id], "quokka", 4, user_id=intruder.id)
+
+    assert mine and theirs == []
+
+
+@pytest.mark.parametrize("absent", ["", None], ids=["empty", "none"])
+def test_a_retrieval_channel_with_no_user_refuses_rather_than_widens(store, absent):
+    """Both chunk channels refuse an absent principal rather than widening.
+
+    `user_id` is keyword-only and annotated as required, so an absent one can
+    only arrive from a caller that bypassed the annotation — which is the case
+    the check exists for. The failure mode is not an error: `_chunk_scope`
+    builds a WHERE clause with no owner term, so the query runs and returns
+    every user's chunks in the named contexts.
+
+    Measured before this existed: removing the check from
+    `search_chunks_pgvector` left the whole fast lane green. The positive
+    control is in the same test because a refusal that returns nothing is
+    indistinguishable from a query that would have found nothing anyway.
+    `late_candidate_ids` carries the same check and is covered beside the
+    corpus that can exercise it, in `test_late_interaction.py`.
+    """
+    user, ctx, near = _hybrid_fixture(store)
+
+    assert store.search_chunks_lexical([ctx.id], "quokka", 4, user_id=user.id), (
+        "the fixture matches nothing, so refusing it would prove nothing"
+    )
+    assert store.search_chunks_pgvector([ctx.id], "quokka", near, 4, user_id=user.id)
+
+    assert store.search_chunks_lexical([ctx.id], "quokka", 4, user_id=absent) == []
+    assert store.search_chunks_pgvector(
+        [ctx.id], "quokka", near, 4, user_id=absent
+    ) == []
+
+
+def test_lexical_search_survives_a_query_of_pure_punctuation(store):
+    """to_tsquery would raise on an empty term list; the caller sees a miss."""
+    user, ctx, _ = _hybrid_fixture(store)
+
+    assert store.search_chunks_lexical([ctx.id], "?? -- ??", 4, user_id=user.id) == []
 
 
 def test_pgvector_filters_fs_path(tmp_path):
@@ -186,3 +249,99 @@ def test_pgvector_filters_fs_path(tmp_path):
 
     assert len(results) == 1
     assert results[0].fs_path == "keep_me"
+
+
+def test_retrieval_ranks_across_contexts_by_relevance(store):
+    """An irrelevant context must not get a fixed share of the answer.
+
+    Ported from the deleted second engine: relevance decides across contexts,
+    so a context that matches neither the words nor the vector contributes
+    nothing however early it was listed.
+    """
+    user = store.create_user(email=f"rk_{uuid.uuid4().hex[:8]}@example.com")
+    poor = store.upsert_context(user.id, f"rk-poor-{uuid.uuid4().hex[:6]}", "ctx")
+    good = store.upsert_context(user.id, f"rk-good-{uuid.uuid4().hex[:6]}", "ctx")
+
+    near = [0.0] * EMBEDDING_DIM
+    near[5] = 1.0
+    far = [0.0] * EMBEDDING_DIM
+    far[9] = 1.0
+    for ctx, body, vec in (
+        (good, "quokka census figures for rottnest island this year", near),
+        (poor, "unrelated pottery glazing notes from the studio archive", far),
+    ):
+        store.add_chunks(ctx.id, [
+            KnowledgeChunk(
+                context_id=ctx.id, fs_path=f"/{ctx.id}-{index}", chunk_index=index,
+                embedding=vec, content=body,
+                meta={"embedding_model_id": "rank"},
+            )
+            for index in range(6)
+        ])
+
+    rag = RAGService(
+        store, embedding_model_id="rank", embed=lambda _text: near, semantic=True,
+    )
+    # The irrelevant context listed first, which is exactly the case that
+    # used to hand it the answer.
+    hits = rag.retrieve(
+        [poor.id, good.id], "quokka census", limit=4,
+        user_id=user.id, min_token_count=0,
+    )
+
+    assert hits
+    assert all(hit.context_id == good.id for hit in hits)
+
+
+def test_a_chunk_the_store_matched_is_never_dropped_by_the_rescore(store):
+    """Postgres and the BM25 tokenizer disagree, and the store wins.
+
+    to_tsvector('simple', ...) splits "user_id" into 'user' + 'id'; bm25's
+    \\w+ keeps it whole. So SQL matched the chunk on "user id" and the
+    re-score gave it 0.0. With the hash encoder lexical is the only live
+    channel, so the whole turn came back empty for a question the corpus
+    answers — the common shape for the source files ingest_path defaults to.
+    """
+    user = store.create_user(email=f"tk_{uuid.uuid4().hex[:8]}@example.com")
+    ctx = store.upsert_context(user.id, f"tk-{uuid.uuid4().hex[:6]}", "fixture")
+
+    rag = RAGService(store, embedding_model_id="tok-encoder")
+    rag.ingest_text(
+        ctx.id,
+        "def resolve_user_id(request): the tenant_id and the user_id are both "
+        "derived from the authenticated jwt token and never from user input",
+        source_path="/auth.py",
+    )
+
+    # The store finds it either way; retrieval must not then throw it away.
+    assert store.search_chunks_lexical([ctx.id], "user id", 8, user_id=user.id)
+    hits = rag.retrieve(
+        [ctx.id], "user id", limit=4, user_id=user.id, min_token_count=0
+    )
+
+    assert [hit.fs_path for hit in hits] == ["/auth.py"]
+
+
+def test_bm25_orders_the_lexical_pool_not_arrival_order(store):
+    """The SQL's ts_rank is a recall filter; BM25 decides the lexical order.
+
+    Pinned at the fusion seam with a pool whose arrival order disagrees with
+    its BM25 order, because a mutation that fused the pool as it arrived
+    passed every retrieval test — the two scorers agree too often on small
+    fixtures for an end-to-end red to catch the difference deterministically.
+    """
+    rag = RAGService(store)
+    off_topic = KnowledgeChunk(
+        id=1, context_id="ctx", fs_path="/off", chunk_index=0, embedding=[],
+        content="unrelated pottery glazing notes from the studio archive",
+    )
+    on_topic = KnowledgeChunk(
+        id=2, context_id="ctx", fs_path="/on", chunk_index=1, embedding=[],
+        content="quokka census figures and quokka census methods",
+    )
+
+    fused = rag._fuse("quokka census", [off_topic, on_topic], dense=[])
+
+    assert [chunk.fs_path for chunk in fused] == ["/on", "/off"], (
+        "the lexical pool kept its arrival order; BM25 never spoke"
+    )

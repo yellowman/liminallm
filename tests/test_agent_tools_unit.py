@@ -118,8 +118,11 @@ class TestFileSearch:
     def test_limit_is_clamped_to_the_documented_range(self):
         seen = {}
 
-        def retrieve(ctx_ids, query, *, limit, user_id, tenant_id):
+        def retrieve(ctx_ids, query, *, limit, user_id, tenant_id, path_scope=None):
+            # Mirrors RAGService.retrieve. A stub that omits an argument the
+            # real one takes asserts an interface rather than observing it.
             seen["limit"] = limit
+            seen["path_scope"] = path_scope
             return []
 
         rag = SimpleNamespace(retrieve=retrieve)

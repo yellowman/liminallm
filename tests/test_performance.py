@@ -19,7 +19,6 @@ def perf_client():
     import os
     os.environ.setdefault("TEST_MODE", "true")
     os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
-    os.environ.setdefault("JWT_SECRET", "test-secret-key")
 
     from liminallm.service.runtime import reset_runtime_for_tests
     reset_runtime_for_tests()

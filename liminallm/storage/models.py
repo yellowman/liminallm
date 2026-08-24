@@ -183,6 +183,11 @@ class KnowledgeContext:
     updated_at: datetime = field(default_factory=_utcnow)
     fs_path: Optional[str] = None
     meta: Dict | None = None
+    #: Set for a conversation's implicit attachment index, and the authority
+    #: on what that context is. `meta.auto` describes the same thing for the
+    #: UI, but only this is a foreign key: it cascades on delete and it is
+    #: what every exclusion filter keys on.
+    conversation_id: Optional[str] = None
 
 
 @dataclass
@@ -276,6 +281,23 @@ class UserMFAConfig:
 
 
 @dataclass
+class ApiKey:
+    """A long-lived bearer credential (user_api_key table).
+
+    Deliberately hashless: the SHA-256 stays in the store, the plaintext is
+    returned exactly once by the route that minted it.
+    """
+
+    id: str
+    user_id: str
+    name: str
+    prefix: str
+    created_at: datetime = field(default_factory=_utcnow)
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+@dataclass
 class Note:
     id: str
     user_id: str
@@ -285,3 +307,29 @@ class Note:
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
     meta: Dict | None = None
+
+
+@dataclass(frozen=True)
+class UserErasure:
+    """What deleting an account removed, for the caller that has to follow it.
+
+    Postgres is canonical and its transaction takes everything with it, but
+    copies of the same rows live in Redis under keys derived from ids the
+    deletion is about to make unreachable. A cached conversation summary
+    outlives its chat by up to an hour, and after the account is gone there is
+    no longer any way to ask which conversations it had. So the deletion says
+    what it took, and the caller purges the copies on a best-effort basis —
+    afterwards, so a Redis outage cannot roll back an erasure.
+
+    Every field is read from Postgres inside the deleting transaction, never
+    reconstructed afterwards from Redis. Redis holds a `auth:user_sessions`
+    set that looks like it could name the sessions, but it is an index with
+    its own TTL rather than the authority on what exists: when it has expired
+    and the session keys it should have named have not, deriving the list from
+    it purges nothing and leaves exactly the sessions that outlived it.
+    """
+
+    user_id: str
+    tenant_id: Optional[str] = None
+    conversation_ids: List[str] = field(default_factory=list)
+    session_ids: List[str] = field(default_factory=list)

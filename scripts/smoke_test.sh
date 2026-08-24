@@ -65,6 +65,14 @@ check_dependencies() {
     else
         JQ_AVAILABLE=true
     fi
+    # The Redis health check reads a nested field, which needs a real JSON
+    # parser rather than a grep. Required, not optional: this suite exists to
+    # establish that Redis is actually healthy, and a run that cannot look is
+    # not a run that found nothing wrong.
+    if ! $JQ_AVAILABLE && ! command -v python3 &> /dev/null; then
+        echo "Error: jq or python3 is required to verify Redis health"
+        exit 1
+    fi
 }
 
 # Wait for service to be ready
@@ -121,6 +129,62 @@ test_healthz() {
         log_fail "Health check response invalid: $response"
         return 1
     fi
+}
+
+# `extract_json` above cannot read this: its jq-less branch greps for a flat
+# "key": "value" pair, and checks.redis.status is three deep. Returns 2 when
+# no parser is installed, so the caller can tell that from an unhealthy Redis.
+redis_status_from() {
+    local json="$1"
+    if $JQ_AVAILABLE; then
+        echo "$json" | jq -r '.checks.redis.status // "missing"' 2>/dev/null || echo "missing"
+    elif command -v python3 &> /dev/null; then
+        echo "$json" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("checks", {}).get("redis", {}).get("status", "missing"))
+except Exception:
+    print("missing")' 2>/dev/null || echo "missing"
+    else
+        return 2
+    fi
+}
+
+test_redis_is_actually_configured() {
+    run_test "Redis is configured, not silently absent"
+
+    # `redis_url` is a managed setting with no environment variable of its
+    # own, so a bare REDIS_URL in the compose file configured nothing and left
+    # the default pointing at localhost — where, inside the app container,
+    # there is no Redis. /healthz already tells "healthy" from
+    # "not_configured", so the fallback cannot be exercised unnoticed.
+    local response
+    response=$(curl -sf "$BASE_URL/healthz" 2>&1) || {
+        log_fail "Health check request failed"
+        return 1
+    }
+
+    local status
+    if ! status=$(redis_status_from "$response"); then
+        # check_dependencies exits before this is reachable. Kept because the
+        # failure it names is a harness fault, and counting it as a pass would
+        # let the suite exit 0 having never established the invariant it is
+        # here for — as it briefly did.
+        log_fail "cannot read checks.redis.status: no JSON parser on this host"
+        return 1
+    fi
+
+    if [ "$status" = "healthy" ]; then
+        log_pass "Redis reports healthy"
+        return 0
+    fi
+    log_fail "checks.redis.status is \"$status\", expected \"healthy\". If this says
+       \"not_configured\", the deployment is running on the in-process
+       fallback: rate limits, idempotency, the session cache and the
+       concurrency slots are all on their fallback path. Seed redis_url
+       through INSTANCE_SETTINGS_JSON. Note that seeding only applies to a
+       first boot, so an existing data volume keeps whatever it already has:
+       docker compose -f docker-compose.test.yml down -v"
+    return 1
 }
 
 test_signup_user() {
@@ -408,6 +472,7 @@ main() {
 
     # Run tests (use || true to continue on test failures with set -e)
     test_healthz || true
+    test_redis_is_actually_configured || true
     test_unauthenticated_protected || true
     test_signup_user || true
     test_login_user || true

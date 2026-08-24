@@ -466,6 +466,8 @@ def test_injection_findings_reach_the_workflow_trace(monkeypatch):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_port}/page"
 
+    from liminallm.service.sandbox import build_tool_network_policy
+
     runtime = get_runtime()
     engine = runtime.workflow
     previous = runtime.llm.backend
@@ -473,6 +475,24 @@ def test_injection_findings_reach_the_workflow_trace(monkeypatch):
     # Local server: the SSRF guard has to be opted out of, as in a test rig.
     monkeypatch.setattr(engine.settings, "web_fetch_allow_private", True, raising=False)
     monkeypatch.setattr(engine.settings, "web_tools_enabled", True, raising=False)
+    # And so does the second guard, which is a different control. The one above
+    # judges the URL; this one is a socket-level allowlist consulted when the
+    # connection is opened, built once from settings in the engine's
+    # constructor so patching settings afterwards does not reach it.
+    #
+    # Opting out of only the first was invisible for as long as it was, because
+    # `connection_allowlist()` returns the *proxy's* host when a proxy is
+    # configured — so anywhere HTTPS_PROXY pointed at a loopback address, this
+    # test's target was allowlisted by coincidence of the developer's
+    # environment. CI has no proxy, so the real target list applied and the
+    # fetch was refused with "Egress address '127.0.0.1' is not allowlisted for
+    # tools", leaving the model to answer without ever reading the page.
+    monkeypatch.setattr(
+        engine,
+        "tool_network_policy",
+        build_tool_network_policy(allowlist=["127.0.0.1"], proxy_url=None),
+        raising=False,
+    )
     try:
         events = asyncio.run(
             _collect_stream(

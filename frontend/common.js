@@ -49,10 +49,13 @@ const getCsrfToken = () => {
 // arrived at (service/tenancy.py), so a client cannot name its own. This used
 // to echo back the value the server itself had just sent at login, where the
 // only two outcomes were "matches" and "401".
+// No `session_id` header either. The browser's session id is an HttpOnly
+// cookie it cannot read (SPEC §17.10), and the access token is the credential
+// this page actually holds; the header remains for API clients that
+// authenticate that way.
 const authHeaders = (idempotencyKey) => {
   const h = {};
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
-  if (state.sessionId) h['session_id'] = state.sessionId;
   const csrf = getCsrfToken();
   if (csrf) h['X-CSRF-Token'] = csrf;
   h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
@@ -144,13 +147,22 @@ const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
   throw new Error(`Request failed after ${retries + 1} attempts: ${lastError?.message || 'unknown'}`);
 }
 
+// The refresh credential is the HttpOnly cookie, which a same-origin request
+// carries on its own and this code could not read if it wanted to. So the body
+// is empty: `refresh_token` in it would require the page to hold a durable
+// credential, which is the thing §17.10 moved into the cookie. `tenant_id` is
+// gone with it — the server derives the tenant from the hostname, and echoing
+// back the value it had just sent was never anything but "matches" or 401.
+//
+// `credentials: 'same-origin'` is the default, and stated rather than assumed
+// because this request is now nothing but the cookie it carries.
 const tryRefreshToken = async () => {
-  if (!state.refreshToken) return false;
   try {
     const resp = await fetch(`${apiBase}/auth/refresh`, {
       method: 'POST',
       headers: jsonHeaders(),
-      body: JSON.stringify({ refresh_token: state.refreshToken, tenant_id: state.tenantId }),
+      credentials: 'same-origin',
+      body: JSON.stringify({}),
     });
     if (!resp.ok) return false;
     const envelope = await resp.json();
@@ -167,7 +179,10 @@ const tryRefreshToken = async () => {
 const requestEnvelope = async (url, options, fallbackMessage) => {
   let resp = await fetchWithRetry(url, options);
 
-  if (resp.status === 401 && state.refreshToken) {
+  // The trigger is "we had an authenticated session", not "a refresh token is
+  // visible to JS" — which is no longer true of any browser session. One
+  // attempt: a second would be retrying a cookie the server just rejected.
+  if (resp.status === 401 && state.accessToken) {
     const refreshed = await tryRefreshToken();
     if (refreshed) {
       const newOptions = { ...options };

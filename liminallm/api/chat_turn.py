@@ -15,8 +15,10 @@ ownership checks are HTTP concerns, so raising HTTPException here fits.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Optional
 
 from liminallm.api.errors import http_error
 from liminallm.api.schemas import ChatResponse
@@ -58,6 +60,7 @@ async def begin(
     content: str,
     content_struct: Any = None,
     mode: str = "text",
+    conversation_meta: Optional[dict] = None,
     owned_conversation,
     owned_context,
 ) -> Turn:
@@ -81,6 +84,7 @@ async def begin(
             user_id=principal.user_id,
             active_context_id=context_id,
             title=turn_effects.conversation_title(content),
+            meta=conversation_meta,
         )
 
     resolved_id = conversation.id
@@ -128,32 +132,62 @@ async def _transcribe(runtime, payload: str, user_id: str) -> tuple[str, dict]:
     return text, {"mode": "voice", "transcript": transcript}
 
 
-async def finish(runtime, turn: Turn, orchestration: Any, *, content: str = "") -> Any:
+@contextmanager
+def _unguarded(_capability: str, _payload: Any):
+    """Stand-in for a caller with no ledger — the streaming path, and tests."""
+    yield SimpleNamespace(replayable=False, result=None)
+
+
+async def finish(
+    runtime,
+    turn: Turn,
+    orchestration: Any,
+    *,
+    content: str = "",
+    assistant_message_id: Optional[str] = None,
+    commit: Optional[Callable[..., Any]] = None,
+) -> Any:
     """Persist the reply, schedule the post-turn work, warm the cache.
 
     ``content`` is the streaming path's token-assembled reply, used when the
-    orchestration carries none.
+    orchestration carries none. ``assistant_message_id`` lets a transport that
+    must announce the reply's id before it exists (the streaming Responses
+    surface) mint it up front and keep every event consistent with the row.
+
+    ``commit`` is the request's ledger (``IdempotencyGuard.commit``). SPEC §11.3
+    makes storing the assistant message the first durable mutation of the write
+    path, so it is guarded here, around the append itself. Guarding the route
+    instead would record that a turn was attempted — which is what the
+    idempotency slot already records, and is not the same claim as "the message
+    is in the table".
     """
     turn.orchestration = orchestration if isinstance(orchestration, dict) else {}
     assistant_content = turn.orchestration.get(
         "content", content or "No response generated."
     )
-    assistant_message = runtime.store.append_message(
-        turn.conversation_id,
-        sender="assistant",
-        role="assistant",
-        content=assistant_content,
-        content_struct=normalize_content_struct(
-            turn.orchestration.get("content_struct"), assistant_content
-        ),
-        meta={
-            "adapters": turn.orchestration.get("adapters", []),
-            "adapter_gates": turn.orchestration.get("adapter_gates", []),
-            "routing_trace": turn.orchestration.get("routing_trace", []),
-            "workflow_trace": turn.orchestration.get("workflow_trace", []),
-            "usage": turn.orchestration.get("usage", {}),
-        },
-    )
+    guard = commit or _unguarded
+    with guard(
+        "message.assistant",
+        {"conversation_id": turn.conversation_id, "content": assistant_content},
+    ) as operation:
+        assistant_message = runtime.store.append_message(
+            turn.conversation_id,
+            sender="assistant",
+            role="assistant",
+            content=assistant_content,
+            content_struct=normalize_content_struct(
+                turn.orchestration.get("content_struct"), assistant_content
+            ),
+            meta={
+                "adapters": turn.orchestration.get("adapters", []),
+                "adapter_gates": turn.orchestration.get("adapter_gates", []),
+                "routing_trace": turn.orchestration.get("routing_trace", []),
+                "workflow_trace": turn.orchestration.get("workflow_trace", []),
+                "usage": turn.orchestration.get("usage", {}),
+            },
+            message_id=assistant_message_id,
+        )
+        operation.result = {"message_id": getattr(assistant_message, "id", None)}
 
     turn_effects.schedule_all(
         runtime,
@@ -172,7 +206,9 @@ async def finish(runtime, turn: Turn, orchestration: Any, *, content: str = "") 
             limit=runtime.settings.max_page_size,
             user_id=turn.user_id,
         )
-        await runtime.workflow.cache_conversation_state(turn.conversation_id, history)
+        await runtime.workflow.cache_conversation_state(
+            turn.conversation_id, history, turn.user_id
+        )
 
     return assistant_message
 

@@ -20,11 +20,11 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from liminallm.logging import log_routing_trace, log_workflow_trace
-from liminallm.service import interpreter
-from liminallm.service.sandbox import tool_network_guard
+from liminallm.service.broker import InvocationContext
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
@@ -48,7 +48,7 @@ class WorkflowStreamingMixin:
         tenant_id: Optional[str] = None,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Execute workflow with streaming token output per SPEC §18.
+        """Execute workflow with streaming token output per SPEC §13.7.
 
         Yields events:
         - {"event": "token", "data": "token_text"}
@@ -59,16 +59,17 @@ class WorkflowStreamingMixin:
         """
         workflow_schema = None
         if workflow_id:
-            workflow_schema = self.store.get_latest_workflow(workflow_id)
+            # Same ownership check as the blocking path: a workflow is an
+            # artifact, and `workflow_id` comes from the request body. Loading
+            # it by id alone let any authenticated user stream another user's
+            # private workflow.
+            workflow_schema = self._load_workflow_for(
+                workflow_id, user_id=user_id, tenant_id=tenant_id
+            )
         if not workflow_schema:
-            # The tool agent handles anything needing tools: conversation
-            # attachments (so uploading a file is all the user has to do) or an
-            # enabled web tool. It degrades to a plain reply when it has no
-            # tools to offer.
-            if (
-                self._conversation_attachments(conversation_id, user_id)
-                or self._web_settings()["enabled"]
-            ):
+            # Same question the blocking path asks, and the same function, so
+            # the two cannot answer it differently. See `_turn_needs_tools`.
+            if self._turn_needs_tools(conversation_id, user_id):
                 workflow_schema = get_default_attachment_workflow_schema()
             else:
                 workflow_schema = self._default_workflow()
@@ -364,7 +365,7 @@ class WorkflowStreamingMixin:
             },
         }
 
-        await self.cache_conversation_state(conversation_id, history)
+        await self.cache_conversation_state(conversation_id, history, user_id)
 
     async def _stream_llm_node(
         self,
@@ -462,8 +463,21 @@ class WorkflowStreamingMixin:
         message = inputs.get("message") or user_message or ""
         attachments = self._conversation_attachments(conversation_id, user_id)
 
-        messages, tools, _ = self._build_agent_context(
-            message, attachments, history, user_id, conversation_id
+        # Off the event loop. Assembling the prompt now includes listing every
+        # configured MCP server, and `mcp_client.run_sync` answers an
+        # already-running loop by starting a thread and joining it — a join
+        # on the loop thread blocks every other request the worker is serving.
+        #
+        # Honest about the evidence: this path did not reproduce the stall.
+        # Reverted, its worst loop gap across a 1.0s listing was 0.021s, while
+        # the blocking path's was 1.10s — so this call already reaches a
+        # worker thread by some route, and there is no test that fails without
+        # this line. It stays because a synchronous network call in an
+        # `async def` is a stall waiting for a caller to change, not because a
+        # measurement demands it.
+        messages, tools, _, mcp_tools = await asyncio.to_thread(
+            self._build_agent_context,
+            message, attachments, history, user_id, conversation_id,
         )
         if not tools or not self.llm.supports_tools:
             async for event in self._stream_llm_node(
@@ -489,69 +503,71 @@ class WorkflowStreamingMixin:
         # Once a token has reached the client, restarting on the plain node
         # would append a second answer to the same bubble.
         emitted_tokens = False
-        deadline = time.monotonic() + self.AGENT_DEADLINE_SECONDS
+        invocation = self.invocations.open(
+            uuid.uuid4().hex,
+            tool="agent.files_v1",
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
 
-        def _turn(msgs: List[dict], offer: List[dict]) -> dict:
-            with tool_network_guard(self.tool_network_policy):
-                return self.llm.generate_with_tools(
-                    msgs, offer, adapters, user_id=user_id
-                )
-
-        def _run_tool(name: str, args: Dict[str, Any]) -> str:
-            with tool_network_guard(self.tool_network_policy):
-                return self._execute_agent_tool(
-                    name,
-                    args,
-                    conversation_id=conversation_id,
-                    context_id=context_id,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                    session=session,
-                    snippets=snippets,
-                    fallback_query=message,
-                )
+        # A cancel arriving mid-round must stop the work, not only the waiting:
+        # the watcher cancels the execution, which takes the worker's process
+        # tree down with it.
+        cancel_watch = self._watch_for_cancel(invocation, cancel_event)
 
         try:
-            # Tool rounds. One round is always reserved for the streamed answer.
-            for _ in range(max(0, self.MAX_AGENT_ROUNDS - 1)):
-                if cancel_event and cancel_event.is_set():
-                    yield {"event": "cancel_ack", "data": {}}
-                    return
-                if time.monotonic() > deadline:
-                    break
-                response = await asyncio.to_thread(_turn, messages, tools)
-                usage = self._merge_usage(usage, response.get("usage") or {})
-                calls = response.get("tool_calls") or []
-                if not calls:
-                    # The model answered without tools; keep its message out of
-                    # the history so the streamed turn produces the text.
-                    break
-                messages.append(
-                    response.get("assistant_message")
-                    or {"role": "assistant", "content": response.get("content") or ""}
-                )
-                for call in calls:
-                    name = call.get("name") or ""
-                    args = self._parse_tool_arguments(call)
-                    # Tell the client what is happening before the slow part.
-                    yield {"event": "trace", "data": {"tool": name, "status": "running"}}
-                    result = await asyncio.to_thread(_run_tool, name, args)
-                    tool_trace.append({"tool": name, "arguments": args})
-                    self.logger.info(
-                        "attachment_tool_called",
-                        tool=name,
-                        conversation_id=conversation_id,
+            # The tool rounds run in the worker, exactly as they do on the
+            # batch path — a second copy of the agent loop here is a second
+            # copy of its defects. `stream_final` stops the worker once the
+            # tools are done and hands back the conversation it built; the
+            # final turn offers no tools, so there is no model-chosen control
+            # flow left in it to contain, and this side streams it.
+            traces: List[dict] = []
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._serve_invocation,
+                    invocation,
+                    "agent.files_v1",
+                    {
+                        "inputs": dict(inputs or {}),
+                        "messages": messages,
+                        "tools": tools,
+                        "message": message,
+                        "max_rounds": self.MAX_AGENT_ROUNDS,
+                        "deadline_seconds": self.AGENT_DEADLINE_SECONDS,
+                        "stream_final": True,
+                    },
+                    InvocationContext(
                         user_id=user_id,
-                        streaming=True,
-                    )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id") or name,
-                            "name": name,
-                            "content": result,
-                        }
-                    )
+                        tenant_id=tenant_id,
+                        conversation_id=conversation_id,
+                        context_id=context_id,
+                        adapters=list(adapters or []),
+                        history=list(history or []),
+                        user_message=user_message,
+                        # On the context, never in the plan above: the plan is
+                        # what the worker reads, and an entry there carries the
+                        # server's URL and its taint class.
+                        mcp_tools=mcp_tools,
+                    ),
+                    self._worker_limits(self.tool_registry.get("agent.files_v1")),
+                    on_capability=traces.append,
+                ),
+                timeout=self.AGENT_DEADLINE_SECONDS,
+            )
+            for entry in traces:
+                yield {"event": "trace", "data": entry}
+            if cancel_event and cancel_event.is_set():
+                yield {"event": "cancel_ack", "data": {}}
+                return
+            messages = result.get("messages") or messages
+            usage = self._merge_usage(usage, result.get("usage") or {})
+            snippets.extend(result.get("context_snippets") or [])
+            tool_trace.extend(result.get("tool_calls") or [])
+            session["artifacts"] = list(result.get("artifacts") or [])
+            session["injection_findings"] = list(
+                result.get("injection_findings") or []
+            )
 
             # Final turn: no tools offered, so the model must answer — streamed.
             content_parts: List[str] = []
@@ -578,6 +594,10 @@ class WorkflowStreamingMixin:
                 await asyncio.sleep(0)
             content = "".join(content_parts)
         except Exception as exc:  # noqa: BLE001 - degrade to a plain answer
+            # Revoke before degrading, not after: the fallback below runs
+            # inside this handler, so a worker left alive would be answering
+            # capability requests while a second answer is being produced.
+            await asyncio.to_thread(invocation.revoke, "agent_stream_failed")
             self.logger.warning(
                 "attachment_agent_stream_failed",
                 conversation_id=conversation_id,
@@ -588,7 +608,6 @@ class WorkflowStreamingMixin:
                 # Keep the partial answer rather than gluing a second one after
                 # it; the caller stores what was streamed.
                 content = "".join(content_parts)
-                interpreter.cleanup_workdir(session.pop("workdir", None))
                 yield {
                     "event": "message_done",
                     "data": {
@@ -615,7 +634,12 @@ class WorkflowStreamingMixin:
                 yield event
             return
         finally:
-            interpreter.cleanup_workdir(session.get("workdir"))
+            if cancel_watch is not None:
+                cancel_watch.cancel()
+            # Closing the execution kills what it started and removes the
+            # scratch, on every path out of here — including the one where a
+            # token had already reached the client. Off the loop: it blocks.
+            await asyncio.to_thread(invocation.close)
 
         yield {
             "event": "message_done",

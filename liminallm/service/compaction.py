@@ -21,6 +21,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from liminallm.logging import get_logger
+from liminallm.service.ranking import SEMANTIC_WEIGHT as RANKING_SEMANTIC_WEIGHT
+from liminallm.service.ranking import fuse_ranks, ranked_positive
 from liminallm.service.tokenizer_utils import estimate_token_count
 
 logger = get_logger(__name__)
@@ -224,14 +226,6 @@ RECALL_HEADER = (
 )
 
 
-def _normalized_scores(raw: List[float]) -> List[float]:
-    """Scale scores to [0,1] by their own max, so signals blend fairly."""
-    top = max(raw) if raw else 0.0
-    if top <= 0:
-        return [0.0] * len(raw)
-    return [max(0.0, s) / top for s in raw]
-
-
 # How many top-BM25 turns get the expensive semantic rerank. Bounds provider
 # embedding calls per recall to at most this many on-demand embeds, so the
 # hot path cost is fixed regardless of conversation length.
@@ -262,7 +256,7 @@ def rank_turns(
     query: str,
     *,
     embeddings=None,
-    semantic_weight: float = 0.6,
+    semantic_weight: float = RANKING_SEMANTIC_WEIGHT,
     max_embed: int = SEMANTIC_RERANK_CANDIDATES,
 ) -> List[float]:
     """Relevance score per older turn: hybrid semantic+BM25, or BM25 alone.
@@ -282,7 +276,10 @@ def rank_turns(
     from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 
     corpus = [tokenize_text(str(getattr(m, "content", "") or "")) for m in older]
-    bm25 = _normalized_scores(compute_bm25_scores(tokenize_text(query), corpus))
+    # Raw, not normalized: rank fusion reads order and nothing else, and the
+    # bm25-only return below is consumed the same way — sorted and filtered
+    # for a positive score. Scaling it was work with no reader.
+    bm25 = compute_bm25_scores(tokenize_text(query), corpus)
 
     if embeddings is None or not getattr(embeddings, "is_semantic", False):
         return bm25
@@ -304,8 +301,6 @@ def rank_turns(
     for i in order:
         vec = _message_embedding(older[i], model_id)
         if vec is None:
-            if budget <= 0 and bm25[i] == 0:
-                continue  # nothing cheap left to justify an embed
             if budget <= 0:
                 continue
             try:
@@ -315,10 +310,18 @@ def rank_turns(
                 vec = None
         if vec:
             sem_raw[i] = cosine_similarity(query_vec, vec)
-    semantic = _normalized_scores(sem_raw)
 
+    # Fused by rank, the same rule rag and notes use (SPEC §2.5). It suits the
+    # cost bound especially well: a turn nobody could afford to embed simply
+    # does not appear in the semantic channel, which is the honest reading of
+    # "not scored" — where a weighted sum had to call it a zero and let that
+    # zero drag the turn down.
     w = min(max(semantic_weight, 0.0), 1.0)
-    return [w * s + (1 - w) * b for s, b in zip(semantic, bm25)]
+    fused = fuse_ranks([
+        (1.0 - w, ranked_positive(bm25)),
+        (w, ranked_positive(sem_raw)),
+    ])
+    return [fused.get(i, 0.0) for i in range(len(older))]
 
 
 def recall_turns(

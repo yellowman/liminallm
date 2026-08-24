@@ -251,3 +251,67 @@ class TestSpecCompliance:
         """Should return 409 if prior attempt is still running per SPEC §18."""
         # Tested in test_raises_conflict_when_in_progress
         pass
+
+
+# --- A cached response has to be serializable ------------------------------
+
+
+@pytest.mark.parametrize(
+    "path, body",
+    [
+        (
+            "/v1/artifacts",
+            {
+                "type": "workflow",
+                "name": "idempotent-workflow",
+                "description": "d",
+                "schema": {"kind": "workflow.chat", "nodes": []},
+            },
+        ),
+        (
+            "/v1/contexts",
+            {"name": "idempotent-context", "description": "d"},
+        ),
+    ],
+)
+def test_an_idempotency_key_does_not_break_a_response_with_timestamps(
+    client, auth_headers, path, body
+):
+    """SPEC §18 accepts Idempotency-Key on these routes. It has to work.
+
+    The guard cached `envelope.model_dump()`, which leaves `datetime` objects
+    as objects, and the record is then JSON-encoded — so every route whose
+    response carries `created_at` answered 500 the moment a client sent the
+    header it is invited to send. Without the header the same request
+    succeeds, which is why nothing noticed.
+    """
+    import uuid as _uuid
+
+    keyed = client.post(
+        path,
+        headers={**auth_headers, "Idempotency-Key": _uuid.uuid4().hex},
+        json=body,
+    )
+    assert keyed.status_code in (200, 201), (
+        f"{path} failed only because an Idempotency-Key was supplied: "
+        f"{keyed.status_code} {keyed.text[:300]}"
+    )
+
+
+def test_a_repeated_key_returns_the_first_response(client, auth_headers):
+    """And the cached copy is the one that comes back."""
+    import uuid as _uuid
+
+    key = _uuid.uuid4().hex
+    body = {"name": "replayed-context", "description": "d"}
+    first = client.post(
+        "/v1/contexts", headers={**auth_headers, "Idempotency-Key": key}, json=body
+    )
+    assert first.status_code in (200, 201), first.text
+    second = client.post(
+        "/v1/contexts", headers={**auth_headers, "Idempotency-Key": key}, json=body
+    )
+    assert second.status_code in (200, 201), second.text
+    assert second.json()["data"]["id"] == first.json()["data"]["id"], (
+        "the replay created a second context instead of returning the first"
+    )

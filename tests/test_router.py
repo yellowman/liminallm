@@ -31,8 +31,8 @@ def test_router_applies_rules_and_normalizes():
         "max_active_adapters": 2,
     }
     adapters = [
-        {"id": "a1", "embedding": [1.0, 0.0]},
-        {"id": "a2", "embedding": [0.0, 1.0]},
+        {"id": "a1", "mode": "hybrid", "embedding": [1.0, 0.0]},
+        {"id": "a2", "mode": "hybrid", "embedding": [0.0, 1.0]},
     ]
     ctx_emb = [1.0, 0.0]
 
@@ -51,8 +51,8 @@ def test_router_similarity_boost_when_no_rules_fire():
     # invalid; use full-width vectors so the similarity boost can be computed.
     ctx_emb = [1.0] + [0.0] * (EMBEDDING_DIM - 1)
     adapters = [
-        {"id": "similar", "embedding": [1.0] + [0.0] * (EMBEDDING_DIM - 1)},
-        {"id": "dissimilar", "embedding": [0.0, 1.0] + [0.0] * (EMBEDDING_DIM - 2)},
+        {"id": "similar", "mode": "hybrid", "embedding": [1.0] + [0.0] * (EMBEDDING_DIM - 1)},
+        {"id": "dissimilar", "mode": "hybrid", "embedding": [0.0, 1.0] + [0.0] * (EMBEDDING_DIM - 2)},
     ]
 
     result = asyncio.run(engine.route({}, ctx_emb, adapters))

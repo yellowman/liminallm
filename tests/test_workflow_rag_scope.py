@@ -8,13 +8,23 @@ class RecordingRAG:
     def __init__(self):
         self.calls = []
 
-    def retrieve(self, context_ids, query, limit=4, *, user_id=None, tenant_id=None):
+    def retrieve(
+        self,
+        context_ids,
+        query,
+        limit=4,
+        *,
+        user_id=None,
+        tenant_id=None,
+        path_scope=None,
+    ):
         self.calls.append(
             {
                 "context_ids": context_ids,
                 "query": query,
                 "user_id": user_id,
                 "tenant_id": tenant_id,
+                "path_scope": path_scope,
             }
         )
         return []
@@ -44,7 +54,25 @@ class StubStore:
         return []
 
     def list_contexts(self, owner_user_id=None, **kwargs):
-        return [SimpleNamespace(id="ctx-1", owner_user_id=owner_user_id)]
+        return [self._context("ctx-1", owner_user_id)]
+
+    @staticmethod
+    def _context(ctx_id, owner_user_id):
+        return SimpleNamespace(id=ctx_id, owner_user_id=owner_user_id, meta=None)
+
+    def get_contexts_for_scope(self, owner_user_id, context_ids):
+        """The named contexts this owner has, mirroring the real store.
+
+        Authorization asks about particular ids rather than reading a page,
+        so the double has to answer that question too — a stub that only
+        knows the old method silently authorizes nothing, and the test then
+        fails somewhere else entirely.
+        """
+        return [
+            self._context(ctx_id, owner_user_id)
+            for ctx_id in context_ids or []
+            if ctx_id == "ctx-1"
+        ]
 
     def get_user(self, user_id):
         return SimpleNamespace(id=user_id, tenant_id="tenant-1")

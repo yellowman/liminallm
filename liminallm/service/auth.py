@@ -20,11 +20,44 @@ from argon2.exceptions import InvalidHash, VerifyMismatchError
 
 from liminallm.config import Settings
 from liminallm.logging import get_logger
-from liminallm.storage.models import Session, User
+from liminallm.service.tenancy import user_belongs_to_site
+from liminallm.storage.models import ApiKey, Session, User
 from liminallm.storage.redis_cache import RedisCache
 
 if TYPE_CHECKING:  # PostgresStore imports from service/, so keep this type-only.
     from liminallm.storage.postgres import PostgresStore
+
+
+def _password_hasher() -> PasswordHasher:
+    """Argon2id at production cost, or a deliberately cheap one under test.
+
+    The library defaults spend 64 MiB and about 65 ms per hash, and that cost
+    is the entire point: it is what makes a stolen hash expensive to attack.
+
+    The test suite creates thousands of accounts and buys nothing with it —
+    measured at 11.5% of the suite's wall clock. So TEST_MODE, and only
+    TEST_MODE, lowers the parameters. There is deliberately no setting of its
+    own: a knob that weakens password hashing is one an operator can turn by
+    accident, and `test_mode` is already the flag that refuses to be on in
+    production.
+
+    Existing hashes keep verifying either way. Argon2 encodes its parameters
+    in the hash string, so `verify` reads them from the stored value rather
+    than from whatever this returns.
+    """
+    from liminallm.config import get_settings
+
+    if get_settings().test_mode:
+        # The minimum the algorithm accepts: 8 KiB per lane, one pass.
+        return PasswordHasher(
+            type=Type.ID, time_cost=1, memory_cost=8, parallelism=1
+        )
+    return PasswordHasher(type=Type.ID)
+
+# Bearer keys for the served Responses API. The prefix makes a key
+# recognizable in a paste or a log scrub, and — having no dots — impossible
+# to confuse with a JWT.
+API_KEY_PREFIX = "sk-liminal-"
 
 # OAuth provider configurations
 OAUTH_PROVIDERS = {
@@ -99,8 +132,8 @@ class AuthService:
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
         self._email_verification_tokens: dict[str, tuple[str, datetime]] = {}
         # Issue 11.2: In-memory fallback for password reset tokens when Redis unavailable
-        self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (email, expires_at)
-        self._pwd_hasher = PasswordHasher(type=Type.ID)
+        self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (user_id, expires_at)
+        self._pwd_hasher = _password_hasher()
         self.logger = logger
         self._last_cleanup = datetime.now(timezone.utc)
         # Allowance for small clock skew across nodes (Issue 76.1/76.2)
@@ -590,6 +623,18 @@ class AuthService:
         existing = self.store.get_user_by_provider(provider, provider_uid)
         email = identity.get("email")
         user = existing or (self.store.get_user_by_email(email) if email else None)
+        if user and not self._site_matches(user, normalized_tenant):
+            # The provider proved who they are, not where they belong. Email
+            # is globally unique, so a lookup finds the account whatever site
+            # the flow started at; without this, signing in with Google at
+            # globex minted acme's tokens. The password path has always
+            # refused this — the two ways in must agree.
+            self.logger.warning(
+                "oauth_tenant_mismatch",
+                provider=provider,
+                site_tenant=normalized_tenant,
+            )
+            return None, None, {}
         if not user:
             user_email = identity.get("email") or f"{provider_uid}@{provider}.oauth"
             handle = identity.get("handle") or provider_uid
@@ -645,8 +690,63 @@ class AuthService:
                 )
         return user
 
-    def delete_user(self, user_id: str) -> bool:
-        return bool(self.store.delete_user(user_id))
+    async def delete_user(self, user_id: str) -> bool:
+        """Erase the account, then the copies of it that live outside Postgres.
+
+        In that order, and never the reverse. Postgres is canonical: the
+        deletion must commit whether or not Redis can be reached, so the purge
+        is best-effort and runs afterwards. A cache that refuses to forget is
+        a stale read; a deletion that refuses to commit because a cache is
+        down is an account that cannot be erased at all.
+
+        Individual chat deletion already retires its cached summary. Bulk
+        erasure went straight to the store and skipped it, so an erased
+        account's recent messages stayed readable under `chat:summary:<id>`
+        for the rest of the TTL — an hour, by default.
+        """
+        erasure = self.store.delete_user(user_id)
+        if erasure is None:
+            return False
+        if self.cache:
+            try:
+                purged = await self.cache.purge_user_state(erasure)
+            except Exception as exc:
+                # Named, not swallowed: the rows are gone and the operator
+                # needs to know a copy may have outlived them.
+                self.logger.warning(
+                    "user_hot_state_purge_failed", user_id=user_id, error=str(exc)
+                )
+            else:
+                failed = sorted(k for k, v in purged.items() if v < 0)
+                if failed:
+                    self.logger.warning(
+                        "user_hot_state_purge_partial",
+                        user_id=user_id,
+                        families=failed,
+                    )
+                self.logger.info(
+                    "user_hot_state_purged", user_id=user_id, **purged
+                )
+        return True
+
+    def _site_matches(self, user: User, site_tenant: Optional[str]) -> bool:
+        """Does this account belong on the site the request arrived at?
+
+        Both halves of a tenanted request must agree (service/tenancy.py).
+        One method rather than one copy per entry point: the next change to
+        this rule — an audit line, a role carve-out — must not be able to
+        land in three places and miss the fourth, because the one it misses
+        is an authorization hole.
+
+        ``None`` means the caller resolved no site and is not making a
+        tenanted decision: logout revokes your own session and needs no
+        opinion about where you belong. A hint that arrived *blank* is a
+        different thing — that caller tried to resolve a site and failed,
+        which is the case least safe to wave through.
+        """
+        if site_tenant is None:
+            return True
+        return user_belongs_to_site(user.tenant_id, site_tenant)
 
     async def login(
         self,
@@ -662,7 +762,7 @@ class AuthService:
         user = self.store.get_user_by_email(email)
         if not user or not self.verify_password(user.id, password):
             return None, None, {}
-        if tenant_id and tenant_id != user.tenant_id:
+        if not self._site_matches(user, tenant_id):
             return None, None, {}
 
         # SPEC §18: Single-session mode - invalidate prior sessions if enabled
@@ -723,7 +823,7 @@ class AuthService:
             return None, None, {}
         if payload.get("sub") != user.id or payload.get("tenant_id") != user.tenant_id:
             return None, None, {}
-        if tenant_hint and tenant_hint != user.tenant_id:
+        if not self._site_matches(user, tenant_hint):
             return None, None, {}
         if not self._refresh_token_matches(session, jti):
             return None, None, {}
@@ -830,7 +930,7 @@ class AuthService:
         user = self.store.get_user(sess.user_id)
         if not user:
             return None
-        if tenant_hint and tenant_hint != user.tenant_id:
+        if not self._site_matches(user, tenant_hint):
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None
@@ -1000,6 +1100,54 @@ class AuthService:
             required_role=required_role,
         )
 
+    def mint_api_key(self, user_id: str, *, name: str) -> Tuple["ApiKey", str]:
+        """Create a key and return (record, plaintext) — the one plaintext sighting.
+
+        The stored form is a SHA-256; a random 256-bit key needs no slow hash,
+        that cost model belongs to low-entropy passwords.
+        """
+        secret = secrets.token_urlsafe(32)
+        plaintext = f"{API_KEY_PREFIX}{secret}"
+        record = self.store.create_api_key(
+            user_id,
+            name=name,
+            key_hash=hashlib.sha256(plaintext.encode()).hexdigest(),
+            prefix=plaintext[: len(API_KEY_PREFIX) + 4],
+        )
+        return record, plaintext
+
+    def authenticate_api_key(
+        self, authorization: Optional[str], *, tenant_hint: Optional[str] = None
+    ) -> Optional[AuthContext]:
+        """A bearer API key to a principal, or None if this isn't one.
+
+        Keys skip the session and MFA machinery on purpose: minting one
+        already required a fully authenticated session, and the key is its
+        own credential class with its own revocation (the tombstone). The
+        tenant check is NOT skipped — a key must not cross sites any more
+        than a token may.
+        """
+        token = self._extract_bearer(authorization)
+        if not token or not token.startswith(API_KEY_PREFIX):
+            return None
+        record = self.store.get_api_key_by_hash(
+            hashlib.sha256(token.encode()).hexdigest()
+        )
+        if not record or record.revoked_at is not None:
+            return None
+        user = self.store.get_user(record.user_id)
+        if not user or not user.is_active:
+            return None
+        if not self._site_matches(user, tenant_hint):
+            return None
+        self.store.touch_api_key(record.id)
+        return AuthContext(
+            user_id=user.id,
+            role=user.role,
+            tenant_id=user.tenant_id,
+            session_id=None,
+        )
+
     def issue_tokens_for_session(
         self, session_id: str
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
@@ -1048,7 +1196,7 @@ class AuthService:
         if not cfg:
             return False
 
-        # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §18)
+        # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §12.1)
         now = self._now()
 
         # Issue 19.3: Use atomic MFA lockout to prevent check-then-act race condition
@@ -1112,33 +1260,65 @@ class AuthService:
             self._mark_session_verified(session_id)
         return True
 
-    async def initiate_password_reset(self, email: str) -> str:
+    async def initiate_password_reset(self, user: User) -> Optional[str]:
+        """Issue a token that names one account, the way verification does.
+
+        The token records `user.id`, not the address it was requested for. An
+        email address is a reassignable name: delete the account that asked
+        for a reset, register the same address, and a token that named the
+        address would resolve to the new account and change its password.
+        Nothing in the flow looks unusual — the attacker holds a token their
+        own account was legitimately issued. Ids are never reused, so binding
+        to one makes the token expire with the account rather than follow the
+        address to whoever holds it next.
+
+        Returns None when the account has gone between the caller resolving it
+        and this write. `/auth/reset/request` resolves the user and then calls
+        here, so an erasure can commit and purge in that gap and this would
+        put a fresh token naming the erased account back afterwards. The
+        caller sends no email and answers exactly as it does for an address
+        that never existed — which is what it already does, and why the
+        distinction is invisible from outside.
+        """
         # Use raw bytes for proper entropy (not string representation)
-        token = hashlib.sha256(b"reset-" + email.encode() + os.urandom(32)).hexdigest()
+        token = hashlib.sha256(b"reset-" + user.id.encode() + os.urandom(32)).hexdigest()
         expires_at = self._now() + timedelta(minutes=15)
-        # Persist a short-lived reset token with TTL in Redis if available
-        if self.cache:
-            await self.cache.client.set(
-                f"reset:{token}",
-                email,
-                ex=int((expires_at - self._now()).total_seconds()),
-            )
-        else:
-            # Issue 11.2: In-memory fallback for password reset tokens.
-            # _with_state_lock() already acquires _state_lock (a non-reentrant
-            # Lock); acquiring it again here would deadlock.
-            with self._with_state_lock():
-                self._password_reset_tokens[token] = (email, expires_at)
-        self.logger.info(
-            "password_reset_requested",
-            email_hash=hashlib.sha256(email.encode()).hexdigest(),
-        )
+        with self.store.hold_live_user(user.id) as live:
+            if not live:
+                self.logger.info("password_reset_skipped_erased", user_id=user.id)
+                return None
+            # Persist a short-lived reset token with TTL in Redis if available
+            if self.cache:
+                await self.cache.client.set(
+                    f"reset:{token}",
+                    user.id,
+                    ex=int((expires_at - self._now()).total_seconds()),
+                )
+            else:
+                # Issue 11.2: In-memory fallback for password reset tokens.
+                # _with_state_lock() already acquires _state_lock (a
+                # non-reentrant Lock); acquiring it again here would deadlock.
+                with self._with_state_lock():
+                    self._password_reset_tokens[token] = (user.id, expires_at)
+        self.logger.info("password_reset_requested", user_id=user.id)
         return token
 
     async def complete_password_reset(self, token: str, new_password: str) -> bool:
-        email = None
+        """Consume the token, then act on what it named.
+
+        In that order. Reading the token and deleting it after the password
+        was written left it valid for the length of the reset, so two requests
+        holding it both resolved a subject and both wrote — the password
+        ending up as whichever arrived last. Consumed first, the second
+        request finds nothing.
+
+        One-time means one attempt, not one success: nothing below puts the
+        token back when the reset fails. Restoring it would be replayability
+        under a friendlier name.
+        """
+        user_id = None
         if self.cache:
-            email = await self.cache.client.get(f"reset:{token}")
+            user_id = await self.cache.consume_identity_token("reset", token)
         else:
             # Issue 11.2: In-memory fallback for password reset tokens. Hold the
             # state lock once for the whole read-modify-write (nesting
@@ -1146,24 +1326,24 @@ class AuthService:
             with self._with_state_lock():
                 stored = self._password_reset_tokens.get(token)
                 if stored:
-                    stored_email, expires_at = stored
+                    stored_user_id, expires_at = stored
                     if expires_at <= self._now() - self._clock_skew_leeway:
                         # Remove expired token to prevent memory leak
                         self._password_reset_tokens.pop(token, None)
                     else:
-                        email = stored_email
+                        user_id = stored_user_id
                         self._password_reset_tokens.pop(token, None)
-        if not email:
+        if not user_id:
             self.logger.warning("password_reset_invalid_token", token_prefix=token[:8])
             return False
-        if isinstance(email, bytes):
-            email = email.decode()
-        user = self.store.get_user_by_email(email)
+        if isinstance(user_id, bytes):
+            user_id = user_id.decode()
+        # By id. `get_user_by_email` would resolve to whichever account owns
+        # the address now, which after an erasure need not be the one that
+        # asked for the reset.
+        user = self.store.get_user(user_id)
         if not user:
-            self.logger.warning(
-                "password_reset_user_missing",
-                email_hash=hashlib.sha256(email.encode()).hexdigest(),
-            )
+            self.logger.warning("password_reset_user_missing", user_id=user_id)
             return False
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)
@@ -1173,34 +1353,49 @@ class AuthService:
             self.logger.warning(
                 "revoke_sessions_failed", user_id=user.id, error=str(exc)
             )
-        if self.cache:
-            await self.cache.client.delete(f"reset:{token}")
         self.logger.info("password_reset_completed", user_id=user.id)
         return True
 
-    async def request_email_verification(self, user: User) -> str:
+    async def request_email_verification(self, user: User) -> Optional[str]:
+        """As above: the token is written under the account it names.
+
+        Returns None when the account has gone between the caller resolving it
+        and this write, so an erasure's purge is the last word on this
+        account's identity tokens.
+        """
         # Use raw bytes for proper entropy (not string representation)
         token = hashlib.sha256(
             b"verify-" + user.email.encode() + os.urandom(32)
         ).hexdigest()
         expires_at = self._now() + timedelta(hours=24)
-        if self.cache:
-            await self.cache.client.set(
-                f"verify:{token}",
-                user.id,
-                ex=int((expires_at - self._now()).total_seconds()),
-            )
-        else:
-            # Issue 28.4: Thread-safe state mutation
-            with self._state_lock:
-                self._email_verification_tokens[token] = (user.id, expires_at)
+        with self.store.hold_live_user(user.id) as live:
+            if not live:
+                self.logger.info("email_verification_skipped_erased", user_id=user.id)
+                return None
+            if self.cache:
+                await self.cache.client.set(
+                    f"verify:{token}",
+                    user.id,
+                    ex=int((expires_at - self._now()).total_seconds()),
+                )
+            else:
+                # Issue 28.4: Thread-safe state mutation
+                with self._state_lock:
+                    self._email_verification_tokens[token] = (user.id, expires_at)
         self.logger.info("email_verification_requested", user_id=user.id)
         return token
 
     async def complete_email_verification(self, token: str) -> bool:
+        """Consumed first, for the same reason the reset is.
+
+        Marking a mailbox verified twice is harmless, so this one is not a
+        vulnerability. It is the same one-time primitive, and leaving one of
+        its two users reading first is how the next reader concludes that
+        reading first is the house pattern.
+        """
         user_id = None
         if self.cache:
-            user_id = await self.cache.client.get(f"verify:{token}")
+            user_id = await self.cache.consume_identity_token("verify", token)
         else:
             # Issue 28.4: Thread-safe state access
             with self._state_lock:
@@ -1223,11 +1418,6 @@ class AuthService:
             self.logger.warning("email_verification_missing_user", user_id=user_id)
             return False
         self.store.mark_email_verified(user.id)
-        if self.cache:
-            await self.cache.client.delete(f"verify:{token}")
-        else:
-            with self._state_lock:
-                self._email_verification_tokens.pop(token, None)
         self.logger.info("email_verified", user_id=user.id)
         return True
 
@@ -1520,7 +1710,7 @@ class AuthService:
             or payload.get("role") != user.role
         ):
             return None
-        if tenant_hint and tenant_hint != user.tenant_id:
+        if not self._site_matches(user, tenant_hint):
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None

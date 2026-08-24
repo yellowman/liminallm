@@ -1,14 +1,19 @@
 -- liminallm schema (SPEC §2).
 --
--- One file, applied once. There is no migration history: this project has
--- never been deployed, so numbered migrations only carried the fiction of an
--- upgrade path that never existed — and with it a real hazard, since the
--- pgvector dimension change had to guess what a "previous encoder" left
--- behind. A single schema has no previous state to reconcile.
+-- This file states the desired schema, not a step in a history. It is applied
+-- by scripts/migrate.sh, which is the only thing that applies it and which
+-- passes :embedding_dim from EMBEDDING_VECTOR_DIM.
 --
--- Apply with scripts/migrate.sh (which passes :embedding_dim from
--- EMBEDDING_VECTOR_DIM). Every statement is IF NOT EXISTS / idempotent, so
--- re-running is safe.
+-- Every statement here must be safe to execute repeatedly against every
+-- database state the project supports: declarations are IF NOT EXISTS, and a
+-- data-repair block must reach the same result whether it runs once or many
+-- times. That property is what makes re-running the schema safe, so it is a
+-- requirement on anything added to this file, not an observation about what
+-- the file currently happens to contain.
+--
+-- If a schema change ever cannot be written that way, add an ordered
+-- migration mechanism before shipping the change rather than weakening the
+-- rule here.
 
 -- pgvector needs a fixed dimension to build an ivfflat index; a bare VECTOR
 -- column fails with "column does not have dimensions". This must match the
@@ -118,7 +123,10 @@ CREATE INDEX IF NOT EXISTS idx_message_conversation_id ON message(conversation_i
 -- Artifact tables aligned to the SPEC kernel primitives
 CREATE TABLE IF NOT EXISTS artifact (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  owner_user_id   UUID REFERENCES app_user(id) ON DELETE CASCADE,
+  -- RESTRICT, not CASCADE and not SET NULL: see the constraint block below
+  -- for why, and for the migration that corrects a database created before
+  -- this line did.
+  owner_user_id   UUID REFERENCES app_user(id) ON DELETE RESTRICT,
   type            TEXT NOT NULL,
   name            TEXT NOT NULL,
   description     TEXT,
@@ -151,6 +159,57 @@ ALTER TABLE artifact
   ADD COLUMN IF NOT EXISTS base_model TEXT;
 ALTER TABLE artifact_version
   ADD COLUMN IF NOT EXISTS base_model TEXT;
+
+-- The key does not guess what an artifact's lifetime should be.
+--
+-- Deleting an account means two different things depending on visibility, and
+-- a foreign key cannot see visibility. Both guesses are wrong in a way that
+-- destroys something:
+--
+--   CASCADE  — what this was — removes every artifact the account published.
+--              A global MCP server, its versions and its config-patch history
+--              vanish because a person left, which SPEC §12.3 says is a change
+--              only config ops may make.
+--   SET NULL — the first correction, and wrong in the other direction: a
+--              *private* artifact survives the deletion of the account that
+--              owned it, unattributed, with its payload still on disk. §2.1
+--              says an account's private artifacts go with it.
+--
+-- So the key refuses instead. `delete_user` is the path that knows the rule:
+-- inside one transaction it deletes the private rows, detaches the published
+-- ones, and only then removes the account — by which point nothing references
+-- it and RESTRICT has nothing to refuse. Measured: `delete_user` completes
+-- unchanged against this constraint.
+--
+-- What RESTRICT costs is a raw `DELETE FROM app_user` that skipped all of
+-- that, and refusing it is the point. An operation that cannot state which
+-- artifacts should die and which should be detached is an operation that
+-- should stop, not one that should pick.
+--
+-- Owner-less remains a real state, reached by detaching rather than by
+-- deletion: `_get_owned_artifact` treats it as a system artifact only an
+-- admin may reach, and `mcp_client.servers_for_turn` skips it, because the
+-- admin attestation is what made it a capability.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint c
+    WHERE c.conrelid = 'artifact'::regclass
+      AND c.contype = 'f'
+      AND c.confrelid = 'app_user'::regclass
+      AND c.confdeltype <> 'r'
+  ) THEN
+    ALTER TABLE artifact
+      DROP CONSTRAINT IF EXISTS artifact_owner_user_id_fkey;
+    -- A database that ran with CASCADE may hold no offending rows at all, and
+    -- one that ran with SET NULL may hold detached private artifacts. Neither
+    -- blocks ADD CONSTRAINT: the key constrains deletion of the parent, not
+    -- the state of the child, so this installs over any history.
+    ALTER TABLE artifact
+      ADD CONSTRAINT artifact_owner_user_id_fkey
+      FOREIGN KEY (owner_user_id) REFERENCES app_user(id) ON DELETE RESTRICT;
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_artifact_owner_user_id ON artifact(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_artifact_type ON artifact(type);
@@ -213,17 +272,125 @@ CREATE TABLE IF NOT EXISTS knowledge_chunk (
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_idx ON knowledge_chunk (context_id);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_embedding_idx ON knowledge_chunk
 USING ivfflat (embedding) WITH (lists = 100);
+-- The lexical half of hybrid retrieval (SPEC §2.5). 'simple' takes no
+-- stemming and no language, so an identifier indexes as itself; the two-arg
+-- to_tsvector is IMMUTABLE, which is what makes it usable in a generated
+-- column. Stored rather than computed per query: the WHERE clause is served
+-- by the index either way, but ts_rank in the ORDER BY has to tokenize every
+-- matching row, and on a large context that was the dominant cost of the
+-- channel — paid on every grounded chat turn.
+ALTER TABLE knowledge_chunk
+  ADD COLUMN IF NOT EXISTS content_tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;
+CREATE INDEX IF NOT EXISTS knowledge_chunk_content_fts_idx ON knowledge_chunk
+USING gin (content_tsv);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_fs_path_idx ON knowledge_chunk (fs_path);
+
+-- Late interaction (SPEC §2.5): several vectors per chunk, compared at query
+-- time by MaxSim. A pooled chunk vector has to average everything the chunk
+-- says into one point; these keep the parts separate. Same encoder and so the
+-- same width as knowledge_chunk.embedding — a segment vector is only ever
+-- compared against a query vector from the same encoder.
+CREATE TABLE IF NOT EXISTS knowledge_chunk_vector (
+  id              BIGSERIAL PRIMARY KEY,
+  chunk_id        BIGINT NOT NULL REFERENCES knowledge_chunk(id) ON DELETE CASCADE,
+  segment_index   INT NOT NULL,
+  content         TEXT NOT NULL,
+  embedding       VECTOR(:embedding_dim) NOT NULL,
+  meta            JSONB
+);
+CREATE INDEX IF NOT EXISTS knowledge_chunk_vector_embedding_idx ON knowledge_chunk_vector
+USING ivfflat (embedding) WITH (lists = 100);
+-- (chunk_id, segment_index) also serves every lookup by chunk_id alone, so
+-- there is no separate index on the leading column. Late interaction makes
+-- this the hottest write path in ingestion; a second btree to maintain per
+-- segment row would be paid on every insert and read by nothing.
+CREATE UNIQUE INDEX IF NOT EXISTS knowledge_chunk_vector_segment_idx
+ON knowledge_chunk_vector (chunk_id, segment_index);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_chunk_idx ON knowledge_chunk (context_id, chunk_index);
 
--- Add FK constraint for conversation.active_context_id now that knowledge_context exists
+-- Deferred re-indexing (SPEC "refresh cadence": a file change enqueues an
+-- ingestion job). A file's bytes change in one request; the set of contexts
+-- covering that file is not bounded by anything that request chose, so the
+-- old chunks are dropped immediately and the re-read is recorded here.
+--
+-- `generation` is the checksum of the bytes the job was queued for. A worker
+-- compares it against what is on disk when it runs and declines to write when
+-- they differ, so a job queued for an older generation can never overwrite a
+-- newer one.
+CREATE TABLE IF NOT EXISTS ingest_job (
+  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  context_id      UUID NOT NULL REFERENCES knowledge_context(id) ON DELETE CASCADE,
+  fs_path         TEXT NOT NULL,
+  generation      TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'queued',
+  attempts        INT NOT NULL DEFAULT 0,
+  detail          TEXT,
+  -- When this job may next be claimed. A failure pushes it out by a backoff,
+  -- because a worker drains until the queue is empty: without a due time it
+  -- would claim, fail and requeue the same job in a tight loop and spend the
+  -- whole retry budget in seconds, which is no protection at all against the
+  -- transient outages the retries exist for.
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- This file is the whole schema story, so it has to converge on a database
+-- built from an earlier revision of itself rather than only on an empty one.
+-- `CREATE TABLE IF NOT EXISTS` silently skips a column added later, and
+-- `CREATE INDEX IF NOT EXISTS` keeps an index whose definition has changed.
+ALTER TABLE ingest_job
+  ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now();
+DROP INDEX IF EXISTS ingest_job_ready_idx;
+CREATE INDEX IF NOT EXISTS ingest_job_ready_idx
+ON ingest_job (status, next_attempt_at);
+-- One pending job per (context, path): a file replaced five times before the
+-- queue is drained needs one re-read of its final bytes, not five of which
+-- four are already obsolete. Enqueue overwrites the generation, so the slot
+-- always holds the newest replacement.
+CREATE UNIQUE INDEX IF NOT EXISTS ingest_job_pending_idx
+ON ingest_job (context_id, fs_path) WHERE status = 'queued';
+
+-- Add FK constraint for conversation.active_context_id now that
+-- knowledge_context exists.
+--
+-- Asked by shape, not by name. The guard used to look for a constraint called
+-- `conversation_active_context_id_fkey` in information_schema, which lists
+-- every constraint type — so anything of that name, a CHECK included,
+-- convinced it the work was done and the foreign key was never created. The
+-- column then held arbitrary UUIDs, and deleting a context left every
+-- conversation bound to it pointing at a row that no longer exists.
+--
+-- `ON DELETE SET NULL` specifically: a conversation's binding to a context is
+-- a preference, so retiring the context releases the chats. CASCADE here
+-- would delete the user's conversations along with a corpus they had merely
+-- selected.
 DO $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM information_schema.table_constraints
-    WHERE constraint_name = 'conversation_active_context_id_fkey'
-      AND table_name = 'conversation'
+    SELECT 1 FROM pg_constraint c
+    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+    JOIN pg_attribute r ON r.attrelid = c.confrelid AND r.attnum = c.confkey[1]
+    WHERE c.conrelid = 'conversation'::regclass
+      AND c.contype = 'f'
+      AND c.confrelid = 'knowledge_context'::regclass
+      AND c.confdeltype = 'n'
+      AND array_length(c.conkey, 1) = 1
+      AND a.attname = 'active_context_id'
+      AND r.attname = 'id'
   ) THEN
+    -- Anything of that name is not the constraint we need; replace it.
+    ALTER TABLE conversation
+      DROP CONSTRAINT IF EXISTS conversation_active_context_id_fkey;
+    -- A database that ran without the key may hold bindings to contexts that
+    -- are gone, and those would make ADD CONSTRAINT fail. They are already
+    -- unusable: release them rather than refusing to install the rule.
+    UPDATE conversation SET active_context_id = NULL
+    WHERE active_context_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM knowledge_context k WHERE k.id = conversation.active_context_id
+      );
     ALTER TABLE conversation
       ADD CONSTRAINT conversation_active_context_id_fkey
       FOREIGN KEY (active_context_id) REFERENCES knowledge_context(id) ON DELETE SET NULL;
@@ -325,6 +492,21 @@ CREATE TABLE IF NOT EXISTS user_mfa_secret (
   meta        JSONB
 );
 
+-- Long-lived bearer credentials for the served Responses API (SPEC §13.1).
+-- Only a SHA-256 of the key is stored; the plaintext is shown once at
+-- creation. Revocation is a tombstone so the row keeps its audit trail.
+CREATE TABLE IF NOT EXISTS user_api_key (
+  id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id       UUID NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+  name          TEXT NOT NULL DEFAULT '',
+  key_hash      TEXT NOT NULL UNIQUE,
+  prefix        TEXT NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at  TIMESTAMPTZ,
+  revoked_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_user_api_key_user ON user_api_key(user_id);
+
 -- Backfill MFA flags on sessions
 ALTER TABLE auth_session
   ADD COLUMN IF NOT EXISTS mfa_required BOOLEAN NOT NULL DEFAULT FALSE,
@@ -397,3 +579,410 @@ CREATE TABLE IF NOT EXISTS sweep_report (
 
 CREATE INDEX IF NOT EXISTS idx_sweep_report_user_created
   ON sweep_report (user_id, created_at DESC);
+
+
+-- ===== from 008_implicit_context_identity.sql =====
+-- One conversation, one implicit attachment context (SPEC §19.5 scopes an
+-- attachment to the chat that received it; §22 puts Postgres across
+-- replicas). Identity used to be "the first row a 500-row listing matched",
+-- and creation was an unconditional INSERT — so two first attachments racing
+-- produced two hidden contexts, and a later lookup found only one of them
+-- while the other kept chunks nothing could reach.
+--
+-- Duplicates that already exist are merged rather than dropped: the losers'
+-- chunks move to the oldest row, which is the one any earlier lookup would
+-- have returned. Deleting a loser outright would take chunks the winner does
+-- not have.
+DO $$
+DECLARE
+  winner RECORD;
+BEGIN
+  FOR winner IN
+    SELECT owner_user_id,
+           meta ->> 'conversation_id' AS conversation_id,
+           MIN(created_at::text || '|' || id::text) AS oldest
+    FROM knowledge_context
+    WHERE COALESCE((meta ->> 'auto')::boolean, false)
+      AND meta ->> 'conversation_id' IS NOT NULL
+    GROUP BY 1, 2
+    HAVING COUNT(*) > 1
+  LOOP
+    UPDATE knowledge_chunk
+    SET context_id = split_part(winner.oldest, '|', 2)::uuid
+    WHERE context_id IN (
+      SELECT id FROM knowledge_context
+      WHERE COALESCE((meta ->> 'auto')::boolean, false)
+        AND owner_user_id = winner.owner_user_id
+        AND meta ->> 'conversation_id' = winner.conversation_id
+        AND id <> split_part(winner.oldest, '|', 2)::uuid
+    );
+    DELETE FROM knowledge_context
+    WHERE COALESCE((meta ->> 'auto')::boolean, false)
+      AND owner_user_id = winner.owner_user_id
+      AND meta ->> 'conversation_id' = winner.conversation_id
+      AND id <> split_part(winner.oldest, '|', 2)::uuid;
+
+    -- Moving the rows is not enough. Both contexts could hold the *same*
+    -- generation — two concurrent first attachments of one file, where the
+    -- second was a disk dedupe hit into a context that was nonetheless new —
+    -- and the merge bypasses replace_chunks_for_path, which is what normally
+    -- keeps one fs_path meaning one complete current generation. Duplicate
+    -- copies also spend candidate slots that belong to other attachments.
+    -- Segment vectors cascade with the chunk rows removed here.
+    DELETE FROM knowledge_chunk kc
+    USING knowledge_chunk keep
+    WHERE kc.context_id = split_part(winner.oldest, '|', 2)::uuid
+      AND keep.context_id = kc.context_id
+      AND keep.fs_path IS NOT DISTINCT FROM kc.fs_path
+      AND keep.chunk_index = kc.chunk_index
+      AND keep.id < kc.id;
+  END LOOP;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS knowledge_context_auto_conversation_idx
+  ON knowledge_context (owner_user_id, (meta ->> 'conversation_id'))
+  WHERE COALESCE((meta ->> 'auto')::boolean, false);
+
+
+-- A conversation's implicit attachment index belongs to that conversation's
+-- lifetime, and that relationship is relational state rather than a string in
+-- JSON. `meta.conversation_id` could not be enforced, could not cascade, and
+-- could not serialize against a deletion: an upload that validated the chat,
+-- did its work, and inserted afterwards left an index behind for a chat that
+-- had been deleted in between, with the attached file's text still in it.
+--
+-- The foreign key makes PostgreSQL the arbiter of that race. Either the
+-- insert commits while the conversation exists and the later delete cascades
+-- it away, or the delete commits first and the insert cannot satisfy its
+-- reference. There is no third outcome and no cleanup pass to get right.
+ALTER TABLE knowledge_context
+  ADD COLUMN IF NOT EXISTS conversation_id UUID
+  REFERENCES conversation(id) ON DELETE CASCADE;
+
+-- Adopt the contexts that already carry the relationship in JSON. Guarded on
+-- the text being a UUID and on the conversation existing, so this is safe to
+-- run against any state, and it does nothing once every row is adopted.
+UPDATE knowledge_context kc
+SET conversation_id = (kc.meta ->> 'conversation_id')::uuid
+WHERE kc.conversation_id IS NULL
+  AND COALESCE((kc.meta ->> 'auto')::boolean, false)
+  AND kc.meta ->> 'conversation_id' ~*
+      '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  AND EXISTS (
+    SELECT 1 FROM conversation c
+    WHERE c.id = (kc.meta ->> 'conversation_id')::uuid
+  );
+
+-- What the previous deletion path left behind. An implicit context whose
+-- conversation is gone is unreachable — every lookup goes through the
+-- conversation — while its chunks still hold the text of files attached to
+-- that chat and still spend candidate slots belonging to other attachments.
+-- Chunks and segment vectors cascade with the context rows.
+DELETE FROM knowledge_context kc
+WHERE kc.conversation_id IS NULL
+  AND COALESCE((kc.meta ->> 'auto')::boolean, false)
+  AND kc.meta ->> 'conversation_id' IS NOT NULL;
+
+-- One conversation, one implicit index. Keyed on the real identity, so no
+-- expression can be substituted for it and no extra key can make it unique
+-- for free.
+--
+-- Deliberately not a partial index. PostgreSQL treats NULLs as distinct in a
+-- unique index, so this already permits any number of ordinary contexts while
+-- admitting one row per conversation — and a predicate here would be one more
+-- thing that has to be verified and can be substituted. `WHERE conversation_id
+-- IS NULL` is unique, single-keyed, on the right column, and constrains none
+-- of the rows this exists to constrain.
+DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx;
+DROP INDEX IF EXISTS knowledge_context_conversation_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS knowledge_context_conversation_idx
+  ON knowledge_context (conversation_id);
+
+CREATE INDEX IF NOT EXISTS knowledge_context_owner_ordinary_idx
+  ON knowledge_context (owner_user_id)
+  WHERE conversation_id IS NULL;
+
+
+-- Payloads waiting to be reclaimed, and when their capability was revoked.
+--
+-- Deleting an artifact and removing its bytes are two acts with different
+-- timing constraints: a turn resolves an adapter from Postgres and only then
+-- reads its weights, so unlinking inside the request lets a caller that
+-- legitimately acquired the artifact read a filesystem where it is gone.
+-- Reclamation is therefore delayed, and this is what it is delayed *from*.
+--
+-- The first attempt took the delay from the payload directory's mtime, which
+-- is the time of the last write rather than of the deletion — an adapter
+-- trained a week ago and deleted a moment ago was a week old by that measure
+-- and collected immediately. Written in the same transaction as the artifact
+-- delete, this row means exactly "the capability stopped existing at T": it
+-- survives a restart, every replica sees the same queue, and a failed cleanup
+-- is retried rather than becoming an orphan nothing looks at again.
+CREATE TABLE IF NOT EXISTS artifact_payload_retirement (
+  artifact_id   UUID PRIMARY KEY,
+  artifact_type TEXT NOT NULL,
+  retired_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS artifact_payload_retirement_due_idx
+  ON artifact_payload_retirement (retired_at);
+
+
+-- Enrolment belongs to the table, not to one caller.
+--
+-- `delete_private_artifact` wrote the retirement row itself, which was correct
+-- for the route it serves and silently wrong everywhere else: admin account
+-- deletion removes artifacts in bulk with `DELETE FROM artifact WHERE
+-- owner_user_id = ...`, so an adapter's weights outlived the whole account and
+-- the ledger-driven sweep had nothing to look at. The previous orphan-scanning
+-- sweep would eventually have found them; exchanging it for exactness made
+-- every unenrolled deletion permanent.
+--
+-- A trigger applies the rule to every path there is — the artifact route, user
+-- deletion, an FK cascade, a future maintenance statement — without any of
+-- them having to remember.
+CREATE OR REPLACE FUNCTION artifact_retire_payload_fn() RETURNS TRIGGER AS $$
+BEGIN
+  -- A real deletion is authoritative about when the capability went, and it
+  -- overrides anything a first-observed scan recorded earlier. DO NOTHING left
+  -- a stale timestamp in place, so an artifact deleted today could inherit a
+  -- grace period that elapsed hours ago and lose its payload immediately.
+  INSERT INTO artifact_payload_retirement (artifact_id, artifact_type)
+  VALUES (OLD.id, OLD.type)
+  ON CONFLICT (artifact_id) DO UPDATE
+    SET artifact_type = EXCLUDED.artifact_type,
+        retired_at = now();
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Retirements recorded for artifacts that still exist. Before creation and
+-- discovery shared a lock, a scan could see a payload directory whose row was
+-- still on its way and enrol it; the artifact then published normally and kept
+-- a retirement it should never have had. Harmless while it lives, and a
+-- poisoned clock the moment it is really deleted. Repeat-safe: on a database
+-- with no such rows this deletes nothing.
+DELETE FROM artifact_payload_retirement r
+USING artifact a
+WHERE r.artifact_id = a.id;
+
+DROP TRIGGER IF EXISTS artifact_retire_payload ON artifact;
+CREATE TRIGGER artifact_retire_payload
+  AFTER DELETE ON artifact
+  FOR EACH ROW EXECUTE FUNCTION artifact_retire_payload_fn();
+
+
+-- Accounts whose filesystem namespace is waiting to be reclaimed.
+--
+-- Deleting an account revokes every capability it had, and the rows go with
+-- the transaction. Its bytes do not: `/users/<id>` holds uploaded files and
+-- content-addressed attachment generations, and `.archive-staging/<id>` holds
+-- whole-tree extraction work. Removing those inside the request has the same
+-- shape of failure as an artifact payload — a turn that resolved a generation
+-- a moment earlier reads a filesystem where it is gone — so reclamation is
+-- delayed, and this row is what it is delayed from.
+--
+-- It also outranks the collectors that live inside that namespace. Three of
+-- them measure age from something on disk, and `sweep_generations` marks from
+-- what the account's conversations reference. Once the rows are gone that mark
+-- set is empty, so every generation the account ever made looks unreferenced
+-- and is judged by the blob's own mtime, which is weeks old: without this row
+-- to say "this user is mid-erasure, leave it alone", the deletion's own grace
+-- period is undercut by the next cleanup pass.
+CREATE TABLE IF NOT EXISTS user_namespace_retirement (
+  user_id    UUID PRIMARY KEY,
+  retired_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS user_namespace_retirement_due_idx
+  ON user_namespace_retirement (retired_at);
+
+
+-- Enrolment belongs to the table, for the reason it does above: the rule has
+-- to hold for every way an account can stop existing, not only for the admin
+-- route that exists today. There is deliberately no foreign key — the row is
+-- written by the delete of the row it names, so a reference would refuse it.
+CREATE OR REPLACE FUNCTION app_user_retire_namespace_fn() RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO user_namespace_retirement (user_id)
+  VALUES (OLD.id)
+  ON CONFLICT (user_id) DO UPDATE SET retired_at = now();
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Retirements recorded for accounts that still exist, from a discovery scan
+-- that saw a namespace directory before its account row was committed. Left
+-- in place it is worse than the artifact case: while this row exists every
+-- subordinate sweep skips the user, so a live account's generations would
+-- never be collected again. The sweep filters live users out on every read as
+-- well; this makes the repair durable. Repeat-safe.
+DELETE FROM user_namespace_retirement r
+USING app_user u
+WHERE r.user_id = u.id;
+
+DROP TRIGGER IF EXISTS app_user_retire_namespace ON app_user;
+CREATE TRIGGER app_user_retire_namespace
+  AFTER DELETE ON app_user
+  FOR EACH ROW EXECUTE FUNCTION app_user_retire_namespace_fn();
+
+-- Python truthiness for a jsonb value, because that is what every deleted
+-- resolver used: `a or b`, never key presence. `->>` renders false, 0, [] and
+-- {} as the non-empty text "false", "0", "[]", "{}", so a text test calls them
+-- present when the old runtime called them absent. These fields lived behind
+-- additionalProperties: true, so nothing type-checked them and such rows can
+-- exist. Dropped again below; it is a repair tool, not part of the schema.
+CREATE OR REPLACE FUNCTION _jsonb_python_truthy(v jsonb) RETURNS boolean AS $$
+  SELECT CASE jsonb_typeof(v)
+    WHEN 'null'    THEN false
+    WHEN 'boolean' THEN v = 'true'::jsonb
+    WHEN 'number'  THEN (v #>> '{}')::numeric <> 0
+    WHEN 'string'  THEN (v #>> '{}') <> ''
+    WHEN 'array'   THEN jsonb_array_length(v) > 0
+    WHEN 'object'  THEN v <> '{}'::jsonb
+    ELSE v IS NOT NULL
+  END
+$$ LANGUAGE sql IMMUTABLE;
+
+-- Pass C data repair: every adapter carries an explicit mode; the legacy
+-- spellings collapse into their canonical fields. The CASE reproduces the
+-- deleted runtime inference exactly — backend/provider chains, prompt-alias
+-- precedence (the extractor's order: prompt_instructions, behavior_prompt,
+-- system_prompt, instructions, prompt_template; strings only, blank means
+-- absent, results stripped), truthiness of prompt fields for the
+-- local-vs-hybrid split, and cephfs_dir winning a directory conflict because
+-- the readers said `cephfs_dir or fs_dir`. tests/test_adapter_canonicalization.py
+-- holds the oracle frozen from the old resolvers before their deletion.
+-- Repairs artifact.schema only: artifact_version rows are history and stay
+-- what they were; a rollback re-enters through the validator.
+-- Repeat-safe: the WHERE matches only rows still carrying a legacy shape.
+UPDATE artifact
+SET schema =
+  (schema - 'backend' - 'provider' - 'cephfs_dir'
+          - 'behavior_prompt' - 'system_prompt' - 'instructions'
+          - 'prompt_template' - 'model_id' - 'adapter_id'
+          - 'prompt_instructions'
+          - (CASE WHEN NOT _jsonb_python_truthy(schema->'fs_dir')
+                  THEN 'fs_dir' ELSE '' END)
+          - (CASE WHEN NOT _jsonb_python_truthy(schema->'remote_model_id')
+                  THEN 'remote_model_id' ELSE '' END)
+          - (CASE WHEN NOT _jsonb_python_truthy(schema->'remote_adapter_id')
+                  THEN 'remote_adapter_id' ELSE '' END))
+  || jsonb_build_object('mode', CASE
+       WHEN _jsonb_python_truthy(schema->'mode') THEN schema->>'mode'
+       WHEN lower(coalesce(schema->>'backend','')) IN ('prompt','prompt_distill')
+         THEN 'prompt'
+       WHEN lower(coalesce(schema->>'backend','')) IN ('local','local_lora')
+            OR lower(coalesce(schema->>'provider','')) = 'local'
+         THEN CASE WHEN _jsonb_python_truthy(schema->'prompt_instructions')
+                      OR _jsonb_python_truthy(schema->'behavior_prompt')
+               THEN 'hybrid' ELSE 'local' END
+       WHEN lower(coalesce(schema->>'backend','')) IN ('api','remote')
+            OR _jsonb_python_truthy(schema->'remote_model_id')
+         THEN 'remote'
+       ELSE 'hybrid' END)
+  || CASE WHEN _jsonb_python_truthy(schema->'cephfs_dir')
+       THEN jsonb_build_object('fs_dir', schema->>'cephfs_dir')
+       ELSE '{}'::jsonb END
+  || CASE WHEN _jsonb_python_truthy(schema->'model_id')
+                 AND NOT _jsonb_python_truthy(schema->'remote_model_id')
+       THEN jsonb_build_object('remote_model_id', schema->>'model_id')
+       ELSE '{}'::jsonb END
+  || CASE WHEN _jsonb_python_truthy(schema->'adapter_id')
+                 AND NOT _jsonb_python_truthy(schema->'remote_adapter_id')
+       THEN jsonb_build_object('remote_adapter_id', schema->>'adapter_id')
+       ELSE '{}'::jsonb END
+  || CASE
+       WHEN jsonb_typeof(schema->'prompt_instructions') = 'string'
+            AND btrim(schema->>'prompt_instructions') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'prompt_instructions'))
+       WHEN jsonb_typeof(schema->'behavior_prompt') = 'string'
+            AND btrim(schema->>'behavior_prompt') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'behavior_prompt'))
+       WHEN jsonb_typeof(schema->'system_prompt') = 'string'
+            AND btrim(schema->>'system_prompt') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'system_prompt'))
+       WHEN jsonb_typeof(schema->'instructions') = 'string'
+            AND btrim(schema->>'instructions') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'instructions'))
+       WHEN jsonb_typeof(schema->'prompt_template') = 'string'
+            AND btrim(schema->>'prompt_template') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'prompt_template'))
+       ELSE '{}'::jsonb END
+WHERE type = 'adapter'
+  AND schema->>'kind' = 'adapter.lora'
+  AND (NOT _jsonb_python_truthy(schema->'mode')
+       OR schema ?| array['backend','provider','cephfs_dir','behavior_prompt',
+                          'system_prompt','instructions','prompt_template',
+                          'model_id','adapter_id']);
+
+-- Post-repair assertion. A nonempty but invalid explicit mode survives the
+-- repair above, because an explicit mode was historically authoritative and
+-- the repair must not invent a meaning the old runtime never gave it. Such a
+-- row is nonetheless one the current validator would refuse to create, so the
+-- migration names it rather than letting the instance boot with it.
+DO $$
+DECLARE bad_count integer;
+BEGIN
+  -- Every row typed 'adapter', not only those still claiming
+  -- kind='adapter.lora'. Scoping this to the kind meant the one corruption
+  -- the pre-C.2 write-path bypass actually produced — an adapter row
+  -- rewritten as another kind, with `type` untouched — was the single shape
+  -- the migration could not see.
+  SELECT count(*) INTO bad_count
+  FROM artifact
+  WHERE type = 'adapter'
+    AND (
+      -- It must still be an adapter.
+      coalesce(schema->>'kind', '') <> 'adapter.lora'
+      -- The mode must be one of the four.
+      OR coalesce(schema->>'mode', '') NOT IN ('local','remote','prompt','hybrid')
+      -- The fields the adapter schema requires must be present and typed.
+      -- Checking a field's type only when present let a patch that *removed*
+      -- one through.
+      OR jsonb_typeof(schema->'base_model') IS DISTINCT FROM 'string'
+      OR jsonb_typeof(schema->'current_version') IS DISTINCT FROM 'number'
+      -- Integral and non-negative, tested numerically rather than by regex:
+      -- JSON Schema accepts 1.0 as an integer (measured), so a regex on the
+      -- rendered text is stricter than the door this guards.
+      OR (schema->>'current_version')::numeric < 0
+      OR (schema->>'current_version')::numeric
+         <> trunc((schema->>'current_version')::numeric)
+      -- No retired spelling may remain.
+      OR schema ?| array['backend','provider','cephfs_dir','behavior_prompt',
+                         'system_prompt','instructions','prompt_template',
+                         'model_id','adapter_id']
+      -- And every field today's validator types must match it when present.
+      -- Checking the mode alone let other shapes through: a numeric
+      -- remote_model_id would have been "repaired" into a row this build
+      -- would refuse to create.
+      OR (schema ? 'prompt_instructions'
+          AND jsonb_typeof(schema->'prompt_instructions') <> 'string')
+      OR (schema ? 'fs_dir' AND jsonb_typeof(schema->'fs_dir') <> 'string')
+      OR (schema ? 'remote_model_id'
+          AND jsonb_typeof(schema->'remote_model_id') <> 'string')
+      OR (schema ? 'remote_adapter_id'
+          AND jsonb_typeof(schema->'remote_adapter_id') <> 'string')
+      -- The rest of what today's validator types. Same class: before C.2 a
+      -- patch could persist {"rank": "banana"} or {"layers": 7}, which this
+      -- build would refuse to create.
+      OR (schema ? 'scope' AND jsonb_typeof(schema->'scope') <> 'string')
+      OR (schema ? 'user_id'
+          AND jsonb_typeof(schema->'user_id') NOT IN ('string', 'null'))
+      OR (schema ? 'rank' AND jsonb_typeof(schema->'rank') <> 'number')
+      OR (schema ? 'layers' AND jsonb_typeof(schema->'layers') <> 'array')
+      OR (schema ? 'matrices' AND jsonb_typeof(schema->'matrices') <> 'array')
+    );
+  IF bad_count > 0 THEN
+    RAISE EXCEPTION
+      'migration incomplete: % row(s) typed adapter are not canonical - a '
+      'kind other than adapter.lora, a mode outside (local, remote, prompt, '
+      'hybrid), a missing or mistyped base_model or current_version, a '
+      'retired field, or a non-string canonical field. No historical meaning '
+      'is recoverable for these; repair or delete them, then re-run.',
+      bad_count;
+  END IF;
+END $$;
+
+-- The repair tool is not part of the schema.
+DROP FUNCTION IF EXISTS _jsonb_python_truthy(jsonb);

@@ -17,29 +17,30 @@ after: backend lanes, model handling, replicas, and ops defaults.
 ## backend lanes and scenarios
 ### local gpu lora (adapters only; base stays frozen)
 - set `model_backend` to `local_gpu_lora` and `model_path` to `/srv/liminallm/models/<base-model>` (hugging face-style dir) in the admin console.
-- copy base weights into `/srv/liminallm/models`; adapters live under `/srv/liminallm/adapters/<adapter_id>/adapter.lora`.
+- copy base weights into `/srv/liminallm/models` (`config.json` + `*.safetensors` + tokenizer files; a checkpoint that exists but will not load fails requests rather than degrading to the synthetic stand-in).
+- adapters live under `/srv/liminallm/adapters/<adapter_id>/vNNNN/params.json`, one directory per trained version. serving reads **only** the version the artifact's `current_version` names — a loose `params.json`, a `latest` pointer, or the newest directory on disk are not servable state, so hand-placing weights does nothing until an artifact records the version. the directory is named for the adapter that owns it; an explicit `fs_dir` may move it, never rename it to another adapter's.
 - gpu prep: install the matching jax gpu wheel (cuda/rocm), verify `nvidia-smi` sees the card, and keep drivers + cuda in `$LD_LIBRARY_PATH`.
-- run: `python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). requests specify `adapter_id` and optionally `adapter_mode` (local/hybrid/prompt); the backend overlays adapters over the frozen base and serves tokens locally.
+- run: `python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). callers do not choose adapters: a chat request carries no `adapter_id` or `adapter_mode`, and the router selects and gates adapters internally from policies and clusters. this backend serves `local` and `hybrid` adapters as weights over the frozen base, carries `prompt` adapters through their instructions, and refuses `remote` — a provider-hosted adapter reaching it means the routing hand-off is broken, not that it should improvise.
 - the base model remains immutable; training writes only adapter weights.
 
 ### api backend (remote inference)
 - set `model_backend` (default `openai`) and `adapter_openai_base_url` in the admin console; the provider key goes in its own admin setting, or the matching `<PROVIDER>_API_KEY` environment variable as a fallback.
-- calls go out to the remote model id you pass as `base_model`; adapters travel as ids or prompt patches when the provider supports multi-lora/prompt layering.
+- calls go out to the remote model id you pass as `base_model`; adapters travel as provider adapter ids, as a fine-tuned model id, or as prompt text, depending on what the provider supports.
 - scenarios:
-  - **managed foundation only**: set `base_model` to the provider model, omit adapters for pure hosted inference.
-  - **hosted foundation + local adapters**: keep adapters on disk and send adapter metadata with the request so the provider overlays your deltas over its model.
-  - **prompt-only adapters**: for providers without lora, use `adapter_mode=prompt` to inject adapter prompts instead of weights.
+  - **managed foundation only**: set `base_model` to the provider model; with no adapters routed this is pure hosted inference.
+  - **provider-hosted adapters** (`mode: remote`): the provider holds the weights. the adapter records `remote_adapter_id` or `remote_model_id`, and the backend sends it — as an `adapter_id` parameter with its gate for a multi-lora provider, or as the model id where one fine-tune serves the request. locally trained weights on disk are **not** usable this way: an api backend cannot apply your `params.json`, and §5.0.1's matrix marks `local` incompatible with it.
+  - **prompt-only adapters**: for providers without lora, route an adapter whose artifact records `mode: prompt` — or a hybrid one, which falls back to its prompt wherever its weights cannot apply. the instructions are materialized once, by `LLMService`, before any backend runs; backends transport prepared messages and never add a second copy.
 - switching providers is an admin-console change: set `model_backend` and the provider key; model services rebuild without a restart.
 
 ### hybrid deployments
 - keep `model_backend` on `local_gpu_lora` for on-prem traffic and point select routes or tenants at an api backend via adapter modes or routing policies stored in artifacts.
-- filesystem artifacts stay authoritative even with api backends; adapter payloads live under `/srv/liminallm/adapters`.
+- adapter metadata and routing policy stay authoritative across a backend change — that is what makes the switch a config edit. the weight *payloads* do not travel: local `params.json` under `shared_fs_root` serves the local backend only, and an api backend carries the same adapter as a provider-hosted adapter/model id (`mode: remote`) or as prompt fallback, never by reading those files.
 
 ## model handling at a glance
 - base models are frozen. local deployments place them under `/srv/liminallm/models` and the local jax backend keeps them resident; api backends treat `base_model` as a provider-owned model id and never upload local weights.
-- adapters live under `/srv/liminallm/adapters/<adapter_id>/adapter.lora` and are loaded or streamed as metadata depending on backend capabilities.
+- adapters live under `/srv/liminallm/adapters/<adapter_id>/vNNNN/`, and a version becomes servable only when an artifact's `current_version` names it. the local backend reads that version's `params.json`; api backends never receive it, and carry the adapter as a provider adapter id or as prompt text instead.
 - training and clustering write only adapter weights. the base model on disk or at the provider is untouched.
-- when sending requests, set `base_model` to the foundation you want and `adapter_id`/`adapter_mode` to pick the adapter path (local weights, provider-hosted adapters, or prompt patching).
+- requests do not pick adapters. `base_model` and `model_backend` are admin settings, and the router chooses and gates adapters per turn from policies, clusters and the user's own personas — which is what makes the same conversation portable across backends without the caller knowing which one answered.
 
 ## ops & safety defaults (from the spec)
 - observability: metrics and traces should include chat latency/error rates, adapter usage, preference/training counts, and workflow node timings; `/healthz` always answers 200 with a per-dependency breakdown (postgres, redis, filesystem) for humans and dashboards, while `/readyz` is the load balancer probe and returns 503 when postgres or the filesystem is unusable.
@@ -54,6 +55,8 @@ scale out by running the same image behind a load balancer. postgres and `shared
 - **probes**: point the balancer at `/readyz`, not `/healthz`. `/readyz` fails a node whose database or filesystem is gone; redis is deliberately excluded so a redis outage degrades every node instead of draining the whole fleet.
 - **shared filesystem**: every replica must mount the *same* `shared_fs_root` (nfs/efs or equivalent). adapters, artifacts, and user uploads are written by whichever node handled the request and read by any other.
 - **node-local scratch**: `interpreter_scratch_dir` must stay off shared storage — it holds throwaway per-tool-call copies and defaults to the system temp dir.
+- **`shared_fs_root/shared` is not a drop box**: per SPEC §18 a path there is reachable only when an artifact whose visibility is `shared` or `global` covers it, never because a user can spell the pathname. no route currently mints such an artifact, so files placed there by hand are not ingestible by anyone — put shared material in the owning user's area and share it as an artifact instead.
+- **kernel confinement is a hard requirement**: every tool call runs in a spawned worker that confines itself before it does anything (SPEC §18), and there is no unconfined fallback — a host that cannot provide the boundary runs no tools at all, chat included. on linux that means user namespaces: `/proc/self/uid_map` present and `kernel.unprivileged_userns_clone` not set to `0`. under docker the default seccomp profile is enough; `--security-opt seccomp=unconfined` is **not** needed and neither is `--privileged`. openbsd uses `unveil`/`pledge` and needs nothing extra. it costs about 6ms of a roughly 75ms worker start, so it is not a tuning knob. a host without it reports `worker_unconfined` on every tool call rather than degrading quietly — which is the intended failure, because the alternative is a process holding `DATABASE_URL` and an open network while being called contained.
 - **sessions/routing**: sticky sessions are not required. websockets are per-connection, and `POST /chat/cancel` reaches the replica holding the stream over the cluster bus, so a stop button works no matter which node the request lands on.
 - **cluster bus**: `cluster_bus_backend` (default `auto`) uses redis pub/sub when redis is reachable and otherwise falls back to postgres `LISTEN`/`NOTIFY`, which is why redis stays optional. force one with `redis`/`postgres`, or set `local` for a single-process deployment to skip peer coordination entirely. the bus is best-effort: if it is down, cancellation falls back to local-only behavior and nothing else changes.
 - **background work**: periodic clustering and adapter-prune proposals take a postgres advisory lock, so they run once per interval cluster-wide rather than once per replica. training jobs need no lock — claiming a job is an atomic conditional update, so exactly one replica wins each one.

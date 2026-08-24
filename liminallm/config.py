@@ -78,14 +78,6 @@ class ModelBackend(str, Enum):
     STUB = "stub"
 
 
-class RagMode(str, Enum):
-    """RAG retrieval implementations supported by the kernel."""
-
-    PGVECTOR = "pgvector"
-    MEMORY = "memory"
-    LOCAL_HYBRID = "local_hybrid"
-
-
 class AdapterMode(str, Enum):
     """Adapter execution modes for dual local/API support.
 
@@ -396,6 +388,24 @@ def resolve_provider_endpoint(mode: str) -> Optional[dict[str, Optional[str]]]:
     return PROVIDER_ENDPOINTS.get((mode or "").lower())
 
 
+def _require_non_blank(value: str) -> str:
+    """A length bound is not a blankness bound.
+
+    ``min_length=1`` accepts "   ", and a whitespace tenant matches no account
+    under the both-halves rule — so an admin who typed spaces into the console
+    locked every user out, including themselves, which is the exact failure
+    the bound was added to prevent.
+    """
+    stripped = str(value).strip()
+    if not stripped:
+        raise ValueError("must not be blank")
+    # Stripped, not just checked. " acme " passes a blankness test and then
+    # matches no account, which is the same lockout by a quieter route — and
+    # the tenant_domains validator already strips its values, so leaving this
+    # one raw made the two halves of a tenant normalize differently.
+    return stripped
+
+
 def env_field(default: Any, env: str, **kwargs):
     """A setting that can only come from the environment.
 
@@ -432,8 +442,10 @@ def secret_field(default: Any = "", **kwargs):
     ordinary managed_field would be echoed back to every admin, into logs, and
     into anything that captures a response body.
 
-    Not for bootstrap secrets. JWT_SECRET and DATABASE_URL are needed before
-    the database can be read at all, so they stay env_field.
+    Not for bootstrap secrets. DATABASE_URL is needed before the database can
+    be read at all, so it stays env_field. jwt_secret is not a bootstrap
+    secret — it is generated on first boot and stored like any other secret
+    here; a JWT_SECRET environment variable reaches nothing.
     """
     extra = kwargs.pop("json_schema_extra", {}) or {}
     extra = {**extra, "admin": True, "secret": True}
@@ -471,7 +483,14 @@ class Settings(BaseModel):
             "durability and caches fall back to in-process state."
         ),
     )
-    shared_fs_root: str = managed_field("/srv/liminallm")
+    # Environment-only, not database-managed. `Runtime` has to construct the
+    # Postgres store — and hand it this root — before it can read a single
+    # managed setting, so a stored value would move the root for every service
+    # built afterwards while the store went on writing where it started:
+    # artifact payloads under one tree, file and adapter authority under
+    # another. It is also the plainest case of what `env_field` is for, a fact
+    # about the machine rather than about the install.
+    shared_fs_root: str = env_field("/srv/liminallm", "SHARED_FS_ROOT")
     tmp_cleanup_interval_seconds: int = managed_field(
         86400,
         description="How often to sweep per-user tmp scratch directories (seconds)",
@@ -787,9 +806,10 @@ class Settings(BaseModel):
         24 * 60,
         description="Refresh token TTL in minutes",
     )
-    default_tenant_id: str = managed_field(
+    default_tenant_id: Annotated[str, AfterValidator(_require_non_blank)] = managed_field(
         "public",
-        description="Tenant for an install that serves one site. Also the tenant for any host not listed in tenant_domains.",
+        min_length=1,
+        description="Tenant for an install that serves one site, i.e. one with tenant_domains empty. Once any domain is mapped, an unlisted host is refused rather than served this tenant. Cannot be blank: a blank site tenant matches no account, so clearing it would lock every user out — including the admin who would have to set it back.",
     )
     tenant_domains: dict[str, str] = managed_field(
         {},
@@ -807,10 +827,6 @@ class Settings(BaseModel):
             "Turn this on only when a reverse proxy you control sets it — "
             "otherwise a client can name its own tenant."
         ),
-    )
-    rag_mode: RagMode = managed_field(
-        RagMode.PGVECTOR,
-        description="RAG mode: pgvector or memory",
     )
     embedding_model_id: Literal[
         "text-embedding",
@@ -863,7 +879,7 @@ class Settings(BaseModel):
     # - voice_transcription_model, voice_synthesis_model, voice_default_voice
     #
     # Model Settings:
-    # - model_path, model_backend, default_adapter_mode, rag_mode, embedding_model_id
+    # - model_path, model_backend, default_adapter_mode, embedding_model_id
     #
     # Tenant & JWT Settings:
     # - default_tenant_id, jwt_issuer, jwt_audience
@@ -1047,6 +1063,36 @@ class Settings(BaseModel):
         400, ge=64, le=4000,
         description="Tokens per knowledge chunk. Changing this rebuilds the model services and only affects newly ingested content.",
     )
+    rag_rerank: Literal["auto", "on", "off"] = managed_field(
+        "auto",
+        description=(
+            "Let the serving model reorder retrieved chunks before they reach "
+            "the answer. Better grounding, one extra model call per retrieval. "
+            "'auto' turns it on only for models known to judge a shortlist "
+            "well; an unrecognized model stays off."
+        ),
+    )
+    rag_rerank_candidates: int = managed_field(
+        20, ge=2, le=100,
+        description="How many retrieved chunks the reranker reads. Ignored when reranking is off.",
+    )
+    rag_late_interaction: bool = managed_field(
+        False,
+        description=(
+            "Store several vectors per chunk and compare them at query time, "
+            "so a chunk is found on its best part rather than its average. "
+            "Needs a real embedding encoder, and only covers content ingested "
+            "after it is turned on."
+        ),
+    )
+    rag_late_segments: int = managed_field(
+        8, ge=2, le=32,
+        description=(
+            "Most vectors stored per chunk. Each one costs an embedding call "
+            "at ingestion and a row in the index. Ignored when late "
+            "interaction is off."
+        ),
+    )
 
     @field_validator("tenant_domains", mode="before")
     @classmethod
@@ -1065,9 +1111,17 @@ class Settings(BaseModel):
                 raise ValueError("tenant_domains must be a JSON object") from exc
         if not isinstance(value, dict):
             raise ValueError("tenant_domains must be a JSON object")
+        # The same normalizer the request path uses, not a second one that
+        # agrees with it most of the time. They disagreed on bracketed IPv6:
+        # this stripped at the first colon, so "[::1]" stored the key "[" and
+        # "::1" stored nothing at all, while normalize_host produced "[::1]".
+        # A loopback-over-IPv6 host was therefore impossible to map — and once
+        # unlisted hosts stopped being exempt, impossible to reach.
+        from liminallm.service.tenancy import normalize_host
+
         normalized: dict[str, str] = {}
         for host, tenant in value.items():
-            host = str(host).strip().lower().rstrip(".").split(":")[0]
+            host = normalize_host(host)
             tenant = str(tenant).strip()
             if not host or not tenant:
                 raise ValueError("tenant_domains entries need a host and a tenant")
@@ -1156,11 +1210,6 @@ class Settings(BaseModel):
         if value is None:
             return None
         return ModelBackend(value)
-
-    @field_validator("rag_mode")
-    @classmethod
-    def _validate_rag_mode(cls, value: RagMode) -> RagMode:
-        return RagMode(value)
 
     @field_validator("default_adapter_mode")
     @classmethod
@@ -1264,7 +1313,9 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
                "default_adapter_mode",
                "adapter_openai_base_url", "adapter_openai_api_key",
                "adapter_server_model", "gemini_api_key")),
-    ("Retrieval", ("rag_mode", "rag_chunk_size", "embedding_model_id",
+    ("Retrieval", ("rag_chunk_size", "embedding_model_id",
+                   "rag_rerank", "rag_rerank_candidates",
+                   "rag_late_interaction", "rag_late_segments",
                    "history_budget_fraction", "history_recall_fraction")),
     ("Features", ("notes_enabled", "allow_signup", "enable_mfa",
                   "web_tools_enabled", "extract_readers")),
@@ -1288,19 +1339,36 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("URLs & identity", ("app_base_url", "oauth_redirect_uri", "jwt_")),
     ("Operations", ("settings_watch_interval_seconds",)),
     ("Infrastructure", ("redis_url", "allow_redis_fallback_dev",
-                        "cluster_bus_backend", "shared_fs_root",
+                        "cluster_bus_backend",
                         "interpreter_scratch_dir")),
 )
 
 # Changing one of these rebuilds the model service stack, which takes a moment
 # and briefly interrupts in-flight work. The console says so before you save.
+#: Settings the model service stack reads once, when it is built. Changing one
+#: tears the stack down and rebuilds it, so this list decides three things that
+#: must agree: what the admin console labels ``reloads_model``, when the admin
+#: route triggers a reload, and what the signature the background watcher
+#: compares is made of.
+#:
+#: One list because it was two, and they drifted the moment a setting was
+#: added: the retrieval settings reached the reload signature and never reached
+#: the console's label, so an admin toggling reranking was told nothing about
+#: the interruption. The console test compared the schema against this list, so
+#: it agreed with itself and noticed nothing.
 MODEL_AFFECTING_SETTINGS = frozenset({
     "model_backend",
     "model_path",
     "default_adapter_mode",
-    "rag_mode",
     "embedding_model_id",
     "rag_chunk_size",
+    # rag_rerank and rag_rerank_candidates are deliberately absent: the
+    # reranker reads them per retrieval, so they change behaviour on the next
+    # turn without a rebuild. They only ever shape one prompt, and tearing
+    # down the LLM, embeddings, training and workflow services to widen a
+    # candidate budget was a cost with nothing behind it.
+    "rag_late_interaction",
+    "rag_late_segments",
 })
 
 

@@ -3,8 +3,9 @@
 This project ships several placeholder components intended to keep the kernel lightweight in constrained environments. Replace them with production-grade implementations before exposing the stack broadly.
 
 ## Local JAX + LoRA backend (`liminallm/service/model_backend.py`)
-- Status: lightweight JAX path that tokenizes requests (or hashes tokens when `transformers` is absent), loads cached adapter weights keyed by `params.json` mtime, and applies paired `.A`/`.B` matrices with width alignment. Generation always builds a single-item batch, multiplies LoRA scores by the attention mask, and samples deterministically from a sinusoidal embedding table seeded by the last prompt token.
-- Path forward: add proper base model logits instead of hashed token sampling, enforce batch-size/length safety for multi-example calls, and plumb per-request RNG seeding to avoid process-wide determinism when concurrency arrives.
+- Status: **no longer a stub.** `service/transformer.py` is a real decoder-only transformer in plain JAX (RMSNorm, RoPE, grouped-query attention with a KV cache, SwiGLU) loading `config.json` + `*.safetensors` from the model directory, and LoRA matrices apply inside its attention projections. Training uses the same forward pass. See `docs/jax_backend.md`.
+- The sinusoidal table this entry used to describe survives in exactly one place: the `absent` checkpoint state, where nothing is on disk. It logs `local_checkpoint_absent`, moves tokens for CI and dev boxes, and does not answer questions. A checkpoint that exists but cannot be served fails requests instead of falling back to it.
+- Path forward: batching (generation builds a single example), per-request RNG seeding for sampling other than greedy, and an LRU with a byte budget on the adapter cache.
 
 ## Jsonschema shim (`jsonschema/__init__.py`)
 - Status: replaced with the upstream `jsonschema` package so artifact schemas run through full Draft 2020-12 validation.

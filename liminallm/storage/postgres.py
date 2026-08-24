@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -8,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from psycopg import errors
 from psycopg.abc import Buffer
@@ -22,9 +23,6 @@ from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
     ArtifactValidationError,
     validate_artifact,
-)
-from liminallm.service.bm25 import (
-    compute_bm25_scores as _compute_bm25_scores,
 )
 from liminallm.service.bm25 import (
     tokenize_text as _tokenize_text,
@@ -48,9 +46,14 @@ from liminallm.storage.cursors import (
     decode_index_cursor,
     decode_time_id_cursor,
 )
-from liminallm.storage.errors import ConstraintViolation
+from liminallm.storage.errors import (
+    ConstraintViolation,
+    ConversationGone,
+    TrainingInProgress,
+)
 from liminallm.storage.models import (
     AdapterRouterState,
+    ApiKey,
     Artifact,
     ArtifactVersion,
     ConfigPatchAudit,
@@ -65,6 +68,7 @@ from liminallm.storage.models import (
     Session,
     TrainingJob,
     User,
+    UserErasure,
     UserMFAConfig,
     UserSettings,
 )
@@ -108,6 +112,50 @@ def _is_uuid(value: Any) -> bool:
     return True
 
 
+# A term longer than this is a checksum or a mangled blob, not a word anyone
+# searched for; tsquery also refuses tokens past 2KB.
+_MAX_TSQUERY_TERM = 100
+_MAX_TSQUERY_TERMS = 32
+
+
+def _tsquery_terms(query: str, *, max_terms: int = _MAX_TSQUERY_TERMS) -> str:
+    """OR'd ``to_tsquery`` input built from a free-text query.
+
+    Terms come from the BM25 tokenizer, which yields ``\\w+`` and nothing else,
+    so no tsquery operator can reach the parser and a user query cannot become
+    a syntax error. Duplicates drop out and the term count is capped, because
+    the cost of the scan grows with the number of terms.
+    """
+    seen: set[str] = set()
+    terms: list[str] = []
+    for token in _tokenize_text(query):
+        if len(token) > _MAX_TSQUERY_TERM or token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+        if len(terms) >= max_terms:
+            break
+    return " | ".join(terms)
+
+
+class _Unset:
+    """"Not mentioned", for patch arguments whose `None` means SQL NULL.
+
+    A patch method that defaults its arguments to `None` cannot express
+    "clear this column": `None` is already spoken for by "leave it alone".
+    Where a caller has to be able to say a field has no value, it takes this
+    instead as its default.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+
 class PostgresStore:
     """Thin Postgres-backed store to persist kernel primitives."""
 
@@ -130,7 +178,6 @@ class PostgresStore:
             raise
 
         try:
-            # Issue 48.2: Add connection pool timeout configuration
             # timeout: max seconds to wait for a connection from the pool
             # max_waiting: max requests that can wait for a connection
             # reconnect_timeout: seconds to wait before reconnecting failed connection
@@ -203,7 +250,7 @@ class PostgresStore:
     def _cache_session(self, session: Session) -> Session:
         """Store session in the in-memory cache and return it.
 
-        Thread-safe per SPEC §18 inference/adapter cache discipline.
+        Thread-safe per SPEC §5.3 adapter cache discipline.
         """
         with self._session_lock:
             now = datetime.now(timezone.utc)
@@ -218,7 +265,7 @@ class PostgresStore:
                 )
                 return expires_at <= now
 
-            # First prune any expired sessions to avoid evicting valid ones (Issue 53.10)
+            # Prune expired sessions first, so the cap never evicts a valid one.
             expired_ids = [sid for sid, sess in self.sessions.items() if _is_expired(sess)]
             for sid in expired_ids:
                 self.sessions.pop(sid, None)
@@ -346,6 +393,7 @@ class PostgresStore:
             "app_user",
             "user_auth_credential",
             "user_auth_provider",
+            "user_api_key",
             "user_settings",
             "auth_session",
             "conversation",
@@ -356,12 +404,23 @@ class PostgresStore:
             "knowledge_context",
             "context_source",
             "knowledge_chunk",
+            "knowledge_chunk_vector",
             "preference_event",
             "semantic_cluster",
             "adapter_router_state",
             "training_job",
             "user_mfa_secret",
             "instance_config",
+            # Load-bearing in artifact DELETE and in the cleanup loop. Without
+            # it an older database boots clean, the first DELETE fails at
+            # request time, and the sweeper reads an unreadable queue as
+            # "nothing to do".
+            "artifact_payload_retirement",
+            # Same, for account erasure. Its absence is worse than a leak: the
+            # subordinate sweeps ask this table which users are mid-erasure,
+            # and an unreadable answer is indistinguishable from "none", so a
+            # deleted account's generations become collectable at once.
+            "user_namespace_retirement",
         ]
 
         with self._connect() as conn:
@@ -379,6 +438,167 @@ class PostgresStore:
                         ", ".join(sorted(missing_tables))
                     )
                 )
+
+            # Retrieval's lexical channel reads this generated column by
+            # name. The table list above cannot catch its absence — the table
+            # is old, the column is not — so an install that pulled new code
+            # without re-running migrations booted clean and then answered
+            # every grounded chat turn with a 500. Fail here instead, where
+            # the message can name the fix.
+            fts_column = conn.execute(
+                """
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'knowledge_chunk'::regclass
+                  AND attname = 'content_tsv' AND NOT attisdropped
+                """
+            ).fetchone()
+            if not fts_column:
+                raise RuntimeError(
+                    "knowledge_chunk.content_tsv is missing, so hybrid retrieval's "
+                    "keyword channel cannot run. Rerun scripts/migrate.sh to apply "
+                    "the SPEC §2.5 schema."
+                )
+
+            # A conversation has at most one implicit attachment context.
+            # `get_or_create_conversation_attachment_context` relies on it:
+            # its `ON CONFLICT DO NOTHING` needs a constraint to collide with,
+            # and without one two concurrent first attachments each insert an
+            # index, leaving an acknowledged attachment no lookup returns.
+            #
+            # Checked here because code can be newer than the database, and a
+            # single unqualified key on a foreign-key column is what makes the
+            # check exact. `indpred IS NULL` is not redundant: a partial index
+            # `WHERE conversation_id IS NULL` satisfies every other clause and
+            # covers no implicit context, since all of them have one.
+            uniqueness = conn.execute(
+                """
+                SELECT 1 FROM pg_index i
+                WHERE i.indrelid = 'knowledge_context'::regclass
+                  AND i.indisunique
+                  AND i.indnkeyatts = 1
+                  AND i.indpred IS NULL
+                  AND pg_get_indexdef(i.indexrelid, 1, true) = 'conversation_id'
+                """
+            ).fetchone()
+            if not uniqueness:
+                raise RuntimeError(
+                    "the unique index making one conversation have one implicit "
+                    "attachment context is missing, so concurrent attachments can "
+                    "create two and one of them becomes unreachable. Rerun "
+                    "scripts/migrate.sh to apply the SPEC §19.5 schema."
+                )
+
+            # The other half of the same invariant, and the one that makes
+            # deletion complete: without the cascading foreign key an implicit
+            # context outlives the conversation it belongs to, keeping the
+            # text of that chat's attachments indexed after the chat is gone.
+            lifetime = conn.execute(
+                """
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_attribute a
+                  ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                JOIN pg_attribute ref
+                  ON ref.attrelid = c.confrelid AND ref.attnum = c.confkey[1]
+                WHERE c.conrelid = 'knowledge_context'::regclass
+                  AND c.contype = 'f'
+                  AND c.confrelid = 'conversation'::regclass
+                  AND c.confdeltype = 'c'
+                  AND array_length(c.conkey, 1) = 1
+                  AND a.attname = 'conversation_id'
+                  -- Referencing the conversation table is not enough; it has
+                  -- to reference the conversation's identity.
+                  AND ref.attname = 'id'
+                """
+            ).fetchone()
+            if not lifetime:
+                raise RuntimeError(
+                    "knowledge_context.conversation_id is not a foreign key that "
+                    "cascades on delete, so deleting a conversation leaves its "
+                    "attachment index and that chat's file text behind. Rerun "
+                    "scripts/migrate.sh to apply the SPEC §19.5 schema."
+                )
+
+            # Retiring a context releases the chats bound to it, and that is
+            # a schema fact rather than something the delete does.
+            #
+            # Checked by shape rather than by constraint name, which any
+            # constraint type can wear. `confdeltype = 'n'` is SET NULL and is
+            # the specific behaviour required: a cascading key here is still a
+            # foreign key, and would delete a user's conversations along with
+            # a corpus they had merely selected.
+            binding = conn.execute(
+                """
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_attribute a
+                  ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                JOIN pg_attribute ref
+                  ON ref.attrelid = c.confrelid AND ref.attnum = c.confkey[1]
+                WHERE c.conrelid = 'conversation'::regclass
+                  AND c.contype = 'f'
+                  AND c.confrelid = 'knowledge_context'::regclass
+                  AND c.confdeltype = 'n'
+                  AND array_length(c.conkey, 1) = 1
+                  AND a.attname = 'active_context_id'
+                  AND ref.attname = 'id'
+                """
+            ).fetchone()
+            if not binding:
+                raise RuntimeError(
+                    "conversation.active_context_id is not a foreign key that "
+                    "nulls on delete, so retiring a knowledge context leaves "
+                    "conversations bound to a row that no longer exists. Rerun "
+                    "scripts/migrate.sh to apply the SPEC §2 schema."
+                )
+
+            # Enrolment into each retirement queue is an AFTER DELETE
+            # trigger. Without it every deletion path silently stops queueing
+            # while the queue table sits there looking correct, which a
+            # ledger-only sweep cannot recover from.
+            #
+            # Checked by shape, not name: a disabled trigger stays in
+            # pg_trigger, and a same-named one on INSERT or calling another
+            # function is equally present and equally useless. tgtype bit 0 is
+            # FOR EACH ROW and bit 3 is DELETE; of tgenabled's four states
+            # only 'O' (origin) and 'A' (always) fire for application
+            # statements — 'R' is replica-only.
+            for table, trigger, consequence in (
+                (
+                    "artifact",
+                    "artifact_retire_payload",
+                    "deleting an artifact leaves its payloads with nothing to "
+                    "reclaim them",
+                ),
+                (
+                    "app_user",
+                    "app_user_retire_namespace",
+                    "deleting an account leaves its files with nothing to "
+                    "reclaim them, and its generations exposed to a sweep that "
+                    "no longer sees anything referencing them",
+                ),
+            ):
+                enrolment = conn.execute(
+                    """
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgrelid = %s::regclass
+                      AND tgname = %s
+                      AND NOT tgisinternal
+                      AND tgenabled IN ('O', 'A')
+                      AND (tgtype & 1) = 1
+                      AND (tgtype & 8) = 8
+                      AND (tgtype & 2) = 0
+                      AND tgfoid = (
+                        SELECT oid FROM pg_proc
+                        WHERE proname = %s || '_fn'
+                          AND pronamespace = 'public'::regnamespace
+                      )
+                    """,
+                    (table, trigger, trigger),
+                ).fetchone()
+                if not enrolment:
+                    raise RuntimeError(
+                        f"the {trigger} trigger is missing, so {consequence}. "
+                        "Rerun scripts/migrate.sh to apply the SPEC §2 schema."
+                    )
 
             vector_ext = conn.execute(
                 "SELECT extname FROM pg_extension WHERE extname = 'vector'"
@@ -842,13 +1062,17 @@ class PostgresStore:
             "dataset_path, new_version, preference_event_ids, meta"
         )
         placeholders = "%s, %s, %s, %s, %s, 'queued', %s, NULL, %s, NULL, %s, %s"
+        # Bound to a name, and concatenated rather than triple-quoted, so the
+        # suppression has a line it can sit on: bandit reports the line a
+        # string opens on, and inside `"""` a comment becomes part of the SQL.
+        insert = (
+            f"INSERT INTO training_job ({columns}) "  # nosec B608 - fragments are source literals; values are always bound via %s
+            f"VALUES ({placeholders}) "
+            "RETURNING *"
+        )
         with self._connect() as conn:
             row = conn.execute(
-                f"""
-                INSERT INTO training_job ({columns})
-                VALUES ({placeholders})
-                RETURNING *
-                """,
+                insert,
                 (
                     job_id,
                     adapter_id,
@@ -868,11 +1092,21 @@ class PostgresStore:
         job_id: str,
         *,
         status: str | None = None,
-        loss: float | None = None,
-        new_version: int | None = None,
+        loss: float | None | _Unset = _UNSET,
+        new_version: int | None | _Unset = _UNSET,
         dataset_path: str | None = None,
         meta: dict | None = None,
     ) -> TrainingJob | None:
+        """Patch one training job. Omitted fields keep their value.
+
+        `loss` and `new_version` distinguish "not mentioned" from "there is
+        none", because a terminal write has to be able to say the second.
+        `None` used to mean the first for both, so a skipped attempt could
+        say it never trained while keeping the loss and version an earlier
+        attempt on the same job had recorded — and the worker retries the
+        same claimed `job_id`, so that pairing is reachable rather than
+        theoretical.
+        """
         existing = self.get_training_job(job_id)
         if not existing:
             return None
@@ -892,8 +1126,12 @@ class PostgresStore:
                 """,
                 (
                     status if status is not None else existing.status,
-                    loss if loss is not None else existing.loss,
-                    new_version if new_version is not None else existing.new_version,
+                    existing.loss if loss is _UNSET else loss,
+                    (
+                        existing.new_version
+                        if new_version is _UNSET
+                        else new_version
+                    ),
                     dataset_path if dataset_path is not None else existing.dataset_path,
                     self._json_param(meta if meta is not None else existing.meta),
                     new_updated_at,
@@ -905,7 +1143,7 @@ class PostgresStore:
         return self._row_to_training_job(row)
 
     def claim_training_job(self, job_id: str) -> TrainingJob | None:
-        """Atomically claim a training job for processing (Issue 26.2).
+        """Atomically claim a training job for processing.
 
         Only claims the job if its status is 'queued'. This prevents race
         conditions where multiple workers could claim the same job.
@@ -1125,6 +1363,86 @@ class PostgresStore:
             return None
         return None
 
+    def _api_key_from_row(self, row) -> ApiKey:
+        return ApiKey(
+            id=row["id"],
+            user_id=row["user_id"],
+            name=row["name"],
+            prefix=row["prefix"],
+            created_at=row["created_at"],
+            last_used_at=row.get("last_used_at"),
+            revoked_at=row.get("revoked_at"),
+        )
+
+    def create_api_key(
+        self, user_id: str, *, name: str, key_hash: str, prefix: str
+    ) -> ApiKey:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO user_api_key (user_id, name, key_hash, prefix)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, user_id, name, prefix, created_at, last_used_at, revoked_at
+                """,
+                (user_id, name, key_hash, prefix),
+            ).fetchone()
+        return self._api_key_from_row(row)
+
+    def get_api_key_by_hash(self, key_hash: str) -> Optional[ApiKey]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, user_id, name, prefix, created_at, last_used_at, revoked_at "
+                "FROM user_api_key WHERE key_hash = %s",
+                (key_hash,),
+            ).fetchone()
+        return self._api_key_from_row(row) if row else None
+
+    def list_api_keys(self, user_id: str) -> List[ApiKey]:
+        if not _is_uuid(user_id):
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, user_id, name, prefix, created_at, last_used_at, revoked_at "
+                "FROM user_api_key WHERE user_id = %s ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
+        return [self._api_key_from_row(row) for row in rows]
+
+    def count_active_api_keys(self, user_id: str) -> int:
+        if not _is_uuid(user_id):
+            return 0
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM user_api_key "
+                "WHERE user_id = %s AND revoked_at IS NULL",
+                (user_id,),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def revoke_api_key(self, key_id: str, *, user_id: str) -> bool:
+        """Tombstone the key. Owner-scoped: someone else's id is a miss."""
+        if not _is_uuid(key_id) or not _is_uuid(user_id):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE user_api_key SET revoked_at = now() "
+                "WHERE id = %s AND user_id = %s AND revoked_at IS NULL "
+                "RETURNING id",
+                (key_id, user_id),
+            ).fetchone()
+        return row is not None
+
+    def touch_api_key(self, key_id: str) -> None:
+        """Best-effort last-used stamp; auth must not fail on it."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE user_api_key SET last_used_at = now() WHERE id = %s",
+                    (key_id,),
+                )
+        except Exception as exc:
+            self.logger.warning("touch_api_key_failed", error=str(exc))
+
     def get_user_settings(self, user_id: str) -> Optional[UserSettings]:
         if not _is_uuid(user_id):
             return None
@@ -1250,44 +1568,114 @@ class PostgresStore:
             return None
         return self._row_to_user(row)
 
-    def delete_user(self, user_id: str) -> bool:
+    def _lock_unfinished_training(self, conn, user_id: str) -> list:
+        """Take this account's unfinished training jobs and hold them.
+
+        A separate step because the lock is the whole point and it is the
+        thing worth naming. Holding the queued rows is what makes a worker's
+        `UPDATE ... WHERE status = 'queued'` wait for this transaction and
+        then find nothing, rather than starting to write weights just after
+        the guard decided there was nothing running.
+
+        Both identities: a tenant adapter can be trained by one user and owned
+        by another, so asking only about `training_job.user_id` misses a job
+        by B against A's adapter.
+        """
+        return conn.execute(
+            "SELECT j.id, j.status FROM training_job j "
+            "LEFT JOIN artifact a ON a.id = j.adapter_id "
+            "WHERE (j.user_id = %s OR a.owner_user_id = %s) "
+            "AND j.status IN ('queued', 'running') "
+            "FOR UPDATE OF j",
+            (user_id, user_id),
+        ).fetchall()
+
+    def user_has_running_training(self, user_id: str) -> bool:
+        """Is a worker writing weights for one of this account's adapters?
+
+        Account deletion removes artifacts in bulk and cascades their training
+        jobs, which would take the record out from under a worker that is
+        still writing and will try to promote a version onto the artifact. The
+        artifact route refuses this; the account route has to refuse it for
+        the same reason.
+        """
+        if not _is_uuid(user_id):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM training_job WHERE user_id = %s AND status = 'running' "
+                "LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return bool(row)
+
+    def delete_user(self, user_id: str) -> Optional[UserErasure]:
         """Delete user and cascade to all related records.
 
-        Per SPEC §12, user deletion must clean up all associated data to prevent
-        orphaned records and ensure complete data removal for privacy compliance.
+        Returns what the erasure took, or `None` if there was no such account.
+        The distinction matters and an empty list is not it: an account with no
+        conversations is still deleted, and the caller has to tell that from a
+        404. The ids come back because they stop being discoverable the moment
+        this commits, and the copies of those rows in Redis are keyed by them.
 
-        Deletes (in order to respect foreign key constraints):
-        - User MFA config
-        - User auth credentials
-        - User auth providers
-        - Sessions
-        - Messages (via conversation)
-        - Conversations
-        - Knowledge chunks (via context)
-        - Context sources (via context)
-        - Knowledge contexts
-        - Config patches (via artifact)
-        - Artifact versions (via artifact)
-        - Artifacts
-        - Preference events
-        - Training jobs
-        - Semantic clusters
-        - Adapter router state
-        - The user record itself
+        Deletes every record the account owns, in foreign-key order, so no
+        orphan survives it (SPEC §12).
         """
         with self._connect() as conn:
-            # Check if user exists first
+            # First, and before any read: this is what the subordinate
+            # collectors wait on. Holding the account row is not enough for
+            # them — a sweep of `users/<id>` holds no row and would otherwise
+            # be free to decide "not being erased" and act on that decision
+            # after this transaction commits. See `hold_user_lifetime`.
+            self._lock_user_lifetime(conn, user_id)
+
+            # Check if user exists first, and hold it: locking the account
+            # stops a new job being created for it while this runs. The tenant
+            # comes back with it because several cache keys are prefixed by it
+            # and the row is about to stop existing.
             exists = conn.execute(
-                "SELECT 1 FROM app_user WHERE id = %s", (user_id,)
+                "SELECT tenant_id FROM app_user WHERE id = %s FOR UPDATE", (user_id,)
             ).fetchone()
             if not exists:
-                return False
+                return None
+            tenant_id = str(exists["tenant_id"]) if exists["tenant_id"] else None
 
-            # Get user's artifacts for cascade (needed for config patches, versions, router state)
+            # The account's *private* artifacts, which are the ones erasure is
+            # about. Published rows are deliberately excluded: SPEC §12.3 says
+            # an artifact that is `shared` or `global` has left its owner's
+            # sole control and changes only through config ops, and taking one
+            # away because a personnel account was removed is a change nobody
+            # reviewed. It also destroyed the version and patch history, which
+            # is the record of what the installation used to do.
+            #
+            # Locked, so another user cannot start training one of this
+            # account's adapters while the deletion is in flight.
             artifact_rows = conn.execute(
-                "SELECT id FROM artifact WHERE owner_user_id = %s", (user_id,)
+                "SELECT id FROM artifact WHERE owner_user_id = %s "
+                "AND visibility = 'private' FOR UPDATE",
+                (user_id,),
             ).fetchall()
             artifact_ids = [str(row["id"]) for row in artifact_rows]
+
+            # The guard belongs here rather than in the route. A check made
+            # before the transaction is a check-then-act: a worker's claim is
+            # an atomic `UPDATE ... WHERE status = 'queued'`, so a job could
+            # become running between the answer and the deletion, and the
+            # cascade would take its record out from under a worker that is
+            # writing weights and will try to promote a version.
+            #
+            # Both identities matter. A tenant adapter can be trained by one
+            # user and owned by another, so asking only about
+            # `training_job.user_id` misses a job by B against A's adapter.
+            # Locking the queued rows too is what makes queued -> running
+            # serialize with this transaction rather than race it.
+            unfinished = self._lock_unfinished_training(conn, user_id)
+            running = [str(j["id"]) for j in unfinished if j["status"] == "running"]
+            if running:
+                raise TrainingInProgress(
+                    "this account has training in progress",
+                    {"user_id": user_id, "job_ids": running},
+                )
 
             # Get user's contexts for cascade (needed for chunks, sources)
             context_rows = conn.execute(
@@ -1300,6 +1688,18 @@ class PostgresStore:
                 "SELECT id FROM conversation WHERE user_id = %s", (user_id,)
             ).fetchall()
             conv_ids = [str(row["id"]) for row in conv_rows]
+
+            # Sessions are read here rather than derived afterwards from
+            # Redis's own `auth:user_sessions:<user>` set. That set is a
+            # convenience index with its own TTL, and it is not the authority
+            # on which sessions exist: it can expire, or be evicted, while an
+            # `auth:session:<id>` key it should have named is still readable.
+            # Purging from it alone leaves exactly those sessions behind —
+            # the ones whose index is already gone.
+            session_rows = conn.execute(
+                "SELECT id FROM auth_session WHERE user_id = %s", (user_id,)
+            ).fetchall()
+            session_ids = [str(row["id"]) for row in session_rows]
 
             # Delete in reverse dependency order
 
@@ -1345,8 +1745,20 @@ class PostgresStore:
                     "DELETE FROM adapter_router_state WHERE artifact_id = ANY(%s)", (artifact_ids,)
                 )
 
-            # 9. Delete artifacts
-            conn.execute("DELETE FROM artifact WHERE owner_user_id = %s", (user_id,))
+            # 9. Delete the private artifacts, and detach the published ones.
+            # This is the only place that knows the difference. The foreign
+            # key is `ON DELETE RESTRICT` precisely because it cannot see
+            # visibility, so both of these have to happen here — and after
+            # them nothing references the account, which is why a restrictive
+            # key never blocks step 17.
+            if artifact_ids:
+                conn.execute(
+                    "DELETE FROM artifact WHERE id = ANY(%s)", (artifact_ids,)
+                )
+            conn.execute(
+                "UPDATE artifact SET owner_user_id = NULL WHERE owner_user_id = %s",
+                (user_id,),
+            )
 
             # 10. Delete preference events
             conn.execute("DELETE FROM preference_event WHERE user_id = %s", (user_id,))
@@ -1380,7 +1792,14 @@ class PostgresStore:
                 for sid in stale_ids:
                     self.sessions.pop(sid, None)
 
-            return result.rowcount > 0
+            if result.rowcount <= 0:
+                return None
+            return UserErasure(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                conversation_ids=conv_ids,
+                session_ids=session_ids,
+            )
 
     # sessions
     def create_session(
@@ -1443,7 +1862,7 @@ class PostgresStore:
                 )
             else:
                 conn.execute("DELETE FROM auth_session WHERE user_id = %s", (user_id,))
-        # Thread-safe iteration over session cache per SPEC §18
+        # Thread-safe iteration over the session cache
         with self._session_lock:
             stale_ids = [
                 sid
@@ -1454,7 +1873,7 @@ class PostgresStore:
                 self.sessions.pop(sid, None)
 
     def mark_session_verified(self, session_id: str) -> None:
-        # Issue 53.1: Cache update MUST only happen if DB update succeeds
+        # Only update the cache once the database write has succeeded.
         # to prevent MFA bypass via transient database failures
         try:
             with self._connect() as conn:
@@ -1608,7 +2027,7 @@ class PostgresStore:
         try:
             with self._connect() as conn:
                 row = conn.execute(
-                    f"UPDATE note SET {', '.join(sets)} WHERE id = %s RETURNING *",
+                    f"UPDATE note SET {', '.join(sets)} WHERE id = %s RETURNING *",  # nosec B608 - fragments are source literals; values are always bound via %s
                     params,
                 ).fetchone()
         except errors.UniqueViolation:
@@ -1785,14 +2204,23 @@ class PostgresStore:
         user_id: str,
         title: Optional[str] = None,
         active_context_id: Optional[str] = None,
+        meta: Optional[dict] = None,
     ) -> Conversation:
         conv_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO conversation (id, user_id, title, created_at, updated_at, active_context_id) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (conv_id, user_id, title, now, now, active_context_id),
+                    "INSERT INTO conversation (id, user_id, title, created_at, updated_at, active_context_id, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        conv_id,
+                        user_id,
+                        title,
+                        now,
+                        now,
+                        active_context_id,
+                        json.dumps(meta) if meta else None,
+                    ),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation(
@@ -1806,6 +2234,7 @@ class PostgresStore:
             created_at=now,
             updated_at=now,
             active_context_id=active_context_id,
+            meta=meta,
         )
 
     def get_conversation(
@@ -1846,6 +2275,43 @@ class PostgresStore:
             ).fetchone()
         return self.get_conversation(conversation_id) if row else None
 
+    def update_conversation(
+        self,
+        conversation_id: str,
+        *,
+        user_id: str,
+        title: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Optional[Conversation]:
+        """Edit the user-editable fields of a conversation; owner-only.
+
+        Only the fields the caller supplied are written, so a PATCH carrying
+        one of them does not blank the other. Nothing else is reachable from
+        here: `meta` and `active_context_id` have their own paths with their
+        own checks, and a general column setter would make this the way
+        around them.
+        """
+        assignments = []
+        params: list[Any] = []
+        if title is not None:
+            assignments.append("title = %s")
+            params.append(title)
+        if status is not None:
+            assignments.append("status = %s")
+            params.append(status)
+        if not assignments:
+            return self.get_conversation(conversation_id, user_id=user_id)
+
+        assignments.append("updated_at = %s")
+        params.extend([datetime.now(timezone.utc), conversation_id, user_id])
+        with self._connect() as conn:
+            row = conn.execute(
+                f"UPDATE conversation SET {', '.join(assignments)} "  # nosec B608 - fragments are source literals; values are always bound via %s
+                "WHERE id = %s AND user_id = %s RETURNING id",
+                tuple(params),
+            ).fetchone()
+        return self.get_conversation(conversation_id) if row else None
+
     def update_message_meta(
         self, message_id: str, *, user_id: str, patch: dict
     ) -> Optional[Any]:
@@ -1874,6 +2340,83 @@ class PostgresStore:
         if not row:
             return None
         return self.get_conversation(conversation_id)
+
+    def upsert_conversation_attachment(
+        self,
+        conversation_id: str,
+        *,
+        user_id: str,
+        record: dict,
+        prune_context_id: Optional[str] = None,
+        paths_for: Optional[Any] = None,
+        generation_prefix: Optional[str] = None,
+    ) -> Optional[list]:
+        """Add or replace one attachment record, atomically. Owner-only.
+
+        The attachment list is one JSON value, so `SELECT ... FOR UPDATE` on
+        the conversation row is what makes editing it safe: concurrent uploads
+        each read-modify-write the same value otherwise. A file lock cannot
+        serve here — the state is in Postgres and §22 runs several replicas.
+
+        Retirement of what this record displaces happens in the same
+        transaction under the same lock, and only of what *this* record
+        displaces: a generation whose record has not been written yet is
+        unfinished, not unauthorized, so pruning the index to an absolute set
+        would delete a concurrent upload's chunks. `paths_for` maps records to
+        the objects they name, keeping that layout in the service that owns
+        it; a displaced object survives while another record still names it,
+        which is what lets two names share identical bytes.
+
+        `generation_prefix` additionally retires rows that can never become
+        authorized — anything in this context that is not an attachment
+        generation at all.
+
+        Returns the resulting list, or None when the conversation is not this
+        user's.
+        """
+        now = datetime.now(timezone.utc)
+        name = record.get("name")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT meta FROM conversation WHERE id = %s AND user_id = %s FOR UPDATE",
+                (conversation_id, user_id),
+            ).fetchone()
+            if not row:
+                return None
+            meta = dict(row["meta"] or {})
+            current = [
+                a for a in (meta.get("attachments") or []) if isinstance(a, dict)
+            ]
+            displaced = [a for a in current if a.get("name") == name]
+            attachments = [a for a in current if a.get("name") != name]
+            attachments.append(record)
+            meta["attachments"] = attachments
+            conn.execute(
+                "UPDATE conversation SET meta = %s::jsonb, updated_at = %s "
+                "WHERE id = %s AND user_id = %s",
+                (json.dumps(meta), now, conversation_id, user_id),
+            )
+            if prune_context_id and paths_for is not None:
+                keep = set(paths_for(attachments))
+                retired = sorted(set(paths_for(displaced)) - keep)
+                if retired:
+                    conn.execute(
+                        "DELETE FROM knowledge_chunk WHERE context_id = %s "
+                        "AND fs_path = ANY(%s)",
+                        (prune_context_id, retired),
+                    )
+                if generation_prefix:
+                    conn.execute(
+                        "DELETE FROM knowledge_chunk WHERE context_id = %s "
+                        "AND (fs_path IS NULL "
+                        "     OR left(fs_path, %s) <> %s)",
+                        (
+                            prune_context_id,
+                            len(generation_prefix),
+                            generation_prefix,
+                        ),
+                    )
+        return attachments
 
     def set_conversation_public(
         self, conversation_id: str, *, user_id: str, public: bool
@@ -1907,7 +2450,22 @@ class PostgresStore:
     def delete_conversation(
         self, conversation_id: str, *, user_id: Optional[str] = None
     ) -> bool:
-        """Delete a conversation and its messages atomically."""
+        """Delete a conversation and everything scoped to it, atomically.
+
+        "Everything scoped to it" is wider than the conversation row: the
+        implicit attachment index is a `knowledge_context` in another table,
+        and SPEC §19.5 scopes an attachment to its chat, so the text of a
+        deleted chat's files must stop being searchable with it.
+
+        Nothing here deletes it. `knowledge_context.conversation_id` is a
+        foreign key with `ON DELETE CASCADE`, so the context goes with the
+        conversation and its chunks go with the context. That is deliberate:
+        a cascade also covers the rows this method never learns about, and it
+        cannot be raced by an upload that creates the index a moment after a
+        cleanup statement would have run.
+        """
+        if not _is_uuid(conversation_id):
+            return False
 
         with self._connect() as conn, conn.transaction():
             params: list[Any] = [conversation_id]
@@ -1917,7 +2475,7 @@ class PostgresStore:
                 params.append(user_id)
 
             deleted = conn.execute(
-                f"DELETE FROM conversation WHERE {where_clause} RETURNING id", tuple(params)
+                f"DELETE FROM conversation WHERE {where_clause} RETURNING id", tuple(params)  # nosec B608 - fragments are source literals; values are always bound via %s
             ).fetchone()
             if not deleted:
                 return False
@@ -1935,6 +2493,7 @@ class PostgresStore:
         content: str,
         meta: Optional[dict] = None,
         content_struct: Optional[dict] = None,
+        message_id: Optional[str] = None,
     ) -> Message:
         try:
             normalized_content_struct = normalize_content_struct(
@@ -1946,13 +2505,20 @@ class PostgresStore:
                         "SELECT 1 FROM conversation WHERE id = %s FOR UPDATE",
                         (conversation_id,),
                     )
-                    # Issue 37.6: Use MAX(seq) instead of COUNT(*) to handle gaps in sequence
+                    # MAX(seq), not COUNT(*): the sequence has gaps.
                     seq_row = conn.execute(
                         "SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq FROM message WHERE conversation_id = %s",
                         (conversation_id,),
                     ).fetchone()
                     seq = seq_row["next_seq"] if seq_row else 0
-                    msg_id = str(uuid.uuid4())
+                    # A caller-minted id lets the streaming Responses surface
+                    # announce the id before the row exists; anything invalid
+                    # falls back to a fresh one rather than a failed INSERT.
+                    msg_id = (
+                        message_id
+                        if message_id and _is_uuid(message_id)
+                        else str(uuid.uuid4())
+                    )
                     now = datetime.now(timezone.utc)
                     conn.execute(
                         "INSERT INTO message (id, conversation_id, sender, role, content, content_struct, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
@@ -1992,6 +2558,55 @@ class PostgresStore:
             meta=meta,
         )
 
+    def get_message(self, message_id: str) -> Optional[Message]:
+        """One message by id, or None.
+
+        Training needs the target's sequence *and* its content (SPEC §5.4.2),
+        and can get neither by scanning a fetch window: an older target simply
+        is not in the newest N messages, so the bound silently does nothing
+        and the fallback target text silently disappears.
+        """
+        if not _is_uuid(message_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM message WHERE id = %s", (message_id,)
+            ).fetchone()
+        return self._message_from_row(row) if row else None
+
+    def list_messages_before(
+        self, conversation_id: str, seq: int, *, limit: int = 200
+    ) -> List[Message]:
+        """The messages preceding ``seq``, oldest-first, bounded to the newest
+        ``limit`` of them — the conversation as it stood when that turn was
+        written."""
+        if not _is_uuid(conversation_id):
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM message WHERE conversation_id = %s AND seq < %s "
+                "ORDER BY seq DESC LIMIT %s",
+                (conversation_id, seq, limit),
+            ).fetchall()
+        return [self._message_from_row(row) for row in reversed(rows)]
+
+    def get_message_conversation(self, message_id: str) -> Optional[str]:
+        """The conversation a message belongs to, or None.
+
+        Purpose-built for the served Responses API, which resolves a
+        ``previous_response_id`` back to the conversation it continues. Only
+        the id comes back: continuity needs nothing else, and ownership is
+        the caller's check to make against the conversation itself.
+        """
+        if not _is_uuid(message_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT conversation_id FROM message WHERE id = %s",
+                (message_id,),
+            ).fetchone()
+        return str(row["conversation_id"]) if row else None
+
     def list_messages(
         self,
         conversation_id: str,
@@ -2011,37 +2626,33 @@ class PostgresStore:
                 query += " LIMIT %s"
                 params.append(limit)
             rows = conn.execute(query, tuple(params)).fetchall()
-        messages: List[Message] = []
-        for row in reversed(rows):
-            content_struct = row.get("content_struct")
-            if isinstance(content_struct, str):
-                try:
-                    content_struct = json.loads(content_struct)
-                except Exception:
-                    content_struct = None
-            content_struct = normalize_content_struct(
-                content_struct, row.get("content")
-            )
-            meta = row.get("meta")
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except Exception:
-                    meta = None
-            messages.append(
-                Message(
-                    id=str(row["id"]),
-                    conversation_id=str(row["conversation_id"]),
-                    sender=row["sender"],
-                    role=row["role"],
-                    content=row["content"],
-                    content_struct=content_struct,
-                    seq=row["seq"],
-                    created_at=row.get("created_at", datetime.now(timezone.utc)),
-                    meta=meta,
-                )
-            )
-        return messages
+        return [self._message_from_row(row) for row in reversed(rows)]
+
+    def _message_from_row(self, row) -> Message:
+        content_struct = row.get("content_struct")
+        if isinstance(content_struct, str):
+            try:
+                content_struct = json.loads(content_struct)
+            except Exception:
+                content_struct = None
+        content_struct = normalize_content_struct(content_struct, row.get("content"))
+        meta = row.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = None
+        return Message(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            sender=row["sender"],
+            role=row["role"],
+            content=row["content"],
+            content_struct=content_struct,
+            seq=row["seq"],
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            meta=meta,
+        )
 
     def list_conversations(
         self, user_id: str, limit: int = 20, offset: int = 0
@@ -2110,6 +2721,23 @@ class PostgresStore:
                 cursor_params.extend([created_at_cursor, artifact_cursor_id])
             except Exception as exc:
                 self.logger.warning("artifact_cursor_decode_failed", error=str(exc))
+        # An explicit visibility filter needs the identity that scopes it.
+        # Without one, the branches below dropped the scoping clause and
+        # returned *every* user's private rows, or every tenant's shared ones.
+        # Unreachable from `/v1/artifacts` — `app_user.tenant_id` is NOT NULL
+        # and the route always passes the caller — but it is the same
+        # fail-open default that `get_latest_workflow` shipped with, so it
+        # narrows here rather than waiting for a caller to find it.
+        if (visibility == "private" and not owner_user_id) or (
+            visibility == "shared" and not tenant_id
+        ):
+            self.logger.warning(
+                "artifact_list_unscoped",
+                visibility=visibility,
+                owner_user_id=owner_user_id,
+                tenant_id=tenant_id,
+            )
+            return []
         with self._connect() as conn:
             clauses = []
             params: list[Any] = []
@@ -2167,45 +2795,39 @@ class PostgresStore:
 
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             query = (
-                "SELECT * FROM artifact"
+                "SELECT * FROM artifact"  # nosec B608 - fragments are source literals; values are always bound via %s
                 + where
                 + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
             )
             params.extend(cursor_params)
             params.extend([limit, offset])
             rows = conn.execute(query, tuple(params)).fetchall()
-        artifacts: List[Artifact] = []
-        for row in rows:
-            artifacts.append(
-                Artifact(
-                    id=str(row["id"]),
-                    type=row["type"],
-                    name=row["name"],
-                    description=row.get("description") or "",
-                    schema=row.get("schema") or {},
-                    owner_user_id=(
-                        str(row["owner_user_id"]) if row.get("owner_user_id") else None
-                    ),
-                    visibility=row.get("visibility", "private"),
-                    created_at=row.get("created_at", datetime.now(timezone.utc)),
-                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
-                    fs_path=row.get("fs_path"),
-                    base_model=row.get("base_model")
-                    or (row.get("schema") or {}).get("base_model"),
-                    meta=row.get("meta"),
-                )
-            )
-        return artifacts
+        return [self._artifact_from_row(row) for row in rows]
 
-    def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
-        if not _is_uuid(artifact_id):
-            return None
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
-            ).fetchone()
-        if not row:
-            return None
+    #: Namespace for the per-artifact lifetime lock. Creation writes the
+    #: canonical payload directory before it publishes the row, and orphan
+    #: discovery reads exactly those directories — so without a shared lock a
+    #: scan in that window records a retirement for an artifact that is about
+    #: to exist. It looks harmless while the artifact is live, because the
+    #: sweep refuses to remove anything Postgres still knows about, but the
+    #: delete trigger's ON CONFLICT DO NOTHING then leaves that stale
+    #: timestamp in place: the real deletion inherits a grace period that has
+    #: already elapsed, and the payload goes immediately.
+    #:
+    #: An advisory lock rather than a file lock, because §22 puts several
+    #: replicas on one Postgres and only one of those is shared state they all
+    #: agree on.
+    _ARTIFACT_LIFETIME_LOCK = 0x6C696661  # "lifa"
+
+    def _lock_artifact_lifetime(self, conn, artifact_id: str) -> None:
+        """Hold this artifact's identity for the rest of the transaction."""
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (self._ARTIFACT_LIFETIME_LOCK, str(artifact_id)),
+        )
+
+    def _artifact_from_row(self, row) -> Artifact:
+        """One mapping from an `artifact` row, so every reader sees the same."""
         schema = row.get("schema")
         if isinstance(schema, str):
             try:
@@ -2230,6 +2852,302 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
+    def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
+        if not _is_uuid(artifact_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
+            ).fetchone()
+        return self._artifact_from_row(row) if row else None
+
+    def artifacts_for_paths(self, paths: Sequence[str]) -> List[Artifact]:
+        """Artifacts whose `fs_path` is exactly one of `paths`.
+
+        The caller passes a filesystem path and its ancestors, so an artifact
+        naming a corpus directory answers for the files inside it while an
+        artifact naming a sibling directory does not. Exact matches rather than
+        a `LIKE` prefix: `/shared/corpus` must not match `/shared/corpus-2`,
+        and a prefix comparison on strings says it does.
+        """
+        wanted = [p for p in paths if p]
+        if not wanted:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM artifact WHERE fs_path = ANY(%s)", (list(wanted),)
+            ).fetchall()
+        found = [self.get_artifact(str(row["id"])) for row in rows]
+        return [artifact for artifact in found if artifact is not None]
+
+    def get_private_artifact(
+        self, artifact_id: str, *, owner_user_id: str
+    ) -> Optional[Artifact]:
+        """One artifact this user may mutate, or None.
+
+        SPEC §12.3 scopes user CRUD to *private* artifacts. Ownership alone is
+        not the rule: publishing an artifact as shared or global binds it into
+        other people's work and into ConfigOps review, so editing or retiring
+        one stops being a private decision.
+        """
+        if not _is_uuid(artifact_id) or not _is_uuid(owner_user_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifact "
+                "WHERE id = %s AND owner_user_id = %s AND visibility = 'private'",
+                (artifact_id, owner_user_id),
+            ).fetchone()
+        return self._artifact_from_row(row) if row else None
+
+    def delete_private_artifact(
+        self, artifact_id: str, *, owner_user_id: str
+    ) -> Optional[Artifact]:
+        """Retire a private artifact, or refuse while it is being trained.
+
+        Returns the deleted artifact so the caller can clean up the payloads
+        the server derived from its identity, or None if there was nothing
+        this user was allowed to delete.
+
+        Versions, config patches, router state and training jobs reference the
+        artifact with `ON DELETE CASCADE`, so the row carries them out.
+
+        The lock is the point. A worker claims a job with an atomic
+        `UPDATE ... WHERE status = 'queued'`, so taking the artifact and its
+        unfinished jobs `FOR UPDATE` gives the two operations one order: if
+        the worker claims first this sees `running` and refuses; if this
+        commits first the claim finds no row to update. Otherwise a delete
+        mid-training cascades the job away while the worker writes weights
+        for an artifact that is gone.
+        """
+        if not _is_uuid(artifact_id) or not _is_uuid(owner_user_id):
+            return None
+        with self._connect() as conn, conn.transaction():
+            row = conn.execute(
+                "SELECT * FROM artifact "
+                "WHERE id = %s AND owner_user_id = %s AND visibility = 'private' "
+                "FOR UPDATE",
+                (artifact_id, owner_user_id),
+            ).fetchone()
+            if not row:
+                return None
+
+            unfinished = conn.execute(
+                "SELECT id, status FROM training_job "
+                "WHERE adapter_id = %s AND status IN ('queued', 'running') "
+                "FOR UPDATE",
+                (artifact_id,),
+            ).fetchall()
+            running = [j for j in unfinished if j["status"] == "running"]
+            if running:
+                raise TrainingInProgress(
+                    "the adapter is being trained and cannot be deleted",
+                    {
+                        "artifact_id": artifact_id,
+                        "job_ids": [str(j["id"]) for j in running],
+                    },
+                )
+
+            artifact = self._artifact_from_row(row)
+            # The retirement row is written by an AFTER DELETE trigger on
+            # `artifact`, in this same transaction. Doing it here instead made
+            # enrolment a property of this one caller, and every other way an
+            # artifact can disappear — account deletion above all — left its
+            # payloads with nothing to collect them.
+            conn.execute("DELETE FROM artifact WHERE id = %s", (artifact_id,))
+        return artifact
+
+    def enrol_artifact_retirement(self, artifact_id: str, artifact_type: str) -> bool:
+        """Record a first-observed orphan, if nothing claims it.
+
+        Enrolment normally comes from the delete trigger, which knows exactly
+        when the capability went. This covers what no deletion produced: a
+        `create_artifact` that wrote its payload and then failed to publish
+        the row leaves a directory no artifact ever named, so there was
+        nothing to delete and nothing to enrol.
+
+        The clock starts now rather than at some unknowable earlier moment, so
+        the grace period still protects anything that might be mid-read.
+        """
+        if not _is_uuid(artifact_id):
+            return False
+        with self._connect() as conn, conn.transaction():
+            # Before looking, so a creation that has written its directory but
+            # not yet published its row finishes first and is then visible.
+            self._lock_artifact_lifetime(conn, artifact_id)
+            if conn.execute(
+                "SELECT 1 FROM artifact WHERE id = %s", (artifact_id,)
+            ).fetchone():
+                return False
+            row = conn.execute(
+                "INSERT INTO artifact_payload_retirement (artifact_id, artifact_type) "
+                "VALUES (%s, %s) ON CONFLICT (artifact_id) DO NOTHING RETURNING 1",
+                (artifact_id, artifact_type),
+            ).fetchone()
+        return bool(row)
+
+    def due_artifact_retirements(self, *, grace_seconds: int) -> list[tuple[str, str]]:
+        """Retired payloads whose grace period has elapsed.
+
+        Measured from the recorded retirement, not from anything on disk: the
+        question is how long ago the capability was revoked, and a payload's
+        own timestamps answer a different one.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT artifact_id, artifact_type FROM artifact_payload_retirement "
+                "WHERE retired_at <= now() - make_interval(secs => %s) "
+                "ORDER BY retired_at",
+                (max(grace_seconds, 0),),
+            ).fetchall()
+        return [(str(r["artifact_id"]), r["artifact_type"]) for r in rows]
+
+    def clear_artifact_retirement(self, artifact_id: str) -> None:
+        """Drop the queue entry once its payloads are gone.
+
+        Only after the bytes are, so a failed cleanup is retried next sweep
+        instead of being forgotten.
+        """
+        if not _is_uuid(artifact_id):
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM artifact_payload_retirement WHERE artifact_id = %s",
+                (artifact_id,),
+            )
+
+    # -- account namespace retirement ---------------------------------------
+    #
+    # `NOT EXISTS (SELECT 1 FROM app_user ...)` guards every read below. A
+    # discovery scan can enrol a namespace whose account row was still on its
+    # way, and that record is not merely stale: while it exists every
+    # subordinate sweep skips the user, so a live account's generations would
+    # accumulate forever. Filtering on read makes the mistake self-healing
+    # rather than permanent, and costs an index probe.
+
+    _USER_LIFETIME_LOCK = 0x6C696675  # "lifu"
+
+    def _lock_user_lifetime(self, conn, user_id: str) -> None:
+        """Hold this account's lifetime for the rest of the transaction."""
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (self._USER_LIFETIME_LOCK, str(user_id)),
+        )
+
+    @contextlib.contextmanager
+    def hold_user_lifetime(self, user_id: str):
+        """Hold one account's lifetime, and say whether it may be collected in.
+
+        Yields True while nothing is erasing this account, and holds that
+        answer true for as long as the caller stays inside the block.
+
+        Holding is the point: asking and then acting is a check-then-act
+        across the one event the answer is about, and a sweep that straddles a
+        deletion unlinks a blob inside the grace period the retirement
+        promised. `delete_user` takes the same lock at the start of its
+        transaction, so only two histories remain — the sweep runs entirely
+        against pre-deletion state, where the account's conversations still
+        name the blob and it is kept, or the deletion commits first and the
+        sweep sees the retirement and does nothing.
+
+        A name that is not a user id yields True: it cannot be an account, so
+        no account's lifetime governs it.
+        """
+        if not _is_uuid(user_id):
+            yield True
+            return
+        with self._connect() as conn, conn.transaction():
+            self._lock_user_lifetime(conn, user_id)
+            row = conn.execute(
+                "SELECT 1 FROM user_namespace_retirement r "
+                "WHERE r.user_id = %s "
+                "  AND NOT EXISTS (SELECT 1 FROM app_user u WHERE u.id = r.user_id)",
+                (user_id,),
+            ).fetchone()
+            yield row is None
+
+    @contextlib.contextmanager
+    def hold_live_user(self, user_id: str):
+        """Hold one account's lifetime, and say whether it still exists.
+
+        The write-side counterpart of `hold_user_lifetime`, on the same lock
+        and deliberately not the same question. That one asks "may a collector
+        act inside this namespace?", true for a directory that is not an
+        account at all; this asks "is this principal still here?", false for
+        the same input. A caller that reused the collector's answer would
+        write on behalf of an account that never existed.
+
+        Hold it across both the decision and the write. A purge is complete at
+        the instant it runs, which is not the same as the account's content
+        being gone: an in-flight request authorized before the deletion
+        finishes by writing, and an idempotency record holds a completed
+        response. Under the lock, either the writer goes first and the purge
+        that follows removes what it wrote, or the deletion goes first and the
+        writer sees no account and writes nothing.
+
+        A name that is not a UUID is accepted rather than refused: `app_user.id`
+        is a UUID, so such a name can never have been an account and has
+        nothing to resurrect. Refusing it would only break idempotency for a
+        caller the erasure has no claim on.
+        """
+        if not _is_uuid(user_id):
+            yield True
+            return
+        with self._connect() as conn, conn.transaction():
+            self._lock_user_lifetime(conn, user_id)
+            row = conn.execute(
+                "SELECT 1 FROM app_user WHERE id = %s", (user_id,)
+            ).fetchone()
+            yield row is not None
+
+    def enrol_user_namespace_retirement(self, user_id: str) -> bool:
+        """Record a namespace no account claims, at first observation.
+
+        Enrolment normally comes from the delete trigger, which knows when the
+        account went. This covers what predates the trigger — a namespace left
+        by a deletion that happened before any of this existed — and it starts
+        the clock now rather than at an unknowable earlier moment, so nothing
+        is removed on the sweep that first sees it.
+        """
+        if not _is_uuid(user_id):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "INSERT INTO user_namespace_retirement (user_id) "
+                "SELECT %s::uuid WHERE NOT EXISTS "
+                "(SELECT 1 FROM app_user u WHERE u.id = %s) "
+                "ON CONFLICT (user_id) DO NOTHING RETURNING 1",
+                (user_id, user_id),
+            ).fetchone()
+        return bool(row)
+
+    def due_user_namespace_retirements(self, *, grace_seconds: int) -> list[str]:
+        """Retired accounts whose grace period has elapsed."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT r.user_id FROM user_namespace_retirement r "
+                "WHERE r.retired_at <= now() - make_interval(secs => %s) "
+                "  AND NOT EXISTS (SELECT 1 FROM app_user u WHERE u.id = r.user_id) "
+                "ORDER BY r.retired_at",
+                (max(grace_seconds, 0),),
+            ).fetchall()
+        return [str(r["user_id"]) for r in rows]
+
+    def clear_user_namespace_retirement(self, user_id: str) -> None:
+        """Drop the queue entry once the namespace is gone.
+
+        Only after both trees are, so a failed removal is retried next sweep
+        instead of being forgotten — and so the subordinate sweeps keep
+        skipping the user until there is nothing left of them to skip.
+        """
+        if not _is_uuid(user_id):
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM user_namespace_retirement WHERE user_id = %s",
+                (user_id,),
+            )
+
     def create_artifact(
         self,
         type_: str,
@@ -2249,9 +3167,14 @@ class PostgresStore:
             self.logger.warning("artifact_validation_failed", errors=exc.errors)
             raise
         artifact_id = str(uuid.uuid4())
-        fs_path = self._persist_payload(artifact_id, 1, schema)
         try:
             with self._connect() as conn, conn.transaction():
+                # Taken before the canonical directory exists, so orphan
+                # discovery cannot see a payload whose row is still on its way
+                # and record a retirement for an artifact that is about to be
+                # perfectly alive.
+                self._lock_artifact_lifetime(conn, artifact_id)
+                fs_path = self._persist_payload(artifact_id, 1, schema)
                 conn.execute(
                     "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path, base_model, visibility) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
@@ -2294,6 +3217,39 @@ class PostgresStore:
             base_model=schema.get("base_model"),
         )
 
+    def update_private_artifact(
+        self,
+        artifact_id: str,
+        schema: dict,
+        description: Optional[str] = None,
+        *,
+        owner_user_id: str,
+        version_author: Optional[str] = None,
+        change_note: Optional[str] = None,
+    ) -> Optional[Artifact]:
+        """Edit an artifact this user owns and has not published.
+
+        The predicate goes into the statement that takes the lock, not into
+        a check the caller made earlier. `update_artifact` locks by id alone,
+        so validating "private and mine" in the route leaves a window:
+        anything publishing the artifact in between lands after the check and
+        before the write, and the edit reaches an artifact that is no longer
+        the caller's alone. Same shape as the delete, enforced the same way.
+
+        `update_artifact` stays unrestricted for the callers that are not a
+        user editing their own thing: training promoting a version, and config
+        ops applying a reviewed patch.
+        """
+        return self.update_artifact(
+            artifact_id,
+            schema,
+            description,
+            version_author=version_author,
+            change_note=change_note,
+            owner_user_id=owner_user_id,
+            require_private=True,
+        )
+
     def update_artifact(
         self,
         artifact_id: str,
@@ -2302,30 +3258,37 @@ class PostgresStore:
         *,
         version_author: Optional[str] = None,
         change_note: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
+        require_private: bool = False,
     ) -> Optional[Artifact]:
-        schema_kind = schema.get("kind")
-        if schema_kind == "workflow.chat":
-            validator_type = "workflow"
-        elif schema_kind == "tool.spec":
-            validator_type = "tool"
-        elif schema_kind == "adapter.lora":
-            validator_type = "adapter"
-        else:
-            validator_type = "artifact"
-        try:
-            validate_artifact(validator_type, schema)  # type: ignore[arg-type]
-        except ArtifactValidationError as exc:
-            self.logger.warning("artifact_validation_failed", errors=exc.errors)
-            raise
         with self._connect() as conn, conn.transaction():
-            # Issue 19.5: Use SELECT ... FOR UPDATE to prevent race condition
-            # This locks the artifact row until the transaction completes,
-            # preventing concurrent version inserts from calculating the same next_version
+            # FOR UPDATE holds the artifact row for the transaction, so two
+            # concurrent inserts cannot compute the same next_version.
+            conditions = ["id = %s"]
+            params: list[Any] = [artifact_id]
+            if owner_user_id is not None:
+                conditions.append("owner_user_id = %s")
+                params.append(owner_user_id)
+            if require_private:
+                conditions.append("visibility = 'private'")
             row = conn.execute(
-                "SELECT * FROM artifact WHERE id = %s FOR UPDATE", (artifact_id,)
+                f"SELECT * FROM artifact WHERE {' AND '.join(conditions)} "  # nosec B608 - fragments are source literals; values are always bound via %s
+                "FOR UPDATE",
+                tuple(params),
             ).fetchone()
             if not row:
                 return None
+            # Against the row's own type, which required reading the row
+            # first: choosing the validator from the incoming schema's `kind`
+            # let a payload pick which rules it would be judged by, and an
+            # adapter rewritten as `kind: tool.spec` passed the tool schema
+            # while the row stayed `type='adapter'`. Inside the transaction
+            # and before `_persist_payload`, so a refusal writes nothing.
+            try:
+                validate_artifact(row["type"], schema)  # type: ignore[arg-type]
+            except ArtifactValidationError as exc:
+                self.logger.warning("artifact_validation_failed", errors=exc.errors)
+                raise
             versions = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s",
                 (artifact_id,),
@@ -2427,7 +3390,7 @@ class PostgresStore:
             # Use a single query with GROUP BY for efficiency
             placeholders = ", ".join(["%s"] * len(artifact_ids))
             rows = conn.execute(
-                f"SELECT artifact_id, MAX(version) as max_version FROM artifact_version "
+                f"SELECT artifact_id, MAX(version) as max_version FROM artifact_version "  # nosec B608 - fragments are source literals; values are always bound via %s
                 f"WHERE artifact_id IN ({placeholders}) GROUP BY artifact_id",
                 tuple(artifact_ids),
             ).fetchall()
@@ -2481,7 +3444,55 @@ class PostgresStore:
             )
         return fs_path
 
-    def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
+    def _deny_workflow(self, workflow_id, user_id, owner_user_id, visibility) -> None:
+        self.logger.warning(
+            "workflow_access_denied",
+            workflow_id=workflow_id,
+            user_id=user_id,
+            owner_user_id=owner_user_id,
+            visibility=visibility,
+        )
+
+    def get_latest_workflow(
+        self,
+        workflow_id: str,
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """The newest version of a workflow this caller may run, or None.
+
+        `user_id` is required rather than optional: `workflow_id` arrives in
+        a request body, so without it, naming another user's private workflow
+        runs it. A keyword with no default means a caller cannot omit the
+        question by accident.
+        """
+        artifact = self.get_artifact(workflow_id)
+        if artifact is None:
+            return None
+        visibility = getattr(artifact, "visibility", "private")
+        owner_id = getattr(artifact, "owner_user_id", None)
+        if visibility == "private":
+            # Ownerless too: an artifact nobody owns cannot be shown to be
+            # this caller's, and the previous form only refused when an owner
+            # was present, so a null owner served everyone.
+            if not owner_id or owner_id != user_id:
+                self._deny_workflow(workflow_id, user_id, owner_id, visibility)
+                return None
+        elif visibility == "shared":
+            # `shared` means within a tenant, and the tenant is the owner's —
+            # `Artifact` has no tenant column, so the previous
+            # `getattr(artifact, "tenant_id", None)` was always None and the
+            # `None in (...)` acceptance served shared workflows across
+            # tenants. Read it from the owner, the way list_artifacts does.
+            owner = self.get_user(owner_id) if owner_id else None
+            if not owner or not tenant_id or owner.tenant_id != tenant_id:
+                self._deny_workflow(workflow_id, user_id, owner_id, visibility)
+                return None
+        elif visibility != "global":
+            # An unrecognized visibility is not a licence.
+            self._deny_workflow(workflow_id, user_id, owner_id, visibility)
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT schema FROM artifact_version WHERE artifact_id = %s ORDER BY version DESC LIMIT 1",
@@ -2753,6 +3764,22 @@ class PostgresStore:
             if not artifact_row:
                 raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
 
+            # The door belongs here, on the mutation, not only on the API
+            # that usually reaches it: an approved patch is model-authored
+            # text, and without this one could remove `mode` or re-add
+            # `backend` and put back exactly the format Pass C deleted.
+            #
+            # Judged against the row's own `type`, never against the incoming
+            # schema's `kind`. Choosing the validator from the payload lets
+            # the payload choose which rules it is judged by — an adapter
+            # rewritten as `kind: tool.spec` passed the tool schema while the
+            # row stayed `type='adapter'`. `type` is immutable through every
+            # mutation path, so an adapter row must remain a valid adapter.
+            #
+            # Inside the transaction and before `_persist_payload`, so a
+            # refusal leaves no row, no version and no payload behind.
+            validate_artifact(artifact_row["type"], new_schema)  # type: ignore[arg-type]
+
             versions = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s",
                 (patch.artifact_id,),
@@ -2863,7 +3890,7 @@ class PostgresStore:
         return None
 
     def _safe_float(self, value: Any, default: float = 1.0, *, context: str = "") -> float:
-        """Parse floats defensively to avoid crashes on malformed data (Issue 39.3)."""
+        """Parse floats defensively; malformed data must not raise."""
 
         try:
             return float(value)
@@ -2920,13 +3947,23 @@ class PostgresStore:
 
         Defaults are never baked into storage, so a future change to a default
         propagates to keys the admin never overrode.
+
+        Filtered to the settings the model still declares, and generically so:
+        a key this build has retired is not an operator's choice — counting it
+        as one refused the first-boot seed on databases whose only history was
+        an older build, and echoed the deleted name from the admin API
+        forever. Any future setting deletion becomes inert here for free.
         """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT config FROM instance_config WHERE name = %s",
                 ("system_settings",),
             ).fetchone()
-        return self._coerce_stored_settings(row)
+        return {
+            key: value
+            for key, value in self._coerce_stored_settings(row).items()
+            if key in SYSTEM_SETTINGS_DEFAULTS
+        }
 
     @staticmethod
     def _coerce_stored_settings(row: Any) -> dict:
@@ -2994,7 +4031,15 @@ class PostgresStore:
                 "SELECT config FROM instance_config WHERE name = %s FOR UPDATE",
                 ("system_settings",),
             ).fetchone()
-            merged = {**self._coerce_stored_settings(row), **settings}
+            # The merge starts from the filtered set, not the raw blob, so a
+            # write physically prunes keys the model no longer declares
+            # instead of carrying them forever.
+            stored = {
+                key: value
+                for key, value in self._coerce_stored_settings(row).items()
+                if key in SYSTEM_SETTINGS_DEFAULTS
+            }
+            merged = {**stored, **settings}
             conn.execute(
                 """
                 INSERT INTO instance_config (name, config, created_at, updated_at)
@@ -3008,6 +4053,130 @@ class PostgresStore:
         return {**SYSTEM_SETTINGS_DEFAULTS, **merged}
 
     # knowledge
+    def get_conversation_attachment_context(
+        self, owner_user_id: str, conversation_id: str
+    ) -> Optional[KnowledgeContext]:
+        """The conversation's implicit index, by identity rather than by page.
+
+        A paged scan is not an identity lookup: an account with more contexts
+        than the page holds loses an older conversation's index entirely,
+        while its records and objects stay intact.
+
+        The relationship is a foreign key, so it is also the row's identity:
+        the unique index on `conversation_id` means this returns at most one
+        row without an ORDER BY to pick a winner from.
+        """
+        if not _is_uuid(owner_user_id) or not _is_uuid(conversation_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM knowledge_context "
+                "WHERE owner_user_id = %s AND conversation_id = %s",
+                (owner_user_id, str(conversation_id)),
+            ).fetchone()
+        return self._context_from_row(row) if row else None
+
+    def get_contexts_for_scope(
+        self, owner_user_id: str, context_ids: Sequence[str]
+    ) -> List[KnowledgeContext]:
+        """The named contexts this user owns, by identity rather than by page.
+
+        Authorization is a question about particular ids, and answering it
+        with `list_contexts` answered a different one: whether those ids are
+        near the top of a listing. That listing pages at 100 rows in SQL, so
+        a context the request had already validated by direct lookup dropped
+        out of retrieval once the account had a hundred newer ones — the turn
+        succeeded and the model was given no grounding.
+
+        Implicit conversation indexes are excluded here as everywhere else:
+        they are reachable only through the conversation that owns them.
+        """
+        wanted = [ctx_id for ctx_id in context_ids or [] if _is_uuid(ctx_id)]
+        if not wanted or not _is_uuid(owner_user_id):
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM knowledge_context "
+                "WHERE owner_user_id = %s AND id = ANY(%s::uuid[]) "
+                "AND conversation_id IS NULL",
+                (owner_user_id, wanted),
+            ).fetchall()
+        return [self._context_from_row(row) for row in rows]
+
+    def get_or_create_conversation_attachment_context(
+        self, owner_user_id: str, conversation_id: str, name: str, description: str
+    ) -> KnowledgeContext:
+        """That context, creating it once however many callers ask at once.
+
+        Lookup-then-insert in one process is not a guard when Postgres is
+        shared across replicas (§22), and it was not one within a process
+        either: two first attachments both looked, both found nothing, and
+        both inserted. Measured, the conversation ended up with two hidden
+        contexts and one of the two acknowledged attachments was searchable
+        from neither, because the later lookup returns one row.
+
+        The database decides. `ON CONFLICT DO NOTHING` against the unique
+        index means the loser inserts nothing and then reads the winner, so
+        every caller comes back with the same context.
+
+        The same insert is what makes the context's lifetime the
+        conversation's. `conversation_id` is a foreign key, so a conversation
+        deleted between this caller validating it and reaching here fails the
+        insert instead of leaving an index behind for a chat that is gone.
+        Postgres serializes that; nothing here has to detect it.
+        """
+        if not _is_uuid(conversation_id):
+            raise ConstraintViolation(
+                "conversation not found", {"conversation_id": conversation_id}
+            )
+        existing = self.get_conversation_attachment_context(
+            owner_user_id, conversation_id
+        )
+        if existing is not None:
+            return existing
+        # Description for the UI and for anything reading contexts
+        # generically. The column carries the relationship; this is not a
+        # second copy anything depends on.
+        meta = {"auto": True, "conversation_id": str(conversation_id)}
+        ctx_id = str(uuid.uuid4())
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO knowledge_context "
+                    "(id, owner_user_id, name, description, meta, conversation_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (
+                        ctx_id,
+                        owner_user_id,
+                        name,
+                        description,
+                        self._json_param(meta),
+                        str(conversation_id),
+                    ),
+                )
+        except errors.ForeignKeyViolation as exc:
+            # Two references, and they fail differently: the owner going away
+            # is an account teardown, the conversation going away is the race
+            # this key exists to lose safely. Naming the wrong one would send
+            # the caller looking in the wrong place.
+            if "conversation" in str(exc):
+                raise ConversationGone(
+                    "conversation deleted during upload",
+                    {"conversation_id": str(conversation_id)},
+                )
+            raise ConstraintViolation(
+                "context owner missing", {"owner_user_id": owner_user_id}
+            )
+        created = self.get_conversation_attachment_context(
+            owner_user_id, conversation_id
+        )
+        if created is None:
+            raise ConstraintViolation(
+                "conversation context could not be created",
+                {"conversation_id": conversation_id},
+            )
+        return created
+
     def upsert_context(
         self,
         owner_user_id: Optional[str],
@@ -3046,16 +4215,8 @@ class PostgresStore:
             meta=meta,
         )
 
-    def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
-        if not _is_uuid(context_id):
-            return None
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM knowledge_context WHERE id = %s", (context_id,)
-            ).fetchone()
-        if not row:
-            return None
-
+    @staticmethod
+    def _context_from_row(row) -> KnowledgeContext:
         return KnowledgeContext(
             id=str(row["id"]),
             owner_user_id=str(row["owner_user_id"]),
@@ -3065,7 +4226,19 @@ class PostgresStore:
             updated_at=row["updated_at"],
             fs_path=row.get("fs_path"),
             meta=row.get("meta"),
+            conversation_id=(
+                str(row["conversation_id"]) if row.get("conversation_id") else None
+            ),
         )
+
+    def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
+        if not _is_uuid(context_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM knowledge_context WHERE id = %s", (context_id,)
+            ).fetchone()
+        return self._context_from_row(row) if row else None
 
     def list_contexts(
         self,
@@ -3076,7 +4249,16 @@ class PostgresStore:
         cursor: Optional[str] = None,
         include_sentinel: bool = False,
         limit: Optional[int] = None,
+        include_auto: bool = True,
     ) -> List[KnowledgeContext]:
+        """This user's contexts, ordered newest first.
+
+        `include_auto` decides whether conversations' implicit indexes are
+        part of the domain. Dropping them from the *result* instead made
+        pagination lie: the ordering and the LIMIT had already happened, so a
+        page whose sentinel row was an implicit context reported no next page
+        with ordinary contexts still unreached.
+        """
         if not owner_user_id:
             return []
 
@@ -3095,9 +4277,15 @@ class PostgresStore:
             except Exception as exc:  # pragma: no cover - defensive
                 self.logger.warning("context_cursor_decode_failed", error=str(exc))
 
+        auto_filter = (
+            ""
+            if include_auto
+            else " AND conversation_id IS NULL"
+        )
         with self._connect() as conn:
             query = (
-                "SELECT * FROM knowledge_context WHERE owner_user_id = %s"
+                "SELECT * FROM knowledge_context WHERE owner_user_id = %s"  # nosec B608 - fragments are source literals; values are always bound via %s
+                + auto_filter
                 + cursor_filter
                 + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
             )
@@ -3106,21 +4294,97 @@ class PostgresStore:
             params.extend([fetch_limit, offset])
             rows = conn.execute(query, tuple(params)).fetchall()
 
-        contexts: List[KnowledgeContext] = []
-        for row in rows:
-            contexts.append(
-                KnowledgeContext(
-                    id=str(row["id"]),
-                    owner_user_id=str(row["owner_user_id"]),
-                    name=row["name"],
-                    description=row["description"],
-                    created_at=row.get("created_at", datetime.now(timezone.utc)),
-                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
-                    fs_path=row.get("fs_path"),
-                    meta=row.get("meta"),
-                )
-            )
-        return contexts
+        return [self._context_from_row(row) for row in rows]
+
+    def update_context(
+        self,
+        context_id: str,
+        *,
+        owner_user_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Optional[KnowledgeContext]:
+        """Rename or redescribe an ordinary context. Owner-only.
+
+        The three conditions are in the statement, not in the caller. The
+        route helper checks them too, and that is not the same thing: a
+        helper guards the callers that use it, while the predicate here
+        guards the row. `conversation_id IS NULL` is what keeps a chat's
+        implicit index out — its lifetime belongs to the conversation
+        (SPEC §19.5), so it is not part of the collection this edits.
+
+        Only supplied fields are written, so a rename does not blank the
+        description.
+        """
+        if not _is_uuid(context_id) or not _is_uuid(owner_user_id):
+            return None
+        assignments = []
+        params: list[Any] = []
+        if name is not None:
+            assignments.append("name = %s")
+            params.append(name)
+        if description is not None:
+            assignments.append("description = %s")
+            params.append(description)
+        if not assignments:
+            return self.get_ordinary_context(context_id, owner_user_id=owner_user_id)
+
+        assignments.append("updated_at = %s")
+        params.extend([datetime.now(timezone.utc), context_id, owner_user_id])
+        with self._connect() as conn:
+            row = conn.execute(
+                f"UPDATE knowledge_context SET {', '.join(assignments)} "  # nosec B608 - fragments are source literals; values are always bound via %s
+                "WHERE id = %s AND owner_user_id = %s AND conversation_id IS NULL "
+                "RETURNING id",
+                tuple(params),
+            ).fetchone()
+        if not row:
+            return None
+        return self.get_context(context_id)
+
+    def delete_context(self, context_id: str, *, owner_user_id: str) -> bool:
+        """Retire an ordinary context. Owner-only.
+
+        Nothing is cleaned up by hand. `context_source` and `knowledge_chunk`
+        reference this row with `ON DELETE CASCADE`, and segment vectors
+        cascade with the chunks, so one statement removes the context and
+        everything that describes its contents. `conversation.active_context_id`
+        references it with `ON DELETE SET NULL`, so chats bound to it are
+        released rather than deleted.
+
+        The files the context indexed are untouched. A context references
+        paths; it does not own them.
+        """
+        if not _is_uuid(context_id) or not _is_uuid(owner_user_id):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "DELETE FROM knowledge_context "
+                "WHERE id = %s AND owner_user_id = %s AND conversation_id IS NULL "
+                "RETURNING id",
+                (context_id, owner_user_id),
+            ).fetchone()
+        return bool(row)
+
+    def get_ordinary_context(
+        self, context_id: str, *, owner_user_id: str
+    ) -> Optional[KnowledgeContext]:
+        """One context this user owns and manages directly, by identity.
+
+        Not a listing. The same identity-versus-page mistake cost an earlier
+        tranche a conversation's whole index: `list_contexts` pages in SQL,
+        so anything past the first page was unreachable by a caller that
+        already knew the id.
+        """
+        if not _is_uuid(context_id) or not _is_uuid(owner_user_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM knowledge_context "
+                "WHERE id = %s AND owner_user_id = %s AND conversation_id IS NULL",
+                (context_id, owner_user_id),
+            ).fetchone()
+        return self._context_from_row(row) if row else None
 
     def add_context_source(
         self,
@@ -3188,7 +4452,16 @@ class PostgresStore:
             )
             return result.rowcount > 0
 
-    def add_chunks(self, context_id: str, chunks: Iterable[KnowledgeChunk]) -> None:
+    def add_chunks(
+        self, context_id: str, chunks: Iterable[KnowledgeChunk]
+    ) -> List[int]:
+        """Insert chunks and return their ids, in order.
+
+        The id is returned (and set on the passed chunk) because late
+        interaction has to attach segment vectors to the row it just wrote,
+        and reading them back by content would be both slower and ambiguous.
+        """
+        inserted: List[int] = []
         try:
             with self._connect() as conn:
                 for chunk in chunks:
@@ -3197,8 +4470,8 @@ class PostgresStore:
                             "fs_path required for knowledge_chunk",
                             {"fs_path": chunk.fs_path},
                         )
-                    conn.execute(
-                        "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    row = conn.execute(
+                        "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
                         (
                             context_id,
                             chunk.fs_path,
@@ -3208,15 +4481,643 @@ class PostgresStore:
                             chunk.created_at,
                             json.dumps(chunk.meta) if chunk.meta else None,
                         ),
-                    )
+                    ).fetchone()
+                    if row:
+                        chunk.id = int(row["id"])
+                        inserted.append(int(row["id"]))
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context not found", {"context_id": context_id})
+        return inserted
+
+    def replace_chunks_for_path(
+        self, context_id: str, fs_path: str, chunks: Iterable[KnowledgeChunk]
+    ) -> List[int]:
+        """Make `chunks` the whole of what this context says about `fs_path`.
+
+        Appending instead would leave the previous generation's chunks beside
+        the new ones, so a search could return, as the contents of that path,
+        text it has not held since an earlier upload. SPEC §2.5 dedupes by
+        checksum *and path* and refreshes a changed path by ingesting it,
+        which describes exactly one generation.
+
+        Delete and insert in one transaction, so a reader never sees the path
+        with no chunks at all — an interrupted refresh that emptied a path
+        would be a worse answer than a stale one.
+        """
+        deleted_generation: List[int] = []
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM knowledge_chunk WHERE context_id = %s AND fs_path = %s",
+                    (context_id, fs_path),
+                )
+                for chunk in chunks:
+                    row = conn.execute(
+                        "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        (
+                            context_id,
+                            fs_path,
+                            chunk.chunk_index,
+                            chunk.content,
+                            chunk.embedding,
+                            chunk.created_at,
+                            json.dumps(chunk.meta) if chunk.meta else None,
+                        ),
+                    ).fetchone()
+                    if row:
+                        chunk.id = int(row["id"])
+                        deleted_generation.append(int(row["id"]))
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("context not found", {"context_id": context_id})
+        return deleted_generation
+
+    def prune_context_to_paths(self, context_id: str, keep_paths: Sequence[str]) -> int:
+        """Drop everything this context says about anything not in `keep_paths`.
+
+        For a conversation's implicit index, where the paths are attachment
+        generations and the conversation's records say which ones it holds.
+        Re-attaching a filename produces a different generation, so the new
+        ingestion replaces nothing and the retired one stays searchable
+        until this removes it.
+
+        A row with no path cannot be matched against a generation, so it goes
+        too: everything in one of these contexts is there to describe an
+        attachment.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM knowledge_chunk WHERE context_id = %s "
+                "AND (fs_path IS NULL OR NOT (fs_path = ANY(%s)))",
+                (context_id, list(keep_paths)),
+            )
+            return cursor.rowcount or 0
+
+    def referenced_attachment_checksums(self, owner_user_id: str) -> set[str]:
+        """Every attachment generation this user's conversations still name.
+
+        The marks for the generation store's sweep. They already exist —
+        each attachment record names its generation — so a reference count
+        would be a second record of the same fact, to be kept correct across
+        every way a conversation is created, edited and deleted.
+
+        Raises rather than returning an empty set when the query fails: the
+        caller deletes what is not in here, and "unknown" must not be
+        mistaken for "nothing".
+        """
+        if not _is_uuid(owner_user_id):
+            raise ValueError("owner_user_id is not a user identifier")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT att ->> 'checksum' AS checksum "
+                "FROM conversation c, LATERAL jsonb_array_elements("
+                "  CASE WHEN jsonb_typeof(c.meta -> 'attachments') = 'array' "
+                "       THEN c.meta -> 'attachments' ELSE '[]'::jsonb END"
+                ") AS att "
+                "WHERE c.user_id = %s AND att ->> 'checksum' IS NOT NULL",
+                (owner_user_id,),
+            ).fetchall()
+        return {str(row["checksum"]) for row in rows}
+
+    def attachment_checksum_referenced(
+        self, owner_user_id: str, checksum: str
+    ) -> bool:
+        """Whether any of this user's conversations still names `checksum`.
+
+        The same question `referenced_attachment_checksums` answers for a
+        whole account, asked about one object so the sweep can re-ask it
+        while holding that object's lock.
+        """
+        if not _is_uuid(owner_user_id):
+            raise ValueError("owner_user_id is not a user identifier")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM conversation c, LATERAL jsonb_array_elements("
+                "  CASE WHEN jsonb_typeof(c.meta -> 'attachments') = 'array' "
+                "       THEN c.meta -> 'attachments' ELSE '[]'::jsonb END"
+                ") AS att "
+                "WHERE c.user_id = %s AND att ->> 'checksum' = %s LIMIT 1",
+                (owner_user_id, checksum),
+            ).fetchone()
+        return row is not None
+
+    def ensure_context_source(
+        self, context_id: str, fs_path: str, *, recursive: bool = False
+    ) -> None:
+        """Record that a context covers a path, unless it is recorded already.
+
+        `add_context_source` is the operator-facing act of adding a source and
+        hands back the row. This is the internal statement that a path a
+        context has just been given is part of what that context covers, so
+        that `context_source` says so rather than the fact being inferable
+        only from the chunks that ingestion happened to leave behind.
+
+        Idempotent: the same file may be uploaded into the same context any
+        number of times, and that is not a new relationship.
+        """
+        if not fs_path or not fs_path.strip():
+            raise ConstraintViolation(
+                "fs_path required for context_source", {"fs_path": fs_path}
+            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO context_source (id, context_id, fs_path, recursive) "
+                    "SELECT %s, %s, %s, %s WHERE NOT EXISTS ("
+                    "SELECT 1 FROM context_source "
+                    "WHERE context_id = %s AND fs_path = %s)",
+                    (
+                        str(uuid.uuid4()),
+                        context_id,
+                        fs_path,
+                        recursive,
+                        context_id,
+                        fs_path,
+                    ),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("context not found", {"context_id": context_id})
+
+    def contexts_covering_path(
+        self, fs_path: str, *, owner_user_id: str
+    ) -> List[str]:
+        """Every context of this owner that covers `fs_path`.
+
+        Read from `context_source` alone, because that table *is* the
+        statement "this context covers this path". `knowledge_chunk` is the
+        materialization of that statement and is not consulted here, however
+        tempting it is: a chunk left behind by a bug would otherwise be read
+        as evidence of coverage, and the next replacement would faithfully
+        re-ingest into a context nobody added — derived state promoting itself
+        into authority. The converse matters as much. A context still covers
+        its source when the chunks are gone, so coverage cannot evaporate
+        because a cleanup removed the index.
+
+        The checksum manifest is not consulted either. It records whichever
+        context an upload happened to name, so a directory source never
+        appears in it and an upload naming none erases what was there.
+
+        Scoped to the owner here, in one place — `knowledge_context` is
+        owned by a user on this schema — so that no caller can re-index a
+        replacement into somebody else's context by naming a path.
+
+        The prefix test runs in Python rather than SQL because a filesystem
+        path may contain `%` or `_`, and a LIKE pattern built out of one
+        matches paths nobody asked about.
+        """
+        target = str(fs_path).rstrip("/")
+        parent = str(Path(target).parent)
+        with self._connect() as conn:
+            sources = conn.execute(
+                "SELECT cs.context_id, cs.fs_path, cs.recursive FROM context_source cs "
+                "JOIN knowledge_context kc ON kc.id = cs.context_id "
+                # Conversations' implicit indexes are excluded here for the
+                # same reason `invalidate_path_in_other_contexts` excludes
+                # them: §19.5 scopes an attachment to the chat that received
+                # it, so one chat's upload must neither empty nor re-fill
+                # another chat's index. The two have to agree — a context this
+                # returned but that one skipped would be queued for a re-index
+                # of chunks nobody invalidated.
+                "WHERE kc.owner_user_id = %s AND kc.conversation_id IS NULL",
+                (owner_user_id,),
+            ).fetchall()
+
+        covering: set[str] = set()
+        for row in sources:
+            source = str(row["fs_path"]).rstrip("/")
+            if source == target or source == parent:
+                # The file itself, or the directory holding it. A directory
+                # source covers its immediate children whether or not it
+                # recurses; `recursive` is about depth below that.
+                covering.add(str(row["context_id"]))
+            elif row.get("recursive") and target.startswith(source + "/"):
+                covering.add(str(row["context_id"]))
+        return sorted(covering)
+
+    def enqueue_ingest_job(
+        self, context_id: str, fs_path: str, generation: str
+    ) -> None:
+        """Record that a context owes this path a re-read of `generation`.
+
+        Collapses onto the pending slot for that (context, path): a file
+        replaced five times before the queue drains needs one re-read of its
+        final bytes, not five of which four describe bytes already gone. The
+        newest generation wins the slot, which is the whole point — an older
+        one must never be what eventually gets indexed.
+
+        A job already running is not disturbed. It carries an older generation,
+        will find the file changed underneath it and decline to write, and this
+        new row is what actually indexes the new bytes.
+        """
+        if not fs_path or not fs_path.strip():
+            raise ConstraintViolation(
+                "fs_path required for ingest_job", {"fs_path": fs_path}
+            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO ingest_job (id, context_id, fs_path, generation) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (context_id, fs_path) WHERE status = 'queued' "
+                    "DO UPDATE SET generation = EXCLUDED.generation, "
+                    # Due now, not whenever the job it displaced was due. This
+                    # is a fresh replacement rather than a retry of the old
+                    # one, so inheriting a backoff would leave the new bytes
+                    # unindexed for as long as the previous failure had earned.
+                    "attempts = 0, detail = NULL, next_attempt_at = now(), "
+                    "updated_at = now()",
+                    (str(uuid.uuid4()), context_id, fs_path, generation),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("context not found", {"context_id": context_id})
+
+    def claim_ingest_jobs(self, limit: int = 16) -> List[Dict[str, Any]]:
+        """Take up to `limit` queued jobs, marking them running.
+
+        `SKIP LOCKED` so two drains — the one a request starts and the one the
+        background worker runs — take different jobs rather than one waiting on
+        the other or, worse, both indexing the same path.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "UPDATE ingest_job SET status = 'running', "
+                "attempts = attempts + 1, updated_at = now() "
+                "WHERE id IN (SELECT id FROM ingest_job WHERE status = 'queued' "
+                # Only work that is due. A job that just failed is scheduled
+                # into the future, so this pass cannot pick it up again and
+                # spend another of its attempts seconds later.
+                "AND next_attempt_at <= now() "
+                # Then `updated_at`, so a job that stood aside for another
+                # worker goes behind its peers rather than straight back to
+                # the front of the same pass.
+                "ORDER BY next_attempt_at ASC, updated_at ASC, created_at ASC "
+                "LIMIT %s FOR UPDATE SKIP LOCKED) "
+                "RETURNING id, context_id, fs_path, generation, attempts",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def finish_ingest_job(
+        self, job_id: str, status: str, *, detail: Optional[str] = None
+    ) -> None:
+        """Close a claimed job, keeping the reason it ended that way.
+
+        `detail` is not decoration. "Ran and indexed nothing" and "declined
+        because the file had already moved on" are the same row count and
+        entirely different events, and only the text separates them.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE ingest_job SET status = %s, detail = %s, updated_at = now() "
+                "WHERE id = %s",
+                (status, detail, job_id),
+            )
+
+    def reclaim_stale_ingest_jobs(
+        self, older_than_seconds: int, *, max_attempts: int
+    ) -> int:
+        """Return jobs abandoned mid-flight to the queue. Returns the count.
+
+        Claiming marks a job `running`, and only `queued` jobs are ever
+        claimed. A process that dies after claiming one would therefore strand
+        it forever — and because the replacement already dropped that path's
+        chunks, the file would stay missing from that context until somebody
+        happened to replace it again. That is the permanent forgetting this
+        queue exists to prevent, reintroduced by the claim itself.
+
+        `max_attempts` is enforced here and not only where a job reports its
+        own failure, because a hard-killed process never reports anything. A
+        job that kills the worker every time it runs would otherwise be
+        revived forever and the limit would mean nothing. The caller passes
+        the policy in; the store keeps none of its own.
+
+        A stale job whose path already has a queued job is closed rather than
+        revived, and so is the older of two stale jobs for the same path: the
+        pending slot holds one, and it should hold the newest.
+        """
+        cutoff = f"{max(1, int(older_than_seconds))} seconds"
+        with self._connect() as conn:
+            # Out of attempts: abandoned rather than revived, so a job that
+            # takes the process down with it stops taking it down.
+            conn.execute(
+                "UPDATE ingest_job SET status = 'failed', updated_at = now(), "
+                "detail = 'reclaimed: abandoned after ' || attempts || ' attempts' "
+                "WHERE status = 'running' AND updated_at < now() - %s::interval "
+                "AND attempts >= %s",
+                (cutoff, max(1, int(max_attempts))),
+            )
+            cursor = conn.execute(
+                "UPDATE ingest_job SET status = 'queued', updated_at = now(), "
+                "next_attempt_at = now(), "
+                "detail = 'reclaimed: claimed but never finished' "
+                "WHERE id IN (SELECT DISTINCT ON (context_id, fs_path) id "
+                "FROM ingest_job WHERE status = 'running' "
+                "AND updated_at < now() - %s::interval "
+                "ORDER BY context_id, fs_path, created_at DESC) "
+                "AND NOT EXISTS (SELECT 1 FROM ingest_job q "
+                "WHERE q.context_id = ingest_job.context_id "
+                "AND q.fs_path = ingest_job.fs_path AND q.status = 'queued')",
+                (cutoff,),
+            )
+            revived = cursor.rowcount or 0
+            # Whatever is still stuck now has a newer job covering its path.
+            conn.execute(
+                "UPDATE ingest_job SET status = 'superseded', updated_at = now(), "
+                "detail = 'reclaimed: a newer job holds this path' "
+                "WHERE status = 'running' AND updated_at < now() - %s::interval",
+                (cutoff,),
+            )
+        if revived:
+            self.logger.info("ingest_jobs_reclaimed", jobs=revived)
+        return revived
+
+    def yield_ingest_job(self, job_id: str, *, detail: Optional[str] = None) -> bool:
+        """Put a job back without charging it an attempt. False if superseded.
+
+        For standing aside rather than failing: another worker holds this
+        path, so nothing was tried and nothing should be counted against the
+        job. Claiming incremented `attempts`, so this gives it back. A worker's
+        pass drains until the queue is empty and would otherwise re-claim a
+        contended job many times a second, spending the whole budget while the
+        holder is still embedding — abandoning a re-index that never once ran.
+
+        `updated_at` moves, which puts the job behind its peers in the claim
+        order rather than straight back at the front of the same pass.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE ingest_job SET status = 'queued', detail = %s, "
+                    "attempts = GREATEST(attempts - 1, 0), "
+                    "next_attempt_at = now(), updated_at = now() "
+                    "WHERE id = %s",
+                    (detail, job_id),
+                )
+            return True
+        except errors.UniqueViolation:
+            return False
+
+    def requeue_ingest_job(
+        self,
+        job_id: str,
+        *,
+        detail: Optional[str] = None,
+        delay_seconds: int = 0,
+    ) -> bool:
+        """Return a claimed job to the queue. False if it is now superseded.
+
+        `delay_seconds` is when it may next be claimed. It is not optional in
+        spirit: a worker drains until the queue is empty, so a job put back
+        with no delay is claimed again immediately and fails again, and five
+        attempts are gone within a second of the first. The retries are there
+        for outages measured in seconds or minutes, and without a delay they
+        cover none of them.
+
+        The pending slot for a (context, path) holds one job. If a replacement
+        landed while this one was running, that newer job is already in the
+        slot and holds the newer generation, so this one must not go back in —
+        and the unique index is what says so, rather than a re-read that could
+        race. `attempts` was incremented when the job was claimed, so one that
+        keeps failing counts up instead of retrying forever.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE ingest_job SET status = 'queued', detail = %s, "
+                    "next_attempt_at = now() + %s::interval, updated_at = now() "
+                    "WHERE id = %s",
+                    (detail, f"{max(0, int(delay_seconds))} seconds", job_id),
+                )
+            return True
+        except errors.UniqueViolation:
+            return False
+
+    def count_pending_ingest_jobs(self, fs_path: Optional[str] = None) -> int:
+        """Jobs neither finished nor abandoned, optionally for one path."""
+        with self._connect() as conn:
+            if fs_path:
+                row = conn.execute(
+                    "SELECT count(*) AS n FROM ingest_job "
+                    "WHERE status IN ('queued', 'running') AND fs_path = %s",
+                    (fs_path,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT count(*) AS n FROM ingest_job "
+                    "WHERE status IN ('queued', 'running')",
+                    (),
+                ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def invalidate_path_in_other_contexts(
+        self,
+        owner_user_id: str,
+        fs_path: str,
+        *,
+        keep_context_id: Optional[str] = None,
+    ) -> int:
+        """Empty what this user's path-following contexts say about `fs_path`.
+
+        Asked of the database rather than of the upload manifest, because the
+        manifest records only the contexts an upload named. A context that
+        acquired the path through ``POST /contexts/{id}/sources`` is not in it
+        and never becomes so, so a sweep driven by the manifest walked past it
+        and left the previous generation's chunks answering for the new bytes.
+        The rows themselves are the reverse index: they are what claims to be
+        the contents of this path, so they are what the question is put to.
+
+        `keep_context_id` is the context about to receive the new generation.
+        Everything else the caller owns is emptied for this path.
+
+        Contexts with a ``conversation_id`` are conversations' implicit
+        indexes and are left alone. §19.5 scopes an attachment to the chat
+        that received it, so another chat's upload of the same filename must
+        not reach into one — removing its chunks would be one chat changing
+        another chat's state as much as replacing them would.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM knowledge_chunk kc USING knowledge_context ctx "
+                "WHERE kc.context_id = ctx.id AND ctx.owner_user_id = %s "
+                "AND kc.fs_path = %s "
+                "AND (%s::uuid IS NULL OR ctx.id <> %s::uuid) "
+                "AND ctx.conversation_id IS NULL",
+                (owner_user_id, fs_path, keep_context_id, keep_context_id),
+            )
+            return cursor.rowcount or 0
+
+    def delete_chunks_under_path(self, owner_user_id: str, fs_path: str) -> int:
+        """Drop everything this user's contexts say about `fs_path` or its tree.
+
+        A chunk's ``fs_path`` claims to be the contents of that path, and the
+        claim is about the path's current bytes — nothing in the row records
+        which generation it came from. So when the path stops existing the
+        claim has to stop with it, or a deleted file stays retrievable through
+        any conversation grounded in a context that indexed it.
+
+        Scoped by owner rather than by context, because neither of the two
+        ways a path gets indexed leaves the route a list to work from: the
+        same file uploaded to a second context is ingested again, and an
+        extracted tree's members are recorded nowhere. Ownership covers both,
+        and covers nothing else.
+
+        The prefix match ends at a separator, so deleting ``bundle`` does not
+        take ``bundle2.md``. ``LIKE`` is avoided rather than escaped, since
+        ``_`` and ``%`` are wildcards a filename may legitimately contain.
+        Segment vectors go with their chunks by cascade.
+        """
+        prefix = fs_path.rstrip("/") + "/"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM knowledge_chunk kc USING knowledge_context ctx "
+                "WHERE kc.context_id = ctx.id AND ctx.owner_user_id = %s "
+                "AND (kc.fs_path = %s OR left(kc.fs_path, %s) = %s)",
+                (owner_user_id, fs_path, len(prefix), prefix),
+            )
+            return cursor.rowcount or 0
+
+    def add_chunk_vectors(
+        self,
+        chunk_id: int,
+        segments: Sequence[Tuple[str, List[float]]],
+        *,
+        meta: Optional[dict[str, Any]] = None,
+    ) -> int:
+        """Persist a chunk's segment vectors, replacing any it already had.
+
+        The replace covers re-indexing one chunk — a backfill, a repair. It is
+        not what makes re-ingestion idempotent: ``add_chunks`` still inserts
+        fresh rows with new ids, so a caller that appends leaves two
+        generations of both chunks and segments. What a named path does
+        instead is ``replace_chunks_for_path``, which drops the path's previous
+        rows in the same transaction that writes its new ones; the segments go
+        with them, because a chunk's segments are keyed on the chunk id.
+        """
+        if not segments:
+            return 0
+        payload = self._json_param(meta)
+        rows = [
+            (chunk_id, index, content, embedding, payload)
+            for index, (content, embedding) in enumerate(segments)
+        ]
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM knowledge_chunk_vector WHERE chunk_id = %s", (chunk_id,)
+            )
+            # One round trip for the batch. Ingestion calls this per chunk, so
+            # a 500-chunk file at eight segments each is 4000 inserts; sending
+            # them one at a time made late interaction the slowest thing in
+            # the pipeline by an order of magnitude.
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO knowledge_chunk_vector (chunk_id, segment_index, content, embedding, meta) VALUES (%s, %s, %s, %s, %s)",
+                    rows,
+                )
+        return len(segments)
+
+    def late_candidate_ids(
+        self,
+        context_ids: Optional[Sequence[str]],
+        query_embedding: List[float],
+        limit: int = 4,
+        filters: Optional[dict[str, Any]] = None,
+        *,
+        user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
+        tenant_id: Optional[str] = None,
+        path_scope: Optional[dict[str, Sequence[str]]] = None,
+    ) -> List[int]:
+        """Chunks with a segment near this query vector, nearest first.
+
+        Candidate generation only. A chunk qualifies on its best segment, not
+        on its average — which is the whole reason the segments are stored
+        separately — and the exact MaxSim score is computed by the caller over
+        every segment of the chunks this returns.
+
+        SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
+        All queries MUST be filtered by user_id to prevent cross-user data leakage.
+        """
+        if not query_embedding or not context_ids:
+            return []
+        if not user_id:
+            self.logger.error("late_candidate_ids_missing_user_id")
+            return []
+        where, params = self._chunk_scope(
+            context_ids,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            filters=filters,
+            path_scope=path_scope,
+        )
+        with self._connect() as conn:
+            sql = """
+                SELECT kcv.chunk_id
+                FROM knowledge_chunk_vector kcv
+                JOIN knowledge_chunk kc ON kcv.chunk_id = kc.id
+                JOIN knowledge_context ctx ON kc.context_id = ctx.id
+                LEFT JOIN app_user u ON ctx.owner_user_id = u.id
+                """
+            sql += where
+            sql += " ORDER BY kcv.embedding <-> %s::vector LIMIT %s"
+            # Over-fetch: several segments of one chunk can occupy the nearest
+            # rows, and each of those is one candidate, not many.
+            rows = conn.execute(
+                sql, (*params, self._format_vector(query_embedding), limit * 4)
+            ).fetchall()
+        seen: List[int] = []
+        for row in rows:
+            chunk_id = int(row["chunk_id"])
+            if chunk_id not in seen:
+                seen.append(chunk_id)
+            if len(seen) >= limit:
+                break
+        return seen
+
+    def chunks_with_vectors(
+        self, chunk_ids: Sequence[int]
+    ) -> List[Tuple[KnowledgeChunk, List[List[float]]]]:
+        """Candidate chunks and every segment vector each one owns.
+
+        Access was already enforced when the ids were generated; this reads
+        rows by primary key and adds no scope of its own.
+        """
+        if not chunk_ids:
+            return []
+        ids = list(chunk_ids)
+        with self._connect() as conn:
+            chunk_rows = conn.execute(
+                """
+                SELECT kc.id, kc.context_id, kc.fs_path, kc.content, kc.embedding, kc.chunk_index, kc.created_at, kc.meta
+                FROM knowledge_chunk kc WHERE kc.id = ANY(%s)
+                """,
+                (ids,),
+            ).fetchall()
+            vector_rows = conn.execute(
+                "SELECT chunk_id, embedding FROM knowledge_chunk_vector"
+                " WHERE chunk_id = ANY(%s) ORDER BY chunk_id, segment_index",
+                (ids,),
+            ).fetchall()
+
+        vectors: dict[int, List[List[float]]] = {}
+        for row in vector_rows:
+            vectors.setdefault(int(row["chunk_id"]), []).append(
+                self._parse_vector(row["embedding"])
+            )
+
+        by_id = {
+            int(row["id"]): self._row_to_knowledge_chunk(row) for row in chunk_rows
+        }
+        # Caller's order is the candidate order; preserve it.
+        return [
+            (by_id[chunk_id], vectors.get(chunk_id, []))
+            for chunk_id in ids
+            if chunk_id in by_id
+        ]
 
     def list_chunks(
         self,
         context_id: Optional[str] = None,
         *,
         owner_user_id: Optional[str] = None,
+        allowed_paths: Optional[Sequence[str]] = None,
         page: int = 1,
         page_size: int = 100,
         cursor: Optional[str] = None,
@@ -3247,6 +5148,11 @@ class PostgresStore:
                     params.append(owner_user_id)
                 query += " WHERE kc.context_id = %s"
                 params.append(context_id)
+                if allowed_paths is not None:
+                    # Part of what the bounded read selects from, not a
+                    # filter over what it returned.
+                    query += " AND kc.fs_path = ANY(%s)"
+                    params.append(list(allowed_paths))
                 if cursor_filter:
                     query += cursor_filter
                     params.extend(cursor_params)
@@ -3267,7 +5173,7 @@ class PostgresStore:
                         self.logger.warning("chunk_cursor_decode_failed", error=str(exc))
 
                 query = (
-                    "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx "
+                    "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx "  # nosec B608 - fragments are source literals; values are always bound via %s
                     "ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s"
                     + cursor_filter
                     + " ORDER BY kc.created_at DESC, kc.id DESC LIMIT %s OFFSET %s"
@@ -3404,33 +5310,41 @@ class PostgresStore:
             return value
         return json.dumps(value)
 
-    def search_chunks_pgvector(
-        self,
-        context_ids: Optional[Sequence[str]],
-        query: str,
-        query_embedding: List[float],
-        limit: int = 4,
-        filters: Optional[dict[str, Any]] = None,
+    # Both chunk searches read the same rows through the same access rules;
+    # only the ORDER BY differs. Kept in one place so a filter added to one
+    # channel cannot go missing from the other — and the missing filter that
+    # matters here is the user isolation one.
+    _CHUNK_SELECT = """
+                SELECT kc.id, kc.context_id, kc.fs_path, kc.content, kc.embedding, kc.chunk_index, kc.created_at, kc.meta
+                FROM knowledge_chunk kc
+                JOIN knowledge_context ctx ON kc.context_id = ctx.id
+                LEFT JOIN app_user u ON ctx.owner_user_id = u.id
+                """
+
+    @staticmethod
+    def _chunk_scope(
+        context_ids: Sequence[str],
         *,
-        user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
-        tenant_id: Optional[str] = None,
-    ) -> List[KnowledgeChunk]:
-        """Primary pgvector-backed retrieval over knowledge chunks.
+        user_id: str,
+        tenant_id: Optional[str],
+        filters: Optional[dict[str, Any]],
+        path_scope: Optional[dict[str, Sequence[str]]] = None,
+    ) -> tuple[str, list[Any]]:
+        """Access and metadata predicate shared by the chunk searches.
 
-        SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
-        All queries MUST be filtered by user_id to prevent cross-user data leakage.
+        `path_scope` restricts named contexts to a set of paths and leaves
+        every other context alone. A conversation's implicit index is scoped
+        this way, to the generations its records still authorize.
+
+        It belongs here rather than after retrieval because it has to reach
+        candidate selection: discarding unauthorized rows from the result
+        keeps them out of the prompt but not out of the ranking, so enough of
+        them take every slot and the authorized file falls outside the cut.
+        Over-fetching is not an answer — any fixed over-fetch is consumed by
+        enough rows.
         """
-
-        if not query_embedding or not context_ids:
-            return []
-        if not user_id:
-            # Defense in depth: reject if user_id somehow bypasses type checking
-            self.logger.error("search_chunks_pgvector_missing_user_id")
-            return []
-        where_clauses: list[str] = []
-        params: list[Any] = []
-        where_clauses.append("kc.context_id = ANY(%s)")
-        params.append(list(context_ids))
+        where_clauses: list[str] = ["kc.context_id = ANY(%s)"]
+        params: list[Any] = [list(context_ids)]
         # Always enforce user isolation - this is not optional
         where_clauses.append("ctx.owner_user_id = %s")
         params.append(user_id)
@@ -3443,72 +5357,117 @@ class PostgresStore:
         if filters and filters.get("embedding_model_id"):
             where_clauses.append("kc.meta->>'embedding_model_id' = %s")
             params.append(filters["embedding_model_id"])
-        where = ""
-        if where_clauses:
-            where = " WHERE " + " AND ".join(where_clauses)
+        if path_scope:
+            scoped = sorted(path_scope)
+            # Unscoped contexts are unrestricted; a scoped one contributes
+            # only its authorized paths. An empty set is a real answer: a
+            # conversation holding nothing retrieves nothing from its index.
+            branches = ["kc.context_id <> ALL(%s)"]
+            params.append(scoped)
+            for ctx_id in scoped:
+                branches.append("(kc.context_id = %s AND kc.fs_path = ANY(%s))")
+                params.extend([ctx_id, list(path_scope[ctx_id])])
+            where_clauses.append("(" + " OR ".join(branches) + ")")
+        return " WHERE " + " AND ".join(where_clauses), params
+
+    def search_chunks_pgvector(
+        self,
+        context_ids: Optional[Sequence[str]],
+        query: str,
+        query_embedding: List[float],
+        limit: int = 4,
+        filters: Optional[dict[str, Any]] = None,
+        *,
+        user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
+        tenant_id: Optional[str] = None,
+        path_scope: Optional[dict[str, Sequence[str]]] = None,
+    ) -> List[KnowledgeChunk]:
+        """Dense candidate generation over knowledge chunks.
+
+        Ordered by vector distance and nothing else. This is a first-stage
+        candidate pool, not a final ranking: ``RAGService`` reranks the pool
+        against the lexical channel per SPEC §2.5, because a single vector
+        cannot express every top-k set a query might want.
+
+        SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
+        All queries MUST be filtered by user_id to prevent cross-user data leakage.
+        """
+
+        if not query_embedding or not context_ids:
+            return []
+        if not user_id:
+            # Defense in depth: reject if user_id somehow bypasses type checking
+            self.logger.error("search_chunks_pgvector_missing_user_id")
+            return []
+        where, params = self._chunk_scope(
+            context_ids,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            filters=filters,
+            path_scope=path_scope,
+        )
         with self._connect() as conn:
-            query = (
-                " "
-                """
-                SELECT kc.id, kc.context_id, kc.fs_path, kc.content, kc.embedding, kc.chunk_index, kc.created_at, kc.meta
-                FROM knowledge_chunk kc
-                JOIN knowledge_context ctx ON kc.context_id = ctx.id
-                LEFT JOIN app_user u ON ctx.owner_user_id = u.id
-                """
-            )
-            query += where
-            query += " ORDER BY kc.embedding <-> %s::vector LIMIT %s"
+            sql = self._CHUNK_SELECT + where
+            sql += " ORDER BY kc.embedding <-> %s::vector LIMIT %s"
             rows = conn.execute(
-                query, (*params, self._format_vector(query_embedding), limit)
+                sql, (*params, self._format_vector(query_embedding), limit)
             ).fetchall()
-        # pgvector mode: results already ordered by vector similarity via SQL
-        # No BM25 re-ranking per SPEC §3 - pure vector search for pgvector mode
         return [self._row_to_knowledge_chunk(row) for row in rows]
 
-    def search_chunks(
+    def search_chunks_lexical(
         self,
-        context_id: Optional[str],
+        context_ids: Optional[Sequence[str]],
         query: str,
-        query_embedding: Optional[List[float]],
         limit: int = 4,
+        filters: Optional[dict[str, Any]] = None,
+        *,
+        user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
+        tenant_id: Optional[str] = None,
+        path_scope: Optional[dict[str, Sequence[str]]] = None,
     ) -> List[KnowledgeChunk]:
-        """Non-pgvector hybrid search; suitable for tests and tiny corpora only."""
+        """Lexical candidate generation over knowledge chunks.
 
-        def _cosine(a: List[float], b: List[float]) -> float:
-            # Belt and braces: knowledge_chunk.embedding is VECTOR(dim) NOT
-            # NULL, so widths cannot differ in practice. If one ever did,
-            # scoring the overlapping prefix would produce a number that looks
-            # like a similarity and is not — contribute nothing instead.
-            if not a or not b or len(a) != len(b):
-                return 0.0
-            dot = sum(x * y for x, y in zip(a, b))
-            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
-            norm_b = sum(y * y for y in b) ** 0.5 or 1.0
-            return dot / (norm_a * norm_b)
+        The keyword half of the hybrid. It is the only channel that works at
+        all when the encoder is the hash fallback, and it is what keeps exact
+        identifiers, error codes and numbers findable when it is not.
 
-        candidate_limit = limit or 4
-        # Issue 25.3: prevent unbounded candidate loading by limiting DB reads
-        max_candidates = min(candidate_limit * 5, 500)
-        candidates = self.list_chunks(context_id, limit=max_candidates)
-        if not candidates:
+        Terms are OR'd, not AND'd: one absent rare word must not empty the
+        pool. ``ts_rank`` only has to be a decent recall filter here — the
+        real ranking is BM25 over the returned pool.
+
+        SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
+        All queries MUST be filtered by user_id to prevent cross-user data leakage.
+        """
+
+        if not context_ids:
             return []
-        query_tokens = _tokenize_text(query)
-        documents = [_tokenize_text(ch.content) for ch in candidates]
-        bm25_scores = _compute_bm25_scores(query_tokens, documents)
-        semantic_scores = [
-            (_cosine(query_embedding, ch.embedding) if query_embedding else 0.0)
-            for ch in candidates
-        ]
-        max_bm25 = max(bm25_scores) or 1.0
-        combined: dict[str, tuple[KnowledgeChunk, float]] = {}
-        for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
-            hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
-            key = " ".join(chunk.content.split()).lower() or str(chunk.id or "")
-            existing = combined.get(key)
-            if not existing or hybrid > existing[1]:
-                combined[key] = (chunk, hybrid)
-        ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
-        return [pair[0] for pair in ranked[:limit]]
+        if not user_id:
+            # Defense in depth: reject if user_id somehow bypasses type checking
+            self.logger.error("search_chunks_lexical_missing_user_id")
+            return []
+        terms = _tsquery_terms(query)
+        if not terms:
+            return []
+        where, params = self._chunk_scope(
+            context_ids,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            filters=filters,
+            path_scope=path_scope,
+        )
+        # 'simple' rather than 'english': no stemming, so an identifier stays
+        # itself, and no language is assumed of the user's own files.
+        with self._connect() as conn:
+            sql = self._CHUNK_SELECT + where
+            # content_tsv is a stored generated column, so neither the match
+            # nor the rank tokenizes anything at query time.
+            sql += " AND kc.content_tsv @@ to_tsquery('simple', %s)"
+            sql += (
+                " ORDER BY ts_rank(kc.content_tsv, to_tsquery('simple', %s))"
+                " DESC, kc.id LIMIT %s"
+            )
+            rows = conn.execute(sql, (*params, terms, terms, limit)).fetchall()
+        return [self._row_to_knowledge_chunk(row) for row in rows]
 
     def inspect_state(
         self,

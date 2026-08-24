@@ -19,7 +19,6 @@ from liminallm.service.sandbox import (
     SandboxError,
     _enforce_network_allowlist,
     _host_matches_allowlist,
-    check_privileged_access,
     get_tool_sandbox_config,
     run_in_sandbox,
     safe_eval_expr,
@@ -347,27 +346,10 @@ def test_a_tool_may_ask_for_less():
     assert config.max_memory_mb == 64
 
 
-# ---------------------------------------------------------------------------
-# Privileged access gate
-# ---------------------------------------------------------------------------
-
-
-def test_a_non_privileged_tool_needs_no_role(scratch):
-    check_privileged_access("harmless", scratch, user_role=None)  # must not raise
-
-
-def test_a_privileged_tool_refuses_a_non_admin():
-    config = SandboxConfig(privileged=True)
-    for role in (None, "user", "moderator", "Admin"):  # case matters
-        with pytest.raises(PrivilegedToolError):
-            check_privileged_access("shell", config, user_role=role)
-
-
-def test_a_privileged_tool_admits_an_admin():
-    check_privileged_access(
-        "shell", SandboxConfig(privileged=True), user_role="admin",
-        requesting_user_id="u1",
-    )  # must not raise
+# The privileged gate's caller half is exercised above, against
+# `get_tool_sandbox_config`. Its provenance half — SPEC §18's *admin-owned
+# artifact* — needs the persisted artifact row, so it lives in
+# tests/test_tool_authority.py where a store is available.
 
 
 # ---------------------------------------------------------------------------

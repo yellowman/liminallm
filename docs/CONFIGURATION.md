@@ -233,5 +233,7 @@ openai_api_key: str = managed_field("", description="...")
 openai_api_key: str = secret_field(description="... Write-only.")
 ```
 
-Bootstrap secrets are the exception: `JWT_SECRET` and `DATABASE_URL` are
-needed before the database can be read, so they stay outside it.
+Bootstrap secrets are the exception: `DATABASE_URL` is needed before the
+database can be read, so it stays outside it. `jwt_secret` is not one of
+them — it is generated on first boot and stored in `instance_config` like
+any other secret; a `JWT_SECRET` environment variable reaches nothing.

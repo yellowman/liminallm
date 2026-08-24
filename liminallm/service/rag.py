@@ -1,16 +1,37 @@
 from __future__ import annotations
 
 import math
-import os
 import re
+import stat
 import unicodedata
-from enum import Enum
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from typing import (
+    Callable,
+    ContextManager,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 
 from liminallm.logging import get_logger
+from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.late import (
+    QUERY_MIN_SEGMENT_WORDS,
+    maxsim,
+    segment_text,
+)
+from liminallm.service.ranking import (
+    LATE_WEIGHT,
+    LEXICAL_WEIGHT,
+    POOLED_WITH_LATE_WEIGHT,
+    SEMANTIC_WEIGHT,
+    fuse_ranks,
+)
 from liminallm.storage.models import KnowledgeChunk
 from liminallm.storage.postgres import PostgresStore
 
@@ -18,6 +39,12 @@ logger = get_logger(__name__)
 
 # Default overlap per SPEC §2.5: "50 token overlap"
 DEFAULT_OVERLAP_TOKENS = 50
+
+# How many candidates each channel offers before the rerank. Wide enough that
+# a chunk one channel buries but the other would rank first still reaches the
+# rerank; capped so the rerank stays cheap on a large context.
+CANDIDATE_POOL_FACTOR = 5
+MAX_CANDIDATE_POOL = 100
 
 
 def _simple_tokenize(text: str) -> List[str]:
@@ -43,30 +70,96 @@ def _detokenize(tokens: List[str]) -> str:
     return "".join(result)
 
 
+def _within_source(candidate: Path, root: Path) -> bool:
+    """Whether `candidate` is a real file inside `root`, and not a link out.
+
+    Three tests, because each refuses something the others accept.
+
+    The link test answers what a directory listing can see. The
+    resolved-containment test catches a path reaching outside through a
+    component the listing did not name — `glob` does not descend into a
+    symlinked directory today, and that is a property of the Python version
+    rather than of this code, so the test does not rely on it.
+
+    The hardlink test is the one neither of the others can make. A hardlink
+    *is* the file it points at, with nothing in the path to say so, so a
+    hardlink to another user's upload inside a source directory passes both
+    other tests. `st_nlink` is the only signal available, and
+    refusing a linked file matches what the archive extractor already does
+    with hardlinked members. A legitimate file with a second link elsewhere is
+    skipped as a consequence, which is the safe direction here — the reader
+    cannot tell the two apart, and the content is somebody's either way.
+    """
+    try:
+        if candidate.is_symlink():
+            return False
+        resolved = candidate.resolve(strict=True)
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+            return False
+    except OSError:
+        return False
+    return root in resolved.parents or resolved == root
+
+
 class RAGService:
-    """Hybrid retriever against knowledge chunks."""
+    """Hybrid retriever against knowledge chunks.
+
+    Retrieval runs two channels and fuses them: dense for meaning, lexical for
+    the exact word. Neither is sound alone. A single vector of dimension d
+    cannot express every top-k set of documents a query might ask for — that
+    ceiling is geometric, so no encoder or training set removes it, and a
+    dense-only ranking has no second opinion when it hits one. Keywords fail
+    the opposite way, on anything the user phrased differently.
+
+    An optional reranker takes the fused shortlist last. It is the only stage
+    not bound by either ceiling, and the only one that can return nothing.
+    """
 
     def __init__(
         self,
         store: PostgresStore,
         default_chunk_size: int = 400,
         *,
-        rag_mode: str | Enum | None = None,
         embed: Callable[[str], List[float]] = deterministic_embedding,
+        embed_many: Optional[Callable[[Sequence[str]], List[List[float]]]] = None,
         embedding_model_id: str = "text-embedding",
+        semantic: bool = False,
+        rerank: Optional[Callable[[str, Sequence[KnowledgeChunk]], List[KnowledgeChunk]]] = None,
+        late_interaction: bool = False,
+        late_segments: int = 0,
     ) -> None:
         self.store = store
         self.default_chunk_size = max(default_chunk_size, 64)
-        mode_value = rag_mode.value if isinstance(rag_mode, Enum) else rag_mode
-        self.rag_mode = str(mode_value or os.getenv("RAG_MODE") or "pgvector").lower()
         self.embed = embed
-        self.embedding_model_id = embedding_model_id
-
-        self._retriever = (
-            self._retrieve_pgvector
-            if self._uses_pgvector()
-            else self._retrieve_local_hybrid
+        # One round trip per chunk instead of one per segment. Falls back to
+        # the single encoder so a caller that supplies only ``embed`` still
+        # works — just slowly, which is the pre-existing behaviour.
+        self.embed_many = embed_many or (
+            lambda texts: [embed(text) for text in texts]
         )
+        self.embedding_model_id = embedding_model_id
+        # EmbeddingsService.is_semantic, carried in. Defaults to False to match
+        # the kernel's default encoder, which is the hash fallback: cosine over
+        # those vectors is noise and must never reach a score (SPEC §2.5).
+        self.semantic = semantic
+        # Injected like ``embed`` so the kernel keeps no opinion about which
+        # model does the reranking, or whether one does at all. The runtime's
+        # reranker decides per call and reports a budget of zero when the
+        # operator has it off, so nothing here has to be rebuilt to turn it
+        # on — and nothing here has to know that.
+        self.rerank = rerank
+        # Late interaction needs a real encoder for the same reason the dense
+        # channel does: MaxSim over hash vectors is noise with extra steps.
+        self.late_interaction = bool(late_interaction and semantic)
+        # Floor of two, not one: a single segment is the pooled vector by
+        # another name, so a caller that enabled the feature without naming a
+        # segment count would index nothing at all and never be told.
+        self.late_segments = max(2, late_segments)
+        # Set when segment indexing fails structurally — a missing table, a
+        # width mismatch. Nothing clears it, because nothing that would fix
+        # those leaves this object standing.
+        self._segment_index_broken = False
 
     def retrieve(
         self,
@@ -78,6 +171,7 @@ class RAGService:
         tenant_id: Optional[str] = None,
         max_tokens: Optional[int] = None,
         min_token_count: int = 10,
+        path_scope: Optional[dict] = None,
     ) -> List[KnowledgeChunk]:
         """Retrieve relevant chunks for a query.
 
@@ -90,6 +184,13 @@ class RAGService:
             max_tokens: Optional maximum total tokens across all returned chunks.
                        Uses token_count from chunk metadata if available.
             min_token_count: Minimum tokens per chunk (filters out very short chunks)
+            path_scope: Per-context restriction on which paths may be
+                       retrieved. A conversation's implicit index is scoped
+                       to the generations its records authorize; every other
+                       context is unrestricted. Applied during candidate
+                       selection, because a filter after the top-k keeps
+                       unauthorized rows out of the prompt without keeping
+                       them out of the ranking.
 
         Returns:
             List of relevant chunks, optionally limited by total token budget
@@ -98,17 +199,27 @@ class RAGService:
             return []
 
         normalized_query = query or ""
-        results = self._retriever(
+        # Retrievers return a shortlist, not the final answer: recall is their
+        # job, and the stages below decide precision. A reranker that only ever
+        # saw ``limit`` chunks could reorder them but never rescue the one that
+        # placed just outside the cut.
+        results = self._retrieve_hybrid(
             context_ids, normalized_query, limit * 2 if max_tokens else limit,
-            user_id=user_id, tenant_id=tenant_id
+            user_id=user_id, tenant_id=tenant_id, path_scope=path_scope,
         )
 
-        # Filter out very short chunks (likely noise)
+        # Filter out very short chunks (likely noise). Before reranking, so no
+        # rerank slot is spent on a chunk that is about to be dropped anyway.
         if min_token_count > 0:
             results = [
                 chunk for chunk in results
                 if self._get_chunk_token_count(chunk) >= min_token_count
             ]
+
+        # The rerank stage lives here rather than inside the retriever, so
+        # it sees the whole shortlist.
+        if self.rerank is not None and results:
+            results = list(self.rerank(normalized_query, results))
 
         # Apply token budget if specified
         if max_tokens is not None and max_tokens > 0:
@@ -161,9 +272,6 @@ class RAGService:
             chunk_count=len(selected),
         )
         return selected
-
-    def _uses_pgvector(self) -> bool:
-        return self.rag_mode in {"pgvector", "pg", "vector"}
 
     def _allowed_context_ids(
         self,
@@ -231,7 +339,7 @@ class RAGService:
 
         return allowed
 
-    def _retrieve_pgvector(
+    def _retrieve_hybrid(
         self,
         context_ids: Sequence[str],
         query: str,
@@ -239,57 +347,278 @@ class RAGService:
         *,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        path_scope: Optional[dict] = None,
     ) -> List[KnowledgeChunk]:
+        """Hybrid retrieval: lexical, dense, and MaxSim channels fused by
+        rank, then one rerank over the shortlist (SPEC §2.5)."""
         allowed_ids = self._allowed_context_ids(
             context_ids, user_id=user_id, tenant_id=tenant_id
         )
         if not allowed_ids:
             return []
 
-        query_embedding = self.embed(query)
-        filters = {"embedding_model_id": self.embedding_model_id}
+        # The encoder filter belongs to the vector channels and only to them:
+        # it exists so a query vector is never compared against a chunk from a
+        # different encoder. Keyword search compares no vectors, and gating it
+        # on encoder identity meant that changing embedding_model_id — a
+        # managed setting an admin can flip — made every stored chunk invisible
+        # to BM25 as well, so retrieval returned nothing at all for an exact
+        # filename or error code until the whole corpus was re-ingested by
+        # hand. There is no backfill job (SPEC §2.5), so "until" was forever.
+        vector_filters = {"embedding_model_id": self.embedding_model_id}
+        pool_size = self._pool_size(limit)
 
-        return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
-            allowed_ids,
-            query,
-            query_embedding,
-            limit,
-            filters=filters,
-            user_id=user_id,
-            tenant_id=tenant_id,
-        )
-
-    def _retrieve_local_hybrid(
-        self,
-        context_ids: Sequence[str],
-        query: str,
-        limit: int,
-        *,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-    ) -> List[KnowledgeChunk]:
-        allowed_ids = self._allowed_context_ids(
-            context_ids, user_id=user_id, tenant_id=tenant_id
-        )
-        if not allowed_ids:
-            return []
-
-        query_embedding = self.embed(query)
-        results: List[KnowledgeChunk] = []
-        per_context_limit = max(1, math.ceil(limit / len(allowed_ids)))
-        for ctx_id in allowed_ids:
-            results.extend(
-                self.store.search_chunks(
-                    ctx_id, query, query_embedding, per_context_limit
+        try:
+            lexical = list(
+                self.store.search_chunks_lexical(  # type: ignore[attr-defined]
+                    allowed_ids,
+                    query,
+                    pool_size,
+                    filters=None,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    path_scope=path_scope,
                 )
             )
+        except Exception as exc:  # noqa: BLE001 - the other channels stand
+            # Belt and braces behind the startup check: a channel failing is
+            # a channel's worth of ranking lost, never the whole turn. The
+            # answer degrades to the vectors rather than 500-ing.
+            logger.warning("rag_lexical_channel_failed", error=str(exc))
+            lexical = []
 
-        filtered = [
-            chunk
-            for chunk in results
-            if (chunk.meta or {}).get("embedding_model_id") == self.embedding_model_id
-        ]
-        return filtered[:limit]
+        # Without a real encoder the dense pool is not a weaker channel, it is
+        # a random sample: hash-vector distance carries no meaning to sort by.
+        # Asking for it would only dilute the keyword pool.
+        dense: List[KnowledgeChunk] = []
+        late: List[KnowledgeChunk] = []
+        if self.semantic:
+            query_vectors = self._query_vectors(query)
+            dense = list(
+                self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
+                    allowed_ids,
+                    query,
+                    query_vectors[0],
+                    pool_size,
+                    filters=vector_filters,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    path_scope=path_scope,
+                )
+            )
+            if self.late_interaction:
+                try:
+                    late = self._retrieve_late(
+                        allowed_ids,
+                        query_vectors,
+                        pool_size,
+                        filters=vector_filters,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        path_scope=path_scope,
+                    )
+                except Exception as exc:  # noqa: BLE001 - the other channels stand
+                    # This channel is an addition, so its failure must cost
+                    # its own contribution and nothing else. The setting is
+                    # hot-reloadable, so the first person to enable it on a
+                    # database that never had sql/schema.sql re-applied would
+                    # otherwise break every chat turn that touches RAG, not
+                    # just the part of ranking that is new.
+                    logger.warning("rag_late_channel_failed", error=str(exc))
+                    late = []
+
+        ranked = self._fuse(query, lexical, dense, late)
+        if not ranked:
+            # Silence here is a result, not a fault: with no encoder and no
+            # keyword overlap there is nothing honest to ground on, and four
+            # arbitrary chunks would read to the model as evidence.
+            logger.info(
+                "rag_no_candidates",
+                semantic=self.semantic,
+                context_count=len(allowed_ids),
+            )
+            return []
+
+        logger.debug(
+            "rag_hybrid_pool",
+            semantic=self.semantic,
+            lexical=len(lexical),
+            dense=len(dense),
+            late=len(late),
+            fused=len(ranked),
+        )
+        return ranked
+
+    def _query_vectors(self, query: str) -> List[List[float]]:
+        """The query as its parts, for MaxSim; the whole query stays first.
+
+        The first vector is the whole query and is what the pooled dense
+        channel uses, so a multi-clause question still gets one honest
+        whole-question vector even when its clauses are also embedded.
+        """
+        vectors = [self.embed(query)]
+        if not self.late_interaction:
+            return vectors
+        parts = segment_text(
+            query,
+            max_segments=self.late_segments,
+            min_words=QUERY_MIN_SEGMENT_WORDS,
+        )
+        if len(parts) > 1:
+            vectors.extend(self.embed(part) for part in parts)
+        return vectors
+
+    def _retrieve_late(
+        self,
+        allowed_ids: Sequence[str],
+        query_vectors: Sequence[List[float]],
+        pool_size: int,
+        *,
+        filters: Dict[str, str],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        path_scope: Optional[dict] = None,
+    ) -> List[KnowledgeChunk]:
+        """MaxSim ranking over chunks that keep their segments separately.
+
+        Two stages, as every multi-vector retriever does it: each part of the
+        query gathers candidates by nearest segment, then the candidates are
+        scored exactly against *all* of their segments. Approximate search
+        decides who is considered; it never decides the order.
+        """
+        # A share each, not first-come. The pool has to be bounded — MaxSim
+        # below is pure Python over every segment of every candidate — but a
+        # single overall cap is spent by the first vector before any other is
+        # consulted, and the first vector is the whole query. That collapses
+        # candidate generation back to single-vector recall, which is the one
+        # thing this channel exists not to be: MaxSim could then only reorder
+        # what a pooled vector had already found.
+        share = max(1, math.ceil(pool_size / len(query_vectors)))
+        candidate_ids: List[int] = []
+        seen: set[int] = set()
+        for vector in query_vectors:
+            taken = 0
+            for chunk_id in self.store.late_candidate_ids(  # type: ignore[attr-defined]
+                allowed_ids,
+                vector,
+                share,
+                filters=filters,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                path_scope=path_scope,
+            ):
+                if chunk_id not in seen:
+                    seen.add(chunk_id)
+                    candidate_ids.append(chunk_id)
+                    taken += 1
+                if taken >= share:
+                    break
+        if not candidate_ids:
+            return []
+
+        scored: List[tuple[float, KnowledgeChunk]] = []
+        for chunk, segments in self.store.chunks_with_vectors(candidate_ids):  # type: ignore[attr-defined]
+            score = maxsim(query_vectors, segments)
+            if score > 0:
+                scored.append((score, chunk))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [chunk for _score, chunk in scored[:pool_size]]
+
+    def _pool_size(self, limit: int) -> int:
+        """How many candidates each channel offers the stages above.
+
+        Wide enough that a chunk one channel buries but the other would rank
+        first still survives to fusion, and never narrower than what the
+        reranker is willing to read — a reranker handed exactly the chunks
+        that were going to be returned anyway can only reorder them.
+        """
+        appetite = int(getattr(self.rerank, "max_candidates", 0) or 0)
+        wanted = max(limit * CANDIDATE_POOL_FACTOR, limit, appetite)
+        return min(wanted, MAX_CANDIDATE_POOL)
+
+    @staticmethod
+    def _chunk_key(chunk: KnowledgeChunk) -> object:
+        """Identity for fusion. Falls back for chunks not yet given an id."""
+        if chunk.id is not None:
+            return chunk.id
+        return (chunk.context_id, chunk.fs_path, chunk.chunk_index)
+
+    def _fuse(
+        self,
+        query: str,
+        lexical: Sequence[KnowledgeChunk],
+        dense: Sequence[KnowledgeChunk],
+        late: Sequence[KnowledgeChunk] = (),
+    ) -> List[KnowledgeChunk]:
+        """Fuse the channels by rank, per SPEC §2.5.
+
+        The lexical pool arrives ordered by ``ts_rank``, which was only ever a
+        recall filter; it is reordered here by real BM25 before fusion. That
+        BM25 scores against the pool rather than the whole corpus, so its IDF
+        is an approximation — sound for ordering a shortlist, which is all it
+        does, since the corpus-wide decision was already made by the SQL.
+
+        The dense and late pools keep the order they arrived in: nearest and
+        MaxSim are what those channels mean, and re-scoring here would say
+        nothing new. When late interaction has something to say, the pooled
+        vector steps back to a lower weight — it is the same signal read less
+        precisely, so it should not vote twice at full strength.
+        """
+        chunks: Dict[object, KnowledgeChunk] = {}
+        for chunk in list(lexical) + list(dense) + list(late):
+            chunks.setdefault(self._chunk_key(chunk), chunk)
+        if not chunks:
+            return []
+
+        channels: List[tuple[float, List[object]]] = []
+        if lexical:
+            # Membership of this pool is itself the match signal: the store's
+            # own full-text query selected every member, so BM25 may order the
+            # pool but must not empty it. Dropping its zeros deleted answers
+            # the store had found — Postgres indexes "user_id" as 'user' +
+            # 'id' while this tokenizer keeps it whole, so a query of
+            # "user id" scored a matching chunk 0.0, and with the hash encoder
+            # retrieval returned nothing for a question the corpus answers.
+            scores = compute_bm25_scores(
+                tokenize_text(query),
+                [tokenize_text(chunk.content) for chunk in lexical],
+            )
+            order = sorted(
+                range(len(lexical)), key=lambda i: scores[i], reverse=True
+            )
+            channels.append(
+                (LEXICAL_WEIGHT, [self._chunk_key(lexical[i]) for i in order])
+            )
+        if late:
+            channels.append(
+                (LATE_WEIGHT, [self._chunk_key(chunk) for chunk in late])
+            )
+        if dense:
+            # The pooled vector steps back only for chunks late interaction
+            # actually ranked. Weighting the whole channel down because *some
+            # other* chunk had segments demoted a chunk from 0.55 to 0.25 on
+            # its neighbours' behalf, with no late contribution to make up the
+            # difference — buried by the arrival of a feature that had nothing
+            # to say about it.
+            late_keys = {self._chunk_key(chunk) for chunk in late}
+            covered = [
+                self._chunk_key(chunk)
+                for chunk in dense
+                if self._chunk_key(chunk) in late_keys
+            ]
+            uncovered = [
+                self._chunk_key(chunk)
+                for chunk in dense
+                if self._chunk_key(chunk) not in late_keys
+            ]
+            if covered:
+                channels.append((POOLED_WITH_LATE_WEIGHT, covered))
+            if uncovered:
+                channels.append((SEMANTIC_WEIGHT, uncovered))
+
+        fused = fuse_ranks(channels)
+        order = sorted(fused, key=lambda key: fused[key], reverse=True)
+        return [chunks[key] for key in order]
 
     def ingest_text(
         self,
@@ -307,17 +636,17 @@ class RAGService:
         - Creates chunks with specified token count
         - Applies overlap between consecutive chunks for context continuity
         """
-        # Issue 24.5: Normalize Unicode input so equivalent text shares canonical form
+        # Equivalent text must share a canonical form before chunking.
         text = unicodedata.normalize("NFC", text)
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
         blob = " ".join(lines)
         if not blob:
-            return 0
+            return self._commit_generation(context_id, source_path, [])
 
         # Tokenize the text per SPEC §2.5 requirement for token-based chunking
         tokens = _simple_tokenize(blob)
         if not tokens:
-            return 0
+            return self._commit_generation(context_id, source_path, [])
 
         chosen_chunk_tokens = max(chunk_size or self.default_chunk_size, 64)
         # Use default overlap if not specified (SPEC §2.5: 50 token overlap)
@@ -391,30 +720,131 @@ class RAGService:
             if end >= len(tokens):
                 break
 
-        if chunks:
+        return self._commit_generation(context_id, source_path, chunks)
+
+    def _commit_generation(
+        self,
+        context_id: str,
+        source_path: Optional[str],
+        chunks: List[KnowledgeChunk],
+    ) -> int:
+        """Make `chunks` the whole of what this context says about a path.
+
+        A named path is replaced rather than appended to, **including by
+        nothing**. These chunks claim to *be* the contents of `source_path`,
+        so once new bytes are committed the previous generation's chunks make
+        that claim about a file that is gone; "this generation produced no
+        text" is an answer about the current bytes, not permission to keep the
+        last ones. Empty input and an extractor refusal both arrive here.
+
+        The cost: a re-scan whose extraction fails transiently drops that
+        path from retrieval until the next ingest. Recoverable, and logged —
+        where an index answering with text the file no longer holds is not.
+
+        `inline` text has no path to be a generation of, so it is added.
+        """
+        replace = getattr(self.store, "replace_chunks_for_path", None)
+        if source_path and callable(replace):
+            replace(context_id, source_path, chunks)
+        elif chunks:
             self.store.add_chunks(context_id, chunks)  # type: ignore[attr-defined]
+        if chunks:
+            self._index_segments(chunks)
         return len(chunks)
 
+    def _index_segments(self, chunks: Sequence[KnowledgeChunk]) -> None:
+        """Store each chunk's segment vectors for late interaction.
+
+        Best effort on purpose: this is an extra index over content that is
+        already ingested and already retrievable. If the encoder fails here,
+        the chunk keeps its pooled vector and its text, and the late channel
+        simply has nothing to say about it — which the fusion already treats
+        as silence rather than as a bad score.
+        """
+        if not self.late_interaction or self._segment_index_broken:
+            return
+        for position, chunk in enumerate(chunks):
+            if chunk.id is None:
+                continue
+            parts = segment_text(chunk.content, max_segments=self.late_segments)
+            if len(parts) < 2:
+                # One segment is the pooled vector by another name, and it
+                # would earn the chunk a second full-weight vote for it.
+                continue
+            try:
+                segments = list(zip(parts, self.embed_many(parts)))
+                self.store.add_chunk_vectors(  # type: ignore[attr-defined]
+                    chunk.id,
+                    segments,
+                    meta={"embedding_model_id": self.embedding_model_id},
+                )
+            except Exception as exc:  # noqa: BLE001 - the pooled vector stands
+                # The write is inside the guard, not just the embed: the chunk
+                # rows are already committed by here, so letting a missing
+                # table or a dimension mismatch escape would fail an ingest
+                # that in fact succeeded, and the retry would duplicate it.
+                #
+                # And stop, latched for this service's life rather than for
+                # this call: these failures are structural — a missing
+                # table, a width mismatch — and `ingest_path` walks a tree
+                # one file at a time, so a per-call stop still pays for
+                # `segments x chunks` embeddings and logs an identical
+                # warning once per file. Changing the setting rebuilds the
+                # service, which is how an operator clears it after fixing
+                # the schema.
+                self._segment_index_broken = True
+                logger.warning(
+                    "rag_segment_index_failed",
+                    chunk_id=chunk.id,
+                    error=str(exc),
+                    skipped=len(chunks) - position - 1,
+                )
+                return
+
     def ingest_file(
-        self, context_id: str, path: str, chunk_size: Optional[int] = None
+        self,
+        context_id: str,
+        path: str,
+        chunk_size: Optional[int] = None,
+        *,
+        format_name: Optional[str] = None,
+        source_identity: Optional[str] = None,
     ) -> int:
+        """Index one file's text as the whole of what this context says about it.
+
+        `format_name` is what the file is called when that differs from where
+        it is kept. An attachment generation is named by its digest, which
+        carries no extension, so without the hint every PDF and Word document
+        reached the extractor as an unrecognised blob.
+
+        `source_identity` is what the resulting chunks claim to be the
+        contents of, when that differs from where the bytes were read. One
+        object can be read two ways — the same bytes attached as `.pdf` and
+        as `.md` — and keying the index by the object made the second reading
+        replace the first.
+        """
+        identity = source_identity or path
         # Route through the shared extractor: read_text() on a PDF "succeeds"
         # and fills the index with stripped-binary garbage that then wins
         # similarity searches. Better to skip a file than to poison retrieval.
         from liminallm.service.extract import ExtractError, extract_text
 
         try:
-            data = extract_text(Path(path))["text"]
+            data = extract_text(Path(path), format_name=format_name)["text"]
         except ExtractError as exc:
+            # A refusal is still an answer about the current bytes, so it
+            # commits an empty generation rather than leaving the last
+            # readable one standing as this path's contents.
             logger.warning(
                 "ingest_file_skipped", path=str(path), reason=exc.reason
             )
-            return 0
+            return self._commit_generation(context_id, identity, [])
         return self.ingest_text(
-            context_id, data, chunk_size=chunk_size, source_path=path
+            context_id, data, chunk_size=chunk_size, source_path=identity
         )
 
-    # Issue 38.3: Default limits for recursive ingestion to prevent resource exhaustion
+    # Default limits for recursive ingestion, so a deep or wide tree cannot
+    # exhaust the process.
     MAX_INGEST_FILES = 10000  # Maximum files to process in one ingest operation
     MAX_INGEST_DEPTH = 20  # Maximum directory depth for recursive ingestion
 
@@ -429,6 +859,7 @@ class RAGService:
         allowed_base: Optional[Union[str, Path]] = None,
         max_files: Optional[int] = None,
         max_depth: Optional[int] = None,
+        file_guard: Optional[Callable[[Path], ContextManager]] = None,
     ) -> int:
         """Ingest content from a filesystem path (file or directory).
 
@@ -444,6 +875,15 @@ class RAGService:
                          Per SPEC §18, path traversal prevention is mandatory.
             max_files: Maximum number of files to process (default: 10000)
             max_depth: Maximum directory depth for recursive mode (default: 20)
+            file_guard: Held around each file's own read-and-commit. A lock on
+                       the source as a whole is the wrong shape: a source
+                       rooted at `files/` takes a key nothing else takes,
+                       while an upload of `files/report.md` takes that name's
+                       key, so the walk reads one generation and commits it
+                       after the upload has published the next. The guard is
+                       taken where the mutation it races is. Callers that
+                       already hold the destination pass none, so an
+                       extraction does not wait for itself.
 
         Returns:
             Total number of chunks created
@@ -451,7 +891,7 @@ class RAGService:
         Raises:
             PathTraversalError: If allowed_base is set and fs_path escapes it
         """
-        # SECURITY: Validate path against allowed base if specified (Issue 14.1)
+        # SECURITY: validate the path against the allowed base.
         if allowed_base is not None:
             base = Path(allowed_base)
             # For absolute paths, verify they're within allowed base
@@ -486,7 +926,7 @@ class RAGService:
                     raise
 
         path = Path(fs_path)
-        # Issue 38.3: Apply default limits to prevent resource exhaustion
+        # Apply the default limits.
         file_limit = max_files or self.MAX_INGEST_FILES
         depth_limit = max_depth or self.MAX_INGEST_DEPTH
         base_depth = len(path.resolve().parts)
@@ -506,35 +946,58 @@ class RAGService:
         if path.is_file():
             # Single file
             if not extensions or path.suffix.lower() in extensions:
-                try:
-                    total_chunks += self.ingest_file(context_id, str(path), chunk_size)
-                except Exception as exc:
-                    logger.warning(
-                        "ingest_path_file_failed",
-                        path=str(path),
-                        error=str(exc),
-                    )
+                # The guard is outside the catch. That catch exists so one
+                # unreadable document does not abandon a whole tree; failing
+                # to take the serialization primitive is not that, and
+                # swallowing it turned a source that never got its lock into
+                # a 201 with zero chunks, with the route's own 409 handler —
+                # the one that removes the source record — unreachable.
+                with (file_guard(path) if file_guard else nullcontext()):
+                    try:
+                        total_chunks += self.ingest_file(
+                            context_id, str(path), chunk_size
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "ingest_path_file_failed",
+                            path=str(path),
+                            error=str(exc),
+                        )
             return total_chunks
 
         if not path.is_dir():
             logger.warning("ingest_path_not_found", path=str(path))
             return 0
 
-        # Directory - iterate through files with limits
+        # Directory - iterate through files with limits.
+        #
+        # The source itself is the authority for everything under it. The
+        # caller's `allowed_base` answers whether *this* path may be read, and
+        # `add_context_source` passes the shared root, which is far broader
+        # than the authority `authorize_path` just established. Descendants
+        # were never checked against anything: `glob` yields a link and
+        # `is_file()` follows it, so a link inside an authorized directory
+        # reads whatever it points at — another user's upload, or a file
+        # outside `shared_fs_root` entirely.
+        #
+        # §18 makes authority the caller's own area or an artifact covering a
+        # particular path. Being somewhere under the shared root is not
+        # authority, so containment is re-established here against the source.
+        source_root = path.resolve()
         pattern = "**/*" if recursive else "*"
         for file_path in path.glob(pattern):
-            if not file_path.is_file():
+            if not _within_source(file_path, source_root):
                 continue
             if extensions and file_path.suffix.lower() not in extensions:
                 continue
 
-            # Issue 38.3: Check depth limit for recursive ingestion
+            # Depth limit.
             if recursive:
                 file_depth = len(file_path.resolve().parts) - base_depth
                 if file_depth > depth_limit:
                     continue
 
-            # Issue 38.3: Check file count limit
+            # File count limit.
             if files_processed >= file_limit:
                 logger.warning(
                     "ingest_path_file_limit_reached",
@@ -544,15 +1007,21 @@ class RAGService:
                 )
                 break
 
-            try:
-                total_chunks += self.ingest_file(context_id, str(file_path), chunk_size)
-                files_processed += 1
-            except Exception as exc:
-                logger.warning(
-                    "ingest_path_file_failed",
-                    path=str(file_path),
-                    error=str(exc),
-                )
+            # The guard is outside the catch below, for the reason given in
+            # the single-file branch: a lock that cannot be taken is an
+            # operation failure, not an unreadable document.
+            with (file_guard(file_path) if file_guard else nullcontext()):
+                try:
+                    total_chunks += self.ingest_file(
+                        context_id, str(file_path), chunk_size
+                    )
+                    files_processed += 1
+                except Exception as exc:
+                    logger.warning(
+                        "ingest_path_file_failed",
+                        path=str(file_path),
+                        error=str(exc),
+                    )
 
         logger.info(
             "ingest_path_completed",

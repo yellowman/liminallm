@@ -78,17 +78,39 @@ _BREAK_TAGS = frozenset({
 
 # Invisible characters used to smuggle instructions past human review:
 # zero-width and bidi controls, word joiners, BOM, and the Unicode tag block.
+#
+# Written as escapes, never as the characters themselves. The literal form is
+# invisible in an editor and in a diff, so nobody can review what this class
+# actually contains — and a file holding raw bidi controls is the Trojan Source
+# shape regardless of intent, which is why bandit reports it as a HIGH. The set
+# is unchanged; `tests/test_web.py` covers what it strips.
 _INVISIBLE_RE = re.compile(
-    "[­​-‏‪-‮⁠-⁤⁦-⁯﻿]"
-    "|[\U000e0000-\U000e007f]"
+    "["
+    "\u00ad"                # soft hyphen
+    "\u200b-\u200f"         # zero-width space/non-joiner/joiner, LRM, RLM
+    "\u202a-\u202e"         # bidi embedding and override
+    "\u2060-\u2064"         # word joiner, invisible operators
+    "\u2066-\u206f"         # bidi isolates, deprecated formatting
+    "\ufeff"                # BOM / zero-width no-break space
+    "]"
+    "|[\U000e0000-\U000e007f]"  # Unicode tag block
 )
 
 # Heuristics for classic prompt-injection phrasings. Redacted, not trusted.
+#
+# A match costs more than it used to. It once meant a redaction plus a warning;
+# it now also taints the turn, and taint withdraws web_fetch and web_search for
+# the rest of it (service/taint.py) — so a page saying "You are now a Pro
+# subscriber" in ordinary prose ends the turn's web access, not just that
+# sentence. That is the trade taken deliberately: the redaction alone protects
+# the model from reading the text, and nothing protects the user from a model
+# that already read it and then chose a URL. Tighten a pattern here rather than
+# weaken the withdrawal.
 _INJECTION_PATTERNS: tuple[tuple[str, str], ...] = (
     ("override-instructions", r"(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+|your\s+)?(?:previous|prior|earlier|above|preceding)\s+(?:instructions?|prompts?|rules?|directions?|context)"),
     ("override-instructions", r"(?:ignore|disregard|forget)\s+(?:everything|all)\s+(?:above|before|prior|previous|you(?:'ve| have)\s+(?:been\s+told|read|learned))"),
     # "forget everything" on its own is a strong signal and rare in prose about
-    # a topic; the cost of a false positive is a redaction plus a warning.
+    # a topic.
     ("override-instructions", r"forget\s+everything\b"),
     ("persona-hijack", r"you\s+are\s+now\s+(?:a|an|the)\b"),
     ("persona-hijack", r"(?:act|behave)\s+as\s+(?:if\s+you\s+are|though\s+you\s+are)\b"),
@@ -228,8 +250,17 @@ def scan_for_injection(text: str) -> tuple[str, list[dict[str, str]]]:
 
 
 def neutralize_markers(text: str) -> str:
-    """Stop content from closing the untrusted-data envelope itself."""
+    """Stop content from writing control tokens it must never write.
+
+    Two vocabularies: the untrusted-data envelope, and the local backend's
+    tool-call tags. The local channel parses ``<tool_call>`` blocks out of
+    model OUTPUT only — input never reaches that parser — but a parrot-prone
+    small model is one echo away from carrying a document's block into the
+    output stream, so the tag is defanged in untrusted input the same way the
+    envelope markers are.
+    """
     cleaned = text.replace(UNTRUSTED_OPEN, "[filtered]").replace(UNTRUSTED_CLOSE, "[filtered]")
+    cleaned = re.sub(r"<\s*/?\s*tool_call\s*>", "[filtered]", cleaned, flags=re.IGNORECASE)
     # Any other all-caps <<<MARKER>>> lookalike gets defanged too.
     return re.sub(r"<<<[A-Z0-9_]{3,}>>>", "[filtered]", cleaned)
 

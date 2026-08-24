@@ -294,3 +294,146 @@ class TestLogout:
         )
 
         assert response.status_code == 200
+
+
+class TestOneCredentialFromTwoTransports:
+    """The browser sends a cookie it cannot read; API clients send a body.
+
+    SPEC §17.10 puts `refresh_token` and `session_id` in `HttpOnly` cookies so
+    the page cannot hold a durable credential. That only works if the server
+    accepts the cookie on its own — a required body field would force the SPA
+    to keep the copy the cookie exists to replace. The body form stays for
+    clients with no cookie jar, which is most of them.
+
+    Disagreement is refused rather than resolved: picking either silently lets
+    a caller who can write one transport override the other.
+    """
+
+    @pytest.fixture
+    def client(self):
+        """An https base URL, because the session cookies are `Secure`.
+
+        Chromium treats 127.0.0.1 as a trustworthy origin and sends them over
+        plain http; httpx applies no such exception, so a client on
+        `http://testserver` silently holds the cookies and never sends them —
+        which would make these pass or fail for a reason that has nothing to
+        do with the server.
+        """
+        from fastapi.testclient import TestClient
+
+        return TestClient(app_module.app, base_url="https://testserver")
+
+    def _signed_in(self, client):
+        import uuid
+
+        email = f"tw_{uuid.uuid4().hex[:8]}@example.com"
+        resp = client.post(
+            "/v1/auth/signup",
+            json={"email": email, "password": "TestPassword123!"},
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["data"]
+
+    def _csrf(self, client):
+        """What the SPA's `jsonHeaders()` sends: the readable CSRF cookie.
+
+        Once the session cookies actually reach the server, so does CSRF
+        enforcement — measured, a test that omitted this got 403 and would
+        have read as a refusal for the reason it was checking.
+        """
+        return {"X-CSRF-Token": client.cookies.get("csrf_token") or ""}
+
+    def test_refresh_works_on_the_cookie_with_an_empty_body(self, client):
+        data = self._signed_in(client)
+        # The signup response set the cookies; the client jar now holds them.
+        assert client.cookies.get("refresh_token")
+
+        resp = client.post(
+            "/v1/auth/refresh", json={}, headers=self._csrf(client)
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["access_token"]
+
+    def test_refresh_still_works_from_the_body_for_a_client_without_cookies(
+        self, client
+    ):
+        data = self._signed_in(client)
+        token = data["refresh_token"]
+        client.cookies.clear()
+
+        resp = client.post("/v1/auth/refresh", json={"refresh_token": token})
+
+        assert resp.status_code == 200, resp.text
+
+    def test_a_refresh_with_no_credential_at_all_is_refused(self, client):
+        self._signed_in(client)
+        client.cookies.clear()
+
+        assert client.post("/v1/auth/refresh", json={}).status_code == 401
+
+    def test_two_disagreeing_refresh_tokens_are_refused_not_reconciled(
+        self, client
+    ):
+        """The body must not be able to override the cookie.
+
+        A *nonsense* body token proves nothing here: it fails whether or not
+        the conflict is detected, because the token is invalid either way —
+        measured, that version passed with the check removed. The credential
+        has to be valid and belong to somebody else, which is the case the
+        refusal exists for: a caller who can write one transport speaking as
+        the account the other transport names.
+        """
+        from fastapi.testclient import TestClient
+
+        self._signed_in(client)
+        mine = client.cookies.get("refresh_token")
+
+        other = TestClient(app_module.app, base_url="https://testserver")
+        theirs = self._signed_in(other)["refresh_token"]
+        assert theirs and theirs != mine
+
+        resp = client.post(
+            "/v1/auth/refresh",
+            json={"refresh_token": theirs},
+            headers=self._csrf(client),
+        )
+
+        assert resp.status_code == 401, (
+            "a valid refresh token in the body overrode the cookie, so the "
+            f"body decided whose session this is: {resp.text}"
+        )
+
+    def test_mfa_request_resolves_the_session_from_the_cookie(self, client):
+        """The browser has no readable session id to put in the body."""
+        self._signed_in(client)
+        assert client.cookies.get("session_id")
+
+        resp = client.post(
+            "/v1/auth/mfa/request", json={}, headers=self._csrf(client)
+        )
+
+        # Not 401: the session resolved. Whatever the MFA state turns out to
+        # be, refusing for "invalid session" would mean the cookie was ignored.
+        assert resp.status_code != 401, resp.text
+
+    def test_a_session_id_that_contradicts_the_cookie_is_refused(self, client):
+        """Same rule, same reason: a real session id belonging to somebody else."""
+        from fastapi.testclient import TestClient
+
+        self._signed_in(client)
+
+        other = TestClient(app_module.app, base_url="https://testserver")
+        theirs = self._signed_in(other)["session_id"]
+        assert theirs and theirs != client.cookies.get("session_id")
+
+        resp = client.post(
+            "/v1/auth/mfa/request",
+            json={"session_id": theirs},
+            headers=self._csrf(client),
+        )
+
+        assert resp.status_code == 401, (
+            "a valid session id in the body overrode the cookie, so MFA acted "
+            f"on a session the caller does not hold: {resp.text}"
+        )

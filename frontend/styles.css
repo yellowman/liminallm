@@ -237,6 +237,51 @@ body {
   color: var(--text-muted);
 }
 
+/* API key rows on the settings tab */
+.api-key-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--panel-muted);
+}
+
+.api-key-item.revoked .api-key-name,
+.api-key-item.revoked .api-key-prefix {
+  text-decoration: line-through;
+  color: var(--text-muted);
+}
+
+.api-key-item .api-key-name {
+  font-weight: 500;
+  margin-right: 8px;
+}
+
+.api-key-item .api-key-prefix {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.api-key-item .meta {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Conversations created by agents over the served Responses API */
+.conversation-item .source-tag {
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--panel-muted);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  vertical-align: 1px;
+}
+
 /* Main content area */
 .main-content {
   padding: 20px 24px 32px;

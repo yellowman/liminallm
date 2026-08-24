@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
 
 from liminallm.logging import get_logger
+from liminallm.service import ingest_queue
 from liminallm.service import notes as notes_service
 from liminallm.service.replication import AdvisoryLock
 
@@ -65,6 +66,8 @@ class TrainingWorker:
         adapter_prune_interval: int = DEFAULT_ADAPTER_PRUNE_INTERVAL_SECONDS,
         reembed_interval: int = DEFAULT_REEMBED_INTERVAL_SECONDS,
         embeddings=None,
+        rag=None,
+        fs_root: Optional[str] = None,
         leader_lock: Optional["AdvisoryLock"] = None,
     ) -> None:
         self.store = store
@@ -81,6 +84,11 @@ class TrainingWorker:
         self.reembed_interval = reembed_interval
         # Needed to re-embed after an encoder change; None disables the sweep.
         self.embeddings = embeddings
+        # Needed to re-index files whose bytes were replaced, and to take the
+        # same publication lock the upload does; either being None disables
+        # the drain, leaving only the replacing request's own pass.
+        self.rag = rag
+        self.fs_root = fs_root
         # Periodic clustering and prune proposals are cluster-wide work, not
         # per-replica work: without this lock every replica repeats them.
         # Queued jobs need no lock — claim_training_job() is an atomic
@@ -120,6 +128,7 @@ class TrainingWorker:
         while self._running:
             try:
                 await self._process_queued_jobs()
+                await self._drain_ingest_queue()
                 await self._maybe_run_periodic_clustering()
                 await self._maybe_recommend_adapter_pruning()
                 await self._maybe_reembed_stale_vectors()
@@ -144,6 +153,30 @@ class TrainingWorker:
                     continue
 
             await asyncio.sleep(self.poll_interval)
+
+    async def _drain_ingest_queue(self) -> None:
+        """Re-index files whose bytes were replaced.
+
+        The replacing request empties the stale chunks itself and starts a
+        drain of its own, so this is not the usual path — it is what makes the
+        queue durable rather than best-effort. A process that dies between
+        recording the work and doing it would otherwise leave those files
+        absent from their contexts permanently, which is the failure this
+        design exists to avoid.
+
+        Every poll, not on an interval: work here means a user is waiting for
+        a file to become searchable again. No leader lock either — the claim
+        is an atomic UPDATE ... SKIP LOCKED, so replicas take different jobs,
+        and the publication lock keeps two of them off one path.
+        """
+        if self.rag is None or not self.fs_root:
+            return
+        await asyncio.to_thread(
+            ingest_queue.drain_until_idle,
+            self.store,
+            self.rag,
+            fs_root=self.fs_root,
+        )
 
     async def _maybe_run_periodic_clustering(self) -> None:
         if not self.clusterer or self.cluster_interval <= 0:
@@ -270,8 +303,20 @@ class TrainingWorker:
                     # did NOT ship weights - record it as gate-rejected rather
                     # than "succeeded", and leave router state alone so an
                     # un-promoted adapter is not credited with a training pass.
+                    # A run that never trained is neither: see
+                    # `TrainingService.terminal_status`, which owns the rule
+                    # for both this and the service's own write.
                     gate = result.get("eval_gate") or {}
-                    promoted = bool(gate.get("promoted", True))
+                    # Absent means unknown, and unknown is not approval: the
+                    # summary used to drop eval_gate entirely, so this
+                    # defaulted to True and credited every rejected run.
+                    promoted = bool(gate.get("promoted", False))
+                    if "promoted" not in gate:
+                        logger.warning(
+                            "training_gate_decision_missing",
+                            job_id=job_id,
+                            detail="treating as not promoted",
+                        )
                     # Merge into the meta TrainingService already wrote (it
                     # holds eval_gate/pooled_skill/distilled); replacing it
                     # would destroy the gate audit trail.
@@ -288,11 +333,15 @@ class TrainingWorker:
                     )
                     self.store.update_training_job(
                         job_id,
-                        status="succeeded" if promoted else "gate_rejected",
+                        status=self.training.terminal_status(
+                            result.get("jax_trace"), gate
+                        ),
                         loss=result.get("loss"),
-                        # TrainingService already set new_version on promotion;
-                        # the result exposes the directory, not the number.
-                        new_version=None,
+                        # `new_version` is deliberately not passed: the service
+                        # already set it on promotion and cleared it otherwise,
+                        # and the result exposes the directory rather than the
+                        # number. Passing `None` here would now mean NULL and
+                        # erase the version the promotion just recorded.
                         meta=existing_meta,
                     )
                     logger.info(
@@ -315,10 +364,16 @@ class TrainingWorker:
                         await self.clusterer.cluster_after_training(user_id)
                     return
                 else:
-                    # No events to train on
+                    # No events to train on. The same rule as any other
+                    # skipped run: this attempt produced no loss and promoted
+                    # nothing, so an earlier attempt's numbers on this job go
+                    # with it rather than surviving under a status that says
+                    # nothing ran.
                     self.store.update_training_job(
                         job_id,
                         status="skipped",
+                        loss=None,
+                        new_version=None,
                         meta={"reason": "no_preference_events"},
                     )
                     logger.info("training_job_skipped", job_id=job_id, reason="no_events")
@@ -348,7 +403,11 @@ class TrainingWorker:
                     )
                     await asyncio.sleep(backoff)
 
-        # All retries exhausted
+        # All retries exhausted. `loss` and `new_version` are deliberately
+        # left as they are rather than cleared: unlike a skipped run, this
+        # says the worker gave up, not that nothing happened. If an attempt
+        # promoted a version before the failure, the artifact really does
+        # carry it, and erasing the record would hide that.
         self.store.update_training_job(
             job_id,
             status="dead_letter",

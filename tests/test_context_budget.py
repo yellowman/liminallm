@@ -155,7 +155,7 @@ def test_agent_context_budgets_history(monkeypatch):
     history = [
         SimpleNamespace(role="user", content="word " * 800) for _ in range(20)
     ]
-    messages, _tools, _preamble = engine._build_agent_context(
+    messages, _tools, _preamble, _mcp = engine._build_agent_context(
         "question", [], history, "user-1", None
     )
     # system + budgeted history + the user turn, not all 20 turns.
@@ -658,7 +658,7 @@ def test_history_search_is_scoped_to_the_owner():
 def test_history_tool_offered_only_once_turns_fall_outside_the_window():
     engine = _engine()
     short = [SimpleNamespace(role="user", content="hi", seq=i) for i in range(3)]
-    _msgs_out, tools, _ = engine._build_agent_context("q", [], short, "u", None)
+    _msgs_out, tools, _, _ = engine._build_agent_context("q", [], short, "u", None)
     assert not any(
         t["function"]["name"] == "history_search" for t in tools
     )
@@ -669,7 +669,7 @@ def test_history_tool_offered_only_once_turns_fall_outside_the_window():
         for i in range(compaction.RECENT_MESSAGES + 5)
     ]
     with _mock.patch.object(engine, "history_budget", return_value=100):
-        _msgs_out, tools, _ = engine._build_agent_context("q", [], long, "u", None)
+        _msgs_out, tools, _, _ = engine._build_agent_context("q", [], long, "u", None)
     assert any(t["function"]["name"] == "history_search" for t in tools)
 
 
@@ -1008,37 +1008,8 @@ def test_stale_vectors_are_re_embedded_not_reused():
     assert scores and scores[0] > 0
 
 
-def test_hybrid_search_ranks_on_the_vector_when_words_do_not_overlap(store):
-    """Semantic search must actually contribute, not collapse to BM25.
-
-    Against PostgresStore.search_chunks, which is the code that runs. These
-    used to drive a hybrid_search_chunks() in storage/common.py that nothing
-    called — the property was right, the implementation was not.
-    """
-    from liminallm.service.embeddings import EMBEDDING_DIM
-    from liminallm.storage.models import KnowledgeChunk
-
-    user = store.create_user(email=f"hs_{uuid.uuid4().hex[:8]}@example.com")
-    ctx = store.upsert_context(user.id, f"hs-{uuid.uuid4().hex[:6]}", "fixture")
-
-    wanted = [0.0] * EMBEDDING_DIM
-    wanted[7] = 1.0
-    other = [0.0] * EMBEDDING_DIM
-    other[EMBEDDING_DIM - 1] = 1.0
-    store.add_chunks(ctx.id, [
-        KnowledgeChunk(context_id=ctx.id, fs_path="/a", content="alpha text",
-                       embedding=wanted, chunk_index=0),
-        KnowledgeChunk(context_id=ctx.id, fs_path="/b", content="beta text",
-                       embedding=other, chunk_index=1),
-    ])
-
-    # The query shares no word with either chunk, so only the vector can decide.
-    hits = store.search_chunks(ctx.id, "zzz", wanted, limit=2)
-    assert hits and hits[0].fs_path == "/a"
-
-
 def test_the_schema_refuses_a_chunk_of_the_wrong_dimension(store):
-    """Why search_chunks needs no mismatch handling: it cannot happen.
+    """Why retrieval needs no width-mismatch handling: it cannot happen.
 
     knowledge_chunk.embedding is VECTOR(:embedding_dim) NOT NULL, so every
     stored vector has the same width and none is absent. That is a stronger

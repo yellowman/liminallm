@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import os
 import posixpath
 import re
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -25,7 +27,7 @@ logger = get_logger(__name__)
 
 _settings = Settings.from_env()
 
-# Version info per SPEC §18
+# Version info per SPEC §15.2
 __version__ = "0.1.0"
 __build__ = _settings.build_sha
 
@@ -684,11 +686,15 @@ async def metrics() -> Response:
     return Response(content="\n".join(lines) + "\n", media_type="text/plain")
 
 
-def _sweep_tmp_dirs(shared_root: Path, max_age_hours: int) -> None:
+def _sweep_tmp_dirs(store, shared_root: Path, max_age_hours: int) -> None:
     """Remove stale files from per-user tmp scratch directories.
 
     SPEC §18 requires per-user scratch cleanup on a daily cadence. This helper
     runs in a thread to avoid blocking the event loop.
+
+    Each account's files are removed while its lifetime is held, so an erasure
+    that starts mid-sweep waits rather than being overtaken. The account's own
+    retirement owns this namespace once it exists; see `hold_user_lifetime`.
     """
 
     cutoff_ts = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).timestamp()
@@ -700,27 +706,167 @@ def _sweep_tmp_dirs(shared_root: Path, max_age_hours: int) -> None:
         tmp_dir = user_dir / "tmp"
         if not tmp_dir.exists():
             continue
-        # Delete stale files and then prune empty directories depth-first
-        for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
-            if path.is_file() and stat.st_mtime < cutoff_ts:
-                path.unlink(missing_ok=True)
-        # Remove empty directories after file cleanup
-        for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            if path.is_dir():
-                try:
-                    next(path.iterdir())
-                except (OSError, StopIteration):
-                    with contextlib.suppress(OSError):
-                        path.rmdir()
         try:
-            next(tmp_dir.iterdir())
-        except (OSError, StopIteration):
-            with contextlib.suppress(OSError):
-                tmp_dir.rmdir()
+            with store.hold_user_lifetime(user_dir.name) as collectable:
+                if not collectable:
+                    continue
+                _sweep_one_tmp_dir(tmp_dir, cutoff_ts)
+        except Exception as exc:
+            logger.warning(
+                "tmp_cleanup_user_skipped", user=user_dir.name, error=str(exc)
+            )
+
+
+def _sweep_one_tmp_dir(tmp_dir: Path, cutoff_ts: float) -> None:
+    """One account's scratch directory, with its lifetime already held."""
+    # Delete stale files and then prune empty directories depth-first
+    for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        if path.is_file() and stat.st_mtime < cutoff_ts:
+            path.unlink(missing_ok=True)
+    # Remove empty directories after file cleanup
+    for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if path.is_dir():
+            try:
+                next(path.iterdir())
+            except (OSError, StopIteration):
+                with contextlib.suppress(OSError):
+                    path.rmdir()
+    try:
+        next(tmp_dir.iterdir())
+    except (OSError, StopIteration):
+        with contextlib.suppress(OSError):
+            tmp_dir.rmdir()
+
+
+def _sweep_archive_staging(store, shared_root: Path, max_age_hours: int) -> None:
+    """Remove archive staging trees no extraction is still filling.
+
+    An extraction renames its staging tree into place and removes what is
+    left in a `finally`, so anything here outlived the process that made it.
+    Nothing reads these directories, so age is the only signal available and
+    the only one needed.
+
+    Held per account, so an erasure that starts mid-sweep waits: once its
+    retirement exists, the whole staging tree is the retirement's to remove.
+    """
+    root = shared_root / ".archive-staging"
+    if not root.is_dir():
+        return
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=max(max_age_hours, 1))
+    ).timestamp()
+    removed = 0
+    for user_dir in root.iterdir():
+        if not user_dir.is_dir():
+            continue
+        try:
+            with store.hold_user_lifetime(user_dir.name) as collectable:
+                if not collectable:
+                    continue
+                removed += _sweep_one_staging_dir(user_dir, cutoff)
+        except Exception as exc:
+            logger.warning(
+                "archive_staging_user_skipped", user=user_dir.name, error=str(exc)
+            )
+    if removed:
+        logger.info("archive_staging_swept", removed=removed)
+
+
+def _sweep_one_staging_dir(user_dir: Path, cutoff: float) -> int:
+    """One account's staging trees, with its lifetime already held."""
+    removed = 0
+    for staging in user_dir.iterdir():
+        try:
+            if staging.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(staging, ignore_errors=True)
+        removed += 1
+    return removed
+
+
+def _sweep_attachment_generations(shared_root: Path, max_age_hours: int) -> None:
+    """Reclaim attached generations no conversation names any more.
+
+    On the same loop and the same age as the scratch sweep, because it is the
+    same question: how long is something nobody claims kept. The age doubles
+    as the grace period covering the window between storing a generation and
+    recording the attachment that names it.
+    """
+    from liminallm.service import attachments as attachments_service
+    from liminallm.service.runtime import get_runtime
+
+    removed = attachments_service.sweep_generations(
+        get_runtime().store,
+        str(shared_root),
+        grace_seconds=max(max_age_hours, 1) * 3600,
+    )
+    if removed:
+        logger.info("attachment_generations_swept", removed=removed)
+
+
+async def _run_cleanup_pass(runtime, shared_root: Path, max_age_hours: int) -> None:
+    """One round of every periodic reclamation. Each failure is its own.
+
+    Extracted from the loop so a test can execute the real thing once. A sweep
+    that exists but is called by nothing is a disk leak with documentation:
+    artifact payload reclamation was added and wired to neither this loop nor
+    anything else, so a deleted artifact's bytes stayed on disk forever — safe
+    from use-after-delete only because nothing ever collected them.
+    """
+    from liminallm.service.artifacts import sweep_artifact_payloads
+    from liminallm.service.users import sweep_user_namespaces
+
+    # First, so a namespace this pass enrols is already excluded from the
+    # sweeps below rather than chewed on once more on the way out.
+    try:
+        await asyncio.to_thread(
+            sweep_user_namespaces, runtime.store, str(shared_root)
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - best-effort cleanup
+        logger.warning("user_namespace_sweep_failed", error=str(exc))
+
+    # Each sweep below holds an account's lifetime while it decides about that
+    # account and while it acts on the decision. There is deliberately no
+    # pass-wide snapshot of which accounts are being erased: a set read here
+    # is already an answer to a question about a moment, and every sweep that
+    # consulted it would be acting on that moment rather than on this one.
+    sweeps = (
+        (
+            "tmp_cleanup_failed",
+            functools.partial(
+                _sweep_tmp_dirs, runtime.store, shared_root, max_age_hours
+            ),
+        ),
+        (
+            "attachment_generation_sweep_failed",
+            functools.partial(_sweep_attachment_generations, shared_root, max_age_hours),
+        ),
+        (
+            "archive_staging_sweep_failed",
+            functools.partial(
+                _sweep_archive_staging, runtime.store, shared_root, max_age_hours
+            ),
+        ),
+        (
+            "artifact_payload_sweep_failed",
+            functools.partial(sweep_artifact_payloads, runtime.store, str(shared_root)),
+        ),
+    )
+    for event, sweep in sweeps:
+        try:
+            await asyncio.to_thread(sweep)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - best-effort cleanup
+            logger.warning(event, error=str(exc))
 
 
 async def _run_tmp_cleanup(
@@ -728,15 +874,12 @@ async def _run_tmp_cleanup(
 ) -> None:
     """Background loop to periodically clean tmp scratch directories."""
 
+    from liminallm.service.runtime import get_runtime
+
     interval = max(interval_seconds, 300)
     try:
         while True:
-            try:
-                await asyncio.to_thread(_sweep_tmp_dirs, shared_root, max_age_hours)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                logger.warning("tmp_cleanup_failed", error=str(exc))
+            await _run_cleanup_pass(get_runtime(), shared_root, max_age_hours)
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         logger.info("tmp_cleanup_task_cancelled")

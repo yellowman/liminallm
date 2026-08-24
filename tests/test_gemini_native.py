@@ -153,18 +153,33 @@ def test_generate_speaks_the_native_wire():
     assert out["usage"]["reasoning_tokens"] == 6
 
 
-def test_prompt_adapters_inject_into_the_system_instruction():
+def test_prompt_adapters_reach_the_system_instruction_exactly_once():
+    """SPEC §5.0.1: LLMService materializes, the backend transports.
+
+    This used to call the backend directly and assert it placed the text
+    itself — which is the second-materializer contract. On the product path
+    the service had already placed it, so the same instruction went out
+    twice. Driven through the service now, and counted rather than merely
+    found present, because "present" was true throughout the defect.
+    """
+    from liminallm.service.llm import LLMService
+
     seen = {}
 
     def handler(request):
         seen["body"] = json.loads(request.read())
         return httpx.Response(200, json=_payload())
 
-    adapter = {"id": "tone", "schema": {"adapter_mode": "prompt",
+    adapter = {"id": "tone", "schema": {"mode": "prompt",
                                         "prompt_instructions": "Answer in haiku."}}
-    out = _backend(handler).generate([{"role": "user", "content": "hi"}], [adapter])
+    backend = _backend(handler)
+    out = LLMService(base_model="gemini-2.5-flash", backend=backend).generate(
+        "hi", [adapter], []
+    )
 
-    assert "Answer in haiku." in seen["body"]["systemInstruction"]["parts"][0]["text"]
+    system = seen["body"]["systemInstruction"]["parts"][0]["text"]
+    assert "Answer in haiku." in system
+    assert json.dumps(seen["body"]).count("Answer in haiku.") == 1
     assert out["adapters_applied"] == ["tone:prompt"]
 
 
@@ -172,7 +187,7 @@ def test_a_weight_bearing_adapter_is_dropped_not_faked():
     def handler(request):
         return httpx.Response(200, json=_payload())
 
-    adapter = {"id": "lora", "schema": {"adapter_mode": "local"}, "fs_dir": "/x"}
+    adapter = {"id": "lora", "schema": {"mode": "local"}, "fs_dir": "/x"}
     out = _backend(handler).generate([{"role": "user", "content": "hi"}], [adapter])
     assert out["adapters_applied"] == []
 

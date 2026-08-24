@@ -11,12 +11,12 @@ from liminallm.service.attachments import (
     INLINE_MAX_BYTES,
     build_attachment_preamble,
     classify_attachment,
+    store_generation,
 )
 from liminallm.service.interpreter import (
     prepare_workdir,
     run_python_sandboxed,
 )
-
 
 # ---------------------------------------------------------------------------
 # Classification
@@ -77,7 +77,9 @@ def test_interpreter_can_unzip_an_attachment(tmp_path):
     archive.parent.mkdir()
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("inner.txt", "hello from inside the archive")
-    workdir = prepare_workdir(str(tmp_path / "sessions"), str(archive.parent), ["data.zip"])
+    workdir = prepare_workdir(
+        str(tmp_path / "sessions"), [("data.zip", str(archive))]
+    )
     code = (
         "import zipfile\n"
         "with zipfile.ZipFile('data.zip') as z:\n"
@@ -124,7 +126,9 @@ def test_interpreter_cannot_see_files_outside_workdir(tmp_path):
     secret.write_text("do not leak")
     (secret.parent / "shared.txt").write_text("fine to read")
     # Only the named attachment is copied in.
-    workdir = prepare_workdir(str(tmp_path / "sessions"), str(secret.parent), ["shared.txt"])
+    workdir = prepare_workdir(
+        str(tmp_path / "sessions"), [("shared.txt", str(secret.parent / "shared.txt"))]
+    )
     result = run_python_sandboxed(
         "import os\nprint(sorted(os.listdir('.')))", workdir=workdir, timeout=60
     )
@@ -133,10 +137,12 @@ def test_interpreter_cannot_see_files_outside_workdir(tmp_path):
 
 
 def test_prepare_workdir_rejects_traversal_names(tmp_path):
-    source = tmp_path / "src"
-    source.mkdir()
-    (tmp_path / "outside.txt").write_text("nope")
-    workdir = prepare_workdir(str(tmp_path / "sessions"), str(source), ["../outside.txt"])
+    """The display name still decides where inside the workdir a copy lands."""
+    outside = tmp_path / "outside.txt"
+    outside.write_text("nope")
+    workdir = prepare_workdir(
+        str(tmp_path / "sessions"), [("../outside.txt", str(outside))]
+    )
     from pathlib import Path
 
     assert list(Path(workdir).iterdir()) == []
@@ -155,12 +161,21 @@ def test_interpreter_timeout_is_reported(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _attached(tmp_path, name, body, **caps):
+    """A record naming a generation the store really holds."""
+    import hashlib
+
+    checksum = hashlib.sha256(body).hexdigest()
+    assert store_generation(str(tmp_path), "u1", body, checksum) is not None
+    record = {"name": name, "size": len(body), "checksum": checksum,
+              "inline": False, "searchable": False, "analyzable": False}
+    record.update(caps)
+    return record
+
+
 def test_preamble_inlines_small_files(tmp_path):
-    files = tmp_path / "users" / "u1" / "files"
-    files.mkdir(parents=True)
-    (files / "notes.txt").write_text("the launch code is ORCHID-9")
     attachments = [
-        {"name": "notes.txt", "size": 26, "inline": True, "searchable": False, "analyzable": False}
+        _attached(tmp_path, "notes.txt", b"the launch code is ORCHID-9", inline=True)
     ]
     text = build_attachment_preamble(attachments, fs_root=str(tmp_path), user_id="u1")
     assert "ORCHID-9" in text
@@ -169,8 +184,8 @@ def test_preamble_inlines_small_files(tmp_path):
 
 def test_preamble_mentions_tools_for_searchable_and_analyzable(tmp_path):
     attachments = [
-        {"name": "big.md", "size": 99999, "inline": False, "searchable": True, "analyzable": False},
-        {"name": "b.zip", "size": 500, "inline": False, "searchable": False, "analyzable": True},
+        _attached(tmp_path, "big.md", b"a longer document\n" * 40, searchable=True),
+        _attached(tmp_path, "b.zip", b"PK\x03\x04 and more", analyzable=True),
     ]
     text = build_attachment_preamble(attachments, fs_root=str(tmp_path), user_id="u1")
     assert "file_search" in text

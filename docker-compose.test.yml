@@ -42,24 +42,17 @@ services:
     environment:
       # Database
       DATABASE_URL: postgresql://liminallm:testpassword123@postgres:5432/liminallm_test
-      # Redis
-      REDIS_URL: redis://redis:6379/0
-      # Auth (test-only secret, DO NOT use in production)
-      JWT_SECRET: Test-JWT-Secret-For-QA-Environment-Only-32chars!
-      JWT_ISSUER: liminallm-test
-      JWT_AUDIENCE: test-clients
-      # Test mode settings
       TEST_MODE: "false"
-      ALLOW_REDIS_FALLBACK_DEV: "false"
       # Admin bootstrap credentials
       ADMIN_EMAIL: admin@test.local
       ADMIN_PASSWORD: TestAdmin123!
-      # Model backend (use stub for deterministic testing without real LLM)
-      INSTANCE_SETTINGS_JSON: '{"model_backend": "stub"}'
-      # Disable email verification for easier testing
-      REQUIRE_EMAIL_VERIFICATION: "false"
-      # Disable MFA for easier testing
-      ENABLE_MFA: "false"
+      # Managed settings, seeded into Postgres on first boot only. Everything
+      # this service configures beyond the six environment-only settings goes
+      # here: managed settings have no environment variables of their own, so
+      # a bare REDIS_URL reached nothing and left redis_url on its localhost
+      # default — inside this container, nowhere.
+      INSTANCE_SETTINGS_JSON: >-
+        {"model_backend":"stub","redis_url":"redis://redis:6379/0","enable_mfa":false}
       # Filesystem
       SHARED_FS_ROOT: /srv/liminallm
     depends_on:
@@ -97,13 +90,14 @@ services:
       dockerfile: Dockerfile
     environment:
       DATABASE_URL: postgresql://liminallm:testpassword123@postgres:5432/liminallm_test
-      REDIS_URL: redis://redis:6379/0
-      JWT_SECRET: Test-JWT-Secret-For-QA-Environment-Only-32chars!
       ADMIN_EMAIL: admin@test.local
       ADMIN_PASSWORD: TestAdmin123!
       SHARED_FS_ROOT: /srv/liminallm
-      # Seeded into the database on first boot; see config.managed_field
-      INSTANCE_SETTINGS_JSON: '{"model_backend": "stub"}'
+      # This service builds the full Runtime, so it is normally the first
+      # process able to seed. The same declaration is on `app` so either
+      # startup order is correct, rather than two definitions of the truth.
+      INSTANCE_SETTINGS_JSON: >-
+        {"model_backend":"stub","redis_url":"redis://redis:6379/0","enable_mfa":false}
     command: ["python", "/app/scripts/bootstrap_admin.py"]
     depends_on:
       migrate:

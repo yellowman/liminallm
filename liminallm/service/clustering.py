@@ -556,8 +556,6 @@ class SemanticClusterer:
                 "tenant_id": tenant_id,
                 # Born on the prompt rung of the adapter ladder (SPEC §5.6).
                 "mode": "prompt",
-                "backend": "prompt",
-                "provider": "prompt",
                 "prompt_instructions": self._skill_prompt_instructions(
                     cluster, positive
                 ),

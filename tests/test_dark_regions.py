@@ -209,8 +209,14 @@ def test_the_shared_pool_is_readable_by_any_authenticated_user(client, voice_use
     assert resp.content == b"ID3-shared-audio"
 
 
+# Fixed uuids, not `uuid.uuid4()`. What matters about these two is the shape —
+# a well-formed id with the wrong extension, and one with a null byte spliced
+# in — and generating them at collection time made the test's own name random.
+# A test whose id changes every run cannot be re-run from a failure report, and
+# under xdist the workers collect different names and refuse to run at all.
 @pytest.mark.parametrize("name", ["..%2F..%2Fetc%2Fpasswd", "clip.mp3", "no-extension",
-                                  f"{uuid.uuid4()}.exe", f"{uuid.uuid4()}.mp3%00.txt"])
+                                  "b1b0f0de-0000-4000-8000-00000000c0de.exe",
+                                  "b1b0f0de-0000-4000-8000-00000000c0de.mp3%00.txt"])
 def test_a_filename_outside_the_pattern_is_a_404(client, voice_user, name):
     """Synthesized files are UUID-named; anything else 404s before auth even
     runs, so probing the route leaks nothing."""
@@ -242,6 +248,7 @@ def _tmp_tree(root: Path, user: str) -> Path:
 
 def test_stale_files_go_and_fresh_files_stay(tmp_path):
     from liminallm.app import _sweep_tmp_dirs
+    from tests.harness import get_test_store
 
     tmp = _tmp_tree(tmp_path, "u1")
     stale = tmp / "old.bin"
@@ -253,7 +260,7 @@ def test_stale_files_go_and_fresh_files_stay(tmp_path):
     fresh = tmp / "new.bin"
     fresh.write_bytes(b"y")
 
-    _sweep_tmp_dirs(tmp_path, max_age_hours=24)
+    _sweep_tmp_dirs(get_test_store(), tmp_path, max_age_hours=24)
 
     assert not stale.exists()
     assert fresh.exists()
@@ -263,6 +270,7 @@ def test_emptied_directories_are_pruned_all_the_way_up(tmp_path):
     import os
 
     from liminallm.app import _sweep_tmp_dirs
+    from tests.harness import get_test_store
 
     tmp = _tmp_tree(tmp_path, "u1")
     nested = tmp / "a" / "b"
@@ -272,7 +280,7 @@ def test_emptied_directories_are_pruned_all_the_way_up(tmp_path):
     old = time.time() - 48 * 3600
     os.utime(f, (old, old))
 
-    _sweep_tmp_dirs(tmp_path, max_age_hours=24)
+    _sweep_tmp_dirs(get_test_store(), tmp_path, max_age_hours=24)
 
     assert not tmp.exists(), "an emptied tmp tree should vanish entirely"
     assert (tmp_path / "users" / "u1").exists(), "only tmp is swept, not the user"
@@ -280,15 +288,17 @@ def test_emptied_directories_are_pruned_all_the_way_up(tmp_path):
 
 def test_a_missing_users_root_is_a_no_op(tmp_path):
     from liminallm.app import _sweep_tmp_dirs
+    from tests.harness import get_test_store
 
-    _sweep_tmp_dirs(tmp_path / "nowhere", max_age_hours=24)
+    _sweep_tmp_dirs(get_test_store(), tmp_path / "nowhere", max_age_hours=24)
 
 
 def test_a_user_without_a_tmp_dir_is_skipped(tmp_path):
     from liminallm.app import _sweep_tmp_dirs
+    from tests.harness import get_test_store
 
     (tmp_path / "users" / "u1").mkdir(parents=True)
-    _sweep_tmp_dirs(tmp_path, max_age_hours=24)
+    _sweep_tmp_dirs(get_test_store(), tmp_path, max_age_hours=24)
     assert (tmp_path / "users" / "u1").exists()
 
 

@@ -298,8 +298,12 @@ def test_interpreter_scratch_is_not_on_shared_storage(tmp_path, monkeypatch):
     monkeypatch.setattr(engine.settings, "shared_fs_root", str(shared), raising=False)
 
     session: dict = {}
-    engine._run_python_tool(
-        "print('hi')", conversation_id=None, user_id="u1", session=session
+    engine._run_python_capability(
+        "print('hi')",
+        invocation=None,
+        conversation_id=None,
+        user_id="u1",
+        session=session,
     )
     workdir = session.get("workdir")
     assert workdir, "the tool should have created a session dir"

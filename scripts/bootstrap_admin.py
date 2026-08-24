@@ -127,12 +127,6 @@ def main():
         print("       (uppercase, lowercase, digits, special characters)")
         sys.exit(1)
 
-    # Set up minimal env for testing if not configured
-    if not os.environ.get("JWT_SECRET"):
-        # Generate a secure secret for bootstrap
-        import secrets
-        os.environ["JWT_SECRET"] = secrets.token_urlsafe(48)
-
     if not os.environ.get("SHARED_FS_ROOT"):
         os.environ["SHARED_FS_ROOT"] = "/tmp/liminallm-bootstrap"
 
@@ -140,8 +134,10 @@ def main():
         print("Error: DATABASE_URL is required; bootstrap writes the admin to Postgres")
         sys.exit(1)
 
+    # TEST_MODE alone: `allow_redis_fallback_dev` is an admin setting with no
+    # environment variable, so setting one here reached nothing. Both feed the
+    # same branch, and this is the half that works.
     os.environ.setdefault("TEST_MODE", "true")
-    os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
 
     try:
         result = asyncio.run(bootstrap_admin(args.email, args.password, args.dry_run))

@@ -181,13 +181,6 @@ scripts/
 
 ## Troubleshooting
 
-### Tests fail with "JWT_SECRET must mix character classes"
-
-The test JWT secret must contain uppercase, lowercase, digits, and special characters:
-
-```bash
-```
-
 ### Redis connection errors in tests
 
 Tests can run without Redis using the in-memory fallback:
