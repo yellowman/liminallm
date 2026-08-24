@@ -16,6 +16,12 @@ dependencies = [
   "pypdf>=4.0",
   "psycopg-pool>=3.2",
   "redis>=5.0",
+  # Imported at module scope by auth, web, sandbox, voice and the Gemini
+  # backend. It was never declared and arrived only because `openai` depends
+  # on it — a direct import satisfied by somebody else's dependency, which
+  # holds until their dependency changes. CI installed a set without it and
+  # the whole application failed to import.
+  "httpx>=0.27,<1",
   "openai>=1.30",
   # The MCP wire, and the reason `liminallm/service/mcp_client.py` contains no
   # protocol code. Version negotiation, Streamable HTTP and the message types
@@ -51,6 +57,9 @@ train = [
   # Reads the base checkpoint's shards framework-neutrally (numpy in, no
   # torch), which is how serving loads weights without a second runtime.
   "safetensors>=0.4",
+  # Imported directly by `transformer.py` when it loads those shards. Arrives
+  # with jax and safetensors anyway; named here because the code imports it.
+  "numpy>=1.24",
 ]
 dev = [
   "pytest>=8.0",

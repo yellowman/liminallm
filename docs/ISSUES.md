@@ -12689,3 +12689,67 @@ Not fixed, and pre-existing: `make lint` also fails on `tests/` — 22 errors on
 main, 25 here. Unsorted imports, `l` as a variable name, and six repeated dict
 keys whose values are identical, so nothing is dropped. CI does not lint
 `tests/`.
+
+## httpx was never a dependency, and openai stopped supplying it
+
+With the invocation fixed, CI got as far as importing the application and
+died there, on every Python version:
+
+    liminallm/service/auth.py:17: import httpx
+    E   ModuleNotFoundError: No module named 'httpx'
+
+**`httpx` is imported at module scope by five files** — `auth`, `web`,
+`sandbox`, `voice`, `gemini_backend` — and appears in no dependency list. It
+has only ever arrived because `openai` depended on it.
+
+The reason it stopped is not a resolution accident. Resolving the base set as
+CI does gives `openai==3.3.1`, and **openai 3.x moved from `httpx` to
+`httpx2`**. Locally the dev extra pins `openai>=2.8.1` and the lockfile holds
+2.8.1, which still uses `httpx` — so every local environment had it and no CI
+environment did. Measured with `uv pip compile` on the exact base set, before
+and after: `httpx` absent, then `httpx==0.28.1` alongside `httpx2==2.12.0`.
+
+That is not a near miss. A direct import satisfied by somebody else's
+requirement holds only until their requirement changes, and when it broke the
+application did not degrade — it failed to import, so every test job died in
+the conftest before collecting anything.
+
+`httpx>=0.27,<1` is declared now. A sweep of every third-party import in
+`liminallm/` found two more undeclared names, and neither is a defect:
+`numpy` is a function-local import beside `safetensors.numpy` in the
+checkpoint loader — added to the `train` extra, since the code imports it
+directly — and `tiktoken` sits inside a `try:` that falls back to a heuristic
+count, which is what optional is supposed to look like.
+
+### The guard
+
+`tests/test_declared_dependencies.py` walks `tree.body` of every module under
+`liminallm/` and requires each third-party name imported **at module scope**
+to be a declared base dependency. The rule is about position, not identity: a
+module-scope import is a hard requirement, and a function-local one is this
+repository's idiom for a capability that can be absent. Two supporting tests
+keep it honest — one asserts the walk actually finds something, so a broken
+parser cannot report a clean list forever, and one pins `numpy` and `tiktoken`
+as deliberately function-local, so moving either to module scope becomes a
+decision rather than an accident.
+
+Mutation: removing the `httpx` line from `pyproject.toml` fails it.
+
+### Still unqualified: CI resolves an openai the suite has never been run against
+
+CI installs unpinned, so it gets `openai==3.3.1`; the Responses conformance
+suite was qualified against 2.8.1, and the dev extra's comment claims the
+lockfile records which snapshot was qualified — but CI does not use the
+lockfile. Checked rather than assumed: 3.3.1 still exports every type those
+tests import, so they will at least collect. Whether the shapes still validate
+is what the run will say. Recorded here because the claim in the dev extra is
+currently stronger than the evidence for it.
+
+### An environment fault, not a code one
+
+Midway through this, the local suite began failing in `initdb` with
+`cannot create /dev/null: Permission denied`. `/dev/null` had been replaced by
+a regular 48-byte file instead of the character device, so anything dropping
+output as an unprivileged user failed. Restored with `mknod /dev/null c 1 3`.
+Worth writing down only because the symptom — Postgres refusing to initialise
+— points nowhere near the cause.
