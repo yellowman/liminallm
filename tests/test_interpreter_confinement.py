@@ -21,6 +21,7 @@ question is what the tool exposes, not what the mechanism intends.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,37 @@ requires_backend = pytest.mark.skipif(
     confine.backend_name() is None,
     reason="no filesystem confinement backend on this platform",
 )
+
+
+def test_a_lane_that_requires_confinement_actually_gets_it(tmp_path):
+    """The guard on the guard: a skip must not be able to pass for a pass.
+
+    `requires_backend` above silences every test in this file when the
+    platform has no backend. That is right on a laptop and wrong in CI, and
+    the difference is not academic — Ubuntu 24.04 turned on
+    `kernel.apparmor_restrict_unprivileged_userns`, which lets `unshare`
+    succeed and then refuses the identity mapping inside the namespace, so
+    confinement stopped working on the hosted runners. Left alone, teaching
+    the availability probe about that knob would have converted thirty-one
+    failing confinement tests into thirty-one skips and reported a green lane.
+
+    So a lane that is supposed to exercise the real boundary says so with
+    `LIMINALLM_REQUIRE_CONFINEMENT`, and this fails loudly when it cannot.
+    It runs code rather than reading a sysctl, because what matters is that
+    the boundary engages, not that a knob looks encouraging.
+    """
+    if not os.environ.get("LIMINALLM_REQUIRE_CONFINEMENT"):
+        pytest.skip("not a lane that claims to exercise real confinement")
+
+    assert confine.backend_name() is not None, (
+        "LIMINALLM_REQUIRE_CONFINEMENT is set, but no confinement backend is "
+        "available — every test in this file would skip and the lane would "
+        "still be green. On Ubuntu 24.04 check "
+        "kernel.apparmor_restrict_unprivileged_userns."
+    )
+    result = _run("print('confined')", tmp_path)
+    assert result["ok"] is True, result["stderr"]
+    assert "confined" in result["stdout"]
 
 
 def _run(code: str, workdir: Path) -> dict:

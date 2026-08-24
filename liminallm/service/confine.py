@@ -130,13 +130,34 @@ def _linux_available() -> bool:
         return False
     if not os.path.exists("/proc/self/uid_map"):
         return False  # user namespaces not compiled in
-    for path, minimum in (
-        ("/proc/sys/user/max_user_namespaces", 1),
+    # Two knobs that must permit, and one that must not forbid. The third is
+    # why reading the first two alone was wrong: on a stock Ubuntu 24.04 host
+    # both of those say yes, `unshare` then *succeeds*, and the process holds
+    # no capabilities in the namespace it just created — so the identity
+    # mapping is refused and confinement fails after this said it was
+    # available. Measured on a GitHub-hosted runner: clone=1,
+    # max_user_namespaces=63838, apparmor_restrict_unprivileged_userns=1, and
+    # `unshare --user --map-root-user true` reporting "write failed
+    # /proc/self/uid_map: Operation not permitted".
+    #
+    # An AppArmor profile carrying `userns create` lifts the restriction for
+    # the programs it covers, so this is pessimistic for a packaged deployment
+    # that ships one. Pessimistic is the right direction here: a wrong False
+    # withholds the interpreter on a host where it would have worked, and a
+    # wrong True offers one that fails on every call. `confine()` remains the
+    # authoritative answer either way.
+    for path, permitted in (
+        ("/proc/sys/user/max_user_namespaces", lambda value: value >= 1),
         # A Debian-family knob; absent on kernels that never had it.
-        ("/proc/sys/kernel/unprivileged_userns_clone", 1),
+        ("/proc/sys/kernel/unprivileged_userns_clone", lambda value: value >= 1),
+        # Ubuntu 24.04 and later; absent before it.
+        (
+            "/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+            lambda value: value == 0,
+        ),
     ):
         try:
-            if int(Path(path).read_text().strip()) < minimum:
+            if not permitted(int(Path(path).read_text().strip())):
                 return False
         except (OSError, ValueError):
             continue

@@ -13006,3 +13006,121 @@ supply all four. That is the same sentence as every other entry here, which is
 why it is written down rather than fixed in passing: **this is a tranche, not a
 carry-over.** Fixing four passing tests while CI is red would mix a speculative
 change into a commit that has to be about the red.
+
+## The runner denied a kernel primitive, and the availability probe did not know
+
+CI's 3.10 and 3.11 jobs both failed, and for once the cause was neither the
+interpreter version nor the dependency set. A CI-matching environment passes
+2671 tests here in parallel, serially, and serially with coverage against a
+schema built by `migrate.sh` — four reproductions, four negatives. The answer
+was only ever in the job log.
+
+Which was, itself, the first problem. The `test` job prints ~2700 verbose
+lines and then dumps the entire Postgres service-container log, so the failure
+summary sits roughly 7000 lines from the end and the available tooling reads
+tails. `get_check_run`'s `output.text` is empty for Actions checks. The summary
+was finally reached by requesting a 4000-line tail, letting it overflow to a
+file, and grepping the file — which costs nothing and should have been the
+first move rather than the fifth.
+
+### 51 failures, and 31 of them one line
+
+    PermissionError: [Errno 13] Permission denied: '/proc/self/setgroups'
+
+That is the sandbox working. `interpreter.py` says it plainly — *"There is no
+unconfined fallback"* — so a kernel that refuses the namespace means
+model-written code does not run, and every test needing a working interpreter
+fails. Failing closed against a hostile host policy is the behaviour to keep,
+not to argue with.
+
+The coverage data from the runner narrowed it before any guess could: lines
+115–117 of `confine.py` were unexecuted while 118 was not, so
+`_linux_available()` returned `True` there, and `unshare` itself had succeeded.
+The refusal was one line later, inside a namespace the kernel had just granted.
+
+### What the diagnostic job found
+
+Reading the runner rather than reasoning about it:
+
+    Ubuntu 24.04.4 LTS, kernel 6.17.0-1022-azure, uid=1001(runner)
+
+    kernel.unprivileged_userns_clone              = 1        ← the probe reads this
+    user.max_user_namespaces                      = 63838    ← and this
+    kernel.apparmor_restrict_unprivileged_userns  = 1        ← it did not read this
+
+    unshare: write failed /proc/self/uid_map: Operation not permitted
+
+Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. The
+namespace is still created; the process simply holds no capabilities inside it,
+so the identity mapping is refused. Every knob the probe consulted said yes
+while the one that decides said no.
+
+So there were two defects, not one, and only the second is about CI.
+
+**`_linux_available()` was wrong on a mainstream distribution.** It now reads
+the AppArmor knob too. This matters off CI: `backend_name()` decides whether
+the interpreter is offered at all, and on a stock Noble host it was advertising
+a capability that fails on every call. The check is pessimistic — an AppArmor
+profile carrying `userns create` lifts the restriction for the programs it
+covers — and pessimistic is the right direction, because a wrong `False`
+withholds a working interpreter while a wrong `True` offers a broken one.
+
+**The three `/proc` writes now name their operation and errno**, the way
+`unshare`, `mount`, `pivot_root` and `umount2` already did. They were the only
+calls in the sequence surfacing as a bare `PermissionError` naming a file
+rather than an operation, and "allowed the namespace, then refused the mapping
+inside it" points at a different fix from "user namespaces are switched off".
+
+### The skip that would have been a lie
+
+Fixing the probe alone would have made CI green and meant nothing.
+`requires_backend` skips this file when `backend_name()` is `None`, so a
+correct probe on a restricted runner converts 31 failing confinement tests into
+31 passing skips, and the lane reports success while the security boundary goes
+completely untested.
+
+So the runner enables the primitive explicitly — `sysctl -w
+kernel.apparmor_restrict_unprivileged_userns=0`, not `|| true`, so the lane
+fails at that step if it ever stops working — and the lane declares
+`LIMINALLM_REQUIRE_CONFINEMENT=1`, which arms a test that fails loudly when no
+backend is available. It runs code inside the sandbox rather than reading a
+sysctl, because what needs proving is that the boundary engages, not that a
+knob looks encouraging.
+
+Mutation, against the runner's actual setting: with the knob reading 1,
+`_linux_available()` returns `False` and `backend_name()` returns `None`; the
+armed probe then fails with a message naming
+`kernel.apparmor_restrict_unprivileged_userns`, and without the environment
+variable the same suite skips 18 tests quietly, which is correct on a laptop.
+
+### Still open, and not confinement
+
+Twenty of the 51 failures are unrelated and are the first look CI has ever had
+at them: `ripgrep` is absent on the runner so two settings tests error on
+`FileNotFoundError: 'rg'` — the undeclared-tool shape again, one level out from
+a Python package — two more fail starting a second Postgres inside a test, and
+seven workflow-retry tests report zero retries. Three of those four files
+predate this branch. CI has never reached them before, because until this week
+it never got past importing the application.
+
+### The diagnostic had the defect it was diagnosing
+
+Reported by Cursor Bugbot against `f9f587a`, and correct. The probe step was
+
+    unshare --user --map-root-user true; echo "unshare(1) rc=$?"
+
+under Actions' default `bash -e`. `unshare` failed, the shell aborted the step
+before the `echo`, and job-level `continue-on-error` does not keep *later steps*
+running — so the two steps that mattered most, the confinement sequence call by
+call and what `_linux_available()` concludes, never ran. They were skipped by
+exactly the failure mode the job existed to distinguish.
+
+The answer arrived anyway, from the earlier steps and from `unshare`'s own
+stderr. That is luck, not design. A probe whose failure *is* the datum must not
+be written so that failing suppresses the report: capture the status
+(`if ! cmd; then ...`, or `cmd || rc=$?`) rather than letting `set -e` decide
+whether the diagnosis gets printed.
+
+The same instinct, one layer up, is why the replacement is a test rather than a
+step. `LIMINALLM_REQUIRE_CONFINEMENT` fails the lane loudly when confinement is
+missing, instead of leaving a green run whose evidence was silently skipped.

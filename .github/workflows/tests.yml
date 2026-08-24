@@ -7,93 +7,6 @@ on:
     branches: [main, develop]
 
 jobs:
-  # TEMPORARY, and delete it once it has answered.
-  #
-  # The sandbox refuses to run model-written code unless the kernel gives it a
-  # user namespace, and on this runner it refuses: `unshare` succeeds and the
-  # very next line, writing "deny" to /proc/self/setgroups, returns EACCES.
-  # That is the sandbox working — there is no unconfined fallback by design —
-  # but it fails 31 tests here, and the choice between "enable the primitive on
-  # the runner" and "prove the boundary in a confinement-capable lane instead"
-  # depends on *which* policy is denying it. This job reports that rather than
-  # letting anyone guess.
-  #
-  # Its own job, not a step in `test`, for a mundane reason: `test` emits ~2700
-  # verbose lines and then the whole Postgres service-container log, so
-  # anything printed before the tests is unreadable in practice. This log is
-  # twenty lines.
-  #
-  # `continue-on-error` because a report that fails the build is a report
-  # nobody gets to read.
-  confinement-diagnostic:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Kernel and distribution
-        run: |
-          uname -a
-          cat /etc/os-release
-          id
-
-      - name: User-namespace policy
-        run: |
-          for knob in kernel.unprivileged_userns_clone user.max_user_namespaces \
-                      kernel.apparmor_restrict_unprivileged_userns; do
-            printf '%s = ' "$knob"; sysctl -n "$knob" 2>/dev/null || echo '(absent)'
-          done
-          echo "--- the two files _linux_available() actually reads ---"
-          for f in /proc/sys/kernel/unprivileged_userns_clone /proc/sys/user/max_user_namespaces; do
-            printf '%s = ' "$f"; cat "$f" 2>/dev/null || echo '(absent)'
-          done
-          echo "--- apparmor ---"
-          aa-status 2>&1 | head -5 || true
-
-      - name: Can this host unshare at all
-        run: |
-          unshare --user --map-root-user true; echo "unshare(1) rc=$?"
-
-      # The same sequence confine.py performs, step by step, so the answer is
-      # which call fails rather than whether something does.
-      - name: The confinement sequence, one call at a time
-        run: |
-          python - <<'PY'
-          import ctypes, ctypes.util, os
-          from pathlib import Path
-          libc = ctypes.CDLL(None, use_errno=True)
-          NEWUSER, NEWNS, NEWNET = 0x10000000, 0x00020000, 0x40000000
-          print("uid", os.getuid(), "euid", os.geteuid(), "gid", os.getgid())
-          rc = libc.unshare(NEWUSER | NEWNS | NEWNET)
-          print("unshare(NEWUSER|NEWNS|NEWNET) ->",
-                "ok" if rc == 0 else f"errno {ctypes.get_errno()} "
-                f"{os.strerror(ctypes.get_errno())}")
-          if rc != 0:
-              raise SystemExit(0)
-          for path, value in (("/proc/self/setgroups", "deny"),
-                              ("/proc/self/uid_map", f"0 {os.getuid()} 1"),
-                              ("/proc/self/gid_map", f"0 {os.getgid()} 1")):
-              try:
-                  Path(path).write_text(value)
-                  print(f"write {path} <- {value!r} -> ok")
-              except OSError as exc:
-                  print(f"write {path} <- {value!r} -> errno {exc.errno} {exc.strerror}")
-          PY
-
-      # What the application itself concludes, which is the number that decides
-      # whether the tests run or fail.
-      - name: What liminallm concludes
-        run: |
-          pip install -q -e . 2>&1 | tail -2 || true
-          python -c "
-          from liminallm.service.confine import backend_name, _linux_available
-          print('_linux_available():', _linux_available())
-          print('backend_name():', backend_name())"
-
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -164,6 +77,27 @@ jobs:
       - name: Compile Python files
         run: python -m compileall liminallm
 
+      # The interpreter refuses to run model-written code without a user
+      # namespace, and Ubuntu 24.04 denies unprivileged processes one through
+      # AppArmor: `unshare` succeeds, the process gets no capabilities in the
+      # namespace it just made, and writing /proc/self/setgroups returns
+      # EACCES. Measured on this runner, that failed thirty-one tests.
+      #
+      # Turning the restriction off is what lets those tests exercise the real
+      # boundary here rather than skip. It widens what an unprivileged process
+      # on this throwaway VM may do; it changes nothing about what Liminal
+      # permits, which is the sandbox's own business and is what the tests
+      # below check.
+      #
+      # Not `|| true`: if this stops working the lane must fail here, with
+      # this comment next to it, rather than silently downgrade to skipping
+      # the confinement suite.
+      - name: Permit unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --user --map-root-user true
+          echo "unprivileged user namespaces work on this runner"
+
       # Runs the deploy command itself rather than reimplementing it, so a
       # break in scripts/migrate.sh is found here and not by an operator.
       - name: Apply schema
@@ -181,6 +115,11 @@ jobs:
           # over a migrate.sh that did nothing.
           TEST_SCHEMA_PREPARED: "true"
           EMBEDDING_VECTOR_DIM: "64"
+          # This lane claims to exercise the real confinement boundary, so a
+          # platform that cannot confine has to fail it rather than skip the
+          # suite. See the sysctl step above and
+          # test_a_lane_that_requires_confinement_actually_gets_it.
+          LIMINALLM_REQUIRE_CONFINEMENT: "1"
         # `-m 'not browser'`: that lane needs a Chromium binary and has its
         # own job below. ALLOW_REDIS_FALLBACK_DEV is not set here because it
         # reaches nothing — the setting is admin-managed with no environment
