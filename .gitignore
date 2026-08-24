@@ -37,6 +37,10 @@ ENV/
 # Testing
 .pytest_cache/
 .coverage
+# Written by `--cov-report=xml`, which is what CI runs and what reproducing a
+# CI failure locally therefore also runs. `.coverage` above was ignored and
+# this was not, so the reproduction left a generated file looking like work.
+coverage.xml
 htmlcov/
 .tox/
 .nox/
