@@ -34,7 +34,7 @@ import uuid
 from pathlib import Path
 
 from liminallm.service import ingest_queue
-from liminallm.service.fs import namespace_key, path_lock
+from liminallm.service.fs import path_lock, publication_key
 from liminallm.service.runtime import get_runtime
 
 BODY = b"# report\nTHE TEXT THAT WAS DELETED\n" * 12
@@ -80,6 +80,13 @@ def _files_dir(runtime, user_id: str) -> Path:
 
 def _root(runtime) -> str:
     return str(runtime.settings.shared_fs_root)
+
+
+def _publication_lock(runtime, fs_path: str, *, timeout: float = 0.1):
+    """The lock an upload, a delete, or a queue job of this path would take."""
+    return path_lock(
+        _root(runtime), publication_key(_root(runtime), fs_path), timeout=timeout
+    )
 
 
 def _add_source(client, headers, context_id, fs_path, *, recursive):
@@ -403,4 +410,136 @@ class TestDeletingATreeReachesInsideIt:
         assert not _chunks_under(runtime, context_id, str(inner))
         assert _chunks_under(runtime, context_id, str(keeper)), (
             "a file beside the deleted tree lost its chunks"
+        )
+
+
+class TestTheLockKeyIsAnchoredNotGuessed:
+    """A tree may contain any names, including the ones the layout uses.
+
+    The key has to identify the *user's* files directory, and a path shape is
+    not an identification: an extracted archive is allowed to contain
+    `users/x/files/`, and looking upward for the nearest thing shaped like one
+    finds the archive's copy rather than the real root. The worker then locks
+    a namespace inside the tree while a delete of the tree locks the tree, and
+    the race this tranche closed is open again — reachable by unpacking an
+    archive that happens to mirror the layout.
+
+    So the root is not searched for. It is given.
+    """
+
+    def test_a_tree_containing_a_lookalike_layout_still_locks_the_tree(
+        self, client, monkeypatch
+    ):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        files_dir = _files_dir(runtime, user_id)
+        # The nasty path: a real tree whose contents mirror the layout.
+        inner = files_dir / "bundle" / "users" / "fake" / "files" / "inner.md"
+        inner.parent.mkdir(parents=True, exist_ok=True)
+        inner.write_bytes(BODY)
+
+        assert _add_source(
+            client, headers, context_id, files_dir / "bundle", recursive=True
+        ).status_code in (200, 201)
+        assert _chunks_under(runtime, context_id, str(inner)), "the tree was not indexed"
+        runtime.store.enqueue_ingest_job(
+            context_id, str(inner), ingest_queue.generation_of(inner)
+        )
+
+        indexing = threading.Event()
+        may_finish = threading.Event()
+        real = runtime.rag.ingest_file
+
+        def gated(*args, **kwargs):
+            indexing.set()
+            assert may_finish.wait(30), "the deletion never released the gate"
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(runtime.rag, "ingest_file", gated)
+        worker = threading.Thread(
+            target=ingest_queue.drain,
+            args=(runtime.store, runtime.rag),
+            kwargs={"fs_root": _root(runtime)},
+            daemon=True,
+        )
+        worker.start()
+        try:
+            assert indexing.wait(30), "the worker never reached its ingest"
+            deleted: list = []
+
+            def delete_it():
+                deleted.append(_delete(client, headers, "bundle").status_code)
+
+            deleter = threading.Thread(target=delete_it, daemon=True)
+            deleter.start()
+            time.sleep(0.5)
+            assert not deleted, (
+                "the delete ran straight through: the worker keyed its lock on "
+                "the lookalike `users/fake/files` inside the tree rather than "
+                "on the tree, so the two never met"
+            )
+        finally:
+            may_finish.set()
+            worker.join(timeout=30)
+            deleter.join(timeout=30)
+
+        assert deleted == [200], deleted
+        assert not _chunks_under(runtime, context_id, str(inner))
+
+
+class TestASupersededJobStaysSuperseded:
+    """Standing aside must not revive a row somebody else has closed.
+
+    A worker marks a job `running` when it claims it, and only then goes for
+    the publication lock. A deletion holding that lock supersedes the job — it
+    is entitled to, the path is going away — and the worker then times out and
+    hands the job back. If handing back is an overwrite rather than a
+    transition, it writes `queued` over `superseded` and the deletion's
+    cancellation is undone by a worker that never touched the path.
+
+    The job would normally then find the file missing and supersede itself, so
+    this does not by itself restore deleted chunks. What it does is make the
+    delete's guarantee false: if the same name with the same bytes reappears
+    before that job runs, it ingests into a context whose exact source row the
+    deletion already removed — derived state recreating itself with no
+    authority behind it.
+    """
+
+    def test_a_worker_that_stands_aside_cannot_requeue_a_cancelled_job(
+        self, client
+    ):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+
+        assert _upload(client, headers, "report.md", BODY).status_code == 200
+        files_dir = _files_dir(runtime, user_id)
+        target = str(files_dir / "report.md")
+        assert _add_source(
+            client, headers, context_id, files_dir, recursive=False
+        ).status_code in (200, 201)
+        runtime.store.enqueue_ingest_job(
+            context_id, target, ingest_queue.generation_of(Path(target))
+        )
+
+        # The worker claims it: the row is `running` and the lock is not yet
+        # taken, which is the window the deletion lands in.
+        claimed = runtime.store.claim_ingest_jobs(1)
+        assert len(claimed) == 1
+
+        with _publication_lock(runtime, target, timeout=5.0):
+            # What DELETE does while it holds the lock.
+            assert runtime.store.cancel_ingest_jobs_under_path(user_id, target) == 1
+            assert runtime.store.count_pending_ingest_jobs(target) == 0
+
+            # And now the worker, which cannot have the lock, stands aside.
+            assert ingest_queue.run_job(
+                runtime.store, runtime.rag, claimed[0], fs_root=_root(runtime)
+            ) is None
+
+        assert runtime.store.count_pending_ingest_jobs(target) == 0, (
+            "standing aside put a cancelled job back in the queue, so the "
+            "deletion's cancellation was undone by a worker that never "
+            "touched the path"
         )
