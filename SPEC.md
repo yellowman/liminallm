@@ -351,6 +351,23 @@ generated `content_tsv` column (GIN-indexed) for the lexical channel, and
   two the path is *absent* from those contexts: recoverable, and unlike a
   stale answer, honest. Emptying without recording the re-read is not a
   correction; it loses the file from every context that covers it.
+- **deleting a path leaves nothing that describes it.** After
+  `DELETE /v1/files/{path}` succeeds, no retrievable state may describe the
+  deleted bytes: its chunks go, throughout the owner's contexts and through a
+  whole subtree; any `ingest_job` still owed for it is closed, because a
+  re-read of a path that no longer exists is owed for nothing; and the
+  `context_source` rows naming that path *or anything inside it* go with it.
+  rows naming an **ancestor** stay — `files/` still covers that directory when
+  one file in it is deleted, and covers the name again if it reappears. the
+  test is containment, never coverage: "delete every source that covers this
+  path" would take the directory's row because one child went, and silently
+  un-index every file beside it.
+  deletion takes the publication lock, on the key `namespace_key` gives — the
+  name's first component, so a recursive delete of a tree and a mutation of a
+  file inside it meet. every side derives that key the same way, through
+  `publication_key` for an absolute path: keying on a file's own parent takes
+  a lock nothing else holds, and a delete then ran straight through a job
+  indexing a file inside the tree.
 - **the queue takes the same publication lock the upload takes**, on the
   same key, and re-reads the generation inside it. A worker that cannot get
   it stands aside without spending an attempt: whoever holds it is

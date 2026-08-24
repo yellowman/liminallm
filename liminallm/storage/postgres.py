@@ -4945,6 +4945,67 @@ class PostgresStore:
             )
             return cursor.rowcount or 0
 
+    def delete_context_sources_under_path(
+        self, owner_user_id: str, fs_path: str
+    ) -> int:
+        """Drop the source rows that name `fs_path` or something inside it.
+
+        A `context_source` row is a claim about a name. Deleting the thing it
+        names makes the claim false, so the row goes — and for a tree, so do
+        the rows naming anything within it.
+
+        **Ancestors stay**, and this is the whole difficulty. A row on
+        ``files/`` says the context covers that directory, which is still true
+        after one file in it is deleted, and will be true again if the name
+        reappears. Removing every source that *covers* the path would take
+        that row too, and one deleted child would silently un-index every
+        other file in the directory. So the test is containment, not coverage:
+        the row's own path must be the target or lie beneath it.
+
+        The prefix match ends at a separator, so deleting ``bundle`` does not
+        take ``bundle2``. ``LIKE`` is avoided rather than escaped, since ``_``
+        and ``%`` are wildcards a filename may legitimately contain.
+        """
+        prefix = fs_path.rstrip("/") + "/"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM context_source cs USING knowledge_context ctx "
+                "WHERE cs.context_id = ctx.id AND ctx.owner_user_id = %s "
+                "AND (cs.fs_path = %s OR left(cs.fs_path, %s) = %s)",
+                (owner_user_id, fs_path, len(prefix), prefix),
+            )
+            return cursor.rowcount or 0
+
+    def cancel_ingest_jobs_under_path(
+        self, owner_user_id: str, fs_path: str
+    ) -> int:
+        """Close any re-index still owed for a path that is being deleted.
+
+        A job carries the checksum of the bytes that prompted it and declines
+        when the file has moved on, so a queued one cannot in fact refill a
+        deleted path — it re-reads, finds nothing, and supersedes itself. This
+        is not relying on that. The queue is where "this context owes this
+        path a re-read" is recorded, and once the path is gone the record is
+        simply false; leaving it to be discovered later means a worker claims
+        it, reads a missing file and writes a failure, for work nobody wants.
+
+        Called under the publication lock, so nothing is mid-ingest on this
+        path: a job that was running has finished and released the lock before
+        the deletion could take it.
+        """
+        prefix = fs_path.rstrip("/") + "/"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE ingest_job job SET status = 'superseded', "
+                "detail = 'the path was deleted', updated_at = now() "
+                "FROM knowledge_context ctx "
+                "WHERE job.context_id = ctx.id AND ctx.owner_user_id = %s "
+                "AND job.status IN ('queued', 'running') "
+                "AND (job.fs_path = %s OR left(job.fs_path, %s) = %s)",
+                (owner_user_id, fs_path, len(prefix), prefix),
+            )
+            return cursor.rowcount or 0
+
     def delete_chunks_under_path(self, owner_user_id: str, fs_path: str) -> int:
         """Drop everything this user's contexts say about `fs_path` or its tree.
 

@@ -385,6 +385,30 @@ def namespace_key(files_dir: str | Path, relative_name: str) -> str:
     return str(Path(files_dir) / (parts[0] if parts else relative_name))
 
 
+def publication_key(fs_root: str | Path, fs_path: str | Path) -> str:
+    """`namespace_key` for an absolute path, found rather than assumed.
+
+    A worker holds an absolute path and the shared root; a route holds the
+    user's files directory and a relative name. Both have to arrive at the
+    same key or they take different locks and never see each other — which is
+    not hypothetical: a queue that keyed on the file's own parent let a
+    recursive delete of a tree run straight through a job indexing a file
+    inside it, and the job then failed on a file removed underneath it.
+
+    So the files directory is located in the path rather than guessed at, and
+    the rest is handed to `namespace_key`. A path that is not under one — an
+    adapter, a shared object — has no tree to belong to, and keying it on
+    itself is both stable and correct for something nothing else contends on.
+    """
+    target = Path(fs_path)
+    for parent in target.parents:
+        # `.../users/<id>/files`, which is the base every namespace is
+        # relative to. Matched by shape because that is what it is.
+        if parent.name == "files" and parent.parent.parent.name == "users":
+            return namespace_key(parent, str(target.relative_to(parent)))
+    return str(target)
+
+
 @contextmanager
 def path_lock(
     fs_root: str | Path,

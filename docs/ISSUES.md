@@ -13599,3 +13599,56 @@ rather than that anything was scheduled to run it. One simulated a racing
 replacement by deleting the very rows that would have proved the defect. The
 same lesson as the entry above, one level up again: a test that passes tells
 you nothing until you have seen it fail for the reason you intend.
+
+## Deleting a file: chunks were the easy half
+
+The invariant: **after `DELETE /v1/files/{path}` returns success, no
+retrievable state may describe the deleted bytes.**
+
+Chunks were already handled — `delete_chunks_under_path` runs under the
+publication lock and covers a whole subtree. What was left is everything that
+would put them back or go on claiming them.
+
+**Source rows are claims about names, and the test is containment, not
+coverage.** A `context_source` naming the deleted path, or anything inside it,
+is a claim about something that has stopped existing, so it goes. A row naming
+an *ancestor* is not: `files/` still covers that directory after one file in it
+is deleted, and covers the name again if it reappears.
+
+The obvious wrong fix is "delete every source that covers this path", and it is
+worth naming because it looks correct and is destructive: one deleted child
+would take the directory's row with it and silently un-index every other file
+beside it. That mistake has its own witness, and the mutation confirms the
+witness catches it and nothing else does.
+
+**A re-read owed for a path that is gone is owed for nothing.** A queued job
+could not in fact refill a deleted path — it re-reads the file, finds nothing
+and supersedes itself — so cancelling is not what makes deletion correct. It is
+that the queue records "this context owes this path a re-read", and once the
+path is gone that record is false; leaving it to be discovered later means a
+worker claims it, reads a missing file and writes a failure, for work nobody
+wants.
+
+**The lock key was wrong, and this is the finding that mattered.** The queue
+merged in the previous tranche keyed its publication lock on the file's own
+parent directory. `namespace_key` deliberately keys a name's *first component*
+so that a recursive delete of `bundle` and a mutation of `bundle/inner.md` meet
+— that is the whole reason it exists. Keying on the parent produced a lock
+nothing else takes.
+
+Measured, before the fix: a delete of `bundle` returned 200 while a job was
+mid-ingest on `bundle/inner.md`, and the job then failed on `FileNotFoundError`
+with the file removed underneath it. Whether the deleted file stayed
+retrievable came down to which of two unsynchronised writes landed second.
+
+The root-file case hid it, because at the top level `namespace_key(files_dir,
+"report.md")` and `namespace_key(files_dir/"", "report.md")` agree. Only the
+nested case separates them — a reminder that a serialization witness proves
+nothing about depths it does not exercise. `publication_key` now derives the
+key from an absolute path by locating the files directory rather than assuming
+a depth, and both sides go through it.
+
+**On the previous entry's carried-over claim.** It said deletion left chunks in
+every context. That was true when it was written and had already been fixed by
+the delete-lock work on this branch before this tranche started. The chunk half
+is verified here rather than re-fixed; what is new is the three above.

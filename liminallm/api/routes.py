@@ -4636,6 +4636,23 @@ async def delete_file(
             # enumerate. For a directory this covers everything under it.
             runtime.store.delete_chunks_under_path(principal.user_id, str(file_path))
 
+            # The chunks were what described the bytes; these two are what
+            # would put them back or go on claiming them.
+            #
+            # A source row naming this path, or anything inside it, is a claim
+            # about a name that is about to stop existing. A row naming an
+            # *ancestor* is not: `files/` still covers that directory, and
+            # will cover the name again if it reappears — so containment is
+            # the test rather than coverage, or one deleted child would
+            # un-index every other file beside it.
+            runtime.store.delete_context_sources_under_path(
+                principal.user_id, str(file_path)
+            )
+            # And any re-read still owed for this path is owed for nothing.
+            runtime.store.cancel_ingest_jobs_under_path(
+                principal.user_id, str(file_path)
+            )
+
             with path_lock(runtime.settings.shared_fs_root, str(manifest_path)):
                 if manifest_path.exists():
                     # Not best effort. The manifest is one of the three
