@@ -680,7 +680,7 @@ class TestAWorkerOwnsItsResources:
 
         pg = ScratchPostgres()
         if not pg.available:
-            pytest.skip("needs initdb")
+            pytest.skip(pg.unavailable_reason)
         base = pg.start()
         try:
             name = postgres_database_name(base)

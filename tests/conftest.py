@@ -153,8 +153,9 @@ def _provision(worker: str) -> None:
         _PG = ScratchPostgres()
         if not _PG.available:
             raise RuntimeError(
-                "The test suite needs Postgres (initdb not found). Install "
-                "postgresql-16 + postgresql-16-pgvector, or set TEST_DATABASE_URL."
+                f"The test suite needs Postgres: {_PG.unavailable_reason}. "
+                "Install postgresql-16 + postgresql-16-pgvector, or set "
+                "TEST_DATABASE_URL."
             )
         os.environ["DATABASE_URL"] = _PG.start()
     elif worker:

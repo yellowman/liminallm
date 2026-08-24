@@ -228,7 +228,7 @@ def test_a_prepared_database_that_is_empty_stops_the_suite():
 
     pg = ScratchPostgres()
     if not pg.available:
-        pytest.skip("initdb not available; cannot build an unprepared database")
+        pytest.skip(f"cannot build an unprepared database: {pg.unavailable_reason}")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     url = pg.start()
     try:

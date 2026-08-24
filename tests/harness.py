@@ -436,6 +436,37 @@ def _pg_bin() -> str | None:
     return None
 
 
+#: The extensions `sql/schema.sql` creates. `vector` is the one that travels
+#: separately — a stock PostgreSQL install does not have it, and the CI runner
+#: reaches pgvector only through a service *container*, while a scratch cluster
+#: is built from the host's own binaries. Without this the shortfall surfaced
+#: as `psql` exiting 3 with its stderr discarded, which names nothing.
+_SCHEMA_EXTENSIONS = ("vector", "citext", "uuid-ossp")
+
+
+def _missing_extensions(bin_dir: str) -> list[str]:
+    """Which of the schema's extensions this installation cannot supply.
+
+    Read from the control files beside the binaries rather than from a running
+    cluster, because the answer decides whether to bother starting one.
+    """
+    try:
+        done = subprocess.run(
+            [f"{bin_dir}/pg_config", "--sharedir"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except OSError:  # pragma: no cover - pg_config ships with the binaries
+        return []
+    share = done.stdout.strip()
+    if not share:  # pragma: no cover - cannot tell; let the schema speak
+        return []
+    return [
+        name
+        for name in _SCHEMA_EXTENSIONS
+        if not Path(share, "extension", f"{name}.control").exists()
+    ]
+
+
 class ScratchPostgres:
     """An initdb'd cluster in a temp dir, torn down with the session."""
 
@@ -447,7 +478,27 @@ class ScratchPostgres:
 
     @property
     def available(self) -> bool:
-        return self._bin is not None
+        return self._bin is not None and not self.missing_extensions
+
+    @property
+    def missing_extensions(self) -> list[str]:
+        """Extensions the schema needs that this installation cannot supply."""
+        return _missing_extensions(self._bin) if self._bin else []
+
+    @property
+    def unavailable_reason(self) -> str:
+        if self._bin is None:
+            return "initdb not available"
+        missing = self.missing_extensions
+        if missing:
+            return (
+                "this PostgreSQL installation has no "
+                + ", ".join(missing)
+                + " extension, so sql/schema.sql cannot be applied to a "
+                "scratch cluster built from it. A pgvector service container "
+                "does not help; that is a different server."
+            )
+        return ""
 
     def start(self) -> str:
         assert self._bin
@@ -623,13 +674,26 @@ def close_test_store() -> None:
 
 
 def apply_schema(url: str, *, embedding_dim: int = 64) -> None:
-    """Apply sql/schema.sql. 64-d matches the test encoder (hash fallback)."""
+    """Apply sql/schema.sql. 64-d matches the test encoder (hash fallback).
+
+    `ON_ERROR_STOP=1` makes psql exit 3 on the first failing statement, and
+    stderr is where it says which one. That used to be discarded, so a schema
+    that would not apply arrived as `CalledProcessError ... exit status 3` —
+    a number, with the explanation thrown away one line earlier.
+    """
     root = Path(__file__).resolve().parent.parent
-    subprocess.run(
+    done = subprocess.run(
         ["psql", url, "-v", "ON_ERROR_STOP=1", "-v", f"embedding_dim={embedding_dim}",
          "-q", "-f", str(root / "sql" / "schema.sql")],
-        check=True, stdout=subprocess.DEVNULL, timeout=180,
+        capture_output=True, text=True, timeout=180,
     )
+    if done.returncode != 0:
+        detail = (done.stderr or done.stdout or "").strip()
+        raise RuntimeError(
+            f"applying sql/schema.sql to {postgres_database_name(url)!r} failed "
+            f"(psql exit {done.returncode})"
+            + (":\n  " + "\n  ".join(detail.splitlines()[-10:]) if detail else "")
+        )
 
 
 def postgres_database_name(url: str) -> str:

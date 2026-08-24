@@ -13366,3 +13366,48 @@ And an instrument that reports the same number for both arms of an experiment
 is reporting that it measured nothing — which is the same shape as the
 tick-count heartbeat and the vacuous witnesses that this file already tracks,
 arriving this time in the verification of a fix rather than in the fix itself.
+
+### The scratch cluster started, and then could not hold the schema
+
+Fixing the socket directory moved `test_worker_isolation` from failing at
+`pg_ctl` to failing at `psql`:
+
+    subprocess.CalledProcessError: Command '['psql', ..., '-f', 'sql/schema.sql']'
+        returned non-zero exit status 3
+
+Exit 3 is psql saying `ON_ERROR_STOP` fired. Which statement failed is in
+stderr, and `apply_schema` sent stdout to `DEVNULL` and never captured stderr —
+so the answer was thrown away one line before it was needed. **That is the
+fifth instrumentation gap of the same shape in two days**, after `confine.py`'s
+`/proc` writes, `pg_ctl`'s log, the sandbox's `worker_unconfined`, and the
+deadlock's own retry counters. The pattern is consistent enough to state as a
+rule: *anything that runs a subprocess and checks its status must keep what the
+subprocess said, because the status is a number and the reason is text.*
+
+`apply_schema` now raises with the database name, the exit code and the tail of
+psql's own output. Measured against a database that does not exist, it reads
+
+    applying sql/schema.sql to 'does_not_exist_db' failed (psql exit 2):
+      psql: error: ... FATAL: database "does_not_exist_db" does not exist
+
+The likely cause of the exit 3 is `sql/schema.sql:236`, `CREATE EXTENSION
+vector`. The runner reaches pgvector through a *service container*, and a
+scratch cluster is built from the **host's** binaries, which are stock
+PostgreSQL. This development box happens to have `postgresql-16-pgvector`
+installed, so the control file is there and the schema applies — the fifth
+environment coincidence in the same list.
+
+So `ScratchPostgres.available` now asks whether the installation can supply the
+extensions the schema creates, reading the control files beside the binaries
+rather than starting a cluster to find out. A host that cannot gets a skip
+naming the missing extension and saying that a pgvector service container does
+not help, because it is a different server. The three call sites report that
+reason instead of "needs initdb", which was true of none of them.
+
+This is a skip, and the earlier argument against skips still applies — so it is
+worth being precise about why this one is not the same. The confinement tests
+would have skipped a *security boundary* on the lane meant to prove it. These
+cover the harness's own worker isolation on a scratch cluster, and the property
+they check is exercised anyway by every xdist run that provisions per-worker
+databases. A host that cannot host the schema cannot run them at all, and
+saying so beats an opaque exit code.
