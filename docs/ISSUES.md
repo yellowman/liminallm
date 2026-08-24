@@ -13652,3 +13652,33 @@ a depth, and both sides go through it.
 every context. That was true when it was written and had already been fixed by
 the delete-lock work on this branch before this tranche started. The chunk half
 is verified here rather than re-fixed; what is new is the three above.
+
+### Two follow-ups the first pass left open
+
+**The recursive cleanup was correct but unwitnessed.** The nested test proves
+the lock key and that descendant *chunks* go. It says nothing about descendant
+source rows or descendant jobs: its source names the tree itself, and its job
+runs to completion before the deletion proceeds. So narrowing either
+predicate from separator-bounded subtree match to exact match would have left
+`bundle/inner.md`'s own source row and its queued job behind while all five
+cases still passed. One tree with three records at three depths — an ancestor
+directory source, an exact-file source inside the tree, and a queued job for
+that file — closes it, and the two narrowings now die by that test alone.
+
+**`ingest_job` had stopped being a required table.** `_verify_required_schema`
+refuses to start against a database missing a table the application needs, and
+names `scripts/migrate.sh`. The queue table was on that list in the tranche
+that introduced it and was not on it after that tranche was merged into
+another branch — a conflict-resolution casualty, silent because nothing
+depended on the list itself.
+
+The consequence is the shape the list exists to prevent: an older database
+boots clean, and the first replacement fails at request time with the queue
+that would have repaired the index unreadable. Restored, with a witness that
+builds a database, drops the table, and requires the refusal to name both the
+table and the fix.
+
+Worth stating as a rule rather than an incident: **a merge can silently
+un-require something.** Nothing about resolving a conflict in a list of table
+names looks like removing a startup guarantee, and no other test referenced
+the entry. The guard is cheap; noticing its absence was not.

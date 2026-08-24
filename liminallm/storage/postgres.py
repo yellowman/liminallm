@@ -405,6 +405,14 @@ class PostgresStore:
             "context_source",
             "knowledge_chunk",
             "knowledge_chunk_vector",
+            # Where "this context owes this path a re-read" is recorded. Every
+            # replacement writes to it and every worker poll reads it, so an
+            # older database without it boots clean and then fails at request
+            # time on the first replacement — with the queue that would have
+            # repaired the index unreadable. It was required by the tranche
+            # that introduced it and lost that status in a merge, which is
+            # what this entry and its test exist to prevent recurring.
+            "ingest_job",
             "preference_event",
             "semantic_cluster",
             "adapter_router_state",

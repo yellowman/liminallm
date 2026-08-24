@@ -340,3 +340,67 @@ class TestDeletionSerializesAgainstTheQueue:
         assert not _chunks_under(runtime, context_id, target), (
             "a file inside a deleted tree is still retrievable"
         )
+
+
+class TestDeletingATreeReachesInsideIt:
+    """The recursive half, for the records the chunk test does not touch.
+
+    The nested case above proves the lock key and that descendant *chunks* go.
+    It says nothing about descendant source rows or descendant jobs, because
+    its source names the tree itself and its job runs to completion before the
+    deletion proceeds. So a future narrowing of either predicate — subtree
+    match quietly becoming exact match — would leave `bundle/inner.md`'s own
+    source row and its queued job behind while every other case here still
+    passes.
+
+    One tree, three records at three different depths, one delete.
+    """
+
+    def test_deleting_a_tree_takes_the_records_inside_it_and_not_above_it(
+        self, client
+    ):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        files_dir = _files_dir(runtime, user_id)
+        files_dir.mkdir(parents=True, exist_ok=True)
+        (files_dir / "bundle").mkdir(exist_ok=True)
+        inner = files_dir / "bundle" / "inner.md"
+        inner.write_bytes(BODY)
+        keeper = files_dir / "keeper.md"
+        keeper.write_bytes(b"# keeper\nSTILL HERE\n" * 12)
+
+        # An ancestor directory source, which must survive.
+        assert _add_source(
+            client, headers, context_id, files_dir, recursive=True
+        ).status_code in (200, 201)
+        # And an exact-file source *inside* the tree, which must not.
+        assert _add_source(
+            client, headers, context_id, inner, recursive=False
+        ).status_code in (200, 201)
+
+        runtime.store.enqueue_ingest_job(
+            context_id, str(inner), ingest_queue.generation_of(inner)
+        )
+        assert runtime.store.count_pending_ingest_jobs(str(inner)) == 1
+        assert _chunks_under(runtime, context_id, str(inner)), "the tree was not indexed"
+
+        assert _delete(client, headers, "bundle").status_code == 200
+
+        sources = _sources(runtime, context_id)
+        assert str(files_dir) in sources, (
+            "deleting a tree removed the directory source above it, so the "
+            "context has stopped covering everything else in that directory"
+        )
+        assert str(inner) not in sources, (
+            "a source row inside the deleted tree survived it: the subtree "
+            "match has narrowed to an exact match, so only the tree's own row "
+            "would be taken"
+        )
+        assert runtime.store.count_pending_ingest_jobs(str(inner)) == 0, (
+            "a re-index is still owed for a file inside a deleted tree"
+        )
+        assert not _chunks_under(runtime, context_id, str(inner))
+        assert _chunks_under(runtime, context_id, str(keeper)), (
+            "a file beside the deleted tree lost its chunks"
+        )

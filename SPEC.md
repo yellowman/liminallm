@@ -368,6 +368,12 @@ generated `content_tsv` column (GIN-indexed) for the lexical channel, and
   `publication_key` for an absolute path: keying on a file's own parent takes
   a lock nothing else holds, and a delete then ran straight through a job
   indexing a file inside the tree.
+  the subtree match is separator-bounded on both records, so deleting
+  `bundle` takes `bundle/inner.md`'s own source row and its queued job and
+  does not take `bundle2`. `ingest_job` is a **required table**: an older
+  database without it would otherwise boot clean and fail at request time on
+  the first replacement, with the queue that would have repaired the index
+  unreadable.
 - **the queue takes the same publication lock the upload takes**, on the
   same key, and re-reads the generation inside it. A worker that cannot get
   it stands aside without spending an attempt: whoever holds it is
