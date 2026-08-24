@@ -4600,6 +4600,314 @@ class PostgresStore:
             ).fetchone()
         return row is not None
 
+    def ensure_context_source(
+        self, context_id: str, fs_path: str, *, recursive: bool = False
+    ) -> None:
+        """Record that a context covers a path, unless it is recorded already.
+
+        `add_context_source` is the operator-facing act of adding a source and
+        hands back the row. This is the internal statement that a path a
+        context has just been given is part of what that context covers, so
+        that `context_source` says so rather than the fact being inferable
+        only from the chunks that ingestion happened to leave behind.
+
+        Idempotent: the same file may be uploaded into the same context any
+        number of times, and that is not a new relationship.
+        """
+        if not fs_path or not fs_path.strip():
+            raise ConstraintViolation(
+                "fs_path required for context_source", {"fs_path": fs_path}
+            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO context_source (id, context_id, fs_path, recursive) "
+                    "SELECT %s, %s, %s, %s WHERE NOT EXISTS ("
+                    "SELECT 1 FROM context_source "
+                    "WHERE context_id = %s AND fs_path = %s)",
+                    (
+                        str(uuid.uuid4()),
+                        context_id,
+                        fs_path,
+                        recursive,
+                        context_id,
+                        fs_path,
+                    ),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("context not found", {"context_id": context_id})
+
+    def contexts_covering_path(
+        self, fs_path: str, *, owner_user_id: str
+    ) -> List[str]:
+        """Every context of this owner that covers `fs_path`.
+
+        Read from `context_source` alone, because that table *is* the
+        statement "this context covers this path". `knowledge_chunk` is the
+        materialization of that statement and is not consulted here, however
+        tempting it is: a chunk left behind by a bug would otherwise be read
+        as evidence of coverage, and the next replacement would faithfully
+        re-ingest into a context nobody added — derived state promoting itself
+        into authority. The converse matters as much. A context still covers
+        its source when the chunks are gone, so coverage cannot evaporate
+        because a cleanup removed the index.
+
+        The checksum manifest is not consulted either. It records whichever
+        context an upload happened to name, so a directory source never
+        appears in it and an upload naming none erases what was there.
+
+        Scoped to the owner here, in one place — `knowledge_context` is
+        owned by a user on this schema — so that no caller can re-index a
+        replacement into somebody else's context by naming a path.
+
+        The prefix test runs in Python rather than SQL because a filesystem
+        path may contain `%` or `_`, and a LIKE pattern built out of one
+        matches paths nobody asked about.
+        """
+        target = str(fs_path).rstrip("/")
+        parent = str(Path(target).parent)
+        with self._connect() as conn:
+            sources = conn.execute(
+                "SELECT cs.context_id, cs.fs_path, cs.recursive FROM context_source cs "
+                "JOIN knowledge_context kc ON kc.id = cs.context_id "
+                # Conversations' implicit indexes are excluded here for the
+                # same reason `invalidate_path_in_other_contexts` excludes
+                # them: §19.5 scopes an attachment to the chat that received
+                # it, so one chat's upload must neither empty nor re-fill
+                # another chat's index. The two have to agree — a context this
+                # returned but that one skipped would be queued for a re-index
+                # of chunks nobody invalidated.
+                "WHERE kc.owner_user_id = %s AND kc.conversation_id IS NULL",
+                (owner_user_id,),
+            ).fetchall()
+
+        covering: set[str] = set()
+        for row in sources:
+            source = str(row["fs_path"]).rstrip("/")
+            if source == target or source == parent:
+                # The file itself, or the directory holding it. A directory
+                # source covers its immediate children whether or not it
+                # recurses; `recursive` is about depth below that.
+                covering.add(str(row["context_id"]))
+            elif row.get("recursive") and target.startswith(source + "/"):
+                covering.add(str(row["context_id"]))
+        return sorted(covering)
+
+    def enqueue_ingest_job(
+        self, context_id: str, fs_path: str, generation: str
+    ) -> None:
+        """Record that a context owes this path a re-read of `generation`.
+
+        Collapses onto the pending slot for that (context, path): a file
+        replaced five times before the queue drains needs one re-read of its
+        final bytes, not five of which four describe bytes already gone. The
+        newest generation wins the slot, which is the whole point — an older
+        one must never be what eventually gets indexed.
+
+        A job already running is not disturbed. It carries an older generation,
+        will find the file changed underneath it and decline to write, and this
+        new row is what actually indexes the new bytes.
+        """
+        if not fs_path or not fs_path.strip():
+            raise ConstraintViolation(
+                "fs_path required for ingest_job", {"fs_path": fs_path}
+            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO ingest_job (id, context_id, fs_path, generation) "
+                    "VALUES (%s, %s, %s, %s) "
+                    "ON CONFLICT (context_id, fs_path) WHERE status = 'queued' "
+                    "DO UPDATE SET generation = EXCLUDED.generation, "
+                    # Due now, not whenever the job it displaced was due. This
+                    # is a fresh replacement rather than a retry of the old
+                    # one, so inheriting a backoff would leave the new bytes
+                    # unindexed for as long as the previous failure had earned.
+                    "attempts = 0, detail = NULL, next_attempt_at = now(), "
+                    "updated_at = now()",
+                    (str(uuid.uuid4()), context_id, fs_path, generation),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("context not found", {"context_id": context_id})
+
+    def claim_ingest_jobs(self, limit: int = 16) -> List[Dict[str, Any]]:
+        """Take up to `limit` queued jobs, marking them running.
+
+        `SKIP LOCKED` so two drains — the one a request starts and the one the
+        background worker runs — take different jobs rather than one waiting on
+        the other or, worse, both indexing the same path.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "UPDATE ingest_job SET status = 'running', "
+                "attempts = attempts + 1, updated_at = now() "
+                "WHERE id IN (SELECT id FROM ingest_job WHERE status = 'queued' "
+                # Only work that is due. A job that just failed is scheduled
+                # into the future, so this pass cannot pick it up again and
+                # spend another of its attempts seconds later.
+                "AND next_attempt_at <= now() "
+                # Then `updated_at`, so a job that stood aside for another
+                # worker goes behind its peers rather than straight back to
+                # the front of the same pass.
+                "ORDER BY next_attempt_at ASC, updated_at ASC, created_at ASC "
+                "LIMIT %s FOR UPDATE SKIP LOCKED) "
+                "RETURNING id, context_id, fs_path, generation, attempts",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def finish_ingest_job(
+        self, job_id: str, status: str, *, detail: Optional[str] = None
+    ) -> None:
+        """Close a claimed job, keeping the reason it ended that way.
+
+        `detail` is not decoration. "Ran and indexed nothing" and "declined
+        because the file had already moved on" are the same row count and
+        entirely different events, and only the text separates them.
+        """
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE ingest_job SET status = %s, detail = %s, updated_at = now() "
+                "WHERE id = %s",
+                (status, detail, job_id),
+            )
+
+    def reclaim_stale_ingest_jobs(
+        self, older_than_seconds: int, *, max_attempts: int
+    ) -> int:
+        """Return jobs abandoned mid-flight to the queue. Returns the count.
+
+        Claiming marks a job `running`, and only `queued` jobs are ever
+        claimed. A process that dies after claiming one would therefore strand
+        it forever — and because the replacement already dropped that path's
+        chunks, the file would stay missing from that context until somebody
+        happened to replace it again. That is the permanent forgetting this
+        queue exists to prevent, reintroduced by the claim itself.
+
+        `max_attempts` is enforced here and not only where a job reports its
+        own failure, because a hard-killed process never reports anything. A
+        job that kills the worker every time it runs would otherwise be
+        revived forever and the limit would mean nothing. The caller passes
+        the policy in; the store keeps none of its own.
+
+        A stale job whose path already has a queued job is closed rather than
+        revived, and so is the older of two stale jobs for the same path: the
+        pending slot holds one, and it should hold the newest.
+        """
+        cutoff = f"{max(1, int(older_than_seconds))} seconds"
+        with self._connect() as conn:
+            # Out of attempts: abandoned rather than revived, so a job that
+            # takes the process down with it stops taking it down.
+            conn.execute(
+                "UPDATE ingest_job SET status = 'failed', updated_at = now(), "
+                "detail = 'reclaimed: abandoned after ' || attempts || ' attempts' "
+                "WHERE status = 'running' AND updated_at < now() - %s::interval "
+                "AND attempts >= %s",
+                (cutoff, max(1, int(max_attempts))),
+            )
+            cursor = conn.execute(
+                "UPDATE ingest_job SET status = 'queued', updated_at = now(), "
+                "next_attempt_at = now(), "
+                "detail = 'reclaimed: claimed but never finished' "
+                "WHERE id IN (SELECT DISTINCT ON (context_id, fs_path) id "
+                "FROM ingest_job WHERE status = 'running' "
+                "AND updated_at < now() - %s::interval "
+                "ORDER BY context_id, fs_path, created_at DESC) "
+                "AND NOT EXISTS (SELECT 1 FROM ingest_job q "
+                "WHERE q.context_id = ingest_job.context_id "
+                "AND q.fs_path = ingest_job.fs_path AND q.status = 'queued')",
+                (cutoff,),
+            )
+            revived = cursor.rowcount or 0
+            # Whatever is still stuck now has a newer job covering its path.
+            conn.execute(
+                "UPDATE ingest_job SET status = 'superseded', updated_at = now(), "
+                "detail = 'reclaimed: a newer job holds this path' "
+                "WHERE status = 'running' AND updated_at < now() - %s::interval",
+                (cutoff,),
+            )
+        if revived:
+            self.logger.info("ingest_jobs_reclaimed", jobs=revived)
+        return revived
+
+    def yield_ingest_job(self, job_id: str, *, detail: Optional[str] = None) -> bool:
+        """Put a job back without charging it an attempt. False if superseded.
+
+        For standing aside rather than failing: another worker holds this
+        path, so nothing was tried and nothing should be counted against the
+        job. Claiming incremented `attempts`, so this gives it back. A worker's
+        pass drains until the queue is empty and would otherwise re-claim a
+        contended job many times a second, spending the whole budget while the
+        holder is still embedding — abandoning a re-index that never once ran.
+
+        `updated_at` moves, which puts the job behind its peers in the claim
+        order rather than straight back at the front of the same pass.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE ingest_job SET status = 'queued', detail = %s, "
+                    "attempts = GREATEST(attempts - 1, 0), "
+                    "next_attempt_at = now(), updated_at = now() "
+                    "WHERE id = %s",
+                    (detail, job_id),
+                )
+            return True
+        except errors.UniqueViolation:
+            return False
+
+    def requeue_ingest_job(
+        self,
+        job_id: str,
+        *,
+        detail: Optional[str] = None,
+        delay_seconds: int = 0,
+    ) -> bool:
+        """Return a claimed job to the queue. False if it is now superseded.
+
+        `delay_seconds` is when it may next be claimed. It is not optional in
+        spirit: a worker drains until the queue is empty, so a job put back
+        with no delay is claimed again immediately and fails again, and five
+        attempts are gone within a second of the first. The retries are there
+        for outages measured in seconds or minutes, and without a delay they
+        cover none of them.
+
+        The pending slot for a (context, path) holds one job. If a replacement
+        landed while this one was running, that newer job is already in the
+        slot and holds the newer generation, so this one must not go back in —
+        and the unique index is what says so, rather than a re-read that could
+        race. `attempts` was incremented when the job was claimed, so one that
+        keeps failing counts up instead of retrying forever.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE ingest_job SET status = 'queued', detail = %s, "
+                    "next_attempt_at = now() + %s::interval, updated_at = now() "
+                    "WHERE id = %s",
+                    (detail, f"{max(0, int(delay_seconds))} seconds", job_id),
+                )
+            return True
+        except errors.UniqueViolation:
+            return False
+
+    def count_pending_ingest_jobs(self, fs_path: Optional[str] = None) -> int:
+        """Jobs neither finished nor abandoned, optionally for one path."""
+        with self._connect() as conn:
+            if fs_path:
+                row = conn.execute(
+                    "SELECT count(*) AS n FROM ingest_job "
+                    "WHERE status IN ('queued', 'running') AND fs_path = %s",
+                    (fs_path,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT count(*) AS n FROM ingest_job "
+                    "WHERE status IN ('queued', 'running')",
+                    (),
+                ).fetchone()
+        return int(row["n"]) if row else 0
+
     def invalidate_path_in_other_contexts(
         self,
         owner_user_id: str,

@@ -19,6 +19,7 @@ from uuid import uuid4
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     Body,
     Depends,
     File,
@@ -127,7 +128,13 @@ from liminallm.config import (
     validate_managed_settings,
 )
 from liminallm.logging import get_logger
-from liminallm.service import admission, cancellation, json_patch, tenancy
+from liminallm.service import (
+    admission,
+    cancellation,
+    ingest_queue,
+    json_patch,
+    tenancy,
+)
 from liminallm.service import extract as extract_service
 from liminallm.service import notes as notes_service
 from liminallm.service.archive import (
@@ -3763,6 +3770,7 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
 
 @router.post("/files/upload", response_model=Envelope, tags=["files"])
 async def upload_file(
+    background: BackgroundTasks,
     file: UploadFile = File(...),
     context_id: Optional[str] = Form(None, max_length=255),
     conversation_id: Optional[str] = Form(None, max_length=255),
@@ -3970,6 +3978,11 @@ async def upload_file(
                 analyzable=attachment_caps["analyzable"],
             )
             return next((r for r in records if r.get("name") == safe_filename), None)
+        # Contexts this upload owes a re-read, filled in under the lock and
+        # drained after the response. A set, because the same context can be
+        # reached by more than one source row.
+        queued_reindex: set = set()
+
         def _publish() -> Optional[int]:
             """Put this upload on disk, in the index, and in the manifest.
 
@@ -4081,18 +4094,35 @@ async def upload_file(
                 # walked straight past it. The chunks are what claim to be
                 # this path's contents, so they are the reverse index.
                 #
-                # Emptied rather than refreshed. `_commit_generation` states
-                # the reason for its own writes: these chunks claim to be the
-                # contents of this path, so once new bytes exist the claim is
-                # false, and "this path has nothing to say" is an answer about
-                # the current bytes. Re-ingesting into contexts the request
-                # never named would instead spend an unbounded amount of work
-                # inside this lock and put content where it was not asked for.
+                # Emptied here, refreshed out of band. `_commit_generation`
+                # states the reason for the emptying: these chunks claim to be
+                # the contents of this path, so once new bytes exist the claim
+                # is false, and "this path has nothing to say" is an answer
+                # about the current bytes.
+                #
+                # But emptying alone answers only half of it. Replacing bytes
+                # changes the file's generation, not which contexts cover it,
+                # and a context that keeps its `context_source` row while its
+                # chunks are gone has not been corrected — it has lost the
+                # file. Re-ingesting for every covering context inside this
+                # lock is genuinely unbounded work the request never chose, so
+                # what happens here is the bounded half: empty now, record the
+                # re-read, and let the queue do it. The path is briefly absent
+                # from those contexts and then back, rather than gone.
                 runtime.store.invalidate_path_in_other_contexts(
                     principal.user_id,
                     str(dest_path),
                     keep_context_id=context_id,
                 )
+                for target in runtime.store.contexts_covering_path(
+                    str(dest_path), owner_user_id=principal.user_id
+                ):
+                    if target == context_id:
+                        continue  # ingested in this request, below
+                    runtime.store.enqueue_ingest_job(
+                        target, str(dest_path), checksum
+                    )
+                    queued_reindex.add(target)
 
             def _persist(contexts: set) -> None:
                 """Record this generation's checksum and its context set.
@@ -4126,6 +4156,14 @@ async def upload_file(
             wants_ingest = bool(context_id) and (
                 not deduped or context_id not in prior_contexts
             )
+            if context_id and generation is None:
+                # Naming a context on an upload is how a file joins one, so
+                # record it where coverage is read from. Left implicit, the
+                # relationship would survive only as long as the chunks this
+                # ingest happens to leave behind. Attachments are excluded:
+                # their context is a conversation's implicit index, which
+                # §19.5 keeps out of path-following coverage entirely.
+                runtime.store.ensure_context_source(context_id, str(dest_path))
             if wants_ingest:
                 try:
                     # Ingestion is its own mutation: the bytes can be on disk
@@ -4214,6 +4252,21 @@ async def upload_file(
             chunk_count, attachment = await asyncio.to_thread(_locked_publish)
         except PathLockTimeout as exc:
             raise http_error("conflict", str(exc), status_code=409)
+
+        # Out of band: after the response, off the request's critical path,
+        # and bounded per pass. The worker drains whatever this leaves.
+        #
+        # No `chunk_size`: a drain takes whatever jobs are due, including
+        # other uploads' jobs, and this request's tuning parameter is not
+        # theirs. The queue uses the configured default, so a job produces
+        # the same chunks whether this request drains it or the worker does.
+        if queued_reindex:
+            background.add_task(
+                ingest_queue.drain,
+                runtime.store,
+                runtime.rag,
+                fs_root=runtime.settings.shared_fs_root,
+            )
 
         # Update idempotency with final result
         resp = FileUploadResponse(

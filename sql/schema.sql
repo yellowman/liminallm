@@ -309,6 +309,49 @@ CREATE UNIQUE INDEX IF NOT EXISTS knowledge_chunk_vector_segment_idx
 ON knowledge_chunk_vector (chunk_id, segment_index);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_chunk_idx ON knowledge_chunk (context_id, chunk_index);
 
+-- Deferred re-indexing (SPEC "refresh cadence": a file change enqueues an
+-- ingestion job). A file's bytes change in one request; the set of contexts
+-- covering that file is not bounded by anything that request chose, so the
+-- old chunks are dropped immediately and the re-read is recorded here.
+--
+-- `generation` is the checksum of the bytes the job was queued for. A worker
+-- compares it against what is on disk when it runs and declines to write when
+-- they differ, so a job queued for an older generation can never overwrite a
+-- newer one.
+CREATE TABLE IF NOT EXISTS ingest_job (
+  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  context_id      UUID NOT NULL REFERENCES knowledge_context(id) ON DELETE CASCADE,
+  fs_path         TEXT NOT NULL,
+  generation      TEXT NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'queued',
+  attempts        INT NOT NULL DEFAULT 0,
+  detail          TEXT,
+  -- When this job may next be claimed. A failure pushes it out by a backoff,
+  -- because a worker drains until the queue is empty: without a due time it
+  -- would claim, fail and requeue the same job in a tight loop and spend the
+  -- whole retry budget in seconds, which is no protection at all against the
+  -- transient outages the retries exist for.
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- This file is the whole schema story, so it has to converge on a database
+-- built from an earlier revision of itself rather than only on an empty one.
+-- `CREATE TABLE IF NOT EXISTS` silently skips a column added later, and
+-- `CREATE INDEX IF NOT EXISTS` keeps an index whose definition has changed.
+ALTER TABLE ingest_job
+  ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now();
+DROP INDEX IF EXISTS ingest_job_ready_idx;
+CREATE INDEX IF NOT EXISTS ingest_job_ready_idx
+ON ingest_job (status, next_attempt_at);
+-- One pending job per (context, path): a file replaced five times before the
+-- queue is drained needs one re-read of its final bytes, not five of which
+-- four are already obsolete. Enqueue overwrites the generation, so the slot
+-- always holds the newest replacement.
+CREATE UNIQUE INDEX IF NOT EXISTS ingest_job_pending_idx
+ON ingest_job (context_id, fs_path) WHERE status = 'queued';
+
 -- Add FK constraint for conversation.active_context_id now that
 -- knowledge_context exists.
 --

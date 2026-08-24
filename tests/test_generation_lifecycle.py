@@ -681,7 +681,21 @@ class TestAReplacedPathLeavesNoOlderGenerationBehind:
             "the first context still describes a generation the file no "
             "longer holds"
         )
-        assert str(target) not in _described_paths(runtime, first_ctx)
+        # Revised: the path stays, carrying the new generation.
+        #
+        # This asserted the path was gone from the first context, which was
+        # the behaviour before the re-index queue existed. Emptying is only
+        # half a correction — the first context still holds this file as a
+        # source, and a context that covers a path but describes nothing has
+        # lost the file rather than been corrected. The upload empties it and
+        # queues the re-read; what is left afterwards is the current bytes.
+        assert str(target) in _described_paths(runtime, first_ctx), (
+            "replacing the bytes dropped the file from a context that covers "
+            "it, instead of refreshing what that context says about it"
+        )
+        assert "THE FIGURES FROM THE SECOND QUARTER" in _text(runtime, first_ctx), (
+            "the covering context was emptied and never re-read"
+        )
 
     def test_replacing_the_bytes_with_no_context_named_invalidates_too(self, client):
         """The simplest form: the second upload names no context at all."""
@@ -1220,7 +1234,16 @@ class TestTheIndexIsItsOwnReverseIndex:
             "a context that acquired the path as a source still describes the "
             "generation the file no longer holds"
         )
-        assert str(target) not in _described_paths(runtime, context_id)
+        # Revised with the test above, and this is the case that makes the
+        # point: the context holds the path only as a source, so emptying it
+        # left a context that covers a file while saying nothing about it.
+        assert str(target) in _described_paths(runtime, context_id), (
+            "the source relationship survived but the file did not"
+        )
+        assert "THE GENERATION THAT REPLACED IT" in _text(runtime, context_id), (
+            "a context that acquired the path as a source was emptied and "
+            "never re-read"
+        )
 
     def test_a_source_rooted_above_the_file_still_serializes(self, client):
         """The lock has to be taken where the mutation happens.

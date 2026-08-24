@@ -13535,3 +13535,67 @@ else in this file arriving one level up. An assertion message is a claim
 written at the same time as the assertion, by the same person, about what a
 failure would mean — so it is not evidence about what the failure *is*. The
 index had to be read.
+
+## Closing the coverage loss: emptying is half a correction
+
+The finding above stops at the right diagnosis — a context stops covering a
+file it covered, silently — and this is what it took to close it.
+
+**One authority for coverage.** `context_source` is the record that a context
+covers a path. Not `knowledge_chunk`, which is the materialisation of that
+record: a stray row would otherwise promote itself into a relationship nobody
+created, and, worse in the other direction, coverage would evaporate whenever
+a cleanup removed the index. Not the upload manifest either, which holds only
+the contexts an upload named — a directory source never appears in it, which
+is exactly how the original defect stayed invisible. `contexts_covering_path`
+reads `context_source` and nothing else, scoped to the owner, and the ingest
+paths now record the relationship so the authority is complete.
+
+**Emptying and refreshing are different halves, and only one is bounded.**
+The upload already emptied every covering context under its publication lock,
+and that half is right: a chunk claiming to be the file's contents is false
+the moment new bytes exist. What it could not do there is re-read and re-embed
+for a set of contexts the request never chose — genuinely unbounded work,
+which is why the code declined to do it and left the file lost. So the upload
+now records an `ingest_job` per covering context instead. Between empty and
+refill the path is *absent* from those contexts: recoverable, and unlike a
+stale answer, honest.
+
+**The queue takes the same lock the upload takes.** `service.fs.path_lock`,
+on the same key, with the generation re-read inside it — because waiting for
+a lock is exactly when a replacement is most likely to have happened. A worker
+that cannot get the lock stands aside without spending an attempt, since
+whoever holds it is publishing that name and will queue what its own bytes
+need. Two locks that merely resembled each other would serialise nothing, so
+that is what the witness checks: a worker holding the lock, an ordinary upload
+of the same path, and a 409. Given the worker a key of its own, the upload
+publishes straight over it — measured, 200 instead of 409.
+
+**What the queue must not do is forget.** Each job carries the checksum of the
+bytes that prompted it and declines if the file has moved on. Repeated
+replacements collapse onto one pending slot holding the newest, with the due
+time reset — it is new bytes, not a retry of the job it displaced. Retries are
+scheduled rather than immediate, because a worker drains until the queue is
+empty and an unscheduled retry is re-claimed within a second of the first
+failure, covering none of the outages retries exist for. A claimed job carries
+a lease, so a process killed mid-job returns its work instead of stranding it:
+the claim must not become the thing that forgets the file. And a read error is
+not a deletion — `FileNotFoundError` finishes a job, every other `OSError`
+leaves it owed.
+
+**Two tests here asserted the old behaviour and were revised, not deleted.**
+`test_replacing_the_bytes_invalidates_the_other_contexts` and
+`test_a_context_that_took_the_path_as_a_source_is_invalidated` both ended by
+asserting the path was *absent* from the covering context. That was an
+accurate description of what the code did and an inaccurate one of what it
+should do. They now assert what the finding above says is missing: the path is
+still described, and what it says is the current generation.
+
+**A note on the witnesses, because three of them had to be rewritten.** Each
+passed against code that was broken, and the mutation is what said so. One
+asserted every waiter eventually succeeded — which they do, just slower. One
+asserted a file came back after a manual drain, proving the job was real work
+rather than that anything was scheduled to run it. One simulated a racing
+replacement by deleting the very rows that would have proved the defect. The
+same lesson as the entry above, one level up again: a test that passes tells
+you nothing until you have seen it fail for the reason you intend.
