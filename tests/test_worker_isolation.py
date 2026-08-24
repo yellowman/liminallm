@@ -201,6 +201,20 @@ class _External:
     def available(self) -> bool:
         return self.pg.available and self.redis.available
 
+    @property
+    def unavailable_reason(self) -> str:
+        """Which of the two is missing, and why.
+
+        A fixed "needs initdb" was wrong for every host that has initdb and
+        lacks pgvector — the case this availability check was extended to
+        catch, reported with the one explanation that could not apply to it.
+        """
+        if not self.pg.available:
+            return self.pg.unavailable_reason
+        if not self.redis.available:
+            return "redis-server not available"
+        return ""
+
     def __enter__(self):
         import psycopg
         import redis
@@ -351,7 +365,7 @@ def _data_keys(keys) -> list[str]:
 def _external_or_skip(redis_db: int = 0, db_in_query: bool = False):
     ext = _External(redis_db, db_in_query)
     if not ext.available:
-        pytest.skip("needs initdb and redis-server to stand up external services")
+        pytest.skip(f"cannot stand up external services: {ext.unavailable_reason}")
     return ext
 
 

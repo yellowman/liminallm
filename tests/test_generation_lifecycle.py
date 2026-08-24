@@ -1271,14 +1271,33 @@ class TestTheIndexIsItsOwnReverseIndex:
             chunks = kwargs.get("chunks")
             if chunks is None and len(args) >= 3:
                 chunks = args[2]
+            source_path = kwargs.get("source_path")
+            if source_path is None and len(args) >= 2:
+                source_path = args[1]
             text = " ".join(getattr(c, "content", "") or "" for c in (chunks or ()))
             if "THE GENERATION THE UPLOAD WROTE" in text:
                 which = "upload"
             elif "THE GENERATION THE WALK READ" in text:
                 which = "walk"
             else:
-                which = f"neither ({len(chunks or ())} chunks)"
-            commits.append((which, round(time.monotonic() - origin, 4)))
+                which = "neither"
+            # The path as well as the generation, because "neither" alone was
+            # ambiguous the first time this failed in CI: a commit carrying no
+            # marker is either an unrelated file the directory walk also
+            # covered, or report.md committed empty, and those are different
+            # bugs. The first recorded failure read
+            # [('walk', 1.2324), ('neither', 1.4468)] against a passing
+            # [('neither', 1.1999), ('upload', 1.4146)] — so the upload's
+            # marked commit was missing entirely, and which file the unmarked
+            # one belonged to is the next thing worth knowing.
+            commits.append(
+                (
+                    which,
+                    Path(str(source_path)).name if source_path else "(no path)",
+                    len(chunks or ()),
+                    round(time.monotonic() - origin, 4),
+                )
+            )
             return real_commit(*args, **kwargs)
 
         results: dict = {}
@@ -1317,9 +1336,9 @@ class TestTheIndexIsItsOwnReverseIndex:
         indexed = _text(runtime, context_id)
         assert "THE GENERATION THE UPLOAD WROTE" in indexed, (
             "the walk committed over the newer generation's chunks. Commits "
-            f"landed as {commits} — (which generation, seconds since the gate "
-            "was armed). The upload's commit must be last; when this passes "
-            "it reads [..., ('upload', _)]"
+            f"landed as {commits} — (which generation, file, chunks, seconds "
+            "since the gate was armed). The upload's commit must be last; "
+            "when this passes it reads [..., ('upload', 'report.md', _, _)]"
         )
         assert "THE GENERATION THE WALK READ" not in indexed, (
             "the index describes a generation the file no longer holds; "

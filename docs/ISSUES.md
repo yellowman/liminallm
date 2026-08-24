@@ -13411,3 +13411,22 @@ cover the harness's own worker isolation on a scratch cluster, and the property
 they check is exercised anyway by every xdist run that provisions per-worker
 databases. A host that cannot host the schema cannot run them at all, and
 saying so beats an opaque exit code.
+
+#### A fourth call site, and the discipline that should have found it
+
+Reported by Cursor Bugbot against `c2a037e`, and correct. Three call sites were
+updated to report `unavailable_reason`; `_external_or_skip` was a fourth, and it
+still skipped with a fixed `"needs initdb and redis-server"`. So a host with
+`initdb` and without pgvector — the exact case the availability check had just
+been extended to catch — was told the one explanation that could not apply to
+it.
+
+This repository's own rule covers it: *grep the class when you fix the
+instance*. Three instances were found by grepping for `.available`, and the
+fourth was behind `_External.available`, which composes two of them and had a
+skip message of its own. One indirection was enough to hide it.
+
+Fixed, and the class swept properly this time. `_External` now reports which of
+its two services is missing and why. The four remaining `"needs redis-server"`
+skips were checked and left alone: each is gated on `ScratchRedis().available`
+only, with no Postgres involved, so the message is accurate.
