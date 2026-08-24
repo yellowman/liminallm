@@ -21,6 +21,7 @@ import asyncio
 import math
 import time
 import uuid
+from functools import partial
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from liminallm.logging import log_routing_trace, log_workflow_trace
@@ -463,6 +464,14 @@ class WorkflowStreamingMixin:
         message = inputs.get("message") or user_message or ""
         attachments = self._conversation_attachments(conversation_id, user_id)
 
+        # Retrieval for an explicitly selected knowledge context. Off the loop
+        # for the plainer of the two reasons below: it is a database round
+        # trip.
+        explicit_ids, grounding = await asyncio.to_thread(
+            self._explicit_context_grounding,
+            message, context_id, user_id=user_id, tenant_id=tenant_id,
+        )
+
         # Off the event loop. Assembling the prompt now includes listing every
         # configured MCP server, and `mcp_client.run_sync` answers an
         # already-running loop by starting a thread and joining it — a join
@@ -476,7 +485,11 @@ class WorkflowStreamingMixin:
         # `async def` is a stall waiting for a caller to change, not because a
         # measurement demands it.
         messages, tools, _, mcp_tools = await asyncio.to_thread(
-            self._build_agent_context,
+            partial(
+                self._build_agent_context,
+                explicit_context_ids=explicit_ids,
+                grounding=grounding,
+            ),
             message, attachments, history, user_id, conversation_id,
         )
         if not tools or not self.llm.supports_tools:
@@ -536,6 +549,10 @@ class WorkflowStreamingMixin:
                         "max_rounds": self.MAX_AGENT_ROUNDS,
                         "deadline_seconds": self.AGENT_DEADLINE_SECONDS,
                         "stream_final": True,
+                        # Already in `messages`; carried so the worker returns
+                        # them among its own and the streamed turn reports the
+                        # grounding it used, not only what a tool fetched.
+                        "context_snippets": list(grounding),
                     },
                     InvocationContext(
                         user_id=user_id,

@@ -2737,9 +2737,21 @@ beyond `llm.generic` and `rag.answer_with_context_v1`, the agent loop offers
 tools conditionally — a schema is only spent when the capability can actually
 be used, so an empty vault or a disabled feature costs zero prompt tokens.
 
+**tool capability is additive to grounding, never a replacement for it.** a
+turn takes the agent path when the deployment has something to offer — an
+attachment, web tools, a published server — and that decision says nothing
+about what the turn is allowed to read. a knowledge context named by the
+caller is retrieved and injected before the first model call on either path,
+under the same ownership check, and its chunks are reported in
+`context_snippets` whether or not the model went on to call a tool. offering
+`file_search` for that context is the additive half: it buys search beyond
+the initial top-k, and must never be the only way the context is reachable —
+a context the user selected does not depend on the model deciding to go
+looking for it.
+
 | tool | offered when | returns |
 |---|---|---|
-| `file_search` | conversation has searchable attachments | excerpts + file names |
+| `file_search` | conversation has searchable attachments, **or** the turn names a knowledge context the caller owns | excerpts + file names |
 | `run_python` | conversation has analyzable attachments | stdout of a sandboxed run |
 | `web_search` | web tools on **and** a provider+key configured | titles/urls/snippets |
 | `web_fetch` | web tools on | one page's visible text |
