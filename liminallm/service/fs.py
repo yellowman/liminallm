@@ -411,16 +411,25 @@ def publication_key(fs_root: str | Path, fs_path: str | Path) -> str:
     has no tree to belong to, and keying it on itself is both stable and
     correct for something nothing else contends on.
     """
-    root = Path(fs_root)
+    logical_root = Path(fs_root)
     target = Path(fs_path)
-    try:
-        rel = target.relative_to(root)
-    except ValueError:
-        return str(target)
-    # users / <id> / files / <name...>, and there has to be a name.
-    if len(rel.parts) >= 4 and rel.parts[0] == "users" and rel.parts[2] == "files":
-        files_dir = root / "users" / rel.parts[1] / "files"
-        return namespace_key(files_dir, Path(*rel.parts[3:]).as_posix())
+    # Recognise through a symlink, name from the logical root. `safe_join`
+    # resolves the paths it hands back, so a stored `fs_path` can be spelled
+    # with the physical root while a route builds its key from the configured
+    # one — the same file under two names, and so two locks. Matching against
+    # both spellings closes that. Resolving the *target* to choose the key
+    # would reopen it from the other side: the lock is on the persistent name,
+    # and a symlinked entry inside the tree would key outside its namespace.
+    for base in (logical_root, logical_root.resolve()):
+        try:
+            rel = target.relative_to(base)
+        except ValueError:
+            continue
+        # users / <id> / files / <name...>, and there has to be a name.
+        if len(rel.parts) >= 4 and rel.parts[0] == "users" and rel.parts[2] == "files":
+            files_dir = logical_root / "users" / rel.parts[1] / "files"
+            return namespace_key(files_dir, Path(*rel.parts[3:]).as_posix())
+        break
     return str(target)
 
 

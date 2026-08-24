@@ -13724,3 +13724,32 @@ by requeueing a row that had never been claimed. That is no longer a state the
 system can produce, so it now claims the job first — the setup was arranging a
 shape rather than reproducing a history, and the predicate made the difference
 visible.
+
+### And a third: the root's own spelling
+
+Anchoring to `fs_root` fixed the lookalike-tree problem and introduced a
+narrower one. `safe_join` resolves the paths it hands back, so when
+`SHARED_FS_ROOT` is a symlink — an ordinary deployment shape — a stored
+`fs_path` carries the physical spelling while a route builds its key from the
+configured one. `relative_to` then fails, the queue falls back to keying on
+the path itself, and the two sides take different locks again.
+
+The correction is smaller than it looks and the distinction is worth stating
+exactly, because the two directions are opposite errors:
+
+* resolve the **root** to *recognise* a target — required, or the physical
+  spelling is unrecognisable;
+* resolve the **target** to *choose* the key — wrong, and the reason the
+  original code avoided `resolve()` at all: the lock is on the persistent
+  name, and a symlinked entry inside a tree would key outside its namespace;
+* build the returned key from the **logical** root — or recognition succeeds
+  and the answer still disagrees with the route's.
+
+One witness covers both identity rules at once: a symlinked root, and inside
+it a tree containing `users/fake/files/`. The key has to come out as the
+logical root's `bundle` — not the archive's copy, and not the physical
+spelling. Mutating away either half kills it.
+
+Three findings in this function now, each from the same family: it answers
+"which lock does this path take", and every wrong answer is some form of
+letting the *spelling* of a path decide instead of its *position*.

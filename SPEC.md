@@ -369,7 +369,15 @@ generated `content_tsv` column (GIN-indexed) for the lexical channel, and
   a lock nothing else holds, and a delete then ran straight through a job
   indexing a file inside the tree.
   the key is read off `fs_root` at a fixed depth, never searched for by
-  shape: a tree may contain any names a user can unpack, `users/` and
+  shape, and always **spelled with the configured root**. `safe_join`
+  resolves the paths it returns, so a stored `fs_path` can carry the physical
+  spelling of a symlinked `SHARED_FS_ROOT` while a route builds its key from
+  the configured one — one file, two names, two locks. the root is therefore
+  matched against both its logical and resolved spellings to *recognise* a
+  path, and the key is built from the logical one. resolving the **target**
+  to choose the key is the opposite error: the lock is on the persistent
+  name, and a symlinked entry inside a tree would key outside its namespace.
+  the fixed depth is what keeps this honest: a tree may contain any names a user can unpack, `users/` and
   `files/` included, so the nearest thing *shaped* like the layout is the
   archive's copy rather than the real root — and a job keyed there while a
   delete keys on the tree reopens the race.
