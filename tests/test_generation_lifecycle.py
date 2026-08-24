@@ -1247,11 +1247,38 @@ class TestTheIndexIsItsOwnReverseIndex:
         armed = {"on": True}
         real_commit = runtime.rag._commit_generation
 
+        # Which commit landed last is the whole question, and the assertions
+        # below can only report that the answer was wrong. This records the
+        # order so a failure says what happened instead of what did not.
+        # It has failed twice on a CI runner and reproduces on no local
+        # configuration tried — ordinary, with confinement broken, pinned to
+        # one and to two CPUs, without a proxy, and pinned under contention at
+        # twice the wall clock — so the next occurrence is the only source of
+        # evidence left.
+        commits: list[tuple[str, float]] = []
+        origin = time.monotonic()
+
         def gated(*args, **kwargs):
             if armed["on"]:
                 armed["on"] = False
                 reached.set()
                 may_continue.wait(30)
+            # Which actor is committing, read from the chunks themselves. The
+            # thread name says `asyncio_0` for both, because the test client
+            # runs each request on an executor thread rather than on the
+            # thread that started it — so a label taken from the thread would
+            # be evidence that distinguishes nothing.
+            chunks = kwargs.get("chunks")
+            if chunks is None and len(args) >= 3:
+                chunks = args[2]
+            text = " ".join(getattr(c, "content", "") or "" for c in (chunks or ()))
+            if "THE GENERATION THE UPLOAD WROTE" in text:
+                which = "upload"
+            elif "THE GENERATION THE WALK READ" in text:
+                which = "walk"
+            else:
+                which = f"neither ({len(chunks or ())} chunks)"
+            commits.append((which, round(time.monotonic() - origin, 4)))
             return real_commit(*args, **kwargs)
 
         results: dict = {}
@@ -1264,8 +1291,10 @@ class TestTheIndexIsItsOwnReverseIndex:
             results["waited_for_release"] = released.is_set()
 
         runtime.rag._commit_generation = gated
-        source_thread = threading.Thread(target=add_source, daemon=True)
-        upload_thread = threading.Thread(target=upload_and_record, daemon=True)
+        source_thread = threading.Thread(target=add_source, name="walk", daemon=True)
+        upload_thread = threading.Thread(
+            target=upload_and_record, name="upload", daemon=True
+        )
         try:
             source_thread.start()
             assert reached.wait(30), "the walk never reached a commit"
@@ -1287,10 +1316,14 @@ class TestTheIndexIsItsOwnReverseIndex:
         assert (files_dir / "report.md").read_bytes() == second
         indexed = _text(runtime, context_id)
         assert "THE GENERATION THE UPLOAD WROTE" in indexed, (
-            "the walk committed over the newer generation's chunks"
+            "the walk committed over the newer generation's chunks. Commits "
+            f"landed as {commits} — (which generation, seconds since the gate "
+            "was armed). The upload's commit must be last; when this passes "
+            "it reads [..., ('upload', _)]"
         )
         assert "THE GENERATION THE WALK READ" not in indexed, (
-            "the index describes a generation the file no longer holds"
+            "the index describes a generation the file no longer holds; "
+            f"commits landed as {commits}"
         )
 
     def test_a_guard_that_cannot_be_taken_fails_the_request(self, client):

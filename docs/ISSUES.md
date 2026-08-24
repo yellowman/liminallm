@@ -13244,3 +13244,76 @@ test starts passing vacuously, which is the defect this file spends most of its
 length on. The next run has 46 fewer failures and workers that actually start,
 which changes its timing substantially; if it fails again, that is a second
 data point worth acting on.
+
+## Fixing confinement uncovered a test that had two guards and satisfied one
+
+With the sandbox working on the runner, the failure count went from 51 to 6 and
+the log contained no mention of `setgroups` or `worker_unconfined` at all. Four
+of the six were the `rg` and Postgres fixes above. The fifth changed its story:
+`test_injection_findings_reach_the_workflow_trace` used to fail with
+`worker_unconfined` and now failed with
+
+    AssertionError: no findings in trace: [{'node': 'files', 'status': 'ok',
+                     'content': 'It boils in 3 minutes.', ...}]
+
+The model answered without reading the page. The log said why:
+
+    "capability": "tools.round"
+    "error": "Egress address '127.0.0.1' is not allowlisted for tools"
+
+**Two guards stand between a tool and a local address.** `web_fetch_allow_private`
+is the SSRF check on the URL, and the test opts out of it explicitly, saying so
+in a comment. The tool network allowlist is a separate socket-level guard,
+consulted when the connection is opened and built once from settings in the
+engine's constructor — so patching settings afterwards never reaches it. The
+test never opted out of that one.
+
+It passed anyway, everywhere, for a reason worth writing down.
+`connection_allowlist()` returns the *proxy's* host when a proxy is configured:
+
+    if self.proxy_url:
+        hosts = [urlparse(self.proxy_url).hostname]
+
+This development environment sets `HTTPS_PROXY=http://127.0.0.1:46691`. So the
+allowlist was literally `['127.0.0.1']`, and the loopback server the test stands
+up was permitted **by coincidence of the developer's proxy configuration**. CI
+has no proxy, so the real target list applied and refused it.
+
+Reproduced by unsetting `HTTPS_PROXY`: the test fails locally with CI's exact
+message, and passes with it set. The rig now opts out of both guards, and
+dropping the allowlist entry makes it fail again, so the opt-out is not
+covering a test that would pass regardless.
+
+That is the fourth environment-coincidence defect in two days, and the most
+uncomfortable one: `httpx`, `numpy` and `ripgrep` were things present here and
+absent there, but this was a *security control* that happened to be satisfied
+by an unrelated environment variable. A guard whose test only passes because of
+the tester's proxy settings was not being tested.
+
+### The last failure, made legible rather than guessed at
+
+`test_a_source_rooted_above_the_file_still_serializes` has now failed twice on
+CI and reproduces on no local configuration tried: ordinary, with confinement
+broken, without a proxy, pinned to one CPU, pinned to two, and pinned under
+three competing CPU hogs at twice the wall clock. Six configurations, no
+failure.
+
+So it was not fixed. Its assertions could only ever report that the answer was
+wrong, and the question is *which commit landed last* — so the gate now records
+each commit as it happens and the failure message carries the sequence.
+
+Two details of that instrumentation are worth keeping, because the first
+version of it was useless and the second nearly was. Labelling by
+`threading.current_thread().name` produced `asyncio_0` for both actors, since
+the test client runs each request on an executor thread rather than the thread
+that started it — evidence that distinguishes nothing. The label is read from
+the committed chunks instead, and says `neither` rather than guessing when it
+cannot tell. Verified by forcing the assertion: a passing run reads
+
+    [('neither (1 chunks)', 1.1999), ('upload', 1.4146)]
+
+The upload's commit is last, which is the correct outcome; a failure will show
+it is not, and by how much. Forcing that assertion also caught the check being
+applied to the wrong function — this file holds two tests with an identical
+block, and the first edit landed on the sibling, which is its own small lesson
+about verifying that a mutation went where it was aimed.
