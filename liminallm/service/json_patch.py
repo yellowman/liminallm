@@ -61,12 +61,36 @@ def validate_op(op: Any) -> None:
         raise BadRequestError(
             "patch operation is missing its path", detail={"op": action}
         )
+    _require_pointer(op, "path", action)
     for member in _OPERANDS[action]:
         if member not in op:
             raise BadRequestError(
                 f"patch operation is missing its {member}",
                 detail={"op": action, "path": op.get("path")},
             )
+    if "from" in _OPERANDS[action]:
+        _require_pointer(op, "from", action)
+
+
+def _require_pointer(op: Dict[str, Any], member: str, action: str) -> None:
+    """A pointer operand is a string (RFC 6901 §3), and is not coerced.
+
+    Presence was required and type was not, so `_segments_or_raise` reached
+    for `.startswith` on whatever arrived and a number, null, array or object
+    left as an uncaught AttributeError — a 500 for a plainly bad request, and
+    reachable over the wire because both API models take `List[dict]`.
+
+    Refused rather than coerced: `str(42)` is `"42"`, a pointer that is not
+    the one anybody wrote, which is the failure this module exists to stop.
+    `bool` is excluded explicitly — it is not a `str`, but saying so keeps
+    the check honest next to the JSON-value rules below.
+    """
+    value = op[member]
+    if not isinstance(value, str):
+        raise BadRequestError(
+            f"patch operation {member} is not a JSON Pointer string",
+            detail={"op": action, member: value, "found": type(value).__name__},
+        )
 
 
 def validate_ops(ops: Any) -> Any:
@@ -115,6 +139,36 @@ def deep_merge(base: dict, patch: dict, *, skip_keys: Iterable[str] = ()) -> dic
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+def json_equal(left: Any, right: Any) -> bool:
+    """RFC 6902 §4.6 equality: JSON values, not Python objects.
+
+    Python makes `True == 1` and `False == 0`, and carries that through lists
+    and dicts, so `test` passed on a value of a different JSON type. It is
+    the one verb whose whole job is guarding the operations behind it, so a
+    generous comparison does not merely misreport — it lets a mutation run on
+    a precondition that was never met.
+
+    JSON has one number type, so `1` and `1.0` are one value. Booleans are
+    their own class and equal only booleans. Everything else compares within
+    its own type.
+    """
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            json_equal(a, b) for a, b in zip(left, right)
+        )
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            json_equal(left[k], right[k]) for k in left
+        )
+    if type(left) is not type(right):
+        return False
+    return left == right
 
 
 def _unescape(token: str, path: str) -> str:
@@ -420,7 +474,7 @@ def apply_op(doc: dict, op: Dict[str, Any]) -> None:
 
     elif action == "test":
         current = _read(doc, segments, path)
-        if current != value:
+        if not json_equal(current, value):
             raise BadRequestError(
                 "JSON Patch test operation failed",
                 detail={"path": path, "expected": value, "actual": current},

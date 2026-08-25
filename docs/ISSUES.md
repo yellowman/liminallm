@@ -14364,6 +14364,52 @@ callers accepted it and wrote a version: the route guarded the engine behind
 times and marked the patch applied. `validate_ops` refuses it, and the route's
 guard is gone so no patch reaches the store without meeting a rule.
 
+### A pointer operand was required to exist, not to be a string
+
+`validate_op` required `path`, and `from` for the verbs that take one, but
+neither to be a string. `_segments_or_raise` reaches straight for
+`path.startswith("/")`, so every non-string left as an uncaught
+`AttributeError`:
+
+```
+path=42   path=null   path=["/a"]   path={"a":1}   from=42
+```
+
+A 500 for a plainly bad request, and reachable over the wire: both API models
+take `List[dict]`, which admits any JSON value in any member.
+
+Refused rather than coerced. `str(42)` is `"42"` — a pointer that is not the
+one anybody wrote, which is the whole failure this module exists to stop.
+
+### `test` compared Python objects, not JSON values
+
+RFC 6902 §4.6 compares JSON values. Python makes `True == 1` and `False == 0`
+and carries that equivalence recursively through lists and dicts, so a
+precondition passed on a value of a different JSON type.
+
+`test` is the one verb whose entire job is guarding the operations behind it,
+so this does not merely misreport. Against `{"enabled": true, "spare":
+"keep"}`:
+
+```json
+[{"op":"test","path":"/enabled","value":1},
+ {"op":"replace","path":"/spare","value":"CHANGED"}]
+```
+
+returned 200, set `spare` to `CHANGED`, and wrote version 2 — a mutation
+applied on a precondition that was never met.
+
+`json_equal` is the rule: booleans equal only booleans, numbers compare
+numerically with `bool` excluded, arrays and objects recurse, everything else
+compares within its own type. JSON has one number type, so `1` and `1.0` are
+one value and there is a control saying so.
+
+The two mutations are complements. Restoring Python `==` kills all seven
+inequality witnesses and both route witnesses; removing only the container
+recursion — a scalar-only fix — kills exactly the array, object and nested
+three. That is what says those three are measuring the recursion rather than
+repeating the scalar case.
+
 ### An array index was whatever `str.isdigit()` allowed
 
 RFC 6901 §4 says `0` or a non-zero digit run, ASCII. `seg.isdigit()` is a much
@@ -14423,7 +14469,8 @@ now drive the mutating entry point.
 
 ### Mutations
 
-Fifteen, all applied and all killed. Four cover the write-location rule:
+Twenty-three, of which twenty-one are killed and two survive by design (see
+below). Four cover the write-location rule:
 `replace` back to a creating traversal; a missing `remove` target back to a
 no-op; traversal manufacturing parents again; an array index past the end
 appending instead of failing. One covers the consumer — ConfigOps swallowing
