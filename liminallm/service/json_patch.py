@@ -85,29 +85,56 @@ def _ensure_list_capacity(idx: int, path: str) -> None:
         )
 
 
-def _walk_create(doc: Any, segments: List[str], path: str) -> Any:
-    """Walk to the parent of the last segment, creating missing containers."""
+def _missing(path: str, at_segments: List[str]) -> BadRequestError:
+    return BadRequestError(
+        "patch path not found",
+        detail={"path": path, "at": "/" + "/".join(at_segments)},
+    )
+
+
+def _walk_parent(doc: Any, segments: List[str], path: str) -> Any:
+    """Walk to the parent of the last segment, creating nothing.
+
+    Every write verb goes through here, because a patch names a location in a
+    document that already exists — it does not describe a document to build.
+    The creating version of this walk is what let `replace /a/b` invent an
+    `a`, report success, and leave the value the caller meant to change
+    exactly as it was.
+
+    Only the *parent* has to be there. `add` may still name a member that does
+    not exist yet; that is the difference between the verbs, and it is decided
+    below rather than here.
+    """
     parent = doc
     for depth, seg in enumerate(segments[:-1]):
         if isinstance(parent, list):
-            try:
-                idx = int(seg)
-            except ValueError:
-                raise BadRequestError(
-                    "list index is not a number",
-                    detail={"path": path, "at": seg},
-                )
-            _ensure_list_capacity(idx, path)
-            while len(parent) <= idx:
-                parent.append({})
+            idx = _read_index(seg, path)
+            if not 0 <= idx < len(parent):
+                raise _missing(path, segments[: depth + 1])
             parent = parent[idx]
         elif isinstance(parent, dict):
-            parent = parent.setdefault(seg, {})
+            if seg not in parent:
+                raise _missing(path, segments[: depth + 1])
+            parent = parent[seg]
         else:
             raise _non_container(path, segments[: depth + 1], parent)
     if not isinstance(parent, (dict, list)):
         raise _non_container(path, segments[:-1], parent)
     return parent
+
+
+def _require_target(parent: Any, key: str, path: str) -> None:
+    """RFC 6902 §4.2/§4.3: `remove` and `replace` need the target to be there.
+
+    Absence is the error, not a no-op. A patch that addressed the wrong path
+    was otherwise indistinguishable from one that did its job.
+    """
+    if isinstance(parent, list):
+        idx = _read_index(key, path)
+        if not 0 <= idx < len(parent):
+            raise _missing(path, [key])
+    elif key not in parent:
+        raise _missing(path, [key])
 
 
 def _walk_existing(doc: Any, segments: List[str], path: str) -> Any:
@@ -143,6 +170,14 @@ def _read_index(seg: str, path: str) -> int:
     while the write path refuses it — the same op legal on one side of a
     round trip and not the other."""
     if not seg.isdigit():
+        # A negative index says something specific about the patch's author,
+        # so it keeps its own message: Python would happily serve `/xs/-1`
+        # from the end, and "not found" would send the reader looking for a
+        # missing element rather than at the index they wrote.
+        if seg.lstrip("-").isdigit():
+            raise BadRequestError(
+                "negative list index", detail={"path": path, "index": int(seg)}
+            )
         raise BadRequestError(
             "patch source path not found", detail={"path": path, "at": seg}
         )
@@ -206,6 +241,16 @@ def _set_at(parent: Any, key: str, value: Any, path: str, *, insert: bool) -> No
                 "list index is not a number", detail={"path": path, "at": key}
             )
         _ensure_list_capacity(idx, path)
+        # RFC 6902 §4.1: an `add` index may equal the length, which appends;
+        # anything beyond it is out of range. Silently appending instead let
+        # `/xs/5` on a two-element array land at position 2 — a write to a
+        # place the caller did not name.
+        limit = len(parent) if insert else len(parent) - 1
+        if idx > limit:
+            raise BadRequestError(
+                "list index out of range",
+                detail={"path": path, "index": idx, "length": len(parent)},
+            )
         if idx < len(parent):
             if insert:
                 parent.insert(idx, value)
@@ -230,36 +275,36 @@ def apply_op(doc: dict, op: Dict[str, Any]) -> None:
 
     if action in ("add", "replace"):
         # RFC add inserts into lists; replace overwrites. On dicts both set.
-        parent = _walk_create(doc, segments, path)
+        # Only `replace` requires the target itself: naming a member that is
+        # not there yet is what `add` is for.
+        parent = _walk_parent(doc, segments, path)
+        if action == "replace":
+            _require_target(parent, key, path)
         _set_at(parent, key, value, path, insert=(action == "add"))
 
     elif action == "remove":
-        parent = _walk_existing(doc, segments, path)
-        if parent is None:
-            return
+        parent = _walk_parent(doc, segments, path)
+        _require_target(parent, key, path)
         if isinstance(parent, list):
-            try:
-                idx = int(key)
-            except ValueError:
-                raise BadRequestError(
-                    "list index is not a number", detail={"path": path, "at": key}
-                )
-            _ensure_list_capacity(idx, path)
-            if 0 <= idx < len(parent):
-                parent.pop(idx)
+            parent.pop(_read_index(key, path))
         else:
-            parent.pop(key, None)
+            parent.pop(key)
 
     elif action in ("move", "copy"):
         from_path = op.get("from", "")
         from_segments = _segments_or_raise(from_path)
+        # The destination is checked before the source is taken. A move is a
+        # remove and an add, and refusing the add after the remove has already
+        # happened deletes a value on behalf of an operation that failed.
+        _walk_parent(doc, segments, path)
         if action == "move":
             moved = _remove_at(doc, from_segments, from_path)
         else:
             moved = copy.deepcopy(_read(doc, from_segments, from_path))
-        # The removal above can invalidate a previously-resolved parent
-        # (moving out of the same list), so resolve the destination after.
-        parent = _walk_create(doc, segments, path)
+        # Resolved again rather than reused: the removal above can invalidate
+        # the parent found a moment ago, when the value is moving out of the
+        # same list it is moving into.
+        parent = _walk_parent(doc, segments, path)
         _set_at(parent, key, moved, path, insert=True)
 
     elif action == "test":

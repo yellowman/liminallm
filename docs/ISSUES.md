@@ -14141,3 +14141,109 @@ the internal file.
 Six mutations, all applied and all killed, and the two new ones land where
 they should: classifying the source by basename kills only the two
 direct-source cases, and removing the queue's check kills only the queue case.
+
+## A patch that named nowhere reported that it had landed
+
+Found by driving ConfigOps against §10 on a running instance. A published
+workflow was patched, the API returned 200, the patch was marked `applied`, a
+new `artifact_version` was written — and the configuration the chat path
+actually consumes did not change. Stored schema said `OMEGA`; serving said
+`ALPHA`, and still did six seconds later.
+
+### One document, two ideas about where its root is
+
+`ArtifactPatchRequest` documented the example
+`{"op":"replace","path":"/schema/foo"}`, and the route docstring repeated it.
+Both callers hand the patch engine `artifact.schema` **itself**, so
+`/schema/foo` names a key *inside* the schema. The engine's `add` and
+`replace` shared a creating traversal, so it obligingly made one:
+
+```
+before  {"spare": "keep"}
+after   {"spare": "keep", "schema": {"spare": "CHANGED"}}
+```
+
+The value the operator meant to change is untouched, a junk key is added, and
+the audit trail says the change was applied. Kind-schema validation cannot
+catch it — an extra top-level key is valid for the workflow kind — so nothing
+downstream objected either.
+
+### The rule, and why `remove` belongs in it
+
+An operation applies to a location that operation permits, or fails without
+changing the document. Two halves: traversal never manufactures missing
+intermediate structure, and an operation requiring an existing target never
+turns absence into success.
+
+`remove` had the second failure in the opposite direction: a missing target
+was treated as nothing to do, which makes a removal that addressed the wrong
+path indistinguishable from one that did its job. Same silent success, same
+class.
+
+RFC 6902 already says all of this — §4.1 for `add`'s array bound, §4.2 for
+`remove`, §4.3 for `replace`. What the module had was a single creating walk
+shared by verbs with different requirements.
+
+### The positive controls carry as much weight as the refusals
+
+"Reject every absent location" also passes every refusal case and breaks
+`add`, whose entire purpose is naming a member that is not there yet. So a
+new member of an existing object, a new member of an existing *nested*
+object, an append at `index == len`, `-`, and an insert that shifts are all
+witnessed, and they are what stops the fix from being a different bug.
+
+### A hazard the fix uncovered
+
+A `move` is a remove and an add. The destination used to be resolved *after*
+the source was taken, so refusing the destination deleted a value on behalf
+of an operation that failed. The destination is now checked first, then
+resolved again after the removal — twice on purpose, because taking the value
+can invalidate the parent found a moment earlier when a value moves within
+one list.
+
+### Three of my own witnesses were vacuous
+
+`apply_ops` deep-copies before it starts, so asserting that the caller's
+document is unchanged after a failure proves that `copy.deepcopy` works and
+nothing else. The risk lives on `apply_op`, which edits in place. Those three
+now drive the mutating entry point, and one of them — the move case — is the
+only witness mutation M5 kills.
+
+### Mutations
+
+Six, all applied and all killed: `replace` back to a creating traversal;
+missing `remove` target back to a no-op; traversal manufacturing parents
+again; an array index past the end appending instead of failing; move/copy
+resolving their destination only after taking the source; and ConfigOps
+swallowing the refusal to apply anyway. The last two kill exactly one witness
+each, which is what says those two witnesses are doing their own work.
+
+### An error message got better, and two tests said so
+
+`/xs/-1` reached the write path as "negative list index" and the read path as
+"patch source path not found" — one mistake with two descriptions, the vaguer
+one pointing at a missing element rather than the index the author wrote.
+Both sides now say the same thing, and the three tests that pinned the old
+wording were updated rather than worked around.
+
+## The isolation lesson from the live ConfigOps campaign
+
+Worth keeping, because six apparent defects evaporated under it.
+
+The first sweep ran every case against one artifact and reported seven
+failures. One case removed `/schema/nodes`; every later path was then missing,
+so the atomicity and current-schema results described damage rather than
+behaviour. Re-run on fresh artifacts, kind-schema validation and atomicity
+were **correct** — a patch producing an invalid artifact returns 400, the
+patch stays `approved`, no version is written, and a multi-op patch whose
+later operation fails changes nothing.
+
+A second self-inflicted error was a substring check. `"OMEGA" in
+json.dumps(schema)` passed while the real node still said `ALPHA`, because the
+text was sitting in the junk `schema` key the defect had just created. The
+check that would have caught it immediately — comparing the specific field —
+is the one the rewritten witnesses use.
+
+Two rules earned here, both cheap: give every case its own fixture when a
+case can corrupt shared state, and assert on the field rather than on the
+serialized document.

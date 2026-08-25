@@ -242,6 +242,13 @@ def test_a_failed_test_op_aborts_the_whole_patch(client, auth_headers, owned_art
 def test_negative_indices_are_refused_on_the_read_path_too(op):
     """RFC 6902 array indices are non-negative. Python's list[-1] quietly
     served `/rules/-1` to move/copy/test while the write path refused it —
-    found reviewing the commit that introduced this module."""
-    with pytest.raises(BadRequestError, match="source path not found"):
+    found reviewing the commit that introduced this module.
+
+    Both sides now name the same mistake the same way. This used to expect
+    "source path not found", which is what the read path happened to say
+    while the write path said "negative list index" — one error with two
+    descriptions, and the vaguer one sent the reader looking for a missing
+    element instead of at the index they wrote.
+    """
+    with pytest.raises(BadRequestError, match="negative list index"):
         json_patch.apply_ops({"rules": [1, 2]}, [op])

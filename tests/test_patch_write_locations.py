@@ -105,10 +105,15 @@ class TestRemoveRequiresAnExistingTarget:
 
     def test_a_refused_removal_leaves_the_document_alone(self):
         """The other half of the rule: refusing is not enough if the walk
-        already wrote the containers it was refusing to remove from."""
+        already wrote the containers it was refusing to remove from.
+
+        Driven through `apply_op`, which edits in place. `apply_ops` copies
+        first, so asserting on the caller's document there proves only that
+        `copy.deepcopy` works — the risk lives on the mutating entry point.
+        """
         doc = {"keep": 1}
         with pytest.raises(BadRequestError):
-            apply(doc, {"op": "remove", "path": "/a/b/c"})
+            json_patch.apply_op(doc, {"op": "remove", "path": "/a/b/c"})
         assert doc == {"keep": 1}
 
 
@@ -173,8 +178,8 @@ class TestMoveAndCopyDestinationsFollowAdd:
         that failed."""
         doc = {"a": {"x": 1}}
         with pytest.raises(BadRequestError):
-            apply(doc, {"op": "move", "from": "/a/x", "path": "/b/x"})
-        assert doc == {"a": {"x": 1}}
+            json_patch.apply_op(doc, {"op": "move", "from": "/a/x", "path": "/b/x"})
+        assert doc == {"a": {"x": 1}}, "the source was taken and never delivered"
 
     def test_a_destination_whose_parent_exists_still_works(self):
         assert apply({"a": {"x": 1}, "b": {}},
@@ -184,13 +189,30 @@ class TestMoveAndCopyDestinationsFollowAdd:
 
 
 class TestAPatchIsAllOrNothing:
-    def test_a_later_op_on_a_missing_target_undoes_the_earlier_one(self):
+    def test_a_later_op_on_a_missing_target_yields_no_document(self):
+        """`apply_ops` either returns a fully patched document or raises.
+
+        It works on a copy, so the caller's own document is safe by
+        construction; what this pins is that no half-applied result is handed
+        back, which is what a caller would otherwise persist.
+        """
         doc = {"a": 1, "b": 2}
         with pytest.raises(BadRequestError):
             apply(doc,
                   {"op": "replace", "path": "/a", "value": 99},
                   {"op": "replace", "path": "/ghost", "value": 0})
-        assert doc == {"a": 1, "b": 2}, "the caller's document was mutated"
+        assert doc == {"a": 1, "b": 2}
+
+    def test_the_mutating_entry_point_stops_at_the_failing_op(self):
+        """`apply_op` edits in place, so a caller looping over ops itself
+        keeps whatever landed before the failure. The engine's own callers
+        copy first; this states the boundary rather than leaving it to be
+        rediscovered."""
+        doc = {"a": 1}
+        json_patch.apply_op(doc, {"op": "replace", "path": "/a", "value": 99})
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(doc, {"op": "replace", "path": "/ghost", "value": 0})
+        assert doc == {"a": 99}
 
 
 # ---------------------------------------------------------------------------

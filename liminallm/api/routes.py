@@ -3391,8 +3391,12 @@ async def patch_artifact(
 ):
     """Update an artifact via RFC 6902 JSON Patch or legacy schema update.
 
+    Paths address the artifact's schema document itself — `/entrypoint`, not
+    `/schema/entrypoint`. See `ArtifactPatchRequest` for why the second
+    spelling was wrong here and is now refused rather than misapplied.
+
     Accepts:
-    - RFC 6902 format: {"patch": [{"op": "replace", "path": "/schema/foo", "value": "bar"}]}
+    - RFC 6902 format: {"patch": [{"op": "replace", "path": "/foo", "value": "bar"}]}
     - Legacy format: {"schema": {...}, "description": "..."} (for backward compatibility)
     """
     runtime = get_runtime()

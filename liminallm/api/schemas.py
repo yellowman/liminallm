@@ -493,8 +493,15 @@ class ArtifactRequest(_SchemaPayload):
 class ArtifactPatchRequest(BaseModel):
     """RFC 6902 JSON Patch request for artifact updates.
 
+    Paths address the artifact's **schema document**, not a wrapper around it:
+    a workflow's entrypoint is `/entrypoint`, not `/schema/entrypoint`. This
+    example used to say `/schema/foo`, which named a key *inside* the schema —
+    the engine created it, reported success, and left the value the caller
+    meant to change alone. Patch traversal no longer invents missing parents,
+    so that spelling is now refused rather than silently misapplied.
+
     Accepts:
-    - RFC 6902 array of operations: [{"op": "replace", "path": "/schema/foo", "value": "bar"}]
+    - RFC 6902 array of operations: [{"op": "replace", "path": "/foo", "value": "bar"}]
     - Wrapper dict with "ops" key: {"ops": [...]}
     - Legacy format for backward compatibility: {"schema": {...}, "description": "..."}
     """
