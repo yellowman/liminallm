@@ -160,6 +160,33 @@ class TestArrayBoundsFollowTheSpec:
         with pytest.raises(BadRequestError):
             apply({"xs": [1, 2]}, {"op": "add", "path": "/xs/5", "value": 3})
 
+    def test_replace_can_address_an_existing_large_array_index(self):
+        """The bound is the list's own length, not a constant.
+
+        A fixed ceiling made position 1024 addressable by `remove`, `test` and
+        both source reads while `replace` and `add` refused it — the same
+        location existing for one verb and not another, which is the
+        inconsistency this file exists to remove.
+        """
+        doc = {"xs": list(range(1025))}
+        assert apply(doc, {"op": "replace", "path": "/xs/1024",
+                           "value": "changed"})["xs"][1024] == "changed"
+
+    def test_add_can_append_to_a_large_existing_array(self):
+        doc = {"xs": list(range(1025))}
+        assert apply(doc, {"op": "add", "path": "/xs/1025",
+                           "value": "tail"})["xs"][-1] == "tail"
+
+    def test_a_huge_gap_is_still_refused_without_allocating(self):
+        """What the ceiling was really for, now carried by the length check.
+
+        `/xs/999999999` on a two-element list would allocate a billion
+        placeholders. It is refused because 999999999 is past the end, which
+        is the same reason `/xs/5` is — one rule instead of two.
+        """
+        with pytest.raises(BadRequestError):
+            apply({"xs": [1, 2]}, {"op": "add", "path": "/xs/999999999", "value": 3})
+
 
 class TestMoveAndCopyDestinationsFollowAdd:
     def test_a_copy_cannot_conjure_its_destination_parent(self):
