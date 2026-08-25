@@ -888,12 +888,10 @@ class TrainingService:
                 and state.success_score < self.ADAPTER_PRUNE_MAX_SUCCESS
                 and (not last_used or last_used < stale_cutoff)
             ):
-                # Ops depend on the artifact: traversal creates nothing, so
-                # `/meta` has to be added when this adapter has none and left
-                # alone when it has one.
+                # One leaf op: see json_patch.meta_ops for why a stored
+                # patch must not carry an `add /meta` alongside it.
                 patch = {
                     "ops": json_patch.meta_ops(
-                        artifact.schema,
                         "auto_prune",
                         {
                             "recommended": True,

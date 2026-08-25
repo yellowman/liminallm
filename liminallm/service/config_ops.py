@@ -42,7 +42,7 @@ class ConfigOpsService:
                 "artifact not found", detail={"artifact_id": artifact_id}
             )
         prompt = self._build_prompt(artifact, goal)
-        patch = self._run_llm_for_patch(prompt, artifact)
+        patch = self._run_llm_for_patch(prompt)
         proposer = "user" if user_id else "system_llm"
         return self.store.record_config_patch(
             artifact_id=artifact_id,
@@ -147,9 +147,7 @@ class ConfigOpsService:
             "Respond with only a JSON-patch style object."
         )
 
-    def _run_llm_for_patch(
-        self, prompt: str, artifact: Optional[Artifact] = None
-    ) -> dict:
+    def _run_llm_for_patch(self, prompt: str) -> dict:
         try:
             response = self.llm.generate(prompt, adapters=[], context_snippets=[])
             content = response.get("content", "{}")
@@ -158,7 +156,7 @@ class ConfigOpsService:
                 return parsed
         except Exception as exc:
             logger.warning("config_patch_llm_error", error=str(exc))
-        return self._fallback_patch(artifact)
+        return self._fallback_patch()
 
     def _safe_truncate_json(self, obj: dict, max_chars: int) -> str:
         """Truncate JSON while maintaining valid syntax by removing trailing keys."""
@@ -182,18 +180,15 @@ class ConfigOpsService:
             return json.dumps(truncated, indent=None, separators=(",", ":"))
         return full_json[: max_chars - 3] + "..."
 
-    def _fallback_patch(self, artifact: Optional[Artifact] = None) -> dict:
+    def _fallback_patch(self) -> dict:
         """The patch proposed when the model does not produce one.
 
-        Takes the artifact because the ops depend on it: traversal creates
-        nothing, so writing under `/meta` has to add `/meta` when the artifact
-        has none, and must not when it has one.
+        One leaf op, deliberately. See `json_patch.meta_ops` for why this must
+        not carry an `add /meta` alongside it.
         """
         timestamp = datetime.now(timezone.utc).isoformat()
-        schema = artifact.schema if artifact is not None else None
         return {
             "ops": json_patch.meta_ops(
-                schema,
                 "llm_autopatch",
                 {
                     "generated_at": timestamp,

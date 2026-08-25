@@ -93,25 +93,39 @@ def _require_pointer(op: Dict[str, Any], member: str, action: str) -> None:
         )
 
 
-def meta_ops(schema: Any, key: str, value: Any) -> List[Dict[str, Any]]:
-    """Ops that write ``value`` at ``/meta/<key>``, fitting the schema given.
+def meta_ops(key: str, value: Any) -> List[Dict[str, Any]]:
+    """Ops that write ``value`` at ``/meta/<key>``, and nothing else.
 
-    For the patches this system generates for itself. Traversal creates
-    nothing, so a producer that writes under `/meta` has to say so when the
-    artifact has no `meta` yet — otherwise the patch stores, approves, and
-    then fails on apply.
+    For the patches this system generates for itself. It exists to hold one
+    decision in place: **the parent is never created here.**
 
-    Adding `/meta` unconditionally would be worse than the refusal it fixes:
-    `add` on a member that is already there replaces it, so an artifact whose
-    `meta` held anything would lose it. Only a genuinely absent `meta` is
-    created, and a `meta` that is present but not an object is left for the
-    engine to refuse rather than silently overwritten.
+    The tempting version inspects the artifact and prepends `add /meta {}`
+    when `meta` is missing, so a proposal against a bare artifact still
+    applies. That was written, and it is wrong. ConfigOps stores a patch and
+    applies it later, and `add` on a member that is already present replaces
+    it — so if anything puts a `meta` there in between (another pending
+    patch, a direct edit, the second producer on the same artifact), the
+    baked `add /meta {}` silently wipes it. The data loss is not avoided,
+    only deferred across the propose/apply gap.
+
+    RFC 6902 has no "add if absent" and no test for absence, so no
+    proposal-time decision about the parent can be made stale-proof. The leaf
+    op alone is both safer and better behaved under staleness:
+
+    ==================  ==========================  ========================
+    at apply time       parent-creating             leaf only
+    ==================  ==========================  ========================
+    `meta` absent       applies                     refused, nothing changed
+    `meta` appeared     **destroys it**             applies, siblings kept
+    ==================  ==========================  ========================
+
+    What it gives up is the bare-artifact case, where the patch is refused
+    instead of applying. That is a visible dead end rather than silent
+    damage, and closing it properly means either version-gating stored
+    patches or moving these annotations to the artifact's own `meta` column —
+    both larger than the engine.
     """
-    ops: List[Dict[str, Any]] = []
-    if not isinstance(schema, dict) or "meta" not in schema:
-        ops.append({"op": "add", "path": "/meta", "value": {}})
-    ops.append({"op": "add", "path": f"/meta/{key}", "value": value})
-    return ops
+    return [{"op": "add", "path": f"/meta/{key}", "value": value}]
 
 
 def validate_ops(ops: Any) -> Any:

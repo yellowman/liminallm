@@ -777,45 +777,66 @@ class TestThePatchProducersEmitApplicablePatches:
     destroyed one. There is a control below holding exactly that line.
     """
 
-    def test_meta_ops_add_the_parent_only_when_it_is_absent(self):
+    def test_the_generated_patch_is_one_leaf_op(self):
+        """No `add /meta` alongside it, ever.
+
+        A stored patch is applied later than it is written, so a parent
+        creation decided at proposal time is a decision made against a
+        document that may no longer be there.
+        """
         from liminallm.service.json_patch import meta_ops
 
-        absent = meta_ops({"kind": "workflow.chat"}, "llm_autopatch", {"x": 1})
-        assert [o["path"] for o in absent] == ["/meta", "/meta/llm_autopatch"]
+        assert [o["path"] for o in meta_ops("llm_autopatch", {"x": 1})] == [
+            "/meta/llm_autopatch"
+        ]
 
-        present = meta_ops(
+    def test_a_meta_that_appeared_since_the_proposal_survives(self):
+        """The witness that made the first repair wrong.
+
+        The patch is written against an artifact with no `meta` and applied
+        after something else has put one there. The parent-creating version
+        carried `add /meta {}` and wiped it; the leaf op adds its own key and
+        leaves the rest alone.
+        """
+        from liminallm.service.json_patch import meta_ops
+
+        proposed = meta_ops("llm_autopatch", {"x": 1})
+        later = {"kind": "workflow.chat", "meta": {"landed_in_between": "KEEP"}}
+        out = json_patch.apply_ops(later, proposed)
+        assert out["meta"] == {"landed_in_between": "KEEP", "llm_autopatch": {"x": 1}}
+
+    def test_an_existing_meta_keeps_its_other_members(self):
+        from liminallm.service.json_patch import meta_ops
+
+        out = json_patch.apply_ops(
             {"kind": "workflow.chat", "meta": {"keep": "ME"}},
-            "llm_autopatch", {"x": 1},
+            meta_ops("auto_prune", {"x": 1}),
         )
-        assert [o["path"] for o in present] == ["/meta/llm_autopatch"]
+        assert out["meta"] == {"keep": "ME", "auto_prune": {"x": 1}}
 
-    def test_the_generated_ops_apply_to_an_artifact_with_no_meta(self):
+    def test_a_bare_artifact_refuses_the_patch_rather_than_mangling_it(self):
+        """What the leaf op gives up, held in place deliberately.
+
+        An artifact with no `meta` refuses this patch. That is a visible dead
+        end rather than silent damage, and it is the better half of the trade:
+        closing it properly means version-gating stored patches or moving
+        these annotations out of the schema document.
+        """
         from liminallm.service.json_patch import meta_ops
 
         schema = {"kind": "workflow.chat", "nodes": []}
-        out = json_patch.apply_ops(schema, meta_ops(schema, "auto_prune", {"x": 1}))
-        assert out["meta"] == {"auto_prune": {"x": 1}}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_ops(schema, meta_ops("auto_prune", {"x": 1}))
+        assert schema == {"kind": "workflow.chat", "nodes": []}
 
-    def test_an_existing_meta_survives_the_generated_ops(self):
-        """The control that rules out the naive repair."""
-        from liminallm.service.json_patch import meta_ops
-
-        schema = {"kind": "workflow.chat", "meta": {"keep": "ME"}}
-        out = json_patch.apply_ops(schema, meta_ops(schema, "auto_prune", {"x": 1}))
-        assert out["meta"] == {"keep": "ME", "auto_prune": {"x": 1}}
-
-    def test_the_configops_fallback_patch_applies_to_a_bare_artifact(
+    def test_the_configops_fallback_is_the_same_single_op(
         self, client, admin_headers
     ):
-        """Through propose, approve and apply, with the LLM failing so the
-        fallback is what gets stored."""
-        artifact = _published(client, admin_headers)
+        """Through the real producer, with the model failing so the fallback
+        is what gets stored — and applied against an artifact that has a
+        `meta`, which is the case the fallback can actually serve."""
+        artifact = _published(client, admin_headers, extra={"meta": {"keep": "ME"}})
         runtime = get_runtime()
-        assert "meta" not in _schema(artifact), "fixture must start without meta"
-
-        # Make the model fail rather than stubbing `_run_llm_for_patch`: the
-        # threading of the artifact into the fallback is the thing under test,
-        # so the real path has to run.
         ops = runtime.config_ops
         original = ops.llm.generate
 
@@ -828,13 +849,17 @@ class TestThePatchProducersEmitApplicablePatches:
         finally:
             ops.llm.generate = original
 
+        assert [o["path"] for o in audit.patch["ops"]] == ["/meta/llm_autopatch"]
+
         client.post(f"/v1/config/patches/{audit.id}/decide",
                     headers=admin_headers, json={"decision": "approve"})
         applied = client.post(f"/v1/config/patches/{audit.id}/apply",
                               headers=admin_headers, json={})
 
         assert applied.status_code == 200, applied.text
-        assert "llm_autopatch" in _schema(artifact).get("meta", {})
+        meta = _schema(artifact)["meta"]
+        assert "llm_autopatch" in meta
+        assert meta["keep"] == "ME", "the proposal clobbered an existing meta"
 
 
 class TestArtifactPatchInheritsIt:

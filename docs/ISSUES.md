@@ -14447,20 +14447,46 @@ The engine is not what was wrong. A patch names a location in a document that
 already exists; the producers were relying on the creating walk. Both hold
 the artifact already, so both can emit ops that fit it.
 
-**The naive repair is worse than the defect.** Unconditionally prepending
-`add /meta {}` looks like the obvious fix and destroys data: `add` on a member
-that is already present replaces it, so any artifact whose `meta` held
-anything would lose it. `meta_ops` adds `/meta` only when it is genuinely
-absent, and leaves a `meta` that is present but not an object for the engine
-to refuse rather than silently overwriting it. The two mutations are
-complements — always adding it kills the surviving-`meta` witness, never
-adding it kills the bare-artifact ones — so neither behaviour can drift back
-in unnoticed.
+**The first repair was wrong, and the same reviewer caught it.** It inspected
+the artifact and prepended `add /meta {}` when `meta` was missing, so a
+proposal against a bare artifact would apply. ConfigOps stores a patch and
+applies it later, and `add` on a member that is already present replaces it —
+so anything that put a `meta` there in between (another pending patch, a
+direct edit, the second producer on the same artifact) was silently wiped.
+Measured: a patch proposed against a bare artifact, applied after
+`{"landed_in_between": "MUST SURVIVE"}` appeared, left `meta` holding only the
+new key. The data loss was not avoided, only deferred across the
+propose/apply gap.
 
-Worth recording as a process point rather than only a defect: this is the
+RFC 6902 has no "add if absent" and no test for absence, so **no
+proposal-time decision about a parent can be made stale-proof.** That leaves
+a trade, and the leaf op wins it everywhere except one case:
+
+| at apply time | parent-creating | leaf only |
+|---|---|---|
+| `meta` absent | applies | refused, nothing changed |
+| `meta` appeared since | **destroys it** | applies, siblings kept |
+
+So `meta_ops` emits one leaf op and never the parent. What that gives up is
+the bare-artifact case, which is now a visible dead end instead of silent
+damage — the better half of the trade, and the same one this project made
+when it refused to repair RAG by making a configured `web_fetch` unreachable.
+
+Closing the dead end properly is larger than the engine and belongs to the
+ConfigOps tranche. Two candidates: version-gate a stored patch so one written
+against a different document is refused rather than misapplied — which
+generalizes past `meta` to *any* stale patch — or move these bookkeeping
+annotations to the `artifact.meta` column that already exists, instead of
+writing them into the schema document that gets kind-validated and served.
+
+Worth recording as process rather than only defect. Two points. This is the
 second time in this campaign that a correct engine-level refusal exposed a
-caller that had been depending on the incorrect behaviour. Grepping for the
-*shape* found the second producer; the report only named the first.
+caller depending on the incorrect behaviour, and grepping for the *shape*
+found the second producer when the report named only the first. And the first
+repair passed its own witnesses, its mutations, and the full lane — what it
+did not have was a witness for the gap between proposing and applying, which
+is the seam a reviewer found by asking when the ops are evaluated rather than
+what they say.
 
 ### Destination errors stopped calling themselves source errors
 
