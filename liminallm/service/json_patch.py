@@ -93,6 +93,27 @@ def _require_pointer(op: Dict[str, Any], member: str, action: str) -> None:
         )
 
 
+def meta_ops(schema: Any, key: str, value: Any) -> List[Dict[str, Any]]:
+    """Ops that write ``value`` at ``/meta/<key>``, fitting the schema given.
+
+    For the patches this system generates for itself. Traversal creates
+    nothing, so a producer that writes under `/meta` has to say so when the
+    artifact has no `meta` yet — otherwise the patch stores, approves, and
+    then fails on apply.
+
+    Adding `/meta` unconditionally would be worse than the refusal it fixes:
+    `add` on a member that is already there replaces it, so an artifact whose
+    `meta` held anything would lose it. Only a genuinely absent `meta` is
+    created, and a `meta` that is present but not an object is left for the
+    engine to refuse rather than silently overwritten.
+    """
+    ops: List[Dict[str, Any]] = []
+    if not isinstance(schema, dict) or "meta" not in schema:
+        ops.append({"op": "add", "path": "/meta", "value": {}})
+    ops.append({"op": "add", "path": f"/meta/{key}", "value": value})
+    return ops
+
+
 def validate_ops(ops: Any) -> Any:
     """Check a whole patch's shape, and refuse one that names no operation.
 

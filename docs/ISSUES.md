@@ -14432,6 +14432,36 @@ Through the route the rest is worse than a refusal would be:
 `/nodes/01/tool` returned 200 and rewrote the **second** node's tool, so an
 operator's typo silently edited a different node than the one they named.
 
+### The fix broke two of this system's own patch producers
+
+Found by Bugbot on the pull request, confirmed by execution, and the only
+defect in this tranche that the tranche itself caused.
+
+Two producers write a single key under `/meta` — `config_ops._fallback_patch`
+and the adapter auto-prune proposer in `training.py`. A freshly created
+artifact has no `meta` in its schema, and traversal no longer invents one, so
+both emitted a patch that stored `pending`, approved cleanly, and then failed
+on apply with "patch path not found". A dead end that did not exist before.
+
+The engine is not what was wrong. A patch names a location in a document that
+already exists; the producers were relying on the creating walk. Both hold
+the artifact already, so both can emit ops that fit it.
+
+**The naive repair is worse than the defect.** Unconditionally prepending
+`add /meta {}` looks like the obvious fix and destroys data: `add` on a member
+that is already present replaces it, so any artifact whose `meta` held
+anything would lose it. `meta_ops` adds `/meta` only when it is genuinely
+absent, and leaves a `meta` that is present but not an object for the engine
+to refuse rather than silently overwriting it. The two mutations are
+complements — always adding it kills the surviving-`meta` witness, never
+adding it kills the bare-artifact ones — so neither behaviour can drift back
+in unnoticed.
+
+Worth recording as a process point rather than only a defect: this is the
+second time in this campaign that a correct engine-level refusal exposed a
+caller that had been depending on the incorrect behaviour. Grepping for the
+*shape* found the second producer; the report only named the first.
+
 ### Destination errors stopped calling themselves source errors
 
 `_read_index` is reached from four callers and only one of them reads a

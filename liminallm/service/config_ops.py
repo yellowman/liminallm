@@ -42,7 +42,7 @@ class ConfigOpsService:
                 "artifact not found", detail={"artifact_id": artifact_id}
             )
         prompt = self._build_prompt(artifact, goal)
-        patch = self._run_llm_for_patch(prompt)
+        patch = self._run_llm_for_patch(prompt, artifact)
         proposer = "user" if user_id else "system_llm"
         return self.store.record_config_patch(
             artifact_id=artifact_id,
@@ -147,7 +147,9 @@ class ConfigOpsService:
             "Respond with only a JSON-patch style object."
         )
 
-    def _run_llm_for_patch(self, prompt: str) -> dict:
+    def _run_llm_for_patch(
+        self, prompt: str, artifact: Optional[Artifact] = None
+    ) -> dict:
         try:
             response = self.llm.generate(prompt, adapters=[], context_snippets=[])
             content = response.get("content", "{}")
@@ -156,7 +158,7 @@ class ConfigOpsService:
                 return parsed
         except Exception as exc:
             logger.warning("config_patch_llm_error", error=str(exc))
-        return self._fallback_patch()
+        return self._fallback_patch(artifact)
 
     def _safe_truncate_json(self, obj: dict, max_chars: int) -> str:
         """Truncate JSON while maintaining valid syntax by removing trailing keys."""
@@ -180,19 +182,24 @@ class ConfigOpsService:
             return json.dumps(truncated, indent=None, separators=(",", ":"))
         return full_json[: max_chars - 3] + "..."
 
-    def _fallback_patch(self) -> dict:
+    def _fallback_patch(self, artifact: Optional[Artifact] = None) -> dict:
+        """The patch proposed when the model does not produce one.
+
+        Takes the artifact because the ops depend on it: traversal creates
+        nothing, so writing under `/meta` has to add `/meta` when the artifact
+        has none, and must not when it has one.
+        """
         timestamp = datetime.now(timezone.utc).isoformat()
+        schema = artifact.schema if artifact is not None else None
         return {
-            "ops": [
+            "ops": json_patch.meta_ops(
+                schema,
+                "llm_autopatch",
                 {
-                    "op": "add",
-                    "path": "/meta/llm_autopatch",
-                    "value": {
-                        "generated_at": timestamp,
-                        "note": "Auto-tuned routing weights",
-                    },
-                }
-            ]
+                    "generated_at": timestamp,
+                    "note": "Auto-tuned routing weights",
+                },
+            )
         }
 
     def _apply_patch_to_schema(self, schema: dict, patch: dict) -> dict:

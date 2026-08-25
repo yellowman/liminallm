@@ -12,7 +12,7 @@ from typing import Any, Iterable, Iterator, List, Optional, Sequence
 
 from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.logging import get_logger
-from liminallm.service import local_format, transformer
+from liminallm.service import json_patch, local_format, transformer
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import adapter_root, safe_join
 from liminallm.service.tokenizer_utils import (
@@ -888,20 +888,21 @@ class TrainingService:
                 and state.success_score < self.ADAPTER_PRUNE_MAX_SUCCESS
                 and (not last_used or last_used < stale_cutoff)
             ):
+                # Ops depend on the artifact: traversal creates nothing, so
+                # `/meta` has to be added when this adapter has none and left
+                # alone when it has one.
                 patch = {
-                    "ops": [
+                    "ops": json_patch.meta_ops(
+                        artifact.schema,
+                        "auto_prune",
                         {
-                            "op": "add",
-                            "path": "/meta/auto_prune",
-                            "value": {
-                                "recommended": True,
-                                "reason": "low_usage_and_success_score",
-                                "usage_count": state.usage_count,
-                                "success_score": state.success_score,
-                                "last_used_at": last_used.isoformat() if last_used else None,
-                            },
-                        }
-                    ]
+                            "recommended": True,
+                            "reason": "low_usage_and_success_score",
+                            "usage_count": state.usage_count,
+                            "success_score": state.success_score,
+                            "last_used_at": last_used.isoformat() if last_used else None,
+                        },
+                    )
                 }
                 try:
                     self.store.record_config_patch(

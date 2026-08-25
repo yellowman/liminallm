@@ -809,21 +809,24 @@ class TestThePatchProducersEmitApplicablePatches:
     ):
         """Through propose, approve and apply, with the LLM failing so the
         fallback is what gets stored."""
-        from liminallm.api.runtime import get_runtime
-
         artifact = _published(client, admin_headers)
         runtime = get_runtime()
         assert "meta" not in _schema(artifact), "fixture must start without meta"
 
+        # Make the model fail rather than stubbing `_run_llm_for_patch`: the
+        # threading of the artifact into the fallback is the thing under test,
+        # so the real path has to run.
         ops = runtime.config_ops
-        original = ops._run_llm_for_patch
-        ops._run_llm_for_patch = lambda prompt: ops._fallback_patch(
-            runtime.store.get_artifact(artifact)
-        )
+        original = ops.llm.generate
+
+        def _fails(*args, **kwargs):
+            raise RuntimeError("no model")
+
+        ops.llm.generate = _fails
         try:
             audit = ops.auto_generate_patch(artifact, None, goal="probe")
         finally:
-            ops._run_llm_for_patch = original
+            ops.llm.generate = original
 
         client.post(f"/v1/config/patches/{audit.id}/decide",
                     headers=admin_headers, json={"decision": "approve"})
