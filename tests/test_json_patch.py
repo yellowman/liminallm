@@ -20,7 +20,13 @@ from liminallm.service.errors import BadRequestError
 
 
 def test_add_and_replace_set_dict_keys():
-    out = json_patch.apply_ops({}, [
+    """Both verbs need the parent to be there; `add` may name a new member.
+
+    This used to start from `{}` and let `add /a/b` invent `/a`. Traversal no
+    longer manufactures containers (tests/test_patch_write_locations.py), so
+    the parent is given rather than conjured.
+    """
+    out = json_patch.apply_ops({"a": {}}, [
         {"op": "add", "path": "/a/b", "value": 1},
         {"op": "replace", "path": "/a/b", "value": 2},
     ])
@@ -43,9 +49,15 @@ def test_dash_appends():
     assert out["xs"] == [1, 2]
 
 
-def test_remove_tolerates_a_missing_key():
-    out = json_patch.apply_ops({"a": 1}, [{"op": "remove", "path": "/ghost"}])
-    assert out == {"a": 1}
+def test_remove_refuses_a_missing_key():
+    """RFC 6902 §4.2: the target location must exist.
+
+    Tolerating absence made a removal that addressed the wrong path
+    indistinguishable from one that did its job, which is the same silent
+    success `replace` had.
+    """
+    with pytest.raises(BadRequestError):
+        json_patch.apply_ops({"a": 1}, [{"op": "remove", "path": "/ghost"}])
 
 
 def test_remove_does_not_create_the_containers_it_removes_from():
@@ -53,18 +65,22 @@ def test_remove_does_not_create_the_containers_it_removes_from():
 
     remove /a/b on {} used to return {"a": {}} — so every model-authored
     patch that dropped an optional nested key quietly wrote an empty object
-    into the config or artifact schema it was editing.
+    into the config or artifact schema it was editing. Removing a missing
+    target is now refused outright, and the refusal must still leave nothing
+    behind: the original complaint was about the walk, not the verdict.
     """
-    assert json_patch.apply_ops({}, [{"op": "remove", "path": "/a/b"}]) == {}
-    assert json_patch.apply_ops(
-        {"keep": 1}, [{"op": "remove", "path": "/a/b/c/d"}]
-    ) == {"keep": 1}
+    doc = {"keep": 1}
+    for path in ("/a/b", "/a/b/c/d"):
+        with pytest.raises(BadRequestError):
+            json_patch.apply_ops(doc, [{"op": "remove", "path": path}])
+    assert doc == {"keep": 1}
 
 
 def test_remove_through_a_missing_list_index_creates_nothing():
-    assert json_patch.apply_ops(
-        {"xs": []}, [{"op": "remove", "path": "/xs/3/name"}]
-    ) == {"xs": []}
+    doc = {"xs": []}
+    with pytest.raises(BadRequestError):
+        json_patch.apply_ops(doc, [{"op": "remove", "path": "/xs/3/name"}])
+    assert doc == {"xs": []}
 
 
 def test_move_takes_the_value_with_it():
