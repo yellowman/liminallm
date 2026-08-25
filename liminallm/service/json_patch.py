@@ -12,13 +12,87 @@ routine arrivals, and the reviewer must be told which path is wrong.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any, Dict, Iterable, List
 
 from liminallm.service.errors import BadRequestError
 
+# RFC 6902 §4: every operation carries `op` and `path`; each verb names the
+# further members it needs. `remove` needs none.
+_OPERANDS: Dict[str, tuple] = {
+    "add": ("value",),
+    "replace": ("value",),
+    "test": ("value",),
+    "move": ("from",),
+    "copy": ("from",),
+    "remove": (),
+}
+
+# RFC 6901 §4 array index: `0`, or a non-zero digit followed by digits. ASCII,
+# and no leading zeros. `str.isdigit()` accepted `01`, `007`, `١` and `０` as
+# ordinary indices, so several spellings named one position — and `²`, which
+# satisfies `isdigit()` but not `int()`, left as an uncaught ValueError.
+_INDEX = re.compile(r"^(?:0|[1-9][0-9]*)$")
+_NEGATIVE_INDEX = re.compile(r"^-(?:0|[1-9][0-9]*)$")
+
+
+def validate_op(op: Any) -> None:
+    """Refuse an operation whose required members are absent.
+
+    The engine is the last boundary rather than the only one: request models
+    call this too, so the API can refuse a malformed patch before it reaches
+    a store, without either side keeping its own copy of the rule.
+
+    Absence is the question, never truthiness — `value: null` is a legal
+    operand, and reading it as "no value" is how `{"op": "replace",
+    "path": "/k"}` came to write `None` over a value nobody asked to change.
+    """
+    if not isinstance(op, dict):
+        raise BadRequestError(
+            "patch operation is not an object",
+            detail={"found": type(op).__name__},
+        )
+    action = op.get("op")
+    if not action or not isinstance(action, str):
+        raise BadRequestError("patch operation is missing its op", detail={"op": op})
+    if action not in _OPERANDS:
+        raise BadRequestError("unknown patch operation", detail={"op": action})
+    if "path" not in op:
+        raise BadRequestError(
+            "patch operation is missing its path", detail={"op": action}
+        )
+    for member in _OPERANDS[action]:
+        if member not in op:
+            raise BadRequestError(
+                f"patch operation is missing its {member}",
+                detail={"op": action, "path": op.get("path")},
+            )
+
+
+def validate_ops(ops: Any) -> Any:
+    """Check a whole patch's shape, and refuse one that names no operation.
+
+    An empty list is well-formed JSON and still a request that changes
+    nothing. Accepting it produced the same dishonest audit entry a
+    half-formed op did, one level up: the artifact route guarded the engine
+    behind ``if ops:`` and went straight to writing a version, and ConfigOps
+    looped zero times and marked the patch applied.
+    """
+    if not isinstance(ops, list):
+        raise BadRequestError(
+            "patch is not a list of operations",
+            detail={"found": type(ops).__name__},
+        )
+    if not ops:
+        raise BadRequestError("patch names no operation", detail={"operations": 0})
+    for op in ops:
+        validate_op(op)
+    return ops
+
 
 def apply_ops(doc: dict, ops: List[Dict[str, Any]]) -> dict:
     """Apply a list of RFC 6902 operations to a copy of ``doc``."""
+    validate_ops(ops)
     working = copy.deepcopy(doc)
     for op in ops:
         apply_op(working, op)
@@ -186,19 +260,21 @@ def _read_index(seg: str, path: str) -> int:
     described `replace /xs/nope` as a problem with an operand it does not
     have.
     """
-    if not seg.isdigit():
-        # A negative index says something specific about the patch's author,
-        # so it keeps its own message: Python would happily serve `/xs/-1`
-        # from the end, and "not found" would send the reader looking for a
-        # missing element rather than at the index they wrote.
-        if seg.lstrip("-").isdigit():
-            raise BadRequestError(
-                "negative list index", detail={"path": path, "index": int(seg)}
-            )
+    if _INDEX.match(seg):
+        return int(seg)
+    # A negative index says something specific about the patch's author, so it
+    # keeps its own message: Python would happily serve `/xs/-1` from the end,
+    # and "not found" would send the reader looking for a missing element
+    # rather than at the index they wrote. Matched strictly for the same
+    # reason as the positive form — `"-²".lstrip("-").isdigit()` was true and
+    # `int("-²")` was not.
+    if _NEGATIVE_INDEX.match(seg):
         raise BadRequestError(
-            "list index is not a number", detail={"path": path, "at": seg}
+            "negative list index", detail={"path": path, "index": int(seg)}
         )
-    return int(seg)
+    raise BadRequestError(
+        "list index is not a number", detail={"path": path, "at": seg}
+    )
 
 
 def _read(doc: Any, segments: List[str], path: str) -> Any:
@@ -286,17 +362,10 @@ def _set_at(parent: Any, key: str, value: Any, path: str, *, insert: bool) -> No
 
 def apply_op(doc: dict, op: Dict[str, Any]) -> None:
     """Apply one operation to ``doc`` in place."""
-    op = op or {}
-    action = op.get("op")
-    value = op.get("value")
-    # An op with no `path` key is structurally incomplete and is skipped, as
-    # it always has been. An op that *says* `path: ""` is a different thing:
-    # it names the whole document, and `_segments_or_raise` refuses it out
-    # loud. Collapsing the two is how the whole-document pointer came to be
-    # ignored in silence.
-    if not action or "path" not in op:
-        return
+    validate_op(op)
+    action = op["op"]
     path = op["path"]
+    value = op.get("value")
 
     segments = _segments_or_raise(path)
     key = segments[-1]
@@ -319,14 +388,10 @@ def apply_op(doc: dict, op: Dict[str, Any]) -> None:
             parent.pop(key)
 
     elif action in ("move", "copy"):
-        # Defaulting a missing `from` to "" sent it through the tokenizer and
-        # reported a verb with no source as a patch that "addresses the whole
-        # document" — a true sentence about the wrong operand.
-        if "from" not in op:
-            raise BadRequestError(
-                "patch operation requires a from path",
-                detail={"op": action, "path": path},
-            )
+        # Present because `validate_op` required it. Defaulting it to "" used
+        # to send a verb with no source through the tokenizer, which reported
+        # it as a patch that "addresses the whole document" — a true sentence
+        # about an operand the caller never wrote.
         from_path = op["from"]
         from_segments = _segments_or_raise(from_path)
         if action == "copy":

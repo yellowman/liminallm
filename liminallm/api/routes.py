@@ -3409,9 +3409,9 @@ async def patch_artifact(
 
     if "ops" in normalized:
         # RFC 6902 JSON Patch operations
-        ops = normalized["ops"]
-        if ops:
-            new_schema = json_patch.apply_ops(new_schema, ops)
+        # No `if ops:` guard: a falsy list used to skip the engine and go
+        # straight to writing a version for a patch that named nothing.
+        new_schema = json_patch.apply_ops(new_schema, normalized["ops"])
     elif "schema_update" in normalized:
         # Legacy schema update - deep merge
         new_schema = json_patch.deep_merge(new_schema, normalized["schema_update"])

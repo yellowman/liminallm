@@ -217,10 +217,16 @@ def test_an_empty_patch_changes_nothing(ops):
 
 
 @pytest.mark.parametrize(
-    "op", [{}, {"op": "add"}, {"path": "/a"}, {"op": "", "path": ""}]
+    "op", [{}, {"op": "add"}, {"path": "/a"}, {"op": "", "path": ""},
+           {"op": "replace", "path": "/a"}, {"op": "move", "path": "/b"}],
+    ids=["empty", "no-path", "no-op", "empty-op", "no-value", "no-from"],
 )
-def test_an_op_missing_its_parts_is_skipped(ops, op):
-    assert ops._apply_patch_to_schema({"a": 1}, {"ops": [op]}) == {"a": 1}
+def test_an_op_missing_its_parts_is_refused(ops, op):
+    """Was `..._is_skipped`, and asserted that each of these left the schema
+    alone. Silently, which is the problem: a patch made of nothing but these
+    was still marked applied."""
+    with pytest.raises(BadRequestError):
+        ops._apply_patch_to_schema({"a": 1}, {"ops": [op]})
 
 
 # ---------------------------------------------------------------------------

@@ -14319,6 +14319,73 @@ While fixing that, `move`/`copy` with no `from` turned out to default the same
 way and report "addresses the whole document" — a true sentence about an
 operand the caller never wrote. It now says which operand is missing.
 
+### An operation was trusted to carry its own operands
+
+One level up from the pointer, same shape. RFC 6902 §4 gives every operation
+`op` and `path`, and each verb the further members it needs. None of it was
+required:
+
+```
+{"op":"replace","path":"/k"}     wrote {"k": None}
+{"op":"add","path":"/new"}       wrote {"new": None}
+{"op":"replace","value":"X"}     skipped in silence
+{}                               skipped in silence
+```
+
+The first does not no-op — it destroys the value on behalf of an operand
+nobody supplied. The silent skips are worse than they look through the
+private-artifact PATCH route: the route carries on into
+`update_private_artifact`, so a patch made entirely of skipped operations
+returned 200 and wrote a new version. Measured on the red: version 1 to 2,
+schema unchanged. An audit entry asserting a change that did not happen —
+the same consequence this tranche opened with.
+
+The rule lives in `validate_op`, and the artifact request model calls it
+rather than keeping a copy. The engine remains the boundary every caller
+crosses; the model checks earlier so the route can refuse before it has
+decided to write anything.
+
+`value: null` is a legal operand, so the question is always whether the
+member is *present*. There is a control for that, and one for `remove` being
+complete with two members, so the fix cannot drift into "reject falsy
+values" or "require three members from everything".
+
+**A test asserted the opposite, and its stated reason was untrue.**
+`test_an_op_without_action_or_path_is_ignored` justified the silence with
+"both callers validated shape upstream and relied on this".
+`ArtifactPatchRequest` did not: it took `List[dict]` and checked nothing. The
+comment is what made the behaviour look deliberate for as long as it did.
+
+**A third instance, found by grepping the class rather than the instance.** An
+empty operation list is well-formed JSON and still names no change, and both
+callers accepted it and wrote a version: the route guarded the engine behind
+`if ops:` and went straight to the store — measured, `{"patch": []}` returned
+200 and took the artifact from version 1 to 2 — while ConfigOps looped zero
+times and marked the patch applied. `validate_ops` refuses it, and the route's
+guard is gone so no patch reaches the store without meeting a rule.
+
+### An array index was whatever `str.isdigit()` allowed
+
+RFC 6901 §4 says `0` or a non-zero digit run, ASCII. `seg.isdigit()` is a much
+larger set, so several distinct spellings named one position:
+
+```
+/xs/01   -> index 1        leading zeros
+/xs/١    -> index 1        arabic-indic
+/xs/０    -> index 0        fullwidth
+/xs/²    -> ValueError     isdigit() true, int() refuses
+```
+
+The last is the only case in this tranche that was a 500 rather than a wrong
+write: `isdigit()` admitted it and `int()` then raised through an
+unhandled path. The negative branch had the same pair — `"-²".lstrip("-")`
+`.isdigit()` was true and `int("-²")` was not — so both forms are matched
+strictly now.
+
+Through the route the rest is worse than a refusal would be:
+`/nodes/01/tool` returned 200 and rewrote the **second** node's tool, so an
+operator's typo silently edited a different node than the one they named.
+
 ### Destination errors stopped calling themselves source errors
 
 `_read_index` is reached from four callers and only one of them reads a
@@ -14390,7 +14457,30 @@ and M8 anchored on the `not_a_number=` argument that the diagnostic fix had
 just deleted, so neither applied. They reported it — the driver treats an
 unmatched anchor as loud, which is why that guard exists — and the repaired
 anchors needed disambiguating too, because removing the argument left
-`_require_target` and `_set_at` sharing one call line.
+`_require_target` and `_set_at` sharing one call line. It happened a second
+time later in the tranche, when `validate_op` replaced the code another
+mutation anchored on.
+
+### Two mutations survive on purpose, and one exists to say why
+
+The operand rule has one definition and two enforcement points: the engine,
+which every caller crosses, and the artifact request model, which checks
+earlier so the route can refuse before it decides to write. Either alone is
+sufficient, so removing either alone changes no observable behaviour:
+
+| mutation | result |
+|---|---|
+| the rule itself deleted | kills both empty-patch witnesses |
+| the model's call site removed | **survives** — the engine catches |
+| the route's `if ops:` guard restored | **survives** — the model catches |
+| both call sites removed, rule intact | kills the route witness, and only that |
+
+The two survivors are the signature of the layering rather than unmeasured
+code: the rule is measured, and what is deliberately not necessary is *which*
+call site does the work. The fourth mutation exists so that claim is
+demonstrated instead of asserted. If the second layer is not wanted, the model
+call site is the piece to delete, and the third row is what would then start
+failing.
 
 Two cover `move`, and the pair is the point. M5 restores the half-fix (check
 the destination, but before the removal) and kills **only** the two new

@@ -300,10 +300,11 @@ class TestAPointerNamesTheKeyItSpells:
 
         A missing `from` used to default to "", go through the tokenizer, and
         come back as "addresses the whole document" — a true sentence about
-        an operand the caller never wrote.
+        an operand the caller never wrote. It is now one entry in the operand
+        table rather than a special case here.
         """
         doc = {"k": 1}
-        with pytest.raises(BadRequestError, match="from path"):
+        with pytest.raises(BadRequestError, match="from"):
             json_patch.apply_op(doc, {"op": "move", "path": "/b"})
         assert doc == {"k": 1}
 
@@ -376,6 +377,23 @@ class TestAnOperationCarriesItsOperands:
         with pytest.raises(BadRequestError):
             json_patch.apply_op(doc, {})
         assert doc == {"k": 1}
+
+    def test_a_patch_that_names_no_operation_is_refused(self):
+        """The same defect one level up, found by grepping the class.
+
+        An empty list is well-formed JSON and still names no change. Both
+        callers accepted it and wrote a version anyway: the artifact route
+        guarded `apply_ops` behind `if ops:` and went straight to the store —
+        measured, `{"patch": []}` returned 200 and took the artifact from
+        version 1 to 2 — and ConfigOps looped zero times and marked the patch
+        applied.
+        """
+        with pytest.raises(BadRequestError, match="no operation"):
+            json_patch.apply_ops({"a": 1}, [])
+
+    def test_a_patch_that_is_not_a_list_is_refused(self):
+        with pytest.raises(BadRequestError):
+            json_patch.apply_ops({"a": 1}, {"op": "remove", "path": "/a"})
 
     def test_a_remove_needs_no_further_operand(self):
         """The control for the operand table: `remove` is complete with
@@ -684,6 +702,21 @@ class TestArtifactPatchInheritsIt:
 
         assert resp.status_code == 400, resp.text
         assert _schema(artifact) == before, "the artifact changed anyway"
+        assert _versions(artifact) == before_versions, "a version was written"
+
+    def test_a_patch_with_no_operations_does_not_write_a_version(
+        self, client, admin_headers
+    ):
+        """`if ops:` skipped the engine entirely, so an empty patch never met
+        a rule — it went straight to the store and got a version."""
+        artifact = _private(client, admin_headers)
+        before, before_versions = _schema(artifact), _versions(artifact)
+
+        resp = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers,
+                            json={"patch": []})
+
+        assert resp.status_code == 400, resp.text
+        assert _schema(artifact) == before
         assert _versions(artifact) == before_versions, "a version was written"
 
     def test_a_leading_zero_index_does_not_reach_a_node(self, client, admin_headers):

@@ -142,10 +142,21 @@ def test_a_malformed_op_names_its_problem(op, match):
         json_patch.apply_ops(doc, [op])
 
 
-def test_an_op_without_action_or_path_is_ignored():
-    """Half-formed entries are dropped rather than guessed at — both callers
-    validated shape upstream and relied on this."""
-    assert json_patch.apply_ops({"a": 1}, [{}, {"op": "add"}, {"path": "/x"}]) == {"a": 1}
+@pytest.mark.parametrize(
+    "op", [{}, {"op": "add"}, {"path": "/x"}, {"op": "replace", "path": "/a"}],
+    ids=["empty", "no-path", "no-op", "no-value"],
+)
+def test_a_half_formed_op_is_refused(op):
+    """This used to assert the opposite, on a premise that was not true.
+
+    Its reason was that "both callers validated shape upstream and relied on
+    this". `ArtifactPatchRequest` did not — it took `List[dict]` and checked
+    nothing — so the artifact route applied a no-op patch and wrote a version
+    for it. SPEC promises JSON Patch, which does not include quietly
+    discarding operations that are not JSON Patch.
+    """
+    with pytest.raises(BadRequestError):
+        json_patch.apply_ops({"a": 1}, [op])
 
 
 # ---------------------------------------------------------------------------

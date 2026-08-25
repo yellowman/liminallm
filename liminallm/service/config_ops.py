@@ -201,6 +201,10 @@ class ConfigOpsService:
         working = copy.deepcopy(schema)
         ops = patch.get("ops") if isinstance(patch, dict) else None
         if isinstance(ops, list):
+            # This loops apply_op rather than apply_ops, so the whole-patch
+            # rule has to be asked for explicitly or an empty `ops` reaches
+            # the store as a patch marked applied.
+            json_patch.validate_ops(ops)
             for op in ops:
                 self._apply_single_op(working, op)
             return working
