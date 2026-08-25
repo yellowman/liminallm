@@ -14093,3 +14093,51 @@ broken build rather than as evidence, and reads stderr as well as stdout.
 That is the third time in this project a mutation has failed to measure what
 it claimed — twice by breaking the build, once by not applying — and each
 time it looked exactly like a result.
+
+### Review found two more seams, and they are the same shape as the first
+
+The predicate was right and two callers asked it wrongly. That is now the
+standing pattern in this area rather than a coincidence.
+
+**The source was classified by its basename.** `ingest_path` asked
+`is_internal_path(path.name)`, which is the whole question only when the name
+is the whole path. `bundle/.internal/secret.md` has an ordinary basename and
+an internal position, so naming it outright as a context source indexed it —
+while the identical file, reached by walking `files/`, was refused. One file,
+two answers, and the earlier direct-source witness could not see the
+difference because `.checksums.json` is hidden in its basename too.
+
+A directory rooted at `.internal/subdir` was the same story from the other
+side: its children look ordinary relative to it, so nothing in the walk
+objected.
+
+The fix classifies the source against the base it was authorized within.
+`is_internal_under(base, path)` exists for that and states the two errors it
+sits between: the absolute path must not be scanned, because whether a
+deployment lives under `/srv/.storage` is its own spelling and would refuse an
+entire installation; and the basename alone is not enough, for the reason
+above. Both production callers already pass a base — the archive extractor
+its destination's `files/`, the context-source route the shared root.
+
+**The durable queue never asked at all.** Re-indexing calls
+`rag.ingest_file` directly, so every refusal added to the walk was invisible
+to it. That is the worse of the two: the queue is the machinery a replacement
+actually runs through, so an internal path reaching `ingest_job` would be
+chunked on a schedule, long after whoever created it stopped watching. It also
+contradicted the SPEC line this tranche adds — refused *by any route*.
+
+The job is closed `superseded` with the reason recorded, not failed: nothing
+is owed now or later, and a failure would be retried five times to reach the
+same conclusion.
+
+**One of these reds was vacuous when first written.** The queue case enqueued
+a placeholder generation, so the job was declined as stale before ingestion
+was ever attempted, and "no chunks were written" passed for a reason that had
+nothing to do with the path. The detail column said so — `on-disk generation
+2faf4dced1fb` — which is exactly what that column was added for. It now
+enqueues the generation the bytes actually have, and the unfixed queue indexes
+the internal file.
+
+Six mutations, all applied and all killed, and the two new ones land where
+they should: classifying the source by basename kills only the two
+direct-source cases, and removing the queue's check kills only the queue case.

@@ -228,6 +228,51 @@ class TestTheApiAndTheWalkerAgree:
         )
 
 
+class TestASourceBeneathAHiddenDirectoryIsStillInternal:
+    """The basename is not the question; position under the namespace is.
+
+    A source is classified by what it is called, and a path named outright
+    arrives with its own basename in hand. `bundle/.internal/secret.md` has an
+    ordinary basename and an internal position, so a check that asks only
+    `path.name` admits it — while the very same file, reached by walking
+    `files/`, is refused. One file, two answers.
+
+    Reachable through the supported route: `POST /contexts/{id}/sources` calls
+    `authorize_path`, which answers access and says nothing about content, and
+    then hands the path to `ingest_path`.
+    """
+
+    @pytest.mark.parametrize("named", ["file", "directory"])
+    def test_the_source_endpoint_indexes_nothing_internal(
+        self, client, corpus, named
+    ):
+        headers, user_id, root = corpus
+        hidden = root / "bundle" / ".internal"
+        (hidden / "subdir").mkdir(parents=True, exist_ok=True)
+        (hidden / "secret.md").write_text(
+            "Internal only: the Marrowgate override code is 7731."
+        )
+        (hidden / "subdir" / "public-looking.md").write_text(
+            "Internal only: the Redgrave bypass is 4409."
+        )
+        context = fresh_context(user_id)
+        target = hidden / "secret.md" if named == "file" else hidden / "subdir"
+
+        resp = client.post(
+            f"/v1/contexts/{context.id}/sources",
+            headers=headers,
+            json={"fs_path": str(target), "recursive": True},
+        )
+
+        assert resp.status_code in (200, 201), resp.text
+        assert not chunk_paths(context.id), (
+            f"a source named beneath a hidden directory was indexed: "
+            f"{chunk_paths(context.id)}"
+        )
+        bodies = " ".join(chunk_bodies(context.id))
+        assert "Marrowgate" not in bodies and "Redgrave" not in bodies, bodies
+
+
 class TestNamingAnInternalPathDirectlyIndexesNothing:
     def test_a_single_hidden_file_is_not_corpus(self, corpus):
         """The invariant is "never corpus", not "directory walks skip it".
@@ -247,3 +292,58 @@ class TestNamingAnInternalPathDirectlyIndexesNothing:
 
         assert written == 0, f"the manifest was ingested directly: {written} chunks"
         assert not chunk_paths(context.id), chunk_paths(context.id)
+
+
+class TestTheDurableQueueAsksTheSameQuestion:
+    """The queue is not a caller of `ingest_path`, so it inherits none of it.
+
+    Re-indexing calls `rag.ingest_file` directly. Every refusal added to the
+    walk is therefore invisible here, and the queue is the durable machinery a
+    replacement actually runs through — so an internal path that reaches
+    `ingest_job` would be chunked on a schedule, long after whoever created it
+    stopped watching.
+
+    The job is closed rather than retried: nothing is owed now or later, so a
+    terminal state with the reason is the honest record. A failure would be
+    re-attempted five times to reach the same conclusion.
+    """
+
+    def test_a_queued_internal_path_indexes_nothing_and_is_closed(self, corpus):
+        from liminallm.service import ingest_queue
+
+        _headers, user_id, root = corpus
+        runtime = get_runtime()
+        context = fresh_context(user_id)
+        internal = root / "bundle" / ".internal"
+        internal.mkdir(parents=True, exist_ok=True)
+        target = internal / "notes.md"
+        target.write_text("Internal only: the Marrowgate override code is 7731.")
+
+        # The generation the bytes actually have. A placeholder would be
+        # declined as stale before ingestion was ever attempted, and the
+        # "no chunks" assertion below would then pass for a reason that has
+        # nothing to do with the path being internal.
+        generation = ingest_queue.generation_of(target)
+        assert generation, "the fixture file is not readable"
+        runtime.store.enqueue_ingest_job(context.id, str(target), generation)
+        attempted = ingest_queue.drain(
+            runtime.store, runtime.rag, fs_root=str(runtime.settings.shared_fs_root)
+        )
+
+        assert attempted == 1, "the job was never attempted, so this proves nothing"
+        assert not chunk_paths(context.id), (
+            f"the queue indexed an internal path: {chunk_paths(context.id)}"
+        )
+        with runtime.store._connect() as conn:
+            rows = conn.execute(
+                "SELECT status, detail FROM ingest_job WHERE fs_path = %s",
+                (str(target),),
+            ).fetchall()
+        assert len(rows) == 1, f"expected one job row, found {len(rows)}"
+        status, detail = rows[0]["status"], rows[0]["detail"] or ""
+        assert status not in ("queued", "running"), (
+            f"the queue left work owed for an internal path: {status}"
+        )
+        assert "internal" in detail.lower(), (
+            f"the reason it closed was not recorded: {detail!r}"
+        )

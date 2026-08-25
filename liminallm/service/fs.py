@@ -145,6 +145,33 @@ def is_internal_path(relative: str | Path) -> bool:
     return any(part.startswith(".") for part in Path(relative).parts)
 
 
+def is_internal_under(base: str | Path, path: str | Path) -> bool:
+    """Whether an absolute path is bookkeeping within the namespace at `base`.
+
+    `is_internal_path` asks about a relative path. This asks the same question
+    of an absolute one, by first putting it in the frame that gives "internal"
+    a meaning at all.
+
+    The absolute path must not be scanned directly. Whether a deployment lives
+    under `/srv/.storage` is its own spelling and says nothing about anybody's
+    corpus, and reading it that way would refuse an entire installation.
+
+    The basename alone is equally wrong in the other direction, and is the
+    mistake this function exists to prevent: `bundle/.internal/secret.md` has
+    an ordinary basename and an internal position, so a caller asking only
+    `path.name` admits the very file the same caller refuses when it arrives
+    by way of a directory walk. One file, two answers.
+
+    Falls back to the basename when the path lies outside the base, which is
+    the most that can honestly be asked with no frame to measure against.
+    """
+    try:
+        relative = Path(path).resolve().relative_to(Path(base).resolve())
+    except (ValueError, OSError):
+        return is_internal_path(Path(path).name)
+    return is_internal_path(relative)
+
+
 class PathAuthorityError(PermissionError):
     """This caller has nothing that entitles them to this filesystem path."""
 
