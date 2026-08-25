@@ -181,6 +181,44 @@ class TestMoveAndCopyDestinationsFollowAdd:
             json_patch.apply_op(doc, {"op": "move", "from": "/a/x", "path": "/b/x"})
         assert doc == {"a": {"x": 1}}, "the source was taken and never delivered"
 
+    def test_move_into_its_own_child_refuses_without_taking_the_source(self):
+        """RFC 6902 §4.4: `from` must not be a proper prefix of `path`.
+
+        Checking the destination before the removal is not enough, because
+        this destination is only invalid *because of* the removal. `/a` is a
+        perfectly good parent until `/a` is the thing being taken, and then
+        there is nowhere to put it back.
+        """
+        doc = {"a": {"x": 1}}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(doc, {"op": "move", "from": "/a", "path": "/a/child"})
+        assert doc == {"a": {"x": 1}}, "the source was taken and never delivered"
+
+    def test_move_to_an_index_the_removal_invalidates_refuses(self):
+        """The same shape without any prefix relationship.
+
+        `/xs/3` is a legal append target on a three-element list and an
+        out-of-range one on the two-element list the removal leaves behind.
+        RFC 6902 defines `move` as a remove followed by an add, so the
+        destination has to be valid in the document the remove produces.
+        """
+        doc = {"xs": ["a", "b", "c"]}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(doc, {"op": "move", "from": "/xs/0", "path": "/xs/3"})
+        assert doc == {"xs": ["a", "b", "c"]}, "the list was shortened by a failure"
+
+    def test_a_move_within_one_list_still_works(self):
+        """The positive control the two above could otherwise break.
+
+        Moving inside a list is exactly the case where the destination must
+        be judged after the removal rather than before it — index 2 is the
+        end of the shortened list, not of the original.
+        """
+        assert json_patch.apply_ops(
+            {"xs": ["a", "b", "c"]},
+            [{"op": "move", "from": "/xs/0", "path": "/xs/2"}],
+        )["xs"] == ["b", "c", "a"]
+
     def test_a_destination_whose_parent_exists_still_works(self):
         assert apply({"a": {"x": 1}, "b": {}},
                      {"op": "move", "from": "/a/x", "path": "/b/x"}) == {
