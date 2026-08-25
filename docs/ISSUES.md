@@ -14184,6 +14184,10 @@ RFC 6902 already says all of this — §4.1 for `add`'s array bound, §4.2 for
 `remove`, §4.3 for `replace`. What the module had was a single creating walk
 shared by verbs with different requirements.
 
+One helper left with the fix. `_walk_existing` was the non-creating walk that
+`remove` used to avoid conjuring the containers it was about to remove from;
+now that every verb walks without creating, it had no caller left.
+
 ### The positive controls carry as much weight as the refusals
 
 "Reject every absent location" also passes every refusal case and breaks
@@ -14192,31 +14196,64 @@ new member of an existing object, a new member of an existing *nested*
 object, an append at `index == len`, `-`, and an insert that shifts are all
 witnessed, and they are what stops the fix from being a different bug.
 
-### A hazard the fix uncovered
+### A hazard the fix uncovered, and the half-fix it got first
 
-A `move` is a remove and an add. The destination used to be resolved *after*
-the source was taken, so refusing the destination deleted a value on behalf
-of an operation that failed. The destination is now checked first, then
-resolved again after the removal — twice on purpose, because taking the value
-can invalidate the parent found a moment earlier when a value moves within
-one list.
+A `move` is a remove and an add. The destination used to be resolved only
+*after* the source was taken, so refusing the destination deleted a value on
+behalf of an operation that failed.
+
+The first repair checked the destination before the removal. That is not
+enough, and the reason is worth stating precisely: RFC 6902 §4.4 defines the
+add as happening in the document the remove **leaves behind**, and there are
+destinations that are valid before the removal and invalid after it. Two
+shapes, reachable by different mechanisms:
+
+```
+{"a": {"x": 1}}          move /a      -> /a/child     left {}
+{"xs": ["a","b","c"]}    move /xs/0   -> /xs/3        left {"xs": ["b","c"]}
+```
+
+The first is the proper-prefix case the RFC names outright: `/a` is a
+perfectly good parent right up until `/a` is the value being taken. The
+second has no prefix relationship at all — `/xs/3` is a legal append target
+on three elements and out of range on the two that remain. Both raised, and
+both destroyed a value while raising.
+
+`move` now rehearses the entire operation on a deep copy first. Whatever the
+rehearsal raises is raised before the real document has been touched, and if
+it raises nothing the replay cannot fail. `copy` needs none of this: reading
+mutates nothing, so the first thing that can change the document is the write.
+
+Cheaper checks were available and rejected. An explicit proper-prefix test is
+a better diagnostic but misses the array-shrink case entirely; validating
+against the pre-removal document is the half-fix above. The rehearsal is the
+only shape that covers both without enumerating them.
 
 ### Three of my own witnesses were vacuous
 
 `apply_ops` deep-copies before it starts, so asserting that the caller's
 document is unchanged after a failure proves that `copy.deepcopy` works and
 nothing else. The risk lives on `apply_op`, which edits in place. Those three
-now drive the mutating entry point, and one of them — the move case — is the
-only witness mutation M5 kills.
+now drive the mutating entry point.
 
 ### Mutations
 
-Six, all applied and all killed: `replace` back to a creating traversal;
-missing `remove` target back to a no-op; traversal manufacturing parents
-again; an array index past the end appending instead of failing; move/copy
-resolving their destination only after taking the source; and ConfigOps
-swallowing the refusal to apply anyway. The last two kill exactly one witness
-each, which is what says those two witnesses are doing their own work.
+Seven, all applied and all killed. Four cover the write-location rule:
+`replace` back to a creating traversal; a missing `remove` target back to a
+no-op; traversal manufacturing parents again; an array index past the end
+appending instead of failing. One covers the consumer — ConfigOps swallowing
+the refusal and applying anyway — and kills exactly one witness.
+
+Two cover `move`, and the pair is the point. M5 restores the half-fix (check
+the destination, but before the removal) and kills **only** the two new
+witnesses; M5b removes the destination check entirely and kills those two plus
+the older one. That difference is what says the two new witnesses measure
+something the shipped preflight did not.
+
+The two new witnesses also come apart under the other mutations, which is how
+we know they are testing different mechanisms rather than one bug twice:
+removing the array bound (M4) kills the index witness alone, and restoring the
+creating traversal (M3) kills the self-descendant witness alone.
 
 ### An error message got better, and two tests said so
 

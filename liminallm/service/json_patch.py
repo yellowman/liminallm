@@ -137,33 +137,6 @@ def _require_target(parent: Any, key: str, path: str) -> None:
         raise _missing(path, [key])
 
 
-def _walk_existing(doc: Any, segments: List[str], path: str) -> Any:
-    """Walk to the parent of the last segment, creating nothing.
-
-    Returns None when the parent is not there. ``remove`` needs this: walking
-    with ``_walk_create`` would conjure the very containers it is about to
-    remove from, so ``remove /a/b`` on ``{}`` left ``{"a": {}}`` behind. A
-    removal that finds nothing has nothing to do — but it must also leave
-    nothing behind.
-    """
-    parent = doc
-    for depth, seg in enumerate(segments[:-1]):
-        if isinstance(parent, list):
-            idx = _read_index(seg, path)
-            if not 0 <= idx < len(parent):
-                return None
-            parent = parent[idx]
-        elif isinstance(parent, dict):
-            if seg not in parent:
-                return None
-            parent = parent[seg]
-        else:
-            raise _non_container(path, segments[: depth + 1], parent)
-    if not isinstance(parent, (dict, list)):
-        raise _non_container(path, segments[:-1], parent)
-    return parent
-
-
 def _read_index(seg: str, path: str) -> int:
     """RFC 6902 array indices are non-negative digit runs. Python's list[-1]
     would otherwise quietly serve `/xs/-1` on the read paths (move/copy/test)
@@ -293,19 +266,29 @@ def apply_op(doc: dict, op: Dict[str, Any]) -> None:
     elif action in ("move", "copy"):
         from_path = op.get("from", "")
         from_segments = _segments_or_raise(from_path)
-        # The destination is checked before the source is taken. A move is a
-        # remove and an add, and refusing the add after the remove has already
-        # happened deletes a value on behalf of an operation that failed.
-        _walk_parent(doc, segments, path)
-        if action == "move":
-            moved = _remove_at(doc, from_segments, from_path)
+        if action == "copy":
+            # Reading mutates nothing, so the first thing that can change the
+            # document is the write, and a refused write leaves it alone.
+            value = copy.deepcopy(_read(doc, from_segments, from_path))
+            _set_at(_walk_parent(doc, segments, path), key, value, path, insert=True)
         else:
-            moved = copy.deepcopy(_read(doc, from_segments, from_path))
-        # Resolved again rather than reused: the removal above can invalidate
-        # the parent found a moment ago, when the value is moving out of the
-        # same list it is moving into.
-        parent = _walk_parent(doc, segments, path)
-        _set_at(parent, key, moved, path, insert=True)
+            # RFC 6902 §4.4: a move is a remove followed by an add, so the add
+            # has to be legal in the document the remove *leaves behind*, not
+            # the one it started from. Checking the destination first accepts
+            # `/a` as a parent while `/a` is the value being taken, and accepts
+            # `/xs/3` as an append target on a three-element list that the
+            # removal shortens to two. Both then deleted the source on behalf
+            # of an operation that went on to fail.
+            #
+            # So rehearse the whole move on a throwaway copy. Whatever it
+            # raises is raised before the real document has been touched, and
+            # if it raises nothing the replay below cannot fail either.
+            shadow = copy.deepcopy(doc)
+            rehearsed = _remove_at(shadow, from_segments, from_path)
+            _set_at(_walk_parent(shadow, segments, path), key, rehearsed, path, insert=True)
+
+            moved = _remove_at(doc, from_segments, from_path)
+            _set_at(_walk_parent(doc, segments, path), key, moved, path, insert=True)
 
     elif action == "test":
         current = _read(doc, segments, path)
