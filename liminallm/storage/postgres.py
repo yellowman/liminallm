@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from psycopg import errors
 from psycopg.abc import Buffer
@@ -31,7 +31,7 @@ from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     validated_embedding,
 )
-from liminallm.service.errors import NotFoundError
+from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.storage.common import (
     blend_centroid,
     clamp_success_score,
@@ -3758,19 +3758,55 @@ class PostgresStore:
     def apply_config_patch(
         self,
         patch: ConfigPatchAudit,
-        new_schema: dict,
+        build_schema: Callable[[dict], dict],
         *,
-        artifact_description: Optional[str] = None,
         approver_user_id: Optional[str] = None,
     ) -> tuple[Artifact, ConfigPatchAudit]:
-        """Atomically persist a config patch application and mark it applied."""
+        """Apply a config patch as one read-modify-write under the row locks.
+
+        SPEC §10.1 says apply loads the *current* `artifact.schema`, applies
+        the patch, validates, writes the version, then marks the patch
+        applied. `build_schema` is that middle step, handed in so the caller
+        keeps the JSON Patch semantics and this method keeps the transaction.
+
+        It used to take an already-computed `new_schema`. The service read the
+        artifact, applied the patch, and passed the result here — so this lock
+        serialized the write without covering the read behind it, and anything
+        committed in between was overwritten by a document derived from an
+        older row. Locking and then writing someone else's snapshot is not
+        atomicity.
+
+        The patch row is locked and re-read for the same reason: its status
+        was checked outside this transaction, so two callers could both see
+        `approved`, queue on the artifact lock, and each write a version for
+        one patch.
+        """
 
         with self._connect() as conn, conn.transaction():
+            # Patch first, then artifact. One order everywhere that takes both.
+            patch_row = conn.execute(
+                "SELECT * FROM config_patch WHERE id = %s FOR UPDATE", (patch.id,)
+            ).fetchone()
+            if not patch_row:
+                raise NotFoundError("patch not found", detail={"patch_id": patch.id})
+            if patch_row["status"] != "approved":
+                raise BadRequestError(
+                    "patch must be approved before applying",
+                    detail={"patch_id": patch.id, "current_status": patch_row["status"]},
+                )
+
             artifact_row = conn.execute(
                 "SELECT * FROM artifact WHERE id = %s FOR UPDATE", (patch.artifact_id,)
             ).fetchone()
             if not artifact_row:
                 raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
+
+            current_schema = artifact_row.get("schema")
+            if isinstance(current_schema, str):
+                current_schema = json.loads(current_schema or "{}")
+            new_schema = build_schema(
+                current_schema if isinstance(current_schema, dict) else {}
+            )
 
             # The door belongs here, on the mutation, not only on the API
             # that usually reaches it: an approved patch is model-authored
@@ -3797,8 +3833,8 @@ class PostgresStore:
             base_model = new_schema.get("base_model") or artifact_row.get("base_model")
 
             conn.execute(
-                "UPDATE artifact SET schema = %s, description = COALESCE(%s, description), updated_at = now(), fs_path = %s, base_model = %s WHERE id = %s",
-                (json.dumps(new_schema), artifact_description, fs_path, base_model, patch.artifact_id),
+                "UPDATE artifact SET schema = %s, updated_at = now(), fs_path = %s, base_model = %s WHERE id = %s",
+                (json.dumps(new_schema), fs_path, base_model, patch.artifact_id),
             )
             conn.execute(
                 "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, base_model, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
@@ -3839,7 +3875,7 @@ class PostgresStore:
             id=str(artifact_row["id"]),
             type=artifact_row["type"],
             name=artifact_row["name"],
-            description=artifact_description or artifact_row.get("description") or "",
+            description=artifact_row.get("description") or "",
             schema=new_schema,
             owner_user_id=(
                 str(artifact_row["owner_user_id"]) if artifact_row.get("owner_user_id") else None

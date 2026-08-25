@@ -14432,6 +14432,61 @@ Through the route the rest is worse than a refusal would be:
 `/nodes/01/tool` returned 200 and rewrote the **second** node's tool, so an
 operator's typo silently edited a different node than the one they named.
 
+### Apply held a lock over a write it had already computed
+
+The deepest of these, and the one the two `meta` rounds were circling without
+naming. SPEC §10.1: applying a config patch loads the **current**
+`artifact.schema`, applies the patch, validates, writes the version, then
+marks the patch applied. §22 assumes multiple replicas, so "current" cannot
+mean "whatever this process read a moment ago".
+
+`ConfigOpsService.apply_patch` read the artifact and computed the new document
+*before* calling the store. The store then locked the artifact row `FOR
+UPDATE` — and validated and wrote the document it had been handed. The lock
+serialized the write without covering the read behind it:
+
+```
+apply reads schema N
+apply computes N + patch
+another replica commits N+1
+apply locks the artifact row
+apply writes its precomputed N-derived schema
+-> the N+1 edit is gone
+```
+
+Locking a row and then writing someone else's snapshot into it is not
+atomicity. The patch application now happens inside that transaction, against
+the schema read under the lock: the store takes a `build_schema` callable, so
+the JSON Patch semantics stay in the service and the transaction stays in the
+store.
+
+The patch row is locked and its status re-read there for the same reason. The
+`approved` check ran outside the transaction and the status write had no
+`approved` guard, so two callers could both see `approved`, queue on the
+artifact lock, and each write a version for one patch.
+
+The description carried the identical staleness — `COALESCE(%s, description)`
+with a value read before the lock reverts a concurrent description change —
+and its only caller was passing back what it had just read, so both the
+argument and the column update are gone.
+
+**The witness that existed was asking the right question at the wrong
+altitude.** The `meta` staleness test called `apply_ops` on an already-later
+dictionary: it exercises the engine and never touches the read/compute/store
+lifecycle, so it passed against code with the race in it. The replacement
+drives a real concurrent edit through the ordinary artifact mutation path
+between the service's read and the store's transaction, and a second one
+witnesses two overlapping applies of the same approved patch. Each is killed
+by exactly one mutation — evaluation moved back outside the lock, and the
+patch row left unlocked — so they are measuring the two halves separately.
+
+Choosing the seam took one failed attempt worth recording: the first version
+made the concurrent edit from inside the patch computation, which after the
+fix runs *under* the artifact lock, so the edit waited on a lock its own call
+held and the suite hung. The seam has to be where no lock is held, which is
+before the store transaction opens — and that is version-agnostic, because
+the unfixed service has already computed its result by then.
+
 ### The fix broke two of this system's own patch producers
 
 Found by Bugbot on the pull request, confirmed by execution, and the only
@@ -14479,6 +14534,15 @@ generalizes past `meta` to *any* stale patch — or move these bookkeeping
 annotations to the `artifact.meta` column that already exists, instead of
 writing them into the schema document that gets kind-validated and served.
 
+**The pruning producer changed twice with no witness either time.** Both
+rounds tested `meta_ops` directly and the ConfigOps fallback; the periodic
+worker test uses a fake training service, so it proves scheduling and not
+patch construction. `recommend_adapter_pruning()` is now driven for real — a
+genuinely prune-eligible adapter with a `meta` sibling, through propose,
+approve and apply — and a mutation that re-adds the parent create at that call
+site alone kills it and nothing else. The thresholds come from the service
+rather than being copied, so the fixture cannot drift away from eligibility.
+
 Worth recording as process rather than only defect. Two points. This is the
 second time in this campaign that a correct engine-level refusal exposed a
 caller depending on the incorrect behaviour, and grepping for the *shape*
@@ -14486,7 +14550,9 @@ found the second producer when the report named only the first. And the first
 repair passed its own witnesses, its mutations, and the full lane — what it
 did not have was a witness for the gap between proposing and applying, which
 is the seam a reviewer found by asking when the ops are evaluated rather than
-what they say.
+what they say. The same question asked once more, of the lifecycle rather than
+the helper, found the lost update above: green is not correctness when the
+seam is a gap in time.
 
 ### Destination errors stopped calling themselves source errors
 

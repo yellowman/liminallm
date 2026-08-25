@@ -22,6 +22,8 @@ is not there yet.
 from __future__ import annotations
 
 import json
+import threading
+import time
 import uuid
 
 import pytest
@@ -829,6 +831,65 @@ class TestThePatchProducersEmitApplicablePatches:
             json_patch.apply_ops(schema, meta_ops("auto_prune", {"x": 1}))
         assert schema == {"kind": "workflow.chat", "nodes": []}
 
+    def test_the_real_pruning_producer_lands_its_key_and_keeps_siblings(
+        self, client, admin_headers
+    ):
+        """`recommend_adapter_pruning()` itself, not the helper it calls.
+
+        This call site has changed twice in this branch and had no witness
+        either time: the tests drove `meta_ops` directly and the ConfigOps
+        fallback, and the periodic-worker test uses a fake training service,
+        so it proves scheduling and not patch construction.
+
+        A genuinely prune-eligible adapter, through propose → approve → apply,
+        with a `meta` sibling that has to survive.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        runtime = get_runtime()
+        store = runtime.store
+
+        made = client.post("/v1/artifacts", headers=admin_headers, json={
+            "type": "adapter", "name": f"ad-{uuid.uuid4().hex[:6]}", "visibility": "private",
+            "schema": {
+                "kind": "adapter.lora", "mode": "prompt", "base_model": "m",
+                "current_version": 1, "meta": {"keep": "ME"},
+            },
+        })
+        assert made.status_code in (200, 201), made.text
+        adapter = made.json()["data"]["id"]
+
+        # Eligible: below both thresholds and last used before the stale
+        # cutoff. Read from the service so the fixture cannot drift from it.
+        stale = datetime.now(timezone.utc) - timedelta(
+            days=runtime.training.ADAPTER_PRUNE_STALE_DAYS + 1
+        )
+        store.update_adapter_router_state(
+            adapter,
+            success_score=runtime.training.ADAPTER_PRUNE_MAX_SUCCESS / 2,
+            last_used_at=stale,
+        )
+
+        assert runtime.training.recommend_adapter_pruning() >= 1, "nothing proposed"
+
+        pending = [
+            p for p in store.list_config_patches("pending")
+            if p.artifact_id == adapter
+        ]
+        assert len(pending) == 1, f"expected one proposal, got {len(pending)}"
+        patch_id = pending[0].id
+        assert [o["path"] for o in pending[0].patch["ops"]] == ["/meta/auto_prune"]
+
+        client.post(f"/v1/config/patches/{patch_id}/decide",
+                    headers=admin_headers, json={"decision": "approve"})
+        applied = client.post(f"/v1/config/patches/{patch_id}/apply",
+                              headers=admin_headers, json={})
+
+        assert applied.status_code == 200, applied.text
+        meta = store.get_artifact(adapter).schema["meta"]
+        assert meta["auto_prune"]["recommended"] is True
+        assert meta["keep"] == "ME", "the producer clobbered an existing meta"
+
     def test_the_configops_fallback_is_the_same_single_op(
         self, client, admin_headers
     ):
@@ -860,6 +921,166 @@ class TestThePatchProducersEmitApplicablePatches:
         meta = _schema(artifact)["meta"]
         assert "llm_autopatch" in meta
         assert meta["keep"] == "ME", "the proposal clobbered an existing meta"
+
+
+class TestApplyIsOneReadModifyWrite:
+    """SPEC §10.1: applying a config patch loads the *current*
+    `artifact.schema`, applies the patch, validates, writes the version, then
+    marks the patch applied.
+
+    "Current" is the load-bearing word. The service read the artifact and
+    computed the new document before entering the store transaction, and the
+    store then locked the artifact row and wrote that already-computed
+    document — so the lock serialized the write without covering the read it
+    came from. Anything committed in between was overwritten.
+
+    The earlier staleness witness in this file asks the right question at the
+    wrong altitude: it calls `apply_ops` on an already-later dictionary, which
+    exercises the engine and never touches the lifecycle.
+    """
+
+    def _proposed(self, client, admin_headers, artifact, ops):
+        proposed = client.post("/v1/config/propose_patch", headers=admin_headers, json={
+            "artifact_id": artifact, "patch": ops, "justification": "race",
+        })
+        assert proposed.status_code in (200, 201), proposed.text
+        patch_id = proposed.json()["data"]["id"]
+        client.post(f"/v1/config/patches/{patch_id}/decide",
+                    headers=admin_headers, json={"decision": "approve"})
+        return patch_id
+
+    def test_an_edit_committed_during_apply_is_not_lost(self, client, admin_headers):
+        """The lost update, driven through the real lifecycle.
+
+        A concurrent edit lands after ConfigOps has read the artifact and
+        computed its result, and before the row is written. Either outcome is
+        correct — apply against the newly locked schema and keep both changes,
+        or refuse as stale and change nothing — but the edit must not vanish.
+        """
+        artifact = _private(client, admin_headers, extra={"meta": {"keep": "ME"}})
+        patch_id = self._proposed(client, admin_headers, artifact, [
+            {"op": "add", "path": "/meta/from_patch", "value": "PATCH"},
+        ])
+
+        runtime = get_runtime()
+        store = runtime.store
+        real = store.apply_config_patch
+
+        def racing(*args, **kwargs):
+            # The seam is here rather than inside the patch computation: once
+            # the fix moves that computation under the artifact lock, an edit
+            # attempted from inside it waits on a lock this very call holds.
+            # This runs before the transaction opens, so it commits through
+            # the ordinary mutation path exactly as another replica would —
+            # and it is the same seam either way, because the unfixed service
+            # has already computed its result by the time it gets here.
+            edit = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers,
+                                json={"patch": [{"op": "add", "path": "/meta/landed",
+                                                 "value": "CONCURRENT"}]})
+            assert edit.status_code == 200, edit.text
+            return real(*args, **kwargs)
+
+        store.apply_config_patch = racing
+        try:
+            applied = client.post(f"/v1/config/patches/{patch_id}/apply",
+                                  headers=admin_headers, json={})
+        finally:
+            store.apply_config_patch = real
+
+        meta = _schema(artifact).get("meta", {})
+        assert meta.get("landed") == "CONCURRENT", (
+            "the concurrent edit was overwritten by a schema computed before it"
+        )
+        if applied.status_code == 200:
+            assert meta.get("from_patch") == "PATCH", "the patch reported success"
+        else:
+            assert "from_patch" not in meta, "a refused apply changed the artifact"
+            status = get_runtime().store.get_config_patch(patch_id).status
+            assert status == "approved", f"a refused apply left the patch {status}"
+
+    def test_one_approved_patch_applies_exactly_once_in_sequence(
+        self, client, admin_headers
+    ):
+        artifact = _private(client, admin_headers, extra={"meta": {"keep": "ME"}})
+        before_versions = _versions(artifact)
+        patch_id = self._proposed(client, admin_headers, artifact, [
+            {"op": "add", "path": "/meta/from_patch", "value": "PATCH"},
+        ])
+
+        first = client.post(f"/v1/config/patches/{patch_id}/apply",
+                            headers=admin_headers, json={})
+        second = client.post(f"/v1/config/patches/{patch_id}/apply",
+                             headers=admin_headers, json={})
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 400, second.text
+        assert _versions(artifact) == before_versions + 1, "two versions for one patch"
+
+    @pytest.mark.slow
+    def test_one_approved_patch_applies_exactly_once_under_contention(
+        self, client, admin_headers
+    ):
+        """Two applies overlapping, which is the case the sequential one
+        cannot reach.
+
+        The status check ran outside the transaction and the status write had
+        no `approved` guard, so both callers could observe `approved` and each
+        write a version for one patch. The sequential test never sees it —
+        the first apply has already committed by the time the second reads.
+
+        Determinism comes from the patch computation, which the fix runs
+        inside the transaction: the first apply blocks there holding both row
+        locks, so the second is queued on the patch row rather than racing.
+        Without the fix, the first blocks before any transaction and the
+        second runs to completion, which is what makes this witness fail.
+        """
+        artifact = _private(client, admin_headers, extra={"meta": {"keep": "ME"}})
+        before_versions = _versions(artifact)
+        patch_id = self._proposed(client, admin_headers, artifact, [
+            {"op": "add", "path": "/meta/from_patch", "value": "PATCH"},
+        ])
+
+        ops = get_runtime().config_ops
+        real = ops._apply_patch_to_schema
+        reached, release = threading.Event(), threading.Event()
+        first_call = threading.Lock()
+        held = {"taken": False}
+
+        def blocking(schema, patch):
+            with first_call:
+                mine = not held["taken"]
+                held["taken"] = True
+            if mine:
+                reached.set()
+                assert release.wait(timeout=30), "the second apply never arrived"
+            return real(schema, patch)
+
+        results = {}
+
+        def apply_as(name):
+            results[name] = client.post(f"/v1/config/patches/{patch_id}/apply",
+                                        headers=admin_headers, json={}).status_code
+
+        ops._apply_patch_to_schema = blocking
+        try:
+            a = threading.Thread(target=apply_as, args=("a",), daemon=True)
+            a.start()
+            assert reached.wait(timeout=30), "the first apply never reached the seam"
+            b = threading.Thread(target=apply_as, args=("b",), daemon=True)
+            b.start()
+            # Long enough for the second to reach the lock it should queue on.
+            time.sleep(1.0)
+            release.set()
+            a.join(timeout=60)
+            b.join(timeout=60)
+        finally:
+            release.set()
+            ops._apply_patch_to_schema = real
+
+        assert sorted(results.values()) == [200, 400], f"both applied: {results}"
+        assert _versions(artifact) == before_versions + 1, (
+            f"two versions for one patch: {_versions(artifact) - before_versions}"
+        )
 
 
 class TestArtifactPatchInheritsIt:

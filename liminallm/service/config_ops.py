@@ -106,14 +106,15 @@ class ConfigOpsService:
                 "artifact missing", detail={"artifact_id": patch.artifact_id}
             )
 
-        # Step 1: Apply patch to artifact (pure function)
-        new_schema = self._apply_patch_to_schema(artifact.schema, patch.patch)
-
-        # Step 2: Persist schema and mark the patch applied, in one transaction
+        # The patch is applied inside the store's transaction, against the
+        # schema the store reads under the artifact lock — not against the
+        # `artifact` above. That read answers the request; it is not what the
+        # write is derived from, because anything committed between the two
+        # would otherwise be overwritten by a document built from the older
+        # row. SPEC §10.1 says apply loads the *current* schema.
         updated, applied_patch = self.store.apply_config_patch(
             patch,
-            new_schema,
-            artifact_description=artifact.description,
+            lambda current: self._apply_patch_to_schema(current, patch.patch),
             approver_user_id=approver_user_id,
         )
         return {"artifact": updated, "patch": applied_patch or patch}
