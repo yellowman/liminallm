@@ -14247,11 +14247,21 @@ the same operation-dependent location semantics this tranche exists to
 remove, hiding inside the fix for it.
 
 The ceiling's stated reason was that `add` may name an index beyond the end,
-so `/xs/999999999` would allocate a billion placeholders. That reason expired
-earlier in this same tranche: `index > len` is now refused outright, so the
-list's own length already bounds the allocation. `MAX_LIST_EXTENSION` and
-`_ensure_list_capacity` are gone, and the billion-index case is refused in
-0.0000s at 12MB RSS for the same reason `/xs/5` on two elements is.
+so `/xs/999999999` would allocate a billion placeholders. `MAX_LIST_EXTENSION`
+and `_ensure_list_capacity` are gone.
+
+**The first version of this section repeated that reason, and it is wrong.**
+Nothing in the current engine pads a list. Measured, with the length check
+deleted: `/xs/999999999` on `[1, 2]` produces `[1, 2, 3]` — one `append`, in
+0.0001s at 11MB. So what the length check defends is the *address*, not the
+heap: `/xs/999999999` must not silently mean `/xs/2`. That is the same
+wrong-location failure as everything else here, which is the better reason
+anyway, but it is not the reason I wrote first.
+
+The claim came from the deleted constant's own comment. Carrying a comment
+forward is not verification — the comment and the code it described were both
+written from the same intent, and the padding implementation it described had
+already gone. Running it took one command.
 
 Two tests pinned the old wording (`tests/test_json_patch.py`,
 `tests/test_config_ops.py`). Both were updated rather than worked around: the
@@ -14261,6 +14271,61 @@ still enforced — the complaint is just "out of range" now.
 **I missed the second one on the first sweep.** The grep was correct; it ended
 in `head -20` and the match was on line 21. Truncating a search for the *class*
 of a fix is the same mistake as not searching for it.
+
+### The pointer was rewritten before it was applied
+
+One step earlier than everything above, and the same invariant: before an
+operation can land where it was aimed, the pointer has to survive being read.
+
+Tokenizing was `strip("/")`, `split("/")` and "drop the empty ones", with no
+escape decoding. That is four separate rewrites of the caller's address:
+
+```
+/a~1b   names key `a/b`      wrote key `a~1b`
+/a~0b   names key `a~b`      wrote key `a~0b`
+/a//b   is `a`, ``, `b`      wrote a.b
+/a/     is a's `` member     replaced `a` itself
+a/b     is not a pointer     accepted as /a/b
+```
+
+The escape pair is the worst, because both spellings can be real keys in the
+same document. So the operation does not fail — it succeeds against a valid
+location nobody named. Through ConfigOps that is 200, status `applied`, a new
+`artifact_version`, and the key the operator wrote still holding its old
+value. The same consequence as the `/schema/foo` defect that opened this
+tranche, reached through the pointer rather than through the path root.
+
+`_segments_or_raise` is now an RFC 6901 tokenizer: leading `/` required, empty
+reference tokens preserved, `~1` then `~0` decoded in that order, and a `~`
+that escapes nothing refused. The order is not cosmetic — decoding `~0` first
+turns `~01` into `~1` and then into `/`, a third key again.
+
+Error details render through `_pointer`, which re-escapes, so a key containing
+`/` does not come back out reading as two tokens.
+
+**A root-path claim was inverted, in the code and in a test that agreed with
+it.** RFC 6901 §5: `""` is the whole document; `/` is the member keyed `""`.
+The engine had it backwards — `/` was refused as "the document root" while
+`""` was ignored in silence. `""` is now refused explicitly and `/` is an
+ordinary location. `test_a_root_path_is_a_bad_request` asserted the inverted
+rule in its docstring; it is rewritten, and a positive witness for `/` sits
+next to it so nothing restores the old reading from the refusal alone.
+
+An op that omits `path` entirely is still skipped. Structurally incomplete is
+not the same as naming the whole document, and conflating them through
+`op.get("path", "")` is how the whole-document pointer came to be ignored.
+
+While fixing that, `move`/`copy` with no `from` turned out to default the same
+way and report "addresses the whole document" — a true sentence about an
+operand the caller never wrote. It now says which operand is missing.
+
+### Destination errors stopped calling themselves source errors
+
+`_read_index` is reached from four callers and only one of them reads a
+source, but its not-a-number message said "patch source path not found". So
+`replace /xs/nope` described a bad destination as a problem with an operand
+`replace` does not have. Both of its messages are direction-neutral now, which
+also deleted the parameter that was carrying the direction.
 
 ### A mutation found a hole that predated the change
 
@@ -14291,7 +14356,7 @@ now drive the mutating entry point.
 
 ### Mutations
 
-Nine, all applied and all killed. Four cover the write-location rule:
+Fifteen, all applied and all killed. Four cover the write-location rule:
 `replace` back to a creating traversal; a missing `remove` target back to a
 no-op; traversal manufacturing parents again; an array index past the end
 appending instead of failing. One covers the consumer — ConfigOps swallowing
@@ -14304,8 +14369,28 @@ a ceiling — for the wrong reason. Deleting the length check (M4) does the
 reverse. Neither check can stand in for the other, and the mutations say so
 rather than the comments.
 
-The ninth is the one that survived first: serving a negative write index from
+One is the mutation that survived first: serving a negative write index from
 the end. Its witness is in the section above.
+
+Six cover the pointer, one rewrite each, and each kills only its own
+witnesses — which is what says the witnesses separate the four ways the old
+tokenizer changed an address rather than testing one of them four times:
+
+| mutation | kills |
+|---|---|
+| empty tokens dropped again | the three empty-token witnesses |
+| `~1` stops decoding | the escaped-slash witnesses, artifact caller included |
+| `~0` stops decoding | the escaped-tilde and decode-order witnesses |
+| escapes decode by naive `replace` | the two malformed-escape witnesses and the order one |
+| leading `/` becomes optional | the not-a-pointer witness |
+| whole-document pointer ignored again | the two whole-document witnesses |
+
+**Two mutations silently measured nothing on the first run of this pass.** M7
+and M8 anchored on the `not_a_number=` argument that the diagnostic fix had
+just deleted, so neither applied. They reported it — the driver treats an
+unmatched anchor as loud, which is why that guard exists — and the repaired
+anchors needed disambiguating too, because removing the argument left
+`_require_target` and `_set_at` sharing one call line.
 
 Two cover `move`, and the pair is the point. M5 restores the half-fix (check
 the destination, but before the removal) and kills **only** the two new

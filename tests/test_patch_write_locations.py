@@ -194,12 +194,13 @@ class TestArrayBoundsFollowTheSpec:
             json_patch.apply_op(doc, {"op": "add", "path": "/xs/-1", "value": 9})
         assert doc == {"xs": [1, 2]}, "a negative index wrote from the end"
 
-    def test_a_huge_gap_is_still_refused_without_allocating(self):
-        """What the ceiling was really for, now carried by the length check.
+    def test_a_huge_gap_must_not_silently_mean_the_end(self):
+        """`/xs/999999999` must not quietly become `/xs/2`.
 
-        `/xs/999999999` on a two-element list would allocate a billion
-        placeholders. It is refused because 999999999 is past the end, which
-        is the same reason `/xs/5` is — one rule instead of two.
+        Nothing here pads a list, so deleting the length check does not
+        allocate a billion entries — measured, it falls through to one
+        `append` and lands at index 2. That is the failure: an address the
+        caller never named, reported as success. Same rule as `/xs/5`.
         """
         with pytest.raises(BadRequestError):
             apply({"xs": [1, 2]}, {"op": "add", "path": "/xs/999999999", "value": 3})
@@ -299,6 +300,18 @@ class TestAPointerNamesTheKeyItSpells:
         document. The existing contract for these is unchanged."""
         doc = {"k": 1}
         json_patch.apply_op(doc, {"op": "replace", "value": "X"})
+        assert doc == {"k": 1}
+
+    def test_a_move_without_a_source_says_so(self):
+        """Found while fixing the pointer, same class as the pointer.
+
+        A missing `from` used to default to "", go through the tokenizer, and
+        come back as "addresses the whole document" — a true sentence about
+        an operand the caller never wrote.
+        """
+        doc = {"k": 1}
+        with pytest.raises(BadRequestError, match="from path"):
+            json_patch.apply_op(doc, {"op": "move", "path": "/b"})
         assert doc == {"k": 1}
 
     def test_a_source_pointer_is_read_the_same_way(self):

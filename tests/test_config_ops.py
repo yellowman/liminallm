@@ -248,11 +248,25 @@ def test_a_path_through_a_scalar_is_a_bad_request(ops, schema, path):
         ops._apply_patch_to_schema(schema, {"ops": [{"op": "add", "path": path, "value": 1}]})
 
 
-def test_a_root_path_is_a_bad_request(ops):
-    """`/` addresses the whole document; treating it as a key wrote an
-    empty-string entry into the schema and said nothing."""
+def test_the_whole_document_pointer_is_a_bad_request(ops):
+    """RFC 6901 §5: the *empty* pointer is the whole document, not `/`.
+
+    This test used to assert the opposite — that `/` was the document root —
+    and the engine agreed with it. Both were wrong: `/` is one empty
+    reference token, naming the member keyed "". The pointer that addresses
+    the whole document is "", and it used to be ignored in silence, which is
+    the failure mode this file exists to catch.
+    """
     with pytest.raises(BadRequestError):
-        ops._apply_patch_to_schema({"a": 1}, {"ops": [{"op": "add", "path": "/", "value": 9}]})
+        ops._apply_patch_to_schema({"a": 1}, {"ops": [{"op": "add", "path": "", "value": 9}]})
+
+
+def test_a_lone_slash_names_the_empty_string_key(ops):
+    """The other half of the same correction, so nothing reverts it by
+    reading only the refusal above."""
+    assert ops._apply_patch_to_schema(
+        {"a": 1}, {"ops": [{"op": "add", "path": "/", "value": 9}]}
+    ) == {"a": 1, "": 9}
 
 
 def test_a_negative_list_index_is_refused(ops):

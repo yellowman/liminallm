@@ -117,7 +117,9 @@ def test_the_original_document_is_never_mutated():
 @pytest.mark.parametrize(
     "op, match",
     [
-        ({"op": "add", "path": "/", "value": 1}, "document root"),
+        # RFC 6901 §5: "" is the whole document. "/" is the member keyed ""
+        # and is a perfectly ordinary location, so it is not listed here.
+        ({"op": "add", "path": "", "value": 1}, "whole document"),
         ({"op": "add", "path": "/rules/x", "value": 1}, "list index"),
         ({"op": "add", "path": "/name/deep", "value": 1}, "non-container"),
         # Not "too large": there is no ceiling any more, only the list's

@@ -43,19 +43,72 @@ def deep_merge(base: dict, patch: dict, *, skip_keys: Iterable[str] = ()) -> dic
     return merged
 
 
-def _split(path: str) -> List[str]:
-    return [seg for seg in (path or "").strip("/").split("/") if seg]
+def _unescape(token: str, path: str) -> str:
+    """RFC 6901 §4: `~1` becomes `/`, then `~0` becomes `~`.
+
+    The order is not cosmetic. Decoding `~0` first turns `~01` into `~1` and
+    then into `/`, which is a third key again; scanning once, two characters
+    at a time, gives the specified order and also catches a `~` that escapes
+    nothing.
+    """
+    if "~" not in token:
+        return token
+    out: List[str] = []
+    i = 0
+    while i < len(token):
+        if token[i] != "~":
+            out.append(token[i])
+            i += 1
+            continue
+        escaped = token[i + 1 : i + 2]
+        if escaped not in ("0", "1"):
+            raise BadRequestError(
+                "malformed JSON Pointer escape",
+                detail={"path": path, "at": "~" + escaped},
+            )
+        out.append("~" if escaped == "0" else "/")
+        i += 2
+    return "".join(out)
 
 
 def _segments_or_raise(path: str) -> List[str]:
-    segments = _split(path)
-    if not segments:
-        # "/" addresses the whole document. Treating it as a key wrote an
-        # empty-string entry into the schema and reported success.
+    """Tokenize an RFC 6901 pointer without changing what it names.
+
+    The previous reader was `strip("/")`, `split("/")` and "drop the empty
+    ones", which is four separate rewrites of the caller's address: `/a//b`
+    became `/a/b`, `/a/` became `/a`, `a/b` was taken for `/a/b`, and `~1`
+    and `~0` were never decoded, so `/a~1b` addressed a key literally spelled
+    `a~1b` rather than the key `a/b`. Both spellings can exist in one
+    document, so that last pair does not fail — it writes to a real location
+    nobody named. This module exists to stop exactly that.
+    """
+    if path == "":
+        # §5: the empty pointer is the whole document. Every verb here edits
+        # a member of a container, so there is nothing to serve — but it is
+        # refused out loud, because returning quietly reports success.
         raise BadRequestError(
-            "patch path addresses the document root", detail={"path": path}
+            "patch path addresses the whole document", detail={"path": path}
         )
-    return segments
+    if not path.startswith("/"):
+        raise BadRequestError(
+            "patch path is not a JSON Pointer",
+            detail={"path": path, "expected": "a pointer begins with '/'"},
+        )
+    # `"/"` is one empty token: the member keyed "". Not the document root —
+    # that is `""`, handled above.
+    return [_unescape(token, path) for token in path[1:].split("/")]
+
+
+def _pointer(tokens: List[str]) -> str:
+    """Render tokens back as a pointer, re-escaped.
+
+    Error details name a location, so a key containing `/` has to go back out
+    as `~1` or the detail reads as two tokens and misdirects the reader the
+    same way the unescaped parse did.
+    """
+    return "".join(
+        "/" + token.replace("~", "~0").replace("/", "~1") for token in tokens
+    )
 
 
 def _non_container(path: str, at_segments: List[str], found: Any) -> BadRequestError:
@@ -63,7 +116,7 @@ def _non_container(path: str, at_segments: List[str], found: Any) -> BadRequestE
         "patch path traverses a non-container value",
         detail={
             "path": path,
-            "at": "/" + "/".join(at_segments),
+            "at": _pointer(at_segments),
             "found": type(found).__name__,
         },
     )
@@ -72,7 +125,7 @@ def _non_container(path: str, at_segments: List[str], found: Any) -> BadRequestE
 def _missing(path: str, at_segments: List[str]) -> BadRequestError:
     return BadRequestError(
         "patch path not found",
-        detail={"path": path, "at": "/" + "/".join(at_segments)},
+        detail={"path": path, "at": _pointer(at_segments)},
     )
 
 
@@ -121,25 +174,30 @@ def _require_target(parent: Any, key: str, path: str) -> None:
         raise _missing(path, [key])
 
 
-def _read_index(seg: str, path: str, *, not_a_number: str = "patch source path not found") -> int:
+def _read_index(seg: str, path: str) -> int:
     """RFC 6902 array indices are non-negative digit runs. Python's list[-1]
     would otherwise quietly serve `/xs/-1` on the read paths (move/copy/test)
     while the write path refuses it — the same op legal on one side of a
     round trip and not the other.
 
-    One definition of a valid index, and the caller supplies the noun for its
-    own direction: a destination that is not a number is not a *source path*.
+    Both messages are direction-neutral, because this is reached from four
+    callers and only one of them is reading a source. A malformed index is a
+    malformed index wherever it appears; calling it a missing *source path*
+    described `replace /xs/nope` as a problem with an operand it does not
+    have.
     """
     if not seg.isdigit():
         # A negative index says something specific about the patch's author,
-        # so it keeps its own message on both sides: Python would happily
-        # serve `/xs/-1` from the end, and "not found" would send the reader
-        # looking for a missing element rather than at the index they wrote.
+        # so it keeps its own message: Python would happily serve `/xs/-1`
+        # from the end, and "not found" would send the reader looking for a
+        # missing element rather than at the index they wrote.
         if seg.lstrip("-").isdigit():
             raise BadRequestError(
                 "negative list index", detail={"path": path, "index": int(seg)}
             )
-        raise BadRequestError(not_a_number, detail={"path": path, "at": seg})
+        raise BadRequestError(
+            "list index is not a number", detail={"path": path, "at": seg}
+        )
     return int(seg)
 
 
@@ -151,7 +209,7 @@ def _read(doc: Any, segments: List[str], path: str) -> Any:
             if seg not in node:
                 raise BadRequestError(
                     "patch source path not found",
-                    detail={"path": path, "at": "/" + "/".join(segments[: depth + 1])},
+                    detail={"path": path, "at": _pointer(segments[: depth + 1])},
                 )
             node = node[seg]
         elif isinstance(node, list):
@@ -160,7 +218,7 @@ def _read(doc: Any, segments: List[str], path: str) -> Any:
             except IndexError:
                 raise BadRequestError(
                     "patch source path not found",
-                    detail={"path": path, "at": "/" + "/".join(segments[: depth + 1])},
+                    detail={"path": path, "at": _pointer(segments[: depth + 1])},
                 )
         else:
             raise _non_container(path, segments[: depth + 1], node)
@@ -197,17 +255,18 @@ def _set_at(parent: Any, key: str, value: Any, path: str, *, insert: bool) -> No
         if key == "-":
             parent.append(value)
             return
-        idx = _read_index(key, path, not_a_number="list index is not a number")
+        idx = _read_index(key, path)
         # RFC 6902 §4.1: an `add` index may equal the length, which appends;
-        # anything beyond it is out of range. Silently appending instead let
-        # `/xs/5` on a two-element array land at position 2 — a write to a
-        # place the caller did not name.
+        # anything beyond it is out of range.
         #
-        # The bound is the list's own length, which is also the whole defence
-        # against `/xs/999999999`: a gap is refused before anything is
-        # allocated. A separate constant ceiling used to do that job and got
-        # the ordinary case wrong, refusing position 1024 on a list that had
-        # one while every read verb served it.
+        # What this defends is the address, not the heap. Nothing here pads a
+        # list, so without the check `/xs/999999999` on two elements falls
+        # through to a single `append` and lands at index 2 — measured. The
+        # failure is that it silently *means* `/xs/2`, which is the same
+        # wrong-location bug as everything else in this module. A constant
+        # ceiling used to sit here instead and got the ordinary case wrong,
+        # refusing position 1024 on a list that had one while every read verb
+        # served it.
         limit = len(parent) if insert else len(parent) - 1
         if idx > limit:
             raise BadRequestError(
@@ -227,11 +286,17 @@ def _set_at(parent: Any, key: str, value: Any, path: str, *, insert: bool) -> No
 
 def apply_op(doc: dict, op: Dict[str, Any]) -> None:
     """Apply one operation to ``doc`` in place."""
-    action = (op or {}).get("op")
-    path = (op or {}).get("path", "")
-    value = op.get("value") if op else None
-    if not action or not path:
+    op = op or {}
+    action = op.get("op")
+    value = op.get("value")
+    # An op with no `path` key is structurally incomplete and is skipped, as
+    # it always has been. An op that *says* `path: ""` is a different thing:
+    # it names the whole document, and `_segments_or_raise` refuses it out
+    # loud. Collapsing the two is how the whole-document pointer came to be
+    # ignored in silence.
+    if not action or "path" not in op:
         return
+    path = op["path"]
 
     segments = _segments_or_raise(path)
     key = segments[-1]
@@ -254,7 +319,15 @@ def apply_op(doc: dict, op: Dict[str, Any]) -> None:
             parent.pop(key)
 
     elif action in ("move", "copy"):
-        from_path = op.get("from", "")
+        # Defaulting a missing `from` to "" sent it through the tokenizer and
+        # reported a verb with no source as a patch that "addresses the whole
+        # document" — a true sentence about the wrong operand.
+        if "from" not in op:
+            raise BadRequestError(
+                "patch operation requires a from path",
+                detail={"op": action, "path": path},
+            )
+        from_path = op["from"]
         from_segments = _segments_or_raise(from_path)
         if action == "copy":
             # Reading mutates nothing, so the first thing that can change the
