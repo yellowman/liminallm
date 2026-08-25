@@ -119,6 +119,59 @@ def safe_join(base: Path, relative: str) -> Path:
     raise PathTraversalError("path traversal detected")
 
 
+def is_internal_path(relative: str | Path) -> bool:
+    """True when a relative path is the server's bookkeeping, not content.
+
+    One rule, asked by everything that has to tell a user's documents from
+    the files the server keeps beside them: the `.checksums.json` upload
+    manifest, and anything under a hidden directory. Uploads and extraction
+    strip leading dots, so a user can never own one of these names.
+
+    Components, not the basename. `bundle/.internal/secret.md` is internal
+    for the same reason the manifest is, and a check that looked only at the
+    last component would index it.
+
+    It lives here rather than in the Files API because two surfaces answer
+    this question and they must not answer it differently: a path the listing
+    omits, and download and delete treat as absent, is a path ingestion must
+    refuse. It was spelled twice inside `routes.py` alone and a third time
+    nowhere — which is how the manifest became a chunk.
+
+    Authorization is a separate question and stays separate. `authorize_path`
+    says whether a caller may read a path; this says whether the path is the
+    user's content. A caller is entitled to their own manifest and it is
+    still not a document.
+    """
+    return any(part.startswith(".") for part in Path(relative).parts)
+
+
+def is_internal_under(base: str | Path, path: str | Path) -> bool:
+    """Whether an absolute path is bookkeeping within the namespace at `base`.
+
+    `is_internal_path` asks about a relative path. This asks the same question
+    of an absolute one, by first putting it in the frame that gives "internal"
+    a meaning at all.
+
+    The absolute path must not be scanned directly. Whether a deployment lives
+    under `/srv/.storage` is its own spelling and says nothing about anybody's
+    corpus, and reading it that way would refuse an entire installation.
+
+    The basename alone is equally wrong in the other direction, and is the
+    mistake this function exists to prevent: `bundle/.internal/secret.md` has
+    an ordinary basename and an internal position, so a caller asking only
+    `path.name` admits the very file the same caller refuses when it arrives
+    by way of a directory walk. One file, two answers.
+
+    Falls back to the basename when the path lies outside the base, which is
+    the most that can honestly be asked with no frame to measure against.
+    """
+    try:
+        relative = Path(path).resolve().relative_to(Path(base).resolve())
+    except (ValueError, OSError):
+        return is_internal_path(Path(path).name)
+    return is_internal_path(relative)
+
+
 class PathAuthorityError(PermissionError):
     """This caller has nothing that entitles them to this filesystem path."""
 

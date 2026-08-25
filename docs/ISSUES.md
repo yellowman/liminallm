@@ -14006,3 +14006,138 @@ easy to write and hard to see: **an artifact listing with no identity is a
 question about the public set.** It is a reasonable default and it fails
 quietly, so every caller that means "what can this principal see" has to say
 so, and a caller that means something else has to decide what.
+
+## The upload manifest was a document
+
+Carried over from the delete tranche, where it was recorded and deferred:
+`.checksums.json` is ingested as corpus content. Measured, the indexed chunk
+reads
+
+```
+{" ferrothorn. txt":{" checksum":" 527c75bd8631…"," contexts":[]}}
+```
+
+— the user's own filenames and their checksums, sitting in the corpus where a
+retrieval can answer out of it. Nobody uploaded that document.
+
+### The rule already existed, in one place
+
+The Files API draws this line and says so in its own comment: hidden
+components are internal bookkeeping, uploads and extraction strip leading
+dots, so a user can never own such a name. Listings omit them; download and
+delete treat them as absent.
+
+Ingestion never learned it. The default extension list includes `.json`, so a
+directory source rooted at `files/` — the obvious source to add, being
+everything the user has uploaded — walked straight into the manifest.
+
+Worth noting where the rule was: spelled twice inside `routes.py` alone, once
+inline in the listing and once as `_is_hidden_relpath`, and a third time
+nowhere. A predicate with two copies and one missing caller is the shape this
+defect is made of.
+
+### Components, not basenames
+
+The obvious patch is `if file_path.name == ".checksums.json": continue`, and
+it fixes the sighting rather than the class. `bundle/.internal/secret.md` is
+internal for exactly the same reason and would stay indexed. The rule the
+Files API applies — and now the only rule — is about **any component** of the
+relative path.
+
+Two witnesses exist to hold the fix at the right altitude:
+
+* one drives the Files API and the corpus walker over a single tree and
+  requires that what the listing omits is exactly what ingestion refuses, so
+  agreement is measured rather than assumed from reading both;
+* one names `.checksums.json` as a source outright. `authorize_path` grants
+  authority over anything under the caller's own `users/{id}` directory and
+  says nothing about bookkeeping, so that path passes authorization and
+  reaches the single-file branch, which never walks a directory at all. The
+  invariant is *never corpus*, not *directory walks skip it*.
+
+Authorization and classification stay separate, and the second witness is why
+that separation is worth stating: a caller is entitled to read their own
+manifest, and it is still not a document.
+
+### What the file budget actually depends on
+
+The walk stops after `max_files` documents, and a tree full of bookkeeping
+must not exhaust that budget before reaching anything a user wrote. It does
+not — but the reason is narrower than where the check sits. `files_processed`
+is incremented only after a successful ingest, so a path that `continue`s
+before that leaves the budget untouched no matter where the test for it
+appears. What makes the property hold is that internal entries are refused at
+all.
+
+That distinction is recorded because it was nearly mis-stated as a claim about
+ordering. The check is early because it is cheap and reads well there, not
+because a behaviour depends on it, and the witness for the budget says
+plainly that it pins a property rather than reproducing a failure — it passes
+against the unfixed code whenever the walk happens to yield a real document
+first.
+
+### Mutations
+
+Four, each applied and each killed: removing the walker's refusal, weakening
+the rule to the basename, narrowing it to the manifest's exact name, and
+dropping the single-file branch's check.
+
+A fifth was attempted and abandoned rather than counted. It would have moved
+the check to after the budget test, which no single-site edit can express and
+which — per the paragraph above — changes no behaviour to observe.
+
+A sixth attempt measured nothing at all: the replacement ended in an escaped
+quote and produced an unterminated string, so pytest never ran and the driver
+reported it as a survivor. It now treats a run with no summary line as a
+broken build rather than as evidence, and reads stderr as well as stdout.
+That is the third time in this project a mutation has failed to measure what
+it claimed — twice by breaking the build, once by not applying — and each
+time it looked exactly like a result.
+
+### Review found two more seams, and they are the same shape as the first
+
+The predicate was right and two callers asked it wrongly. That is now the
+standing pattern in this area rather than a coincidence.
+
+**The source was classified by its basename.** `ingest_path` asked
+`is_internal_path(path.name)`, which is the whole question only when the name
+is the whole path. `bundle/.internal/secret.md` has an ordinary basename and
+an internal position, so naming it outright as a context source indexed it —
+while the identical file, reached by walking `files/`, was refused. One file,
+two answers, and the earlier direct-source witness could not see the
+difference because `.checksums.json` is hidden in its basename too.
+
+A directory rooted at `.internal/subdir` was the same story from the other
+side: its children look ordinary relative to it, so nothing in the walk
+objected.
+
+The fix classifies the source against the base it was authorized within.
+`is_internal_under(base, path)` exists for that and states the two errors it
+sits between: the absolute path must not be scanned, because whether a
+deployment lives under `/srv/.storage` is its own spelling and would refuse an
+entire installation; and the basename alone is not enough, for the reason
+above. Both production callers already pass a base — the archive extractor
+its destination's `files/`, the context-source route the shared root.
+
+**The durable queue never asked at all.** Re-indexing calls
+`rag.ingest_file` directly, so every refusal added to the walk was invisible
+to it. That is the worse of the two: the queue is the machinery a replacement
+actually runs through, so an internal path reaching `ingest_job` would be
+chunked on a schedule, long after whoever created it stopped watching. It also
+contradicted the SPEC line this tranche adds — refused *by any route*.
+
+The job is closed `superseded` with the reason recorded, not failed: nothing
+is owed now or later, and a failure would be retried five times to reach the
+same conclusion.
+
+**One of these reds was vacuous when first written.** The queue case enqueued
+a placeholder generation, so the job was declined as stale before ingestion
+was ever attempted, and "no chunks were written" passed for a reason that had
+nothing to do with the path. The detail column said so — `on-disk generation
+2faf4dced1fb` — which is exactly what that column was added for. It now
+enqueues the generation the bytes actually have, and the unfixed queue indexes
+the internal file.
+
+Six mutations, all applied and all killed, and the two new ones land where
+they should: classifying the source by basename kills only the two
+direct-source cases, and removing the queue's check kills only the queue case.

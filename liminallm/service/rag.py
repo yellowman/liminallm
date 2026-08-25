@@ -19,7 +19,12 @@ from typing import (
 from liminallm.logging import get_logger
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.embeddings import deterministic_embedding
-from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.fs import (
+    PathTraversalError,
+    is_internal_path,
+    is_internal_under,
+    safe_join,
+)
 from liminallm.service.late import (
     QUERY_MIN_SEGMENT_WORDS,
     maxsim,
@@ -68,6 +73,20 @@ def _detokenize(tokens: List[str]) -> str:
             result.append(" ")
         result.append(token)
     return "".join(result)
+
+
+def _internal_source(path: Path, allowed_base) -> bool:
+    """Whether a named ingestion source is bookkeeping rather than content.
+
+    Both production callers pass a base — the archive extractor its
+    destination's `files/`, the context-source route the shared root — so the
+    strong form is what actually runs. With no base there is no namespace to
+    measure position against, and the basename is the most that can honestly
+    be asked.
+    """
+    if allowed_base is not None:
+        return is_internal_under(allowed_base, path)
+    return is_internal_path(path.name)
 
 
 def _within_source(candidate: Path, root: Path) -> bool:
@@ -943,8 +962,25 @@ class RAGService:
         total_chunks = 0
         files_processed = 0
 
+        # The source itself, classified before the file/directory branch. A
+        # path named outright is a path `authorize_path` allowed, and that
+        # answers access rather than content: a caller is entitled to read
+        # their own bookkeeping and it is still not a document.
+        #
+        # Measured against the base it was authorized within, because that is
+        # the only frame where "internal" means anything. `path.name` is not
+        # enough — `bundle/.internal/secret.md` has an ordinary basename and
+        # an internal position, and is refused when the same walk reaches it
+        # from `files/`.
+        if _internal_source(path, allowed_base):
+            logger.info(
+                "ingest_path_internal_skipped",
+                context_id=context_id,
+                fs_path=str(path),
+            )
+            return 0
+
         if path.is_file():
-            # Single file
             if not extensions or path.suffix.lower() in extensions:
                 # The guard is outside the catch. That catch exists so one
                 # unreadable document does not abandon a whole tree; failing
@@ -987,6 +1023,19 @@ class RAGService:
         pattern = "**/*" if recursive else "*"
         for file_path in path.glob(pattern):
             if not _within_source(file_path, source_root):
+                continue
+            # Early because it is cheap and reads with the other filters, not
+            # because anything depends on the position: `files_processed` is
+            # incremented only after a successful ingest, so a path that
+            # `continue`s before that leaves the file budget untouched
+            # wherever the test for it sits. What keeps a tree full of
+            # bookkeeping from starving real documents of that budget is that
+            # these entries are refused at all.
+            try:
+                relative = file_path.resolve().relative_to(source_root)
+            except ValueError:  # pragma: no cover - _within_source ruled it out
+                continue
+            if is_internal_path(relative):
                 continue
             if extensions and file_path.suffix.lower() not in extensions:
                 continue

@@ -36,7 +36,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from liminallm.logging import get_logger
-from liminallm.service.fs import PathLockTimeout, path_lock, publication_key
+from liminallm.service.fs import (
+    PathLockTimeout,
+    is_internal_under,
+    path_lock,
+    publication_key,
+)
 
 logger = get_logger(__name__)
 
@@ -120,6 +125,23 @@ def run_job(
     """
     job_id = str(job["id"])
     path = Path(str(job["fs_path"]))
+
+    # This function is not a caller of `ingest_path`, so it inherits none of
+    # that walk's refusals — it calls `rag.ingest_file` directly. The queue is
+    # the durable machinery a replacement actually runs through, so an
+    # internal path reaching `ingest_job` would be chunked on a schedule, long
+    # after whoever created it stopped watching.
+    #
+    # Closed rather than failed: nothing is owed now or later, and a failure
+    # would be re-attempted five times to reach the same conclusion. Measured
+    # against `fs_root` for the same reason a source is measured against its
+    # base — the absolute path carries the deployment's own spelling.
+    if is_internal_under(fs_root, path):
+        store.finish_ingest_job(
+            job_id, "superseded", detail="internal path is not corpus"
+        )
+        logger.info("ingest_job_internal_path", job_id=job_id, fs_path=str(path))
+        return 0
 
     try:
         with path_lock(
