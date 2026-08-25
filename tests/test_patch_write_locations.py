@@ -395,6 +395,29 @@ class TestAnOperationCarriesItsOperands:
         with pytest.raises(BadRequestError):
             json_patch.apply_ops({"a": 1}, {"op": "remove", "path": "/a"})
 
+    @pytest.mark.parametrize(
+        "bad", [None, 42, 1.5, ["/a"], {"a": 1}, True],
+        ids=["null", "number", "float", "array", "object", "bool"],
+    )
+    def test_a_path_that_is_not_a_string_is_refused(self, bad):
+        """Presence was required, type was not.
+
+        `_segments_or_raise` reaches straight for `path.startswith("/")`, so a
+        non-string pointer left as an uncaught AttributeError — a 500 for what
+        is plainly a bad request. Both API models accept nested arbitrary
+        dicts, so this arrives over the wire.
+        """
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op({"k": 1}, {"op": "replace", "path": bad, "value": "X"})
+
+    @pytest.mark.parametrize(
+        "bad", [None, 42, ["/a"], {"a": 1}],
+        ids=["null", "number", "array", "object"],
+    )
+    def test_a_from_that_is_not_a_string_is_refused(self, bad):
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op({"k": 1}, {"op": "move", "path": "/dest", "from": bad})
+
     def test_a_remove_needs_no_further_operand(self):
         """The control for the operand table: `remove` is complete with
         `op` and `path` alone."""
@@ -452,6 +475,62 @@ class TestArrayIndexGrammar:
                      {"op": "replace", "path": "/xs/10", "value": "X"})["xs"][10] == "X"
         assert apply({"xs": ["a"]},
                      {"op": "add", "path": "/xs/-", "value": "b"})["xs"] == ["a", "b"]
+
+
+class TestTestComparesJsonValues:
+    """RFC 6902 §4.6 compares JSON values. Python `==` does not.
+
+    Python makes `True == 1` and `False == 0`, and carries that equivalence
+    recursively through lists and dicts. JSON has no such rule: booleans and
+    numbers are different value classes. `test` exists to guard the
+    operations after it, so an equality that is too generous does not just
+    misreport — it lets a mutation through on a precondition that was never
+    actually met.
+    """
+
+    @pytest.mark.parametrize(
+        "held, expected, why",
+        [
+            (True, 1, "a JSON boolean is not the number one"),
+            (1, True, "and the same in the other direction"),
+            (False, 0, "nor is false the number zero"),
+            (0, False, "either way round"),
+            ([True], [1], "arrays carry the confusion into their elements"),
+            ({"a": True}, {"a": 1}, "and objects into their members"),
+            ([1, [True]], [1, [1]], "at any depth"),
+        ],
+        ids=["true-1", "1-true", "false-0", "0-false", "array", "object", "nested"],
+    )
+    def test_a_boolean_is_not_a_number(self, held, expected, why):
+        with pytest.raises(BadRequestError, match="test operation failed"):
+            json_patch.apply_op({"k": held}, {"op": "test", "path": "/k",
+                                              "value": expected})
+
+    @pytest.mark.parametrize(
+        "held, expected, why",
+        [
+            (1, 1.0, "JSON has one number type, so 1 and 1.0 are one value"),
+            (True, True, "a boolean still equals itself"),
+            ([1, {"a": "s"}], [1, {"a": "s"}], "and structures still match"),
+            (None, None, "null equals null"),
+        ],
+        ids=["int-float", "bool-bool", "nested", "null"],
+    )
+    def test_equal_json_values_still_pass(self, held, expected, why):
+        """The controls. A fix that just refused more would pass every case
+        above and break `test` entirely."""
+        json_patch.apply_op({"k": held}, {"op": "test", "path": "/k",
+                                          "value": expected})
+
+    @pytest.mark.parametrize(
+        "held, expected",
+        [("1", 1), (1, "1"), (None, 0), (0, None), ({"a": 1}, {"a": 1, "b": 2})],
+        ids=["str-num", "num-str", "null-zero", "zero-null", "extra-key"],
+    )
+    def test_other_type_mismatches_still_fail(self, held, expected):
+        with pytest.raises(BadRequestError, match="test operation failed"):
+            json_patch.apply_op({"k": held}, {"op": "test", "path": "/k",
+                                              "value": expected})
 
 
 class TestMoveAndCopyDestinationsFollowAdd:
@@ -718,6 +797,96 @@ class TestArtifactPatchInheritsIt:
         assert resp.status_code == 400, resp.text
         assert _schema(artifact) == before
         assert _versions(artifact) == before_versions, "a version was written"
+
+    @pytest.mark.parametrize(
+        "op, label",
+        [
+            ({"op": "replace", "path": 42, "value": "X"}, "path"),
+            ({"op": "move", "path": "/dest", "from": 42}, "from"),
+        ],
+        ids=["path", "from"],
+    )
+    def test_a_non_string_pointer_is_a_bad_request_not_a_crash(
+        self, client, admin_headers, op, label
+    ):
+        """It arrives over the wire as valid JSON, so it has to leave as 400.
+
+        `ArtifactPatchRequest.patch` is `List[dict]`, which admits any JSON
+        value in any member. `_segments_or_raise` then calls `.startswith`
+        on it.
+        """
+        artifact = _private(client, admin_headers)
+        before, before_versions = _schema(artifact), _versions(artifact)
+
+        resp = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers,
+                            json={"patch": [op]})
+
+        assert resp.status_code == 400, f"{label}: {resp.text}"
+        assert _schema(artifact) == before
+        assert _versions(artifact) == before_versions
+
+    def test_a_failed_test_stops_the_operations_after_it(
+        self, client, admin_headers
+    ):
+        """What `test` is for, and what Python equality quietly gave away.
+
+        The stored value is JSON `true` and the precondition asks for the
+        number 1. Those are different JSON values, so the guard must fail and
+        the replace behind it must never run. `True == 1` in Python, so it
+        ran: `spare` changed and a version was written on a precondition that
+        was never met.
+        """
+        artifact = _private(client, admin_headers, extra={"enabled": True})
+        before, before_versions = _schema(artifact), _versions(artifact)
+
+        resp = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers, json={
+            "patch": [
+                {"op": "test", "path": "/enabled", "value": 1},
+                {"op": "replace", "path": "/spare", "value": "CHANGED"},
+            ],
+        })
+
+        assert resp.status_code == 400, resp.text
+        assert _schema(artifact)["spare"] == "keep", "the guarded op ran anyway"
+        assert _schema(artifact) == before
+        assert _versions(artifact) == before_versions, "a version was written"
+
+    def test_a_numeric_field_is_not_guarded_by_a_boolean(
+        self, client, admin_headers
+    ):
+        """The inverse, so a fix cannot special-case one direction."""
+        artifact = _private(client, admin_headers, extra={"retries": 1})
+        before_versions = _versions(artifact)
+
+        resp = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers, json={
+            "patch": [
+                {"op": "test", "path": "/retries", "value": True},
+                {"op": "replace", "path": "/spare", "value": "CHANGED"},
+            ],
+        })
+
+        assert resp.status_code == 400, resp.text
+        assert _schema(artifact)["spare"] == "keep"
+        assert _versions(artifact) == before_versions
+
+    def test_a_test_that_holds_still_lets_the_patch_through(
+        self, client, admin_headers
+    ):
+        """The control at the caller: a precondition that is genuinely met
+        must still apply the operations behind it."""
+        artifact = _private(client, admin_headers, extra={"enabled": True})
+        before_versions = _versions(artifact)
+
+        resp = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers, json={
+            "patch": [
+                {"op": "test", "path": "/enabled", "value": True},
+                {"op": "replace", "path": "/spare", "value": "CHANGED"},
+            ],
+        })
+
+        assert resp.status_code == 200, resp.text
+        assert _schema(artifact)["spare"] == "CHANGED"
+        assert _versions(artifact) == before_versions + 1
 
     def test_a_leading_zero_index_does_not_reach_a_node(self, client, admin_headers):
         """The index grammar in the shape it actually arrives in.
