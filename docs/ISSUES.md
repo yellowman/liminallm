@@ -14229,6 +14229,59 @@ a better diagnostic but misses the array-shrink case entirely; validating
 against the pre-removal document is the half-fix above. The rehearsal is the
 only shape that covers both without enumerating them.
 
+### A constant ceiling made one position exist for four verbs and not two
+
+`_set_at` refused any index at or above 1024 before it looked at the list.
+Nothing else did, so on a 1025-element list:
+
+```
+replace /xs/1024          refused, "list index too large"
+add     /xs/1025          refused          (append at len)
+remove  /xs/1024          fine
+test    /xs/1024          fine
+copy/move from /xs/1024   fine
+```
+
+Position 1024 existed for four verbs and not for the two that write to it —
+the same operation-dependent location semantics this tranche exists to
+remove, hiding inside the fix for it.
+
+The ceiling's stated reason was that `add` may name an index beyond the end,
+so `/xs/999999999` would allocate a billion placeholders. That reason expired
+earlier in this same tranche: `index > len` is now refused outright, so the
+list's own length already bounds the allocation. `MAX_LIST_EXTENSION` and
+`_ensure_list_capacity` are gone, and the billion-index case is refused in
+0.0000s at 12MB RSS for the same reason `/xs/5` on two elements is.
+
+Two tests pinned the old wording (`tests/test_json_patch.py`,
+`tests/test_config_ops.py`). Both were updated rather than worked around: the
+memory-exhaustion concern they were written for is still exactly right, and
+still enforced — the complaint is just "out of range" now.
+
+**I missed the second one on the first sweep.** The grep was correct; it ended
+in `head -20` and the match was on line 21. Truncating a search for the *class*
+of a fix is the same mistake as not searching for it.
+
+### A mutation found a hole that predated the change
+
+Removing the negative-index rejection from the write path killed nothing, so
+`add` gained a mutation that survived. It is not a false alarm:
+
+```
+add /xs/-1  on [1, 2]  ->  [1, 9, 2]
+add /xs/-2  on [1, 2]  ->  [9, 1, 2]
+```
+
+`list.insert(-1, v)` writes before the last element, so a negative final
+segment does not fail on the write path — it lands somewhere the caller never
+named, which is this tranche's defect class exactly. `replace` was already
+covered, because requiring an existing target reads the index first; `add` has
+no target to require, so it is the one verb where the index itself must be
+refused.
+
+The behaviour was correct before this pass and after it. What was missing was
+the witness, and review had not found it in two passes over the same file.
+
 ### Three of my own witnesses were vacuous
 
 `apply_ops` deep-copies before it starts, so asserting that the caller's
@@ -14238,11 +14291,21 @@ now drive the mutating entry point.
 
 ### Mutations
 
-Seven, all applied and all killed. Four cover the write-location rule:
+Nine, all applied and all killed. Four cover the write-location rule:
 `replace` back to a creating traversal; a missing `remove` target back to a
 no-op; traversal manufacturing parents again; an array index past the end
 appending instead of failing. One covers the consumer — ConfigOps swallowing
 the refusal and applying anyway — and kills exactly one witness.
+
+Two more cover the array bound, and they are complements rather than
+duplicates. Restoring the constant ceiling (M7) kills the two large-index
+witnesses and leaves the huge-gap one alive, because a gap stays refused under
+a ceiling — for the wrong reason. Deleting the length check (M4) does the
+reverse. Neither check can stand in for the other, and the mutations say so
+rather than the comments.
+
+The ninth is the one that survived first: serving a negative write index from
+the end. Its witness is in the section above.
 
 Two cover `move`, and the pair is the point. M5 restores the half-fix (check
 the destination, but before the removal) and kills **only** the two new
@@ -14262,6 +14325,32 @@ creating traversal (M3) kills the self-descendant witness alone.
 one pointing at a missing element rather than the index the author wrote.
 Both sides now say the same thing, and the three tests that pinned the old
 wording were updated rather than worked around.
+
+## Observation, not this tranche: a teardown race in the xdist lane
+
+Seen once in 2,917 tests and not reproduced — recorded because a one-sighting
+race that nobody writes down is a race that gets rediscovered.
+
+`test_a_replacement_cannot_be_undone_by_a_write_already_in_flight` failed under
+`make test-xdist` with `psycopg_pool.PoolClosed: the pool 'pool-1' is already
+closed`, raised on a background thread:
+
+```
+routes.upload_file
+  idempotency.IdempotencyGuard.__aexit__
+    runtime._set_cached_idempotency_record
+      store.hold_live_user  ->  self._connect()
+```
+
+So a fire-and-forget idempotency write outlived the session that owned the
+pool. It passes alone (31s), passes 3/3 as a file under `-n 4`, and the full
+lane was green on the next run. It has no reach into the patch engine — the
+file never mentions `json_patch`, and the module's only call site in
+`routes.py` is the artifact PATCH route, not the upload route in the trace.
+
+Worth a look on its own terms: the shape is a background write racing
+teardown, which is a product question about that write's lifetime as much as a
+harness question.
 
 ## The isolation lesson from the live ConfigOps campaign
 

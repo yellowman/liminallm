@@ -264,8 +264,13 @@ def test_a_negative_list_index_is_refused(ops):
 
 def test_a_huge_list_index_is_refused(ops):
     """Padding a list out to the requested index is how a one-line patch
-    becomes a memory exhaustion."""
-    with pytest.raises(BadRequestError, match="too large"):
+    becomes a memory exhaustion.
+
+    The defence used to be a constant ceiling and is now the list's own
+    length, so the complaint is "out of range" rather than "too large" — and
+    it arrives before anything is allocated either way.
+    """
+    with pytest.raises(BadRequestError, match="out of range"):
         ops._apply_patch_to_schema(
             {"rules": []},
             {"ops": [{"op": "add", "path": "/rules/999999999", "value": 1}]},

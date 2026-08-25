@@ -177,6 +177,23 @@ class TestArrayBoundsFollowTheSpec:
         assert apply(doc, {"op": "add", "path": "/xs/1025",
                            "value": "tail"})["xs"][-1] == "tail"
 
+    def test_a_negative_write_index_is_not_counted_from_the_end(self):
+        """`list.insert(-1, v)` writes before the last element, silently.
+
+        So a negative final segment does not fail loudly on the write path —
+        it lands somewhere the caller did not name: `add /xs/-1` on [1, 2]
+        produces [1, 9, 2], and `/xs/-2` produces [9, 1, 2]. `replace` is
+        already covered, because requiring an existing target reads the index
+        first. `add` has no target to require, so it is the one verb where the
+        index itself has to be refused.
+
+        Found by a mutation that survived, not by review.
+        """
+        doc = {"xs": [1, 2]}
+        with pytest.raises(BadRequestError, match="negative"):
+            json_patch.apply_op(doc, {"op": "add", "path": "/xs/-1", "value": 9})
+        assert doc == {"xs": [1, 2]}, "a negative index wrote from the end"
+
     def test_a_huge_gap_is_still_refused_without_allocating(self):
         """What the ceiling was really for, now carried by the length check.
 

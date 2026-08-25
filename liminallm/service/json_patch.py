@@ -16,10 +16,6 @@ from typing import Any, Dict, Iterable, List
 
 from liminallm.service.errors import BadRequestError
 
-# A patch may grow a list (add at index beyond the end), but an index like
-# 10**9 would allocate that many placeholder entries. Bound it.
-MAX_LIST_EXTENSION = 1024
-
 
 def apply_ops(doc: dict, ops: List[Dict[str, Any]]) -> dict:
     """Apply a list of RFC 6902 operations to a copy of ``doc``."""
@@ -71,18 +67,6 @@ def _non_container(path: str, at_segments: List[str], found: Any) -> BadRequestE
             "found": type(found).__name__,
         },
     )
-
-
-def _ensure_list_capacity(idx: int, path: str) -> None:
-    if idx < 0:
-        raise BadRequestError(
-            "negative list index", detail={"path": path, "index": idx}
-        )
-    if idx >= MAX_LIST_EXTENSION:
-        raise BadRequestError(
-            "list index too large",
-            detail={"path": path, "index": idx, "max_index": MAX_LIST_EXTENSION - 1},
-        )
 
 
 def _missing(path: str, at_segments: List[str]) -> BadRequestError:
@@ -137,23 +121,25 @@ def _require_target(parent: Any, key: str, path: str) -> None:
         raise _missing(path, [key])
 
 
-def _read_index(seg: str, path: str) -> int:
+def _read_index(seg: str, path: str, *, not_a_number: str = "patch source path not found") -> int:
     """RFC 6902 array indices are non-negative digit runs. Python's list[-1]
     would otherwise quietly serve `/xs/-1` on the read paths (move/copy/test)
     while the write path refuses it — the same op legal on one side of a
-    round trip and not the other."""
+    round trip and not the other.
+
+    One definition of a valid index, and the caller supplies the noun for its
+    own direction: a destination that is not a number is not a *source path*.
+    """
     if not seg.isdigit():
         # A negative index says something specific about the patch's author,
-        # so it keeps its own message: Python would happily serve `/xs/-1`
-        # from the end, and "not found" would send the reader looking for a
-        # missing element rather than at the index they wrote.
+        # so it keeps its own message on both sides: Python would happily
+        # serve `/xs/-1` from the end, and "not found" would send the reader
+        # looking for a missing element rather than at the index they wrote.
         if seg.lstrip("-").isdigit():
             raise BadRequestError(
                 "negative list index", detail={"path": path, "index": int(seg)}
             )
-        raise BadRequestError(
-            "patch source path not found", detail={"path": path, "at": seg}
-        )
+        raise BadRequestError(not_a_number, detail={"path": path, "at": seg})
     return int(seg)
 
 
@@ -182,8 +168,12 @@ def _read(doc: Any, segments: List[str], path: str) -> Any:
 
 
 def _remove_at(doc: Any, segments: List[str], path: str) -> Any:
-    """Remove and return the value at ``segments``. Missing is an error for
-    move (the value must exist to be moved); remove tolerates it."""
+    """Remove and return the value at ``segments``.
+
+    `move`'s helper only, now that `remove` requires its target through
+    `_require_target` and pops in place. A `from` that is not there is an
+    error: the value has to exist to be moved.
+    """
     parent = _read(doc, segments[:-1], path) if len(segments) > 1 else doc
     key = segments[-1]
     if isinstance(parent, dict):
@@ -207,17 +197,17 @@ def _set_at(parent: Any, key: str, value: Any, path: str, *, insert: bool) -> No
         if key == "-":
             parent.append(value)
             return
-        try:
-            idx = int(key)
-        except ValueError:
-            raise BadRequestError(
-                "list index is not a number", detail={"path": path, "at": key}
-            )
-        _ensure_list_capacity(idx, path)
+        idx = _read_index(key, path, not_a_number="list index is not a number")
         # RFC 6902 §4.1: an `add` index may equal the length, which appends;
         # anything beyond it is out of range. Silently appending instead let
         # `/xs/5` on a two-element array land at position 2 — a write to a
         # place the caller did not name.
+        #
+        # The bound is the list's own length, which is also the whole defence
+        # against `/xs/999999999`: a gap is refused before anything is
+        # allocated. A separate constant ceiling used to do that job and got
+        # the ordinary case wrong, refusing position 1024 on a list that had
+        # one while every read verb served it.
         limit = len(parent) if insert else len(parent) - 1
         if idx > limit:
             raise BadRequestError(

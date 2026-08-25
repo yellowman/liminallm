@@ -120,7 +120,10 @@ def test_the_original_document_is_never_mutated():
         ({"op": "add", "path": "/", "value": 1}, "document root"),
         ({"op": "add", "path": "/rules/x", "value": 1}, "list index"),
         ({"op": "add", "path": "/name/deep", "value": 1}, "non-container"),
-        ({"op": "add", "path": "/rules/9999", "value": 1}, "too large"),
+        # Not "too large": there is no ceiling any more, only the list's
+        # length. 9999 is refused for the same reason /xs/5 is on two
+        # elements — it names a position past the end.
+        ({"op": "add", "path": "/rules/9999", "value": 1}, "out of range"),
         ({"op": "add", "path": "/rules/-1/x", "value": 1}, "negative"),
         ({"op": "move", "path": "/b", "from": "/ghost"}, "source path not found"),
         ({"op": "copy", "path": "/b", "from": "/rules/99"}, "source path not found"),
