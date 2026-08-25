@@ -159,9 +159,24 @@ def test_the_original_schema_is_not_mutated(ops):
     assert schema == {"meta": {"weight": 1}}
 
 
-def test_a_missing_intermediate_is_created(ops):
+def test_a_missing_intermediate_is_refused(ops):
+    """Patch traversal names a place in the document; it does not build one.
+
+    This asserted the opposite — `add /a/b/c` on `{}` producing the whole
+    chain — and that creating walk is what let a ConfigOps patch address a
+    path the schema did not have, report `applied`, write a version, and
+    leave the configuration serving consumes untouched
+    (tests/test_patch_write_locations.py).
+
+    `add` still names a member that is not there yet; what it may no longer
+    do is invent the parent holding it.
+    """
+    with pytest.raises(BadRequestError):
+        ops._apply_patch_to_schema(
+            {}, {"ops": [{"op": "add", "path": "/a/b/c", "value": 1}]}
+        )
     out = ops._apply_patch_to_schema(
-        {}, {"ops": [{"op": "add", "path": "/a/b/c", "value": 1}]}
+        {"a": {"b": {}}}, {"ops": [{"op": "add", "path": "/a/b/c", "value": 1}]}
     )
     assert out == {"a": {"b": {"c": 1}}}
 
