@@ -205,6 +205,110 @@ class TestArrayBoundsFollowTheSpec:
             apply({"xs": [1, 2]}, {"op": "add", "path": "/xs/999999999", "value": 3})
 
 
+class TestAPointerNamesTheKeyItSpells:
+    """RFC 6901. The same invariant as the rest of this file, one step
+    earlier: before an operation can land where it was aimed, the pointer has
+    to survive being read.
+
+    Tokenizing with `strip("/")`, `split("/")` and "drop the empty segments"
+    rewrites the caller's path four separate ways, and every one of them is a
+    silent change of address rather than a refusal.
+    """
+
+    def test_an_escaped_slash_addresses_the_key_it_spells(self):
+        """`~1` is a `/`, so `/a~1b` names one key called `a/b`.
+
+        Undecoded it names a *different, also-valid* key spelled `a~1b` — so
+        a document holding both gets the wrong one written and the right one
+        left alone, with nothing raised.
+        """
+        doc = {"a/b": "RIGHT", "a~1b": "WRONG"}
+        json_patch.apply_op(doc, {"op": "replace", "path": "/a~1b", "value": "X"})
+        assert doc == {"a/b": "X", "a~1b": "WRONG"}
+
+    def test_an_escaped_tilde_addresses_the_key_it_spells(self):
+        doc = {"a~b": "RIGHT", "a~0b": "WRONG"}
+        json_patch.apply_op(doc, {"op": "replace", "path": "/a~0b", "value": "X"})
+        assert doc == {"a~b": "X", "a~0b": "WRONG"}
+
+    def test_the_escapes_decode_in_the_order_the_rfc_gives(self):
+        """§4: `~1` first, then `~0`. `~01` is the two-character key `~1`.
+
+        Decoding `~0` first would turn it into `~1` and then into `/`, which
+        is a third key again.
+        """
+        doc = {"~1": "RIGHT", "/": "WRONG", "~01": "ALSO WRONG"}
+        json_patch.apply_op(doc, {"op": "replace", "path": "/~01", "value": "X"})
+        assert doc == {"~1": "X", "/": "WRONG", "~01": "ALSO WRONG"}
+
+    def test_an_empty_reference_token_is_a_real_key(self):
+        """`/a//b` is three tokens — `a`, ``, `b` — not two.
+
+        Dropping the empty one addressed `a.b`, a sibling of the key named.
+        """
+        doc = {"a": {"": {"b": "RIGHT"}, "b": "WRONG"}}
+        json_patch.apply_op(doc, {"op": "replace", "path": "/a//b", "value": "X"})
+        assert doc == {"a": {"": {"b": "X"}, "b": "WRONG"}}
+
+    def test_a_trailing_slash_names_the_empty_key(self):
+        """`/a/` names `a`'s empty-string member, not `a` itself.
+
+        Stripping it replaced the whole object with the value.
+        """
+        doc = {"a": {"": "RIGHT", "keep": "WRONG"}}
+        json_patch.apply_op(doc, {"op": "replace", "path": "/a/", "value": "X"})
+        assert doc == {"a": {"": "X", "keep": "WRONG"}}
+
+    def test_a_lone_slash_names_the_empty_key_at_the_top(self):
+        doc = {"": "RIGHT", "keep": "WRONG"}
+        json_patch.apply_op(doc, {"op": "replace", "path": "/", "value": "X"})
+        assert doc == {"": "X", "keep": "WRONG"}
+
+    def test_a_pointer_must_begin_with_a_slash(self):
+        """`a/b` is not a pointer. Accepting it as `/a/b` guesses."""
+        doc = {"a": {"b": "RIGHT"}}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(doc, {"op": "replace", "path": "a/b", "value": "X"})
+        assert doc == {"a": {"b": "RIGHT"}}
+
+    def test_an_escape_that_escapes_nothing_is_refused(self):
+        """`~` must be followed by `0` or `1`. Passing `~2` through would make
+        it a literal, which is a fifth silent reinterpretation."""
+        doc = {"a~2b": "RIGHT"}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(doc, {"op": "replace", "path": "/a~2b", "value": "X"})
+        assert doc == {"a~2b": "RIGHT"}
+
+    def test_a_trailing_tilde_is_refused(self):
+        doc = {"a~": "RIGHT"}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(doc, {"op": "replace", "path": "/a~", "value": "X"})
+        assert doc == {"a~": "RIGHT"}
+
+    def test_the_whole_document_pointer_is_refused_not_ignored(self):
+        """`""` is the whole document (§5). Every verb here edits a member of
+        a container, so there is nothing to serve — but it is refused out
+        loud. It used to return quietly, which reports success."""
+        doc = {"k": 1}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(doc, {"op": "replace", "path": "", "value": "X"})
+        assert doc == {"k": 1}
+
+    def test_an_op_that_omits_its_path_is_still_skipped(self):
+        """Structurally incomplete, which is not the same as naming the whole
+        document. The existing contract for these is unchanged."""
+        doc = {"k": 1}
+        json_patch.apply_op(doc, {"op": "replace", "value": "X"})
+        assert doc == {"k": 1}
+
+    def test_a_source_pointer_is_read_the_same_way(self):
+        """`from` goes through the same tokenizer, or `move` and `copy` get
+        their own address book."""
+        doc = {"a/b": "RIGHT", "a~1b": "WRONG"}
+        json_patch.apply_op(doc, {"op": "move", "from": "/a~1b", "path": "/moved"})
+        assert doc == {"a~1b": "WRONG", "moved": "RIGHT"}
+
+
 class TestMoveAndCopyDestinationsFollowAdd:
     def test_a_copy_cannot_conjure_its_destination_parent(self):
         with pytest.raises(BadRequestError):
@@ -302,10 +406,12 @@ class TestAPatchIsAllOrNothing:
 # ---------------------------------------------------------------------------
 
 
-def _published(client, admin_headers):
+def _published(client, admin_headers, extra=None):
+    schema = json.loads(json.dumps(WORKFLOW))
+    schema.update(extra or {})
     made = client.post("/v1/artifacts", headers=admin_headers, json={
         "type": "workflow", "name": f"wl-{uuid.uuid4().hex[:6]}",
-        "schema": json.loads(json.dumps(WORKFLOW)), "visibility": "global",
+        "schema": schema, "visibility": "global",
     })
     assert made.status_code in (200, 201), made.text
     return made.json()["data"]["id"]
@@ -350,6 +456,39 @@ class TestConfigOpsInheritsIt:
         assert _versions(artifact) == before_versions, "a version was written"
         status = get_runtime().store.get_config_patch(patch_id).status
         assert status == "approved", f"the patch was marked {status}"
+
+    def test_an_escaped_pointer_lands_on_the_key_it_names(
+        self, client, admin_headers
+    ):
+        """The pointer form of the defect that started this tranche.
+
+        `/a~1b` names the key `a/b`. Undecoded it names `a~1b`, which is a
+        real and different key. So this patch succeeds — 200, `applied`, a new
+        artifact_version — while changing a key the operator did not name and
+        leaving the one they did name alone. Same audit trail asserting a
+        change that did not happen, reached through the pointer instead of
+        through the path root.
+        """
+        artifact = _published(client, admin_headers,
+                              extra={"a/b": "RIGHT", "a~1b": "WRONG"})
+
+        proposed = client.post("/v1/config/propose_patch", headers=admin_headers, json={
+            "artifact_id": artifact,
+            "patch": [{"op": "replace", "path": "/a~1b", "value": "CHANGED"}],
+            "justification": "an escaped slash in the pointer",
+        })
+        assert proposed.status_code in (200, 201), proposed.text
+        patch_id = proposed.json()["data"]["id"]
+        client.post(f"/v1/config/patches/{patch_id}/decide",
+                    headers=admin_headers, json={"decision": "approve"})
+
+        applied = client.post(f"/v1/config/patches/{patch_id}/apply",
+                              headers=admin_headers, json={})
+        assert applied.status_code == 200, applied.text
+
+        schema = _schema(artifact)
+        assert schema["a/b"] == "CHANGED", "the named key was not the one written"
+        assert schema["a~1b"] == "WRONG", "a key the pointer did not name was written"
 
     def test_a_patch_to_a_location_that_exists_still_applies(
         self, client, admin_headers
