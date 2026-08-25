@@ -295,13 +295,6 @@ class TestAPointerNamesTheKeyItSpells:
             json_patch.apply_op(doc, {"op": "replace", "path": "", "value": "X"})
         assert doc == {"k": 1}
 
-    def test_an_op_that_omits_its_path_is_still_skipped(self):
-        """Structurally incomplete, which is not the same as naming the whole
-        document. The existing contract for these is unchanged."""
-        doc = {"k": 1}
-        json_patch.apply_op(doc, {"op": "replace", "value": "X"})
-        assert doc == {"k": 1}
-
     def test_a_move_without_a_source_says_so(self):
         """Found while fixing the pointer, same class as the pointer.
 
@@ -320,6 +313,127 @@ class TestAPointerNamesTheKeyItSpells:
         doc = {"a/b": "RIGHT", "a~1b": "WRONG"}
         json_patch.apply_op(doc, {"op": "move", "from": "/a~1b", "path": "/moved"})
         assert doc == {"a~1b": "WRONG", "moved": "RIGHT"}
+
+
+class TestAnOperationCarriesItsOperands:
+    """RFC 6902 §4: an operation carries `op` and `path`, and each verb names
+    the further members it needs.
+
+    Treating an absent member as a default is the same defect one level up
+    from a mis-parsed pointer: the engine acts on an operand nobody supplied.
+    A half-formed op used to be skipped in silence, which through the artifact
+    route still wrote a new version — an audit entry for a patch that did
+    nothing.
+    """
+
+    def test_a_replace_without_a_value_does_not_write_none(self):
+        """The sharpest of these: it does not no-op, it destroys.
+
+        `{"op": "replace", "path": "/k"}` produced `{"k": None}` — the value
+        overwritten on behalf of an operand the caller never wrote.
+        """
+        doc = {"k": "ORIGINAL"}
+        with pytest.raises(BadRequestError, match="value"):
+            json_patch.apply_op(doc, {"op": "replace", "path": "/k"})
+        assert doc == {"k": "ORIGINAL"}, "the value was destroyed by a malformed op"
+
+    def test_an_add_without_a_value_is_refused(self):
+        doc = {}
+        with pytest.raises(BadRequestError, match="value"):
+            json_patch.apply_op(doc, {"op": "add", "path": "/new"})
+        assert doc == {}
+
+    def test_a_test_without_a_value_is_a_shape_error_not_a_comparison(self):
+        """It used to compare against `None` and report the *test* as failed,
+        which sends the reader looking at their document."""
+        with pytest.raises(BadRequestError, match="value"):
+            json_patch.apply_op({"k": 1}, {"op": "test", "path": "/k"})
+
+    def test_an_explicit_null_value_is_still_a_legal_operand(self):
+        """The control that stops the fix from being "reject falsy values".
+
+        `value: null` is a perfectly good JSON Patch operand. The question is
+        whether the member is *present*, never whether it is truthy.
+        """
+        doc = {"k": "ORIGINAL"}
+        json_patch.apply_op(doc, {"op": "replace", "path": "/k", "value": None})
+        assert doc == {"k": None}
+
+    def test_an_op_without_a_path_is_refused(self):
+        doc = {"k": 1}
+        with pytest.raises(BadRequestError, match="path"):
+            json_patch.apply_op(doc, {"op": "replace", "value": "X"})
+        assert doc == {"k": 1}
+
+    def test_an_op_without_a_verb_is_refused(self):
+        doc = {"k": 1}
+        with pytest.raises(BadRequestError, match="op"):
+            json_patch.apply_op(doc, {"path": "/k", "value": "X"})
+        assert doc == {"k": 1}
+
+    def test_an_empty_operation_is_refused(self):
+        doc = {"k": 1}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(doc, {})
+        assert doc == {"k": 1}
+
+    def test_a_remove_needs_no_further_operand(self):
+        """The control for the operand table: `remove` is complete with
+        `op` and `path` alone."""
+        doc = {"k": 1, "j": 2}
+        json_patch.apply_op(doc, {"op": "remove", "path": "/k"})
+        assert doc == {"j": 2}
+
+
+class TestArrayIndexGrammar:
+    """RFC 6901 §4: an array index is `0` or a non-zero digit run. ASCII, no
+    leading zeros.
+
+    `str.isdigit()` is a far larger set, so several distinct pointer spellings
+    named one position — the normalization this whole file exists to stop.
+    """
+
+    def test_a_leading_zero_is_not_the_same_index(self):
+        doc = {"xs": ["a", "b", "c"]}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(doc, {"op": "replace", "path": "/xs/01", "value": "X"})
+        assert doc == {"xs": ["a", "b", "c"]}
+
+    @pytest.mark.parametrize(
+        "token, name",
+        [("١", "arabic-indic one"), ("０", "fullwidth zero")],
+        ids=["arabic-indic", "fullwidth"],
+    )
+    def test_a_non_ascii_digit_is_not_an_index(self, token, name):
+        """`"١".isdigit()` is True and `int("١")` is 1, so these reached a real
+        position under a spelling RFC 6901 does not define."""
+        doc = {"xs": ["a", "b", "c"]}
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(
+                doc, {"op": "replace", "path": f"/xs/{token}", "value": "X"}
+            )
+        assert doc == {"xs": ["a", "b", "c"]}, f"{name} addressed a position"
+
+    @pytest.mark.parametrize("token", ["²", "-²"], ids=["sup2", "neg-sup2"])
+    def test_a_digit_int_cannot_read_is_a_bad_request_not_a_crash(self, token):
+        """`"²".isdigit()` is True and `int("²")` raises. The pair let a
+        malformed pointer leave as an uncaught ValueError instead of a 400 —
+        the one case here that was a 500 rather than a wrong write.
+        """
+        with pytest.raises(BadRequestError):
+            json_patch.apply_op(
+                {"xs": ["a"]}, {"op": "replace", "path": f"/xs/{token}", "value": "X"}
+            )
+
+    def test_ordinary_indices_still_work(self):
+        """The control. Refusing every unusual spelling must not refuse the
+        ordinary ones, including a two-digit index and the append token."""
+        assert apply({"xs": ["a", "b"]},
+                     {"op": "replace", "path": "/xs/0", "value": "X"})["xs"] == ["X", "b"]
+        assert apply({"xs": list(range(11))},
+                     {"op": "replace", "path": "/xs/10", "value": "X"})["xs"][10] == "X"
+        assert apply({"xs": ["a"]},
+                     {"op": "add", "path": "/xs/-", "value": "b"})["xs"] == ["a", "b"]
 
 
 class TestMoveAndCopyDestinationsFollowAdd:
@@ -430,6 +544,31 @@ def _published(client, admin_headers, extra=None):
     return made.json()["data"]["id"]
 
 
+def _private(client, admin_headers, extra=None):
+    schema = json.loads(json.dumps(WORKFLOW))
+    schema.update(extra or {})
+    made = client.post("/v1/artifacts", headers=admin_headers, json={
+        "type": "workflow", "name": f"pv-{uuid.uuid4().hex[:6]}",
+        "schema": schema, "visibility": "private",
+    })
+    assert made.status_code in (200, 201), made.text
+    return made.json()["data"]["id"]
+
+
+# Two tool_call nodes, so an index that should be refused still names a real
+# `tool` when it is wrongly normalized. Against the single-tool_call fixture
+# `/nodes/01/tool` would be refused for having no target, which proves
+# nothing about the index.
+TWO_TOOLS = {
+    "entrypoint": "first",
+    "nodes": [
+        {"id": "first", "type": "tool_call", "tool": "llm.generic", "next": "second"},
+        {"id": "second", "type": "tool_call", "tool": "llm.generic", "next": "end"},
+        {"id": "end", "type": "end"},
+    ],
+}
+
+
 def _schema(artifact_id):
     return get_runtime().store.get_artifact(artifact_id).schema
 
@@ -527,14 +666,49 @@ class TestConfigOpsInheritsIt:
 
 
 class TestArtifactPatchInheritsIt:
+    def test_a_half_formed_op_does_not_write_a_version(self, client, admin_headers):
+        """The route's own consequence for a silently skipped operation.
+
+        `{"op": "replace", "value": "CHANGED"}` has no `path`. The engine used
+        to return quietly, so the route carried on into
+        `update_private_artifact` and wrote an artifact update and a new
+        version recording a patch that changed nothing. The request model does
+        not check operand shape either, so nothing above the engine caught it.
+        """
+        artifact = _private(client, admin_headers)
+        before, before_versions = _schema(artifact), _versions(artifact)
+
+        resp = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers, json={
+            "patch": [{"op": "replace", "value": "CHANGED"}],
+        })
+
+        assert resp.status_code == 400, resp.text
+        assert _schema(artifact) == before, "the artifact changed anyway"
+        assert _versions(artifact) == before_versions, "a version was written"
+
+    def test_a_leading_zero_index_does_not_reach_a_node(self, client, admin_headers):
+        """The index grammar in the shape it actually arrives in.
+
+        `/nodes/01/tool` is not a JSON Pointer array index. It used to
+        normalize to 1 and rewrite the second node's tool, then return 200 and
+        write a version — an operator's typo becoming a silent edit to a
+        different node than the one they named.
+        """
+        artifact = _private(client, admin_headers, extra=TWO_TOOLS)
+        before, before_versions = _schema(artifact), _versions(artifact)
+
+        resp = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers, json={
+            "patch": [{"op": "replace", "path": "/nodes/01/tool", "value": "CHANGED"}],
+        })
+
+        assert resp.status_code == 400, resp.text
+        assert _schema(artifact) == before, "a node the pointer did not name changed"
+        assert _versions(artifact) == before_versions, "a version was written"
+
     def test_a_private_artifact_refuses_a_location_that_does_not_exist(
         self, client, admin_headers
     ):
-        made = client.post("/v1/artifacts", headers=admin_headers, json={
-            "type": "workflow", "name": f"pv-{uuid.uuid4().hex[:6]}",
-            "schema": json.loads(json.dumps(WORKFLOW)), "visibility": "private",
-        })
-        artifact = made.json()["data"]["id"]
+        artifact = _private(client, admin_headers)
         before, before_versions = _schema(artifact), _versions(artifact)
 
         resp = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers, json={
