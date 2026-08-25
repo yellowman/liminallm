@@ -762,6 +762,78 @@ class TestConfigOpsInheritsIt:
         assert _versions(artifact) == before_versions + 1
 
 
+class TestThePatchProducersEmitApplicablePatches:
+    """A patch this system generates for itself must apply to the artifact it
+    names.
+
+    Two producers write a single key under `/meta`: the ConfigOps fallback
+    patch and the adapter auto-prune proposer. A freshly created artifact has
+    no `meta` in its schema, and traversal no longer invents one, so both now
+    emit a patch that stores `pending`, approves cleanly, and then fails on
+    apply — a dead end this branch introduced.
+
+    Prepending an unconditional `add /meta` is not the fix: `add` on a member
+    that is already there replaces it, so that trades a refused patch for a
+    destroyed one. There is a control below holding exactly that line.
+    """
+
+    def test_meta_ops_add_the_parent_only_when_it_is_absent(self):
+        from liminallm.service.json_patch import meta_ops
+
+        absent = meta_ops({"kind": "workflow.chat"}, "llm_autopatch", {"x": 1})
+        assert [o["path"] for o in absent] == ["/meta", "/meta/llm_autopatch"]
+
+        present = meta_ops(
+            {"kind": "workflow.chat", "meta": {"keep": "ME"}},
+            "llm_autopatch", {"x": 1},
+        )
+        assert [o["path"] for o in present] == ["/meta/llm_autopatch"]
+
+    def test_the_generated_ops_apply_to_an_artifact_with_no_meta(self):
+        from liminallm.service.json_patch import meta_ops
+
+        schema = {"kind": "workflow.chat", "nodes": []}
+        out = json_patch.apply_ops(schema, meta_ops(schema, "auto_prune", {"x": 1}))
+        assert out["meta"] == {"auto_prune": {"x": 1}}
+
+    def test_an_existing_meta_survives_the_generated_ops(self):
+        """The control that rules out the naive repair."""
+        from liminallm.service.json_patch import meta_ops
+
+        schema = {"kind": "workflow.chat", "meta": {"keep": "ME"}}
+        out = json_patch.apply_ops(schema, meta_ops(schema, "auto_prune", {"x": 1}))
+        assert out["meta"] == {"keep": "ME", "auto_prune": {"x": 1}}
+
+    def test_the_configops_fallback_patch_applies_to_a_bare_artifact(
+        self, client, admin_headers
+    ):
+        """Through propose, approve and apply, with the LLM failing so the
+        fallback is what gets stored."""
+        from liminallm.api.runtime import get_runtime
+
+        artifact = _published(client, admin_headers)
+        runtime = get_runtime()
+        assert "meta" not in _schema(artifact), "fixture must start without meta"
+
+        ops = runtime.config_ops
+        original = ops._run_llm_for_patch
+        ops._run_llm_for_patch = lambda prompt: ops._fallback_patch(
+            runtime.store.get_artifact(artifact)
+        )
+        try:
+            audit = ops.auto_generate_patch(artifact, None, goal="probe")
+        finally:
+            ops._run_llm_for_patch = original
+
+        client.post(f"/v1/config/patches/{audit.id}/decide",
+                    headers=admin_headers, json={"decision": "approve"})
+        applied = client.post(f"/v1/config/patches/{audit.id}/apply",
+                              headers=admin_headers, json={})
+
+        assert applied.status_code == 200, applied.text
+        assert "llm_autopatch" in _schema(artifact).get("meta", {})
+
+
 class TestArtifactPatchInheritsIt:
     def test_a_half_formed_op_does_not_write_a_version(self, client, admin_headers):
         """The route's own consequence for a silently skipped operation.
