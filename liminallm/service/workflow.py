@@ -196,6 +196,27 @@ class WorkflowEngine(WorkflowStreamingMixin):
         self.tool_fetcher = AllowlistedFetcher(self.tool_network_policy)
         self._shutdown = False
 
+    @staticmethod
+    def _successors(node: Dict[str, Any], tool_result: Any) -> List[str]:
+        """Where a tool node goes next, given how the call finished.
+
+        One place, because there were two. `on_error` replaces `next`
+        entirely when the call failed — and the circuit-open path had its own
+        copy that read `next` and never looked at `on_error`, so a graph
+        declaring `tool -> recover` on failure ran `tool -> normal` whenever
+        the breaker was open. A failure is a failure however it arose.
+        """
+        if isinstance(tool_result, dict) and tool_result.get("status") == "error":
+            err_next = node.get("on_error")
+            if err_next:
+                return [err_next]
+        next_nodes = node.get("next")
+        if isinstance(next_nodes, str):
+            return [next_nodes]
+        if isinstance(next_nodes, list):
+            return [n for n in next_nodes if n]
+        return []
+
     def _error_event(
         self, code: str, message: str, details: dict | None = None
     ) -> dict:
@@ -1859,13 +1880,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 }
                 outputs = {}
                 node_id = node.get("id", "unknown")
-                next_nodes = node.get("next")
-                if isinstance(next_nodes, str):
-                    next_nodes_list = [next_nodes]
-                elif isinstance(next_nodes, list):
-                    next_nodes_list = [n for n in next_nodes if n]
-                else:
-                    next_nodes_list = []
+                # Through the same chooser as every other tool failure. This
+                # used to read `next` directly and return, so an open breaker
+                # took the success edge into nodes that assume outputs the
+                # failed node never produced.
+                next_nodes_list = self._successors(node, tool_result)
                 result_payload = {
                     "node_id": node_id,
                     "status": tool_result.get("status", "done"),
@@ -1942,17 +1961,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 for k, v in tool_result.items()
                 if k not in {"usage", "context_snippets", "_failure_recorded"}
             }
-        next_nodes = node.get("next")
-        if isinstance(next_nodes, str):
-            next_nodes_list: List[str] = [next_nodes]
-        elif isinstance(next_nodes, list):
-            next_nodes_list = [n for n in next_nodes if n]
-        else:
-            next_nodes_list = []
-        if isinstance(tool_result, dict) and tool_result.get("status") == "error":
-            err_next = node.get("on_error")
-            if err_next:
-                next_nodes_list = [err_next]
+        next_nodes_list = self._successors(node, tool_result)
         result_payload: Dict[str, Any] = {
             "status": (
                 tool_result.get("status", "ok")

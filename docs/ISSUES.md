@@ -14160,6 +14160,37 @@ graph ran node `first`; a dangling `next` ran only its source; duplicate ids
 left one node silently replacing the other. All three are accepted at
 `POST /v1/artifacts` with 201.
 
+### An open circuit took the success edge
+
+The validator says a workflow executes the graph it declares. The graph here
+is valid; what was wrong is which edge execution chose.
+
+`on_error` replaces `next` when a tool call fails — except on the
+circuit-breaker path, which built its own error result, read `next`, and
+returned before reaching the swap. Measured on a graph declaring
+`tool -> normal` with `on_error: recover`, breaker forced open:
+
+```
+expected  tool -> recover
+actual    tool -> normal
+```
+
+So an open breaker sent the turn down the *success* path, into nodes that
+assume outputs the failed node never produced. Two copies of "where does this
+node go next" is what made it possible, so there is one `_successors` now and
+both callers use it.
+
+**My own docstring asserted the behaviour that path did not have.** I read
+that branch while measuring the edge fields, recorded its `next` handling,
+and then wrote "taken instead of `next` when a tool call fails" as though it
+were universal. Which is what a comment is worth as evidence.
+
+**A second witness came from a mutation, not from review.** Removing
+`on_error` from the chooser entirely killed only the circuit-open witness —
+so the primary path, a tool that simply fails, was resting on the breaker
+case to notice. It has its own witness now, and the two mutations separate:
+restoring the early-return copy kills one, removing the rule kills both.
+
 ### Streaming carried its own copy of the repair semantics
 
 `run_streaming` is a separate graph execution path, with the same entrypoint

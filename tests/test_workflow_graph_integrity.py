@@ -434,11 +434,14 @@ class TestAFailedToolTakesItsErrorEdge:
 
     @pytest.fixture
     def engine(self):
-        from tests.test_workflow_retry_timeout import (
-            MockLLM, MockRAG, MockRedisCache, MockRouter, MockStore,
-        )
-
         from liminallm.service.workflow import WorkflowEngine
+        from tests.test_workflow_retry_timeout import (
+            MockLLM,
+            MockRAG,
+            MockRedisCache,
+            MockRouter,
+            MockStore,
+        )
 
         return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
                               cache=MockRedisCache())
@@ -473,3 +476,26 @@ class TestAFailedToolTakesItsErrorEdge:
         ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
         assert "normal" in ran, f"a successful tool call took the error edge: {ran}"
         assert "recover" not in ran, ran
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_tool_failure_also_takes_on_error(
+        self, engine, monkeypatch
+    ):
+        """The other caller of the chooser, which had no witness of its own.
+
+        Found by a mutation rather than by review: removing `on_error` from
+        the chooser entirely killed only the circuit-open witness, which meant
+        the primary path — a tool that simply fails — was resting on the
+        breaker case to notice. An unknown tool name is an ordinary error
+        result, and tool names are not graph-validated yet, so this reaches
+        the failure tail rather than the breaker branch.
+        """
+        schema = json.loads(json.dumps(self.BREAKER))
+        schema["nodes"][0]["tool"] = "no.such.tool.v1"
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
+
+        assert "recover" in ran, f"a failing tool did not take its error edge: {ran}"
+        assert "normal" not in ran, ran
