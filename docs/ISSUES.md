@@ -14142,6 +14142,73 @@ Six mutations, all applied and all killed, and the two new ones land where
 they should: classifying the source by basename kills only the two
 direct-source cases, and removing the queue's check kills only the queue case.
 
+## A workflow did not execute the graph it declared
+
+Reference validation, part one. Found by asking the engine what it does with
+a reference that names nothing, rather than what the schema says about it.
+
+Three ways the executor quietly ran a different graph from the published one:
+
+```
+entrypoint names nowhere   ran `next(iter(node_map))` — whatever came first
+next names nowhere         `if not node: continue`, continuation vanished
+two nodes share an id      the node_map dict comprehension kept the last
+```
+
+Measured against the engine, not read: `entrypoint: "nowhere"` on a two-node
+graph ran node `first`; a dangling `next` ran only its source; duplicate ids
+left one node silently replacing the other. All three are accepted at
+`POST /v1/artifacts` with 201.
+
+### The edge fields had to be measured, and that is the whole lesson
+
+The executor consumes **five** node-reference fields:
+
+| field | read at | in the artifact kind schema? |
+|---|---|---|
+| `entrypoint` | choosing where to start | yes |
+| `next`, scalar or list | ordinary nodes and parallel children | yes |
+| `branches[].next` | switch | yes |
+| `after` | where a parallel fan-in continues | **no** |
+| `on_error` | taken instead of `next` when a tool call fails | **no** |
+
+Writing the validator from the kind schema is the obvious move and would have
+covered three of five while looking complete. `after` and `on_error` are not
+in that schema at all — nothing else in the system knows they exist — and
+`on_error` is the one that matters most, because it is the transition a
+workflow takes precisely when it can least afford to stop silently.
+
+The two mutations that drop them from the edge set kill only their own
+witnesses, which is what says the pair is separated rather than covered twice.
+
+### Two altitudes, both load-bearing
+
+`graph_problems` is pure and returns every problem rather than the first, so
+each caller raises in its own vocabulary: admission gives
+`ArtifactValidationError`, the engine `BadRequestError`. Admission stops new
+invalid graphs; the engine checks again before building `node_map`, because a
+row can predate the check or arrive by import, and silently repairing such a
+row at execution *is* the defect.
+
+Unlike the operand rule in the patch tranche, these two are not redundant:
+the mutation removing each kills only its own witnesses.
+
+### A mutation retired rather than left surviving
+
+Re-adding the engine's old "replace a dangling entrypoint with the first
+node" fallback survived — because it cannot fire once the check above it has
+refused such an entrypoint. A mutation that changes no behaviour says the code
+it adds is dead, not that the tests are weak, so it was retired with that
+reasoning recorded instead of being counted as a survivor.
+
+### A control that was measuring the harness
+
+One witness asserted that the workflows this system synthesises for itself
+still *run*. They do not, under the mock engine those tests use — its default
+node returns an error, and it did so with the change stashed too. The property
+that belongs here is that the built-in graphs are not *refused*, and a second
+witness checks them against the rule directly, with no harness in the way.
+
 ## A patch that named nowhere reported that it had landed
 
 Found by driving ConfigOps against §10 on a running instance. A published

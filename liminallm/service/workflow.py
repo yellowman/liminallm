@@ -75,6 +75,7 @@ from liminallm.service.tokenizer_utils import (
     MAX_GENERATION_TOKENS,
     estimate_token_count,
 )
+from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
     MAX_CONTEXT_SNIPPETS,
@@ -469,14 +470,25 @@ class WorkflowEngine(WorkflowStreamingMixin):
             conversation_id, user_id=user_id, tenant_id=tenant_id
         )
 
+        # Before `node_map`, because building it is where two of these stop
+        # being visible: duplicate ids collapse into one key, and a dangling
+        # `entrypoint` used to be replaced with whatever node came first.
+        # Admission checks this too; a row can still predate that check or
+        # arrive by import, and repairing such a row silently is the defect.
+        problems = graph_problems(workflow_schema)
+        if problems:
+            raise BadRequestError(
+                "workflow graph is not consistent", detail={"problems": problems}
+            )
+
         node_map = {
             n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")
         }
         if not node_map:
             raise BadRequestError("workflow has no nodes to execute")
+        # `graph_problems` has already refused an entrypoint that names
+        # nothing, so this only chooses a start when none was named.
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
-        if not entry or entry not in node_map:
-            entry = next(iter(node_map)) if node_map else None
 
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []

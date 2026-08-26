@@ -192,11 +192,14 @@ class TestTheEngineRefusesRatherThanRepairs:
 
     @pytest.fixture
     def engine(self):
-        from tests.test_workflow_retry_timeout import (
-            MockLLM, MockRAG, MockRedisCache, MockRouter, MockStore,
-        )
-
         from liminallm.service.workflow import WorkflowEngine
+        from tests.test_workflow_retry_timeout import (
+            MockLLM,
+            MockRAG,
+            MockRedisCache,
+            MockRouter,
+            MockStore,
+        )
 
         return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
                               cache=MockRedisCache())
@@ -237,8 +240,28 @@ class TestTheEngineRefusesRatherThanRepairs:
         assert out.get("status") != "error", out
 
     @pytest.mark.asyncio
-    async def test_the_workflows_this_system_builds_itself_still_run(self, engine):
+    async def test_the_workflows_this_system_builds_itself_are_not_refused(
+        self, engine
+    ):
         """No workflow id at all, so the engine synthesises one. If either
-        built-in schema failed the new rule, every ordinary turn would."""
+        built-in schema failed the new rule, every ordinary turn would.
+
+        The assertion is that the graph is not *refused*, not that the turn
+        succeeds: under these mocks the default workflow's node returns an
+        error either way, measured on the unwired code as well. A graph
+        problem raises; a tool problem comes back in the result. Asserting on
+        the result would have made this a witness for the mock harness.
+        """
         out = await engine.run(None, None, "hello", None, user_id="u")
-        assert out.get("status") != "error", out
+        assert "graph" not in str(out.get("error", "")).lower(), out
+
+    @pytest.mark.asyncio
+    async def test_both_built_in_graphs_pass_the_rule_directly(self):
+        """The same property without the harness in the way."""
+        from liminallm.service.workflow import (
+            WorkflowEngine,
+            get_default_attachment_workflow_schema,
+        )
+
+        assert graph_problems(get_default_attachment_workflow_schema()) == []
+        assert graph_problems(WorkflowEngine._default_workflow(None)) == []
