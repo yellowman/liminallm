@@ -55,3 +55,6 @@ htmlcov/
 # Redis
 dump.rdb
 *.rdb
+
+# Left behind only if the mutation driver is killed mid-run.
+.mutation-in-progress

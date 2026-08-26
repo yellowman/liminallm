@@ -12,7 +12,6 @@ Tests for:
 import pytest
 
 
-
 @pytest.fixture
 def test_user(store):
     """Create a test user."""
@@ -329,7 +328,7 @@ class TestArtifactOperations:
             "nodes": [{"id": "start", "type": "llm_call"}],
             "version": 2,
         }
-        updated = store.update_artifact(artifact.id, new_schema)
+        updated = store.update_artifact(artifact.id, lambda _locked: new_schema)
 
         assert updated.schema["version"] == 2
 
@@ -345,16 +344,14 @@ class TestArtifactOperations:
             },
             owner_user_id=test_user.id,
         )
-        store.update_artifact(artifact.id, {
-            "kind": "workflow.chat",
-            "nodes": [{"id": "start", "type": "llm_call"}],
-            "version": 2,
-        })
-        store.update_artifact(artifact.id, {
-            "kind": "workflow.chat",
-            "nodes": [{"id": "start", "type": "llm_call"}],
-            "version": 3,
-        })
+        # The builder ignores the locked schema here because these two are
+        # whole-document replacements, which is what a versioning test wants.
+        for version in (2, 3):
+            store.update_artifact(artifact.id, lambda _locked, v=version: {
+                "kind": "workflow.chat",
+                "nodes": [{"id": "start", "type": "llm_call"}],
+                "version": v,
+            })
 
         versions = store.list_artifact_versions(artifact.id)
 

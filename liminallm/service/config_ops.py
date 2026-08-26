@@ -106,14 +106,15 @@ class ConfigOpsService:
                 "artifact missing", detail={"artifact_id": patch.artifact_id}
             )
 
-        # Step 1: Apply patch to artifact (pure function)
-        new_schema = self._apply_patch_to_schema(artifact.schema, patch.patch)
-
-        # Step 2: Persist schema and mark the patch applied, in one transaction
+        # The patch is applied inside the store's transaction, against the
+        # schema the store reads under the artifact lock — not against the
+        # `artifact` above. That read answers the request; it is not what the
+        # write is derived from, because anything committed between the two
+        # would otherwise be overwritten by a document built from the older
+        # row. SPEC §10.1 says apply loads the *current* schema.
         updated, applied_patch = self.store.apply_config_patch(
             patch,
-            new_schema,
-            artifact_description=artifact.description,
+            lambda current: self._apply_patch_to_schema(current, patch.patch),
             approver_user_id=approver_user_id,
         )
         return {"artifact": updated, "patch": applied_patch or patch}
@@ -181,18 +182,20 @@ class ConfigOpsService:
         return full_json[: max_chars - 3] + "..."
 
     def _fallback_patch(self) -> dict:
+        """The patch proposed when the model does not produce one.
+
+        One leaf op, deliberately. See `json_patch.meta_ops` for why this must
+        not carry an `add /meta` alongside it.
+        """
         timestamp = datetime.now(timezone.utc).isoformat()
         return {
-            "ops": [
+            "ops": json_patch.meta_ops(
+                "llm_autopatch",
                 {
-                    "op": "add",
-                    "path": "/meta/llm_autopatch",
-                    "value": {
-                        "generated_at": timestamp,
-                        "note": "Auto-tuned routing weights",
-                    },
-                }
-            ]
+                    "generated_at": timestamp,
+                    "note": "Auto-tuned routing weights",
+                },
+            )
         }
 
     def _apply_patch_to_schema(self, schema: dict, patch: dict) -> dict:
@@ -201,6 +204,10 @@ class ConfigOpsService:
         working = copy.deepcopy(schema)
         ops = patch.get("ops") if isinstance(patch, dict) else None
         if isinstance(ops, list):
+            # This loops apply_op rather than apply_ops, so the whole-patch
+            # rule has to be asked for explicitly or an empty `ops` reaches
+            # the store as a patch marked applied.
+            json_patch.validate_ops(ops)
             for op in ops:
                 self._apply_single_op(working, op)
             return working

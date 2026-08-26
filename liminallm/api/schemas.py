@@ -490,11 +490,29 @@ class ArtifactRequest(_SchemaPayload):
     visibility: Literal["private", "shared", "global"] = "private"
 
 
+def _validated_ops(ops):
+    """Check the patch's shape with the engine's own rule, not a copy of it.
+
+    Imported here rather than at module scope: schemas is imported by the
+    service layer, and a top-level import would close the ring.
+    """
+    from liminallm.service.json_patch import validate_ops
+
+    return validate_ops(ops)
+
+
 class ArtifactPatchRequest(BaseModel):
     """RFC 6902 JSON Patch request for artifact updates.
 
+    Paths address the artifact's **schema document**, not a wrapper around it:
+    a workflow's entrypoint is `/entrypoint`, not `/schema/entrypoint`. This
+    example used to say `/schema/foo`, which named a key *inside* the schema —
+    the engine created it, reported success, and left the value the caller
+    meant to change alone. Patch traversal no longer invents missing parents,
+    so that spelling is now refused rather than silently misapplied.
+
     Accepts:
-    - RFC 6902 array of operations: [{"op": "replace", "path": "/schema/foo", "value": "bar"}]
+    - RFC 6902 array of operations: [{"op": "replace", "path": "/foo", "value": "bar"}]
     - Wrapper dict with "ops" key: {"ops": [...]}
     - Legacy format for backward compatibility: {"schema": {...}, "description": "..."}
     """
@@ -515,15 +533,23 @@ class ArtifactPatchRequest(BaseModel):
         return self
 
     def get_normalized_patch(self) -> dict:
-        """Get patch in normalized format for processing."""
+        """Get patch in normalized format for processing.
+
+        Operation shape is checked here, against the patch engine's own
+        predicate, so a malformed op is refused before the route reaches the
+        store. The engine checks again when it applies — it is the boundary
+        every caller crosses — but by then this route has already decided to
+        write a version, and a half-formed op that the engine skipped in
+        silence used to get one.
+        """
         if self.patch is not None:
             # RFC 6902 format
             if isinstance(self.patch, list):
-                return {"ops": self.patch}
+                return {"ops": _validated_ops(self.patch)}
             elif isinstance(self.patch, dict):
                 if "ops" in self.patch or "operations" in self.patch:
                     ops = self.patch.get("ops") or self.patch.get("operations")
-                    return {"ops": ops}
+                    return {"ops": _validated_ops(ops)}
                 # Dict without ops key - treat as legacy schema update
                 return {"schema_update": self.patch}
             return {}

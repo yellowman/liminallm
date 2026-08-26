@@ -159,9 +159,24 @@ def test_the_original_schema_is_not_mutated(ops):
     assert schema == {"meta": {"weight": 1}}
 
 
-def test_a_missing_intermediate_is_created(ops):
+def test_a_missing_intermediate_is_refused(ops):
+    """Patch traversal names a place in the document; it does not build one.
+
+    This asserted the opposite — `add /a/b/c` on `{}` producing the whole
+    chain — and that creating walk is what let a ConfigOps patch address a
+    path the schema did not have, report `applied`, write a version, and
+    leave the configuration serving consumes untouched
+    (tests/test_patch_write_locations.py).
+
+    `add` still names a member that is not there yet; what it may no longer
+    do is invent the parent holding it.
+    """
+    with pytest.raises(BadRequestError):
+        ops._apply_patch_to_schema(
+            {}, {"ops": [{"op": "add", "path": "/a/b/c", "value": 1}]}
+        )
     out = ops._apply_patch_to_schema(
-        {}, {"ops": [{"op": "add", "path": "/a/b/c", "value": 1}]}
+        {"a": {"b": {}}}, {"ops": [{"op": "add", "path": "/a/b/c", "value": 1}]}
     )
     assert out == {"a": {"b": {"c": 1}}}
 
@@ -202,10 +217,16 @@ def test_an_empty_patch_changes_nothing(ops):
 
 
 @pytest.mark.parametrize(
-    "op", [{}, {"op": "add"}, {"path": "/a"}, {"op": "", "path": ""}]
+    "op", [{}, {"op": "add"}, {"path": "/a"}, {"op": "", "path": ""},
+           {"op": "replace", "path": "/a"}, {"op": "move", "path": "/b"}],
+    ids=["empty", "no-path", "no-op", "empty-op", "no-value", "no-from"],
 )
-def test_an_op_missing_its_parts_is_skipped(ops, op):
-    assert ops._apply_patch_to_schema({"a": 1}, {"ops": [op]}) == {"a": 1}
+def test_an_op_missing_its_parts_is_refused(ops, op):
+    """Was `..._is_skipped`, and asserted that each of these left the schema
+    alone. Silently, which is the problem: a patch made of nothing but these
+    was still marked applied."""
+    with pytest.raises(BadRequestError):
+        ops._apply_patch_to_schema({"a": 1}, {"ops": [op]})
 
 
 # ---------------------------------------------------------------------------
@@ -233,11 +254,25 @@ def test_a_path_through_a_scalar_is_a_bad_request(ops, schema, path):
         ops._apply_patch_to_schema(schema, {"ops": [{"op": "add", "path": path, "value": 1}]})
 
 
-def test_a_root_path_is_a_bad_request(ops):
-    """`/` addresses the whole document; treating it as a key wrote an
-    empty-string entry into the schema and said nothing."""
+def test_the_whole_document_pointer_is_a_bad_request(ops):
+    """RFC 6901 §5: the *empty* pointer is the whole document, not `/`.
+
+    This test used to assert the opposite — that `/` was the document root —
+    and the engine agreed with it. Both were wrong: `/` is one empty
+    reference token, naming the member keyed "". The pointer that addresses
+    the whole document is "", and it used to be ignored in silence, which is
+    the failure mode this file exists to catch.
+    """
     with pytest.raises(BadRequestError):
-        ops._apply_patch_to_schema({"a": 1}, {"ops": [{"op": "add", "path": "/", "value": 9}]})
+        ops._apply_patch_to_schema({"a": 1}, {"ops": [{"op": "add", "path": "", "value": 9}]})
+
+
+def test_a_lone_slash_names_the_empty_string_key(ops):
+    """The other half of the same correction, so nothing reverts it by
+    reading only the refusal above."""
+    assert ops._apply_patch_to_schema(
+        {"a": 1}, {"ops": [{"op": "add", "path": "/", "value": 9}]}
+    ) == {"a": 1, "": 9}
 
 
 def test_a_negative_list_index_is_refused(ops):
@@ -249,8 +284,13 @@ def test_a_negative_list_index_is_refused(ops):
 
 def test_a_huge_list_index_is_refused(ops):
     """Padding a list out to the requested index is how a one-line patch
-    becomes a memory exhaustion."""
-    with pytest.raises(BadRequestError, match="too large"):
+    becomes a memory exhaustion.
+
+    The defence used to be a constant ceiling and is now the list's own
+    length, so the complaint is "out of range" rather than "too large" — and
+    it arrives before anything is allocated either way.
+    """
+    with pytest.raises(BadRequestError, match="out of range"):
         ops._apply_patch_to_schema(
             {"rules": []},
             {"ops": [{"op": "add", "path": "/rules/999999999", "value": 1}]},
@@ -536,6 +576,6 @@ class TestValidationIsAnchoredToTheArtifactsOwnType:
         with pytest.raises(ArtifactValidationError):
             store.update_artifact(
                 canonical_adapter.id,
-                {"kind": "tool.spec", "name": "x", "handler": "x"},
+                lambda _locked: {"kind": "tool.spec", "name": "x", "handler": "x"},
             )
         assert store.get_artifact(canonical_adapter.id).schema["kind"] == "adapter.lora"

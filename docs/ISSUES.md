@@ -14141,3 +14141,670 @@ the internal file.
 Six mutations, all applied and all killed, and the two new ones land where
 they should: classifying the source by basename kills only the two
 direct-source cases, and removing the queue's check kills only the queue case.
+
+## A patch that named nowhere reported that it had landed
+
+Found by driving ConfigOps against §10 on a running instance. A published
+workflow was patched, the API returned 200, the patch was marked `applied`, a
+new `artifact_version` was written — and the configuration the chat path
+actually consumes did not change. Stored schema said `OMEGA`; serving said
+`ALPHA`, and still did six seconds later.
+
+### One document, two ideas about where its root is
+
+`ArtifactPatchRequest` documented the example
+`{"op":"replace","path":"/schema/foo"}`, and the route docstring repeated it.
+Both callers hand the patch engine `artifact.schema` **itself**, so
+`/schema/foo` names a key *inside* the schema. The engine's `add` and
+`replace` shared a creating traversal, so it obligingly made one:
+
+```
+before  {"spare": "keep"}
+after   {"spare": "keep", "schema": {"spare": "CHANGED"}}
+```
+
+The value the operator meant to change is untouched, a junk key is added, and
+the audit trail says the change was applied. Kind-schema validation cannot
+catch it — an extra top-level key is valid for the workflow kind — so nothing
+downstream objected either.
+
+### The rule, and why `remove` belongs in it
+
+An operation applies to a location that operation permits, or fails without
+changing the document. Two halves: traversal never manufactures missing
+intermediate structure, and an operation requiring an existing target never
+turns absence into success.
+
+`remove` had the second failure in the opposite direction: a missing target
+was treated as nothing to do, which makes a removal that addressed the wrong
+path indistinguishable from one that did its job. Same silent success, same
+class.
+
+RFC 6902 already says all of this — §4.1 for `add`'s array bound, §4.2 for
+`remove`, §4.3 for `replace`. What the module had was a single creating walk
+shared by verbs with different requirements.
+
+One helper left with the fix. `_walk_existing` was the non-creating walk that
+`remove` used to avoid conjuring the containers it was about to remove from;
+now that every verb walks without creating, it had no caller left.
+
+### The positive controls carry as much weight as the refusals
+
+"Reject every absent location" also passes every refusal case and breaks
+`add`, whose entire purpose is naming a member that is not there yet. So a
+new member of an existing object, a new member of an existing *nested*
+object, an append at `index == len`, `-`, and an insert that shifts are all
+witnessed, and they are what stops the fix from being a different bug.
+
+### A hazard the fix uncovered, and the half-fix it got first
+
+A `move` is a remove and an add. The destination used to be resolved only
+*after* the source was taken, so refusing the destination deleted a value on
+behalf of an operation that failed.
+
+The first repair checked the destination before the removal. That is not
+enough, and the reason is worth stating precisely: RFC 6902 §4.4 defines the
+add as happening in the document the remove **leaves behind**, and there are
+destinations that are valid before the removal and invalid after it. Two
+shapes, reachable by different mechanisms:
+
+```
+{"a": {"x": 1}}          move /a      -> /a/child     left {}
+{"xs": ["a","b","c"]}    move /xs/0   -> /xs/3        left {"xs": ["b","c"]}
+```
+
+The first is the proper-prefix case the RFC names outright: `/a` is a
+perfectly good parent right up until `/a` is the value being taken. The
+second has no prefix relationship at all — `/xs/3` is a legal append target
+on three elements and out of range on the two that remain. Both raised, and
+both destroyed a value while raising.
+
+`move` now rehearses the entire operation on a deep copy first. Whatever the
+rehearsal raises is raised before the real document has been touched, and if
+it raises nothing the replay cannot fail. `copy` needs none of this: reading
+mutates nothing, so the first thing that can change the document is the write.
+
+Cheaper checks were available and rejected. An explicit proper-prefix test is
+a better diagnostic but misses the array-shrink case entirely; validating
+against the pre-removal document is the half-fix above. The rehearsal is the
+only shape that covers both without enumerating them.
+
+### A constant ceiling made one position exist for four verbs and not two
+
+`_set_at` refused any index at or above 1024 before it looked at the list.
+Nothing else did, so on a 1025-element list:
+
+```
+replace /xs/1024          refused, "list index too large"
+add     /xs/1025          refused          (append at len)
+remove  /xs/1024          fine
+test    /xs/1024          fine
+copy/move from /xs/1024   fine
+```
+
+Position 1024 existed for four verbs and not for the two that write to it —
+the same operation-dependent location semantics this tranche exists to
+remove, hiding inside the fix for it.
+
+The ceiling's stated reason was that `add` may name an index beyond the end,
+so `/xs/999999999` would allocate a billion placeholders. `MAX_LIST_EXTENSION`
+and `_ensure_list_capacity` are gone.
+
+**The first version of this section repeated that reason, and it is wrong.**
+Nothing in the current engine pads a list. Measured, with the length check
+deleted: `/xs/999999999` on `[1, 2]` produces `[1, 2, 3]` — one `append`, in
+0.0001s at 11MB. So what the length check defends is the *address*, not the
+heap: `/xs/999999999` must not silently mean `/xs/2`. That is the same
+wrong-location failure as everything else here, which is the better reason
+anyway, but it is not the reason I wrote first.
+
+The claim came from the deleted constant's own comment. Carrying a comment
+forward is not verification — the comment and the code it described were both
+written from the same intent, and the padding implementation it described had
+already gone. Running it took one command.
+
+Two tests pinned the old wording (`tests/test_json_patch.py`,
+`tests/test_config_ops.py`). Both were updated rather than worked around: the
+memory-exhaustion concern they were written for is still exactly right, and
+still enforced — the complaint is just "out of range" now.
+
+**I missed the second one on the first sweep.** The grep was correct; it ended
+in `head -20` and the match was on line 21. Truncating a search for the *class*
+of a fix is the same mistake as not searching for it.
+
+### The pointer was rewritten before it was applied
+
+One step earlier than everything above, and the same invariant: before an
+operation can land where it was aimed, the pointer has to survive being read.
+
+Tokenizing was `strip("/")`, `split("/")` and "drop the empty ones", with no
+escape decoding. That is four separate rewrites of the caller's address:
+
+```
+/a~1b   names key `a/b`      wrote key `a~1b`
+/a~0b   names key `a~b`      wrote key `a~0b`
+/a//b   is `a`, ``, `b`      wrote a.b
+/a/     is a's `` member     replaced `a` itself
+a/b     is not a pointer     accepted as /a/b
+```
+
+The escape pair is the worst, because both spellings can be real keys in the
+same document. So the operation does not fail — it succeeds against a valid
+location nobody named. Through ConfigOps that is 200, status `applied`, a new
+`artifact_version`, and the key the operator wrote still holding its old
+value. The same consequence as the `/schema/foo` defect that opened this
+tranche, reached through the pointer rather than through the path root.
+
+`_segments_or_raise` is now an RFC 6901 tokenizer: leading `/` required, empty
+reference tokens preserved, `~1` then `~0` decoded in that order, and a `~`
+that escapes nothing refused. The order is not cosmetic — decoding `~0` first
+turns `~01` into `~1` and then into `/`, a third key again.
+
+Error details render through `_pointer`, which re-escapes, so a key containing
+`/` does not come back out reading as two tokens.
+
+**A root-path claim was inverted, in the code and in a test that agreed with
+it.** RFC 6901 §5: `""` is the whole document; `/` is the member keyed `""`.
+The engine had it backwards — `/` was refused as "the document root" while
+`""` was ignored in silence. `""` is now refused explicitly and `/` is an
+ordinary location. `test_a_root_path_is_a_bad_request` asserted the inverted
+rule in its docstring; it is rewritten, and a positive witness for `/` sits
+next to it so nothing restores the old reading from the refusal alone.
+
+An op that omits `path` entirely is still skipped. Structurally incomplete is
+not the same as naming the whole document, and conflating them through
+`op.get("path", "")` is how the whole-document pointer came to be ignored.
+
+While fixing that, `move`/`copy` with no `from` turned out to default the same
+way and report "addresses the whole document" — a true sentence about an
+operand the caller never wrote. It now says which operand is missing.
+
+### An operation was trusted to carry its own operands
+
+One level up from the pointer, same shape. RFC 6902 §4 gives every operation
+`op` and `path`, and each verb the further members it needs. None of it was
+required:
+
+```
+{"op":"replace","path":"/k"}     wrote {"k": None}
+{"op":"add","path":"/new"}       wrote {"new": None}
+{"op":"replace","value":"X"}     skipped in silence
+{}                               skipped in silence
+```
+
+The first does not no-op — it destroys the value on behalf of an operand
+nobody supplied. The silent skips are worse than they look through the
+private-artifact PATCH route: the route carries on into
+`update_private_artifact`, so a patch made entirely of skipped operations
+returned 200 and wrote a new version. Measured on the red: version 1 to 2,
+schema unchanged. An audit entry asserting a change that did not happen —
+the same consequence this tranche opened with.
+
+The rule lives in `validate_op`, and the artifact request model calls it
+rather than keeping a copy. The engine remains the boundary every caller
+crosses; the model checks earlier so the route can refuse before it has
+decided to write anything.
+
+`value: null` is a legal operand, so the question is always whether the
+member is *present*. There is a control for that, and one for `remove` being
+complete with two members, so the fix cannot drift into "reject falsy
+values" or "require three members from everything".
+
+**A test asserted the opposite, and its stated reason was untrue.**
+`test_an_op_without_action_or_path_is_ignored` justified the silence with
+"both callers validated shape upstream and relied on this".
+`ArtifactPatchRequest` did not: it took `List[dict]` and checked nothing. The
+comment is what made the behaviour look deliberate for as long as it did.
+
+**A third instance, found by grepping the class rather than the instance.** An
+empty operation list is well-formed JSON and still names no change, and both
+callers accepted it and wrote a version: the route guarded the engine behind
+`if ops:` and went straight to the store — measured, `{"patch": []}` returned
+200 and took the artifact from version 1 to 2 — while ConfigOps looped zero
+times and marked the patch applied. `validate_ops` refuses it, and the route's
+guard is gone so no patch reaches the store without meeting a rule.
+
+### A pointer operand was required to exist, not to be a string
+
+`validate_op` required `path`, and `from` for the verbs that take one, but
+neither to be a string. `_segments_or_raise` reaches straight for
+`path.startswith("/")`, so every non-string left as an uncaught
+`AttributeError`:
+
+```
+path=42   path=null   path=["/a"]   path={"a":1}   from=42
+```
+
+A 500 for a plainly bad request, and reachable over the wire: both API models
+take `List[dict]`, which admits any JSON value in any member.
+
+Refused rather than coerced. `str(42)` is `"42"` — a pointer that is not the
+one anybody wrote, which is the whole failure this module exists to stop.
+
+### `test` compared Python objects, not JSON values
+
+RFC 6902 §4.6 compares JSON values. Python makes `True == 1` and `False == 0`
+and carries that equivalence recursively through lists and dicts, so a
+precondition passed on a value of a different JSON type.
+
+`test` is the one verb whose entire job is guarding the operations behind it,
+so this does not merely misreport. Against `{"enabled": true, "spare":
+"keep"}`:
+
+```json
+[{"op":"test","path":"/enabled","value":1},
+ {"op":"replace","path":"/spare","value":"CHANGED"}]
+```
+
+returned 200, set `spare` to `CHANGED`, and wrote version 2 — a mutation
+applied on a precondition that was never met.
+
+`json_equal` is the rule: booleans equal only booleans, numbers compare
+numerically with `bool` excluded, arrays and objects recurse, everything else
+compares within its own type. JSON has one number type, so `1` and `1.0` are
+one value and there is a control saying so.
+
+The two mutations are complements. Restoring Python `==` kills all seven
+inequality witnesses and both route witnesses; removing only the container
+recursion — a scalar-only fix — kills exactly the array, object and nested
+three. That is what says those three are measuring the recursion rather than
+repeating the scalar case.
+
+### An array index was whatever `str.isdigit()` allowed
+
+RFC 6901 §4 says `0` or a non-zero digit run, ASCII. `seg.isdigit()` is a much
+larger set, so several distinct spellings named one position:
+
+```
+/xs/01   -> index 1        leading zeros
+/xs/١    -> index 1        arabic-indic
+/xs/０    -> index 0        fullwidth
+/xs/²    -> ValueError     isdigit() true, int() refuses
+```
+
+The last is the only case in this tranche that was a 500 rather than a wrong
+write: `isdigit()` admitted it and `int()` then raised through an
+unhandled path. The negative branch had the same pair — `"-²".lstrip("-")`
+`.isdigit()` was true and `int("-²")` was not — so both forms are matched
+strictly now.
+
+Through the route the rest is worse than a refusal would be:
+`/nodes/01/tool` returned 200 and rewrote the **second** node's tool, so an
+operator's typo silently edited a different node than the one they named.
+
+### Apply held a lock over a write it had already computed
+
+The deepest of these, and the one the two `meta` rounds were circling without
+naming. SPEC §10.1: applying a config patch loads the **current**
+`artifact.schema`, applies the patch, validates, writes the version, then
+marks the patch applied. §22 assumes multiple replicas, so "current" cannot
+mean "whatever this process read a moment ago".
+
+`ConfigOpsService.apply_patch` read the artifact and computed the new document
+*before* calling the store. The store then locked the artifact row `FOR
+UPDATE` — and validated and wrote the document it had been handed. The lock
+serialized the write without covering the read behind it:
+
+```
+apply reads schema N
+apply computes N + patch
+another replica commits N+1
+apply locks the artifact row
+apply writes its precomputed N-derived schema
+-> the N+1 edit is gone
+```
+
+Locking a row and then writing someone else's snapshot into it is not
+atomicity. The patch application now happens inside that transaction, against
+the schema read under the lock: the store takes a `build_schema` callable, so
+the JSON Patch semantics stay in the service and the transaction stays in the
+store.
+
+The patch row is locked and its status re-read there for the same reason. The
+`approved` check ran outside the transaction and the status write had no
+`approved` guard, so two callers could both see `approved`, queue on the
+artifact lock, and each write a version for one patch.
+
+The description carried the identical staleness — `COALESCE(%s, description)`
+with a value read before the lock reverts a concurrent description change —
+and its only caller was passing back what it had just read, so both the
+argument and the column update are gone.
+
+**The witness that existed was asking the right question at the wrong
+altitude.** The `meta` staleness test called `apply_ops` on an already-later
+dictionary: it exercises the engine and never touches the read/compute/store
+lifecycle, so it passed against code with the race in it. The replacement
+drives a real concurrent edit through the ordinary artifact mutation path
+between the service's read and the store's transaction, and a second one
+witnesses two overlapping applies of the same approved patch. Each is killed
+by exactly one mutation — evaluation moved back outside the lock, and the
+patch row left unlocked — so they are measuring the two halves separately.
+
+Choosing the seam took one failed attempt worth recording: the first version
+made the concurrent edit from inside the patch computation, which after the
+fix runs *under* the artifact lock, so the edit waited on a lock its own call
+held and the suite hung. The seam has to be where no lock is held, which is
+before the store transaction opens — and that is version-agnostic, because
+the unfixed service has already computed its result by then.
+
+### Apply and delete took the two rows in opposite orders
+
+The fix for the lost update introduced a lock on the `config_patch` row, and
+put it in the wrong place. `apply_config_patch` took patch then artifact, with
+a comment claiming that was the universal order. It is not:
+`delete_private_artifact` takes the artifact and then deletes it, and
+`config_patch.artifact_id` is `ON DELETE CASCADE`, so the delete reaches the
+patch rows *through* the artifact.
+
+```
+delete:  artifact -> config_patch (via cascade)
+apply:   config_patch -> artifact
+```
+
+An ABBA cycle. Reachable rather than theoretical: propose accepts any artifact
+id, so a private artifact can carry an approved patch while its owner deletes
+it, and account erasure meets the same relationship. Measured:
+`{'apply': 'DeadlockDetected', 'delete': 'ok'}`.
+
+Postgres broke the cycle by aborting a transaction, so nothing was corrupted —
+which is why this was a MEDIUM and not a HIGH. But a deadlock victim is not
+the same as two operations having one intentional order, and every other
+writer here already takes the artifact first. `apply_config_patch` now does
+too, and re-checks the patch row's identity and status once both locks are
+held.
+
+Artifact-first did not cost the exactly-once property: two applies of one
+patch contend on the artifact first, the winner marks the patch, and the loser
+then takes the patch row and sees `applied`. The mutation that restores
+patch-first kills the deadlock witness alone, and both exactly-once witnesses
+survive it, which is what says so.
+
+**The witness is deterministic by construction rather than by timing.** The
+delete is held after it has taken the artifact lock and before the cascade —
+using the `_artifact_from_row` call that already sits between them, so no test
+hook was added to production code — and the apply is released only once
+`pg_stat_activity` shows a backend genuinely waiting on a lock. A sleep would
+have made the red probabilistic, and a probabilistic red is not a witness.
+
+**A process note that cost a real scare.** Interrupting the mutation driver
+mid-run left a mutation applied to `json_patch.py`: the restore lives in a
+`finally`, and a killed process never reaches it. The routine `git status`
+after every mutation run is what caught it. The driver now writes a marker
+naming what it has applied, so an interrupted run says so instead of leaving
+the tree quietly wrong.
+
+### The same stale write in every other artifact caller
+
+Fixing ConfigOps closed the race for one writer. It did not close the class,
+and I did not look — a reviewer did. `update_artifact` had the identical
+shape: `FOR UPDATE`, then validate and write the `schema` argument rather
+than a transformation of the row it had just locked. Six callers passed a
+precomputed document.
+
+Interleaved the other way round it is the *applied* ConfigOps patch that
+vanishes:
+
+```
+private PATCH reads schema N, computes N + D
+ConfigOps locks, reads N, writes N + C, marks the patch applied
+private PATCH takes the lock, writes its precomputed N + D
+-> C is gone, and its audit trail still says applied
+```
+
+Measured: `field_c` back to `ORIGINAL` with the patch row still `'applied'`.
+That is the campaign invariant itself, reached from the other side.
+
+`update_artifact` and `update_private_artifact` now take a `build_schema`
+callable, applied to the schema read under the lock. The private PATCH route
+builds there instead of before, which also moved the kind-prefix check inside
+the transaction, so a refusal writes nothing. `description` stopped being
+replayed: the route passes `None` when the request did not ask for one, which
+the store already reads as "leave it alone" — writing back the value you read
+reverts a concurrent change to it, the same staleness one column over.
+
+**Training's promotion was the worst of them.** `dict(adapter.schema)` came
+from a snapshot taken before the training run, so the window is minutes, not
+microseconds — long enough for a ConfigOps patch to be proposed, approved,
+applied, audited, and then erased when promotion finally took the lock. All
+five training call sites are builders now, each changing only the fields it
+owns.
+
+**My first promotion witness was vacuous, and the mutation caught it.** It
+applied the concurrent patch at the first `update_artifact` for that adapter
+— which is the pre-training vocab-size write. Training refreshes its snapshot
+afterwards, so by promotion time the document already contained the patch and
+the witness passed against the defect. The mutation that rebuilds from
+`adapter.schema` survived, which is the only reason I noticed. The seam is now
+inside the training run itself: after the last refresh, before promotion takes
+the lock.
+
+### The fix broke two of this system's own patch producers
+
+Found by Bugbot on the pull request, confirmed by execution, and the only
+defect in this tranche that the tranche itself caused.
+
+Two producers write a single key under `/meta` — `config_ops._fallback_patch`
+and the adapter auto-prune proposer in `training.py`. A freshly created
+artifact has no `meta` in its schema, and traversal no longer invents one, so
+both emitted a patch that stored `pending`, approved cleanly, and then failed
+on apply with "patch path not found". A dead end that did not exist before.
+
+The engine is not what was wrong. A patch names a location in a document that
+already exists; the producers were relying on the creating walk. Both hold
+the artifact already, so both can emit ops that fit it.
+
+**The first repair was wrong, and the same reviewer caught it.** It inspected
+the artifact and prepended `add /meta {}` when `meta` was missing, so a
+proposal against a bare artifact would apply. ConfigOps stores a patch and
+applies it later, and `add` on a member that is already present replaces it —
+so anything that put a `meta` there in between (another pending patch, a
+direct edit, the second producer on the same artifact) was silently wiped.
+Measured: a patch proposed against a bare artifact, applied after
+`{"landed_in_between": "MUST SURVIVE"}` appeared, left `meta` holding only the
+new key. The data loss was not avoided, only deferred across the
+propose/apply gap.
+
+RFC 6902 has no "add if absent" and no test for absence, so **no
+proposal-time decision about a parent can be made stale-proof.** That leaves
+a trade, and the leaf op wins it everywhere except one case:
+
+| at apply time | parent-creating | leaf only |
+|---|---|---|
+| `meta` absent | applies | refused, nothing changed |
+| `meta` appeared since | **destroys it** | applies, siblings kept |
+
+So `meta_ops` emits one leaf op and never the parent. What that gives up is
+the bare-artifact case, which is now a visible dead end instead of silent
+damage — the better half of the trade, and the same one this project made
+when it refused to repair RAG by making a configured `web_fetch` unreachable.
+
+Closing the dead end properly is larger than the engine and belongs to the
+ConfigOps tranche. Two candidates: version-gate a stored patch so one written
+against a different document is refused rather than misapplied — which
+generalizes past `meta` to *any* stale patch — or move these bookkeeping
+annotations to the `artifact.meta` column that already exists, instead of
+writing them into the schema document that gets kind-validated and served.
+
+**The pruning producer changed twice with no witness either time.** Both
+rounds tested `meta_ops` directly and the ConfigOps fallback; the periodic
+worker test uses a fake training service, so it proves scheduling and not
+patch construction. `recommend_adapter_pruning()` is now driven for real — a
+genuinely prune-eligible adapter with a `meta` sibling, through propose,
+approve and apply — and a mutation that re-adds the parent create at that call
+site alone kills it and nothing else. The thresholds come from the service
+rather than being copied, so the fixture cannot drift away from eligibility.
+
+Worth recording as process rather than only defect. Two points. This is the
+second time in this campaign that a correct engine-level refusal exposed a
+caller depending on the incorrect behaviour, and grepping for the *shape*
+found the second producer when the report named only the first. And the first
+repair passed its own witnesses, its mutations, and the full lane — what it
+did not have was a witness for the gap between proposing and applying, which
+is the seam a reviewer found by asking when the ops are evaluated rather than
+what they say. The same question asked once more, of the lifecycle rather than
+the helper, found the lost update above: green is not correctness when the
+seam is a gap in time.
+
+### Destination errors stopped calling themselves source errors
+
+`_read_index` is reached from four callers and only one of them reads a
+source, but its not-a-number message said "patch source path not found". So
+`replace /xs/nope` described a bad destination as a problem with an operand
+`replace` does not have. Both of its messages are direction-neutral now, which
+also deleted the parameter that was carrying the direction.
+
+### A mutation found a hole that predated the change
+
+Removing the negative-index rejection from the write path killed nothing, so
+`add` gained a mutation that survived. It is not a false alarm:
+
+```
+add /xs/-1  on [1, 2]  ->  [1, 9, 2]
+add /xs/-2  on [1, 2]  ->  [9, 1, 2]
+```
+
+`list.insert(-1, v)` writes before the last element, so a negative final
+segment does not fail on the write path — it lands somewhere the caller never
+named, which is this tranche's defect class exactly. `replace` was already
+covered, because requiring an existing target reads the index first; `add` has
+no target to require, so it is the one verb where the index itself must be
+refused.
+
+The behaviour was correct before this pass and after it. What was missing was
+the witness, and review had not found it in two passes over the same file.
+
+### Three of my own witnesses were vacuous
+
+`apply_ops` deep-copies before it starts, so asserting that the caller's
+document is unchanged after a failure proves that `copy.deepcopy` works and
+nothing else. The risk lives on `apply_op`, which edits in place. Those three
+now drive the mutating entry point.
+
+### Mutations
+
+Twenty-three, of which twenty-one are killed and two survive by design (see
+below). Four cover the write-location rule:
+`replace` back to a creating traversal; a missing `remove` target back to a
+no-op; traversal manufacturing parents again; an array index past the end
+appending instead of failing. One covers the consumer — ConfigOps swallowing
+the refusal and applying anyway — and kills exactly one witness.
+
+Two more cover the array bound, and they are complements rather than
+duplicates. Restoring the constant ceiling (M7) kills the two large-index
+witnesses and leaves the huge-gap one alive, because a gap stays refused under
+a ceiling — for the wrong reason. Deleting the length check (M4) does the
+reverse. Neither check can stand in for the other, and the mutations say so
+rather than the comments.
+
+One is the mutation that survived first: serving a negative write index from
+the end. Its witness is in the section above.
+
+Six cover the pointer, one rewrite each, and each kills only its own
+witnesses — which is what says the witnesses separate the four ways the old
+tokenizer changed an address rather than testing one of them four times:
+
+| mutation | kills |
+|---|---|
+| empty tokens dropped again | the three empty-token witnesses |
+| `~1` stops decoding | the escaped-slash witnesses, artifact caller included |
+| `~0` stops decoding | the escaped-tilde and decode-order witnesses |
+| escapes decode by naive `replace` | the two malformed-escape witnesses and the order one |
+| leading `/` becomes optional | the not-a-pointer witness |
+| whole-document pointer ignored again | the two whole-document witnesses |
+
+**Two mutations silently measured nothing on the first run of this pass.** M7
+and M8 anchored on the `not_a_number=` argument that the diagnostic fix had
+just deleted, so neither applied. They reported it — the driver treats an
+unmatched anchor as loud, which is why that guard exists — and the repaired
+anchors needed disambiguating too, because removing the argument left
+`_require_target` and `_set_at` sharing one call line. It happened a second
+time later in the tranche, when `validate_op` replaced the code another
+mutation anchored on.
+
+### Two mutations survive on purpose, and one exists to say why
+
+The operand rule has one definition and two enforcement points: the engine,
+which every caller crosses, and the artifact request model, which checks
+earlier so the route can refuse before it decides to write. Either alone is
+sufficient, so removing either alone changes no observable behaviour:
+
+| mutation | result |
+|---|---|
+| the rule itself deleted | kills both empty-patch witnesses |
+| the model's call site removed | **survives** — the engine catches |
+| the route's `if ops:` guard restored | **survives** — the model catches |
+| both call sites removed, rule intact | kills the route witness, and only that |
+
+The two survivors are the signature of the layering rather than unmeasured
+code: the rule is measured, and what is deliberately not necessary is *which*
+call site does the work. The fourth mutation exists so that claim is
+demonstrated instead of asserted. If the second layer is not wanted, the model
+call site is the piece to delete, and the third row is what would then start
+failing.
+
+Two cover `move`, and the pair is the point. M5 restores the half-fix (check
+the destination, but before the removal) and kills **only** the two new
+witnesses; M5b removes the destination check entirely and kills those two plus
+the older one. That difference is what says the two new witnesses measure
+something the shipped preflight did not.
+
+The two new witnesses also come apart under the other mutations, which is how
+we know they are testing different mechanisms rather than one bug twice:
+removing the array bound (M4) kills the index witness alone, and restoring the
+creating traversal (M3) kills the self-descendant witness alone.
+
+### An error message got better, and two tests said so
+
+`/xs/-1` reached the write path as "negative list index" and the read path as
+"patch source path not found" — one mistake with two descriptions, the vaguer
+one pointing at a missing element rather than the index the author wrote.
+Both sides now say the same thing, and the three tests that pinned the old
+wording were updated rather than worked around.
+
+## Observation, not this tranche: a teardown race in the xdist lane
+
+Seen once in 2,917 tests and not reproduced — recorded because a one-sighting
+race that nobody writes down is a race that gets rediscovered.
+
+`test_a_replacement_cannot_be_undone_by_a_write_already_in_flight` failed under
+`make test-xdist` with `psycopg_pool.PoolClosed: the pool 'pool-1' is already
+closed`, raised on a background thread:
+
+```
+routes.upload_file
+  idempotency.IdempotencyGuard.__aexit__
+    runtime._set_cached_idempotency_record
+      store.hold_live_user  ->  self._connect()
+```
+
+So a fire-and-forget idempotency write outlived the session that owned the
+pool. It passes alone (31s), passes 3/3 as a file under `-n 4`, and the full
+lane was green on the next run. It has no reach into the patch engine — the
+file never mentions `json_patch`, and the module's only call site in
+`routes.py` is the artifact PATCH route, not the upload route in the trace.
+
+Worth a look on its own terms: the shape is a background write racing
+teardown, which is a product question about that write's lifetime as much as a
+harness question.
+
+## The isolation lesson from the live ConfigOps campaign
+
+Worth keeping, because six apparent defects evaporated under it.
+
+The first sweep ran every case against one artifact and reported seven
+failures. One case removed `/schema/nodes`; every later path was then missing,
+so the atomicity and current-schema results described damage rather than
+behaviour. Re-run on fresh artifacts, kind-schema validation and atomicity
+were **correct** — a patch producing an invalid artifact returns 400, the
+patch stays `approved`, no version is written, and a multi-op patch whose
+later operation fails changes nothing.
+
+A second self-inflicted error was a substring check. `"OMEGA" in
+json.dumps(schema)` passed while the real node still said `ALPHA`, because the
+text was sitting in the junk `schema` key the defect had just created. The
+check that would have caught it immediately — comparing the specific field —
+is the one the rewritten witnesses use.
+
+Two rules earned here, both cheap: give every case its own fixture when a
+case can corrupt shared state, and assert on the field rather than on the
+serialized document.

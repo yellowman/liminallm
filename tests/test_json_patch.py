@@ -20,7 +20,13 @@ from liminallm.service.errors import BadRequestError
 
 
 def test_add_and_replace_set_dict_keys():
-    out = json_patch.apply_ops({}, [
+    """Both verbs need the parent to be there; `add` may name a new member.
+
+    This used to start from `{}` and let `add /a/b` invent `/a`. Traversal no
+    longer manufactures containers (tests/test_patch_write_locations.py), so
+    the parent is given rather than conjured.
+    """
+    out = json_patch.apply_ops({"a": {}}, [
         {"op": "add", "path": "/a/b", "value": 1},
         {"op": "replace", "path": "/a/b", "value": 2},
     ])
@@ -43,9 +49,15 @@ def test_dash_appends():
     assert out["xs"] == [1, 2]
 
 
-def test_remove_tolerates_a_missing_key():
-    out = json_patch.apply_ops({"a": 1}, [{"op": "remove", "path": "/ghost"}])
-    assert out == {"a": 1}
+def test_remove_refuses_a_missing_key():
+    """RFC 6902 §4.2: the target location must exist.
+
+    Tolerating absence made a removal that addressed the wrong path
+    indistinguishable from one that did its job, which is the same silent
+    success `replace` had.
+    """
+    with pytest.raises(BadRequestError):
+        json_patch.apply_ops({"a": 1}, [{"op": "remove", "path": "/ghost"}])
 
 
 def test_remove_does_not_create_the_containers_it_removes_from():
@@ -53,18 +65,22 @@ def test_remove_does_not_create_the_containers_it_removes_from():
 
     remove /a/b on {} used to return {"a": {}} — so every model-authored
     patch that dropped an optional nested key quietly wrote an empty object
-    into the config or artifact schema it was editing.
+    into the config or artifact schema it was editing. Removing a missing
+    target is now refused outright, and the refusal must still leave nothing
+    behind: the original complaint was about the walk, not the verdict.
     """
-    assert json_patch.apply_ops({}, [{"op": "remove", "path": "/a/b"}]) == {}
-    assert json_patch.apply_ops(
-        {"keep": 1}, [{"op": "remove", "path": "/a/b/c/d"}]
-    ) == {"keep": 1}
+    doc = {"keep": 1}
+    for path in ("/a/b", "/a/b/c/d"):
+        with pytest.raises(BadRequestError):
+            json_patch.apply_ops(doc, [{"op": "remove", "path": path}])
+    assert doc == {"keep": 1}
 
 
 def test_remove_through_a_missing_list_index_creates_nothing():
-    assert json_patch.apply_ops(
-        {"xs": []}, [{"op": "remove", "path": "/xs/3/name"}]
-    ) == {"xs": []}
+    doc = {"xs": []}
+    with pytest.raises(BadRequestError):
+        json_patch.apply_ops(doc, [{"op": "remove", "path": "/xs/3/name"}])
+    assert doc == {"xs": []}
 
 
 def test_move_takes_the_value_with_it():
@@ -101,10 +117,15 @@ def test_the_original_document_is_never_mutated():
 @pytest.mark.parametrize(
     "op, match",
     [
-        ({"op": "add", "path": "/", "value": 1}, "document root"),
+        # RFC 6901 §5: "" is the whole document. "/" is the member keyed ""
+        # and is a perfectly ordinary location, so it is not listed here.
+        ({"op": "add", "path": "", "value": 1}, "whole document"),
         ({"op": "add", "path": "/rules/x", "value": 1}, "list index"),
         ({"op": "add", "path": "/name/deep", "value": 1}, "non-container"),
-        ({"op": "add", "path": "/rules/9999", "value": 1}, "too large"),
+        # Not "too large": there is no ceiling any more, only the list's
+        # length. 9999 is refused for the same reason /xs/5 is on two
+        # elements — it names a position past the end.
+        ({"op": "add", "path": "/rules/9999", "value": 1}, "out of range"),
         ({"op": "add", "path": "/rules/-1/x", "value": 1}, "negative"),
         ({"op": "move", "path": "/b", "from": "/ghost"}, "source path not found"),
         ({"op": "copy", "path": "/b", "from": "/rules/99"}, "source path not found"),
@@ -121,10 +142,21 @@ def test_a_malformed_op_names_its_problem(op, match):
         json_patch.apply_ops(doc, [op])
 
 
-def test_an_op_without_action_or_path_is_ignored():
-    """Half-formed entries are dropped rather than guessed at — both callers
-    validated shape upstream and relied on this."""
-    assert json_patch.apply_ops({"a": 1}, [{}, {"op": "add"}, {"path": "/x"}]) == {"a": 1}
+@pytest.mark.parametrize(
+    "op", [{}, {"op": "add"}, {"path": "/x"}, {"op": "replace", "path": "/a"}],
+    ids=["empty", "no-path", "no-op", "no-value"],
+)
+def test_a_half_formed_op_is_refused(op):
+    """This used to assert the opposite, on a premise that was not true.
+
+    Its reason was that "both callers validated shape upstream and relied on
+    this". `ArtifactPatchRequest` did not — it took `List[dict]` and checked
+    nothing — so the artifact route applied a no-op patch and wrote a version
+    for it. SPEC promises JSON Patch, which does not include quietly
+    discarding operations that are not JSON Patch.
+    """
+    with pytest.raises(BadRequestError):
+        json_patch.apply_ops({"a": 1}, [op])
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +258,13 @@ def test_a_failed_test_op_aborts_the_whole_patch(client, auth_headers, owned_art
 def test_negative_indices_are_refused_on_the_read_path_too(op):
     """RFC 6902 array indices are non-negative. Python's list[-1] quietly
     served `/rules/-1` to move/copy/test while the write path refused it —
-    found reviewing the commit that introduced this module."""
-    with pytest.raises(BadRequestError, match="source path not found"):
+    found reviewing the commit that introduced this module.
+
+    Both sides now name the same mistake the same way. This used to expect
+    "source path not found", which is what the read path happened to say
+    while the write path said "negative list index" — one error with two
+    descriptions, and the vaguer one sent the reader looking for a missing
+    element instead of at the index they wrote.
+    """
+    with pytest.raises(BadRequestError, match="negative list index"):
         json_patch.apply_ops({"rules": [1, 2]}, [op])

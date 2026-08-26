@@ -3391,8 +3391,12 @@ async def patch_artifact(
 ):
     """Update an artifact via RFC 6902 JSON Patch or legacy schema update.
 
+    Paths address the artifact's schema document itself — `/entrypoint`, not
+    `/schema/entrypoint`. See `ArtifactPatchRequest` for why the second
+    spelling was wrong here and is now refused rather than misapplied.
+
     Accepts:
-    - RFC 6902 format: {"patch": [{"op": "replace", "path": "/schema/foo", "value": "bar"}]}
+    - RFC 6902 format: {"patch": [{"op": "replace", "path": "/foo", "value": "bar"}]}
     - Legacy format: {"schema": {...}, "description": "..."} (for backward compatibility)
     """
     runtime = get_runtime()
@@ -3400,36 +3404,50 @@ async def patch_artifact(
     current = _get_private_artifact(runtime, artifact_id, principal)
 
     normalized = body.get_normalized_patch()
-    new_schema = dict(current.schema) if isinstance(current.schema, dict) else {}
-    new_description = current.description
 
-    if "ops" in normalized:
-        # RFC 6902 JSON Patch operations
-        ops = normalized["ops"]
-        if ops:
-            new_schema = json_patch.apply_ops(new_schema, ops)
-    elif "schema_update" in normalized:
-        # Legacy schema update - deep merge
-        new_schema = json_patch.deep_merge(new_schema, normalized["schema_update"])
+    def build_schema(locked: dict) -> dict:
+        """Applied to the schema the store reads under the artifact lock.
 
-    if "description" in normalized:
-        new_description = normalized["description"]
+        `current` above answers the request; it is not what the write is
+        derived from. Computing the whole document here and handing it over
+        made this lock serialize the write without covering the read behind
+        it, so a change committed in between was replaced by a result built
+        from the older row.
 
-    # Validate kind prefix
-    schema_kind = new_schema.get("kind")
-    if schema_kind and not schema_kind.startswith(f"{current.type}."):
-        raise BadRequestError(
-            "kind must start with the type prefix",
-            detail={"kind": schema_kind, "type": current.type},
-        )
+        The kind check moved in here with it, which also means a refusal
+        happens inside the transaction and writes nothing. `current.type` is
+        safe to close over: type is immutable through every mutation path.
+        """
+        if "ops" in normalized:
+            # No `if ops:` guard: a falsy list used to skip the engine and go
+            # straight to writing a version for a patch that named nothing.
+            candidate = json_patch.apply_ops(locked, normalized["ops"])
+        elif "schema_update" in normalized:
+            candidate = json_patch.deep_merge(locked, normalized["schema_update"])
+        else:
+            candidate = locked
+
+        schema_kind = candidate.get("kind")
+        if schema_kind and not schema_kind.startswith(f"{current.type}."):
+            raise BadRequestError(
+                "kind must start with the type prefix",
+                detail={"kind": schema_kind, "type": current.type},
+            )
+        return candidate
+
+    # None when the request did not ask for one, which the store reads as
+    # "leave it alone". Passing back the description we read would revert a
+    # concurrent change to it — the same staleness as the schema, one column
+    # over.
+    new_description = normalized.get("description")
 
     # The private-owner predicate travels into the statement that takes the
     # lock. `_get_private_artifact` above answers the request; this is what
     # makes the answer still true at the moment of the write.
     artifact = runtime.store.update_private_artifact(
         artifact_id,
-        schema=new_schema,
-        description=new_description,
+        build_schema,
+        new_description,
         owner_user_id=principal.user_id,
         version_author=principal.user_id,
     )
