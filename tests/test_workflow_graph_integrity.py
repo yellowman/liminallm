@@ -265,3 +265,138 @@ class TestTheEngineRefusesRatherThanRepairs:
 
         assert graph_problems(get_default_attachment_workflow_schema()) == []
         assert graph_problems(WorkflowEngine._default_workflow(None)) == []
+
+
+class TestAReferenceHasTheShapeTheExecutorReads:
+    """Referential integrity is not enough: the *cardinality* has to match too.
+
+    The executor supports a list only for `next`. `after` is inserted as one
+    pending node id, and `on_error` is wrapped as one next-node id, so a list
+    in either position reaches `node_map.get(...)` as a list rather than a
+    node id. Neither field is in the artifact kind schema, so JSON Schema does
+    not reject the shape either — measured, `{"after": ["join"]}` passed both
+    admission layers with zero problems and then failed at execution.
+
+    This is the second half of the lesson from measuring fields the schema did
+    not know about: their cardinality is unpinned for exactly the same reason
+    their targets were.
+    """
+
+    @pytest.mark.parametrize("field", ["after", "on_error"], ids=["after", "on_error"])
+    def test_a_list_where_the_executor_reads_one_id_is_a_problem(self, field):
+        problems = graph_problems(_graph(**{f"work__{field}": ["join"]}))
+        assert problems, f"{field} accepted a list the executor cannot use"
+
+    def test_a_scalar_next_and_a_list_next_are_both_fine(self):
+        """`next` is the one field where the executor really does take both,
+        so narrowing it would be a different bug."""
+        assert graph_problems(_graph(work__next="join")) == []
+        assert graph_problems(_graph(work__next=["join", "end"])) == []
+
+    def test_a_list_branch_target_is_a_problem(self):
+        """The switch executor appends `branch["next"]` as one value and does
+        not flatten. The kind schema advertised string-or-array, which is a
+        contradiction the schema now no longer states."""
+        assert graph_problems(_graph(start__branches=[
+            {"when": "true", "next": ["fan"]},
+        ]))
+
+    def test_a_non_string_reference_is_a_problem(self):
+        for value in (7, {"id": "join"}, True):
+            assert graph_problems(_graph(work__next=value)), value
+
+
+class TestANodeIdIsUsableAsAnId:
+    """`node_map` is keyed by id and drops falsy ones, so a declared node with
+    an empty id disappears — the same silent-removal shape as a duplicate."""
+
+    def test_an_empty_node_id_is_a_problem(self):
+        schema = json.loads(json.dumps(VALID))
+        schema["nodes"].append({"id": "", "type": "end"})
+        assert graph_problems(schema)
+
+    def test_a_non_string_node_id_is_a_problem(self):
+        schema = json.loads(json.dumps(VALID))
+        schema["nodes"].append({"id": 7, "type": "end"})
+        assert graph_problems(schema)
+
+    def test_an_explicitly_empty_entrypoint_is_a_problem(self):
+        """Different from omitting it. Omitted means "start at the first
+        node"; written as empty means the operator named something and it is
+        not a node."""
+        assert graph_problems(_graph(entrypoint=""))
+
+    def test_admission_refuses_an_empty_node_id(self, client, admin_headers):
+        schema = json.loads(json.dumps(VALID))
+        schema["nodes"].append({"id": "", "type": "end"})
+        made = client.post("/v1/artifacts", headers=admin_headers, json={
+            "type": "workflow", "name": f"wg-{uuid.uuid4().hex[:6]}",
+            "schema": schema, "visibility": "private",
+        })
+        assert made.status_code == 400, made.text
+
+
+class TestStreamingRefusesTheSameGraphs:
+    """The batch/streaming altitude split.
+
+    `run_streaming` is a separate graph execution path with its own copy of
+    the repair semantics: the same entrypoint fallback and the same
+    `if not node: continue`. Blocking chat fails closed on an invalid row
+    while streaming chat silently runs a different graph — which is the exact
+    row this tranche exists to protect.
+    """
+
+    @pytest.fixture
+    def engine(self):
+        from tests.test_workflow_retry_timeout import (
+            MockLLM, MockRAG, MockRedisCache, MockRouter, MockStore,
+        )
+
+        from liminallm.service.workflow import WorkflowEngine
+
+        return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
+                              cache=MockRedisCache())
+
+    @pytest.mark.parametrize(
+        "changes",
+        [{"entrypoint": "nowhere"}, {"work__next": "nowhere"},
+         {"fan__after": "nowhere"}, {"work__on_error": "nowhere"}],
+        ids=["entrypoint", "next", "after", "on_error"],
+    )
+    @pytest.mark.asyncio
+    async def test_an_invalid_graph_is_refused_before_anything_is_emitted(
+        self, engine, monkeypatch, changes
+    ):
+        monkeypatch.setattr(engine, "_load_workflow_for",
+                            lambda *a, **k: _graph(**changes))
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hello", None, user_id="u")]
+
+        assert events, "the stream produced nothing at all"
+        first = events[0]
+        assert first.get("event") == "error", (
+            f"the graph was executed before it was checked: {events[:3]}"
+        )
+        assert first["data"]["code"] == "validation_error", first
+        # Before any token, trace or node execution — the point of failing
+        # closed is that nothing downstream ever saw the repaired graph.
+        assert not any(e.get("event") in {"token", "trace"} for e in events), events
+
+    @pytest.mark.asyncio
+    async def test_streaming_refuses_duplicate_ids(self, engine, monkeypatch):
+        schema = json.loads(json.dumps(VALID))
+        schema["nodes"].append({"id": "work", "type": "end"})
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hello", None, user_id="u")]
+        assert events[0].get("event") == "error", events[:3]
+
+    @pytest.mark.asyncio
+    async def test_streaming_still_runs_a_valid_graph(self, engine, monkeypatch):
+        """The control at this altitude."""
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: VALID)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hello", None, user_id="u")]
+        assert events, "the stream produced nothing at all"
+        codes = [e["data"].get("code") for e in events if e.get("event") == "error"]
+        assert "validation_error" not in codes, events[:3]
