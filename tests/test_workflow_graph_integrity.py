@@ -403,3 +403,73 @@ class TestStreamingRefusesTheSameGraphs:
         assert events, "the stream produced nothing at all"
         codes = [e["data"].get("code") for e in events if e.get("event") == "error"]
         assert "validation_error" not in codes, events[:3]
+
+
+class TestAFailedToolTakesItsErrorEdge:
+    """`on_error` is the edge a tool node takes when the call fails, and the
+    circuit-breaker path did not take it.
+
+    The ordinary tool tail swaps `next` for `on_error` on an error result. The
+    circuit-open branch builds its own error result, reads `next`, and returns
+    before reaching that swap — so an open breaker sends the turn down the
+    *success* path, into nodes that assume outputs the failed node never
+    produced.
+
+    This is the same class the rest of this file is about, one level in: the
+    declared graph says `tool -> recover` on failure and the runtime does
+    `tool -> normal`. The graph validator cannot see it, because the graph is
+    valid; what was wrong is which edge execution chose.
+    """
+
+    BREAKER = {
+        "kind": "workflow.chat",
+        "entrypoint": "tool",
+        "nodes": [
+            {"id": "tool", "type": "tool_call", "tool": "llm.generic",
+             "next": "normal", "on_error": "recover"},
+            {"id": "normal", "type": "end"},
+            {"id": "recover", "type": "end"},
+        ],
+    }
+
+    @pytest.fixture
+    def engine(self):
+        from tests.test_workflow_retry_timeout import (
+            MockLLM, MockRAG, MockRedisCache, MockRouter, MockStore,
+        )
+
+        from liminallm.service.workflow import WorkflowEngine
+
+        return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
+                              cache=MockRedisCache())
+
+    @pytest.mark.asyncio
+    async def test_an_open_circuit_takes_on_error_not_next(
+        self, engine, monkeypatch
+    ):
+        async def open_breaker(tool_name, *, tenant_id=None):
+            return True, None
+
+        monkeypatch.setattr(engine.cache, "check_circuit_breaker", open_breaker)
+        monkeypatch.setattr(engine, "_load_workflow_for",
+                            lambda *a, **k: self.BREAKER)
+
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
+
+        assert "recover" in ran, f"the declared error edge was not taken: {ran}"
+        assert "normal" not in ran, (
+            f"an open breaker took the success edge into nodes that assume "
+            f"outputs the failed node never produced: {ran}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_closed_circuit_still_takes_next(self, engine, monkeypatch):
+        """The control. Routing every tool node to `on_error` would pass the
+        witness above and break every successful turn."""
+        monkeypatch.setattr(engine, "_load_workflow_for",
+                            lambda *a, **k: self.BREAKER)
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
+        assert "normal" in ran, f"a successful tool call took the error edge: {ran}"
+        assert "recover" not in ran, ran
