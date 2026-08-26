@@ -47,6 +47,26 @@ def apply(doc, *ops):
     return json_patch.apply_ops(doc, list(ops))
 
 
+def _wait_until_a_backend_blocks(store, timeout: float = 30.0) -> bool:
+    """Wait until some connection is genuinely waiting on a lock.
+
+    Polling the server beats sleeping a guessed interval: the concurrency
+    witnesses need the second operation to have *reached* its lock before the
+    first is released, and a fixed sleep either flakes or wastes wall clock.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with store._connect() as conn:
+            waiting = conn.execute(
+                "SELECT count(*) AS n FROM pg_stat_activity "
+                "WHERE wait_event_type = 'Lock' AND datname = current_database()"
+            ).fetchone()
+        if (waiting or {}).get("n", 0) >= 1:
+            return True
+        time.sleep(0.05)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # replace
 # ---------------------------------------------------------------------------
@@ -1050,6 +1070,98 @@ class TestApplyIsOneReadModifyWrite:
             assert schema["field_d"] == "D", "the route reported success"
         else:
             assert schema["field_d"] == "ORIGINAL", "a refused route call still wrote"
+
+    @pytest.mark.slow
+    def test_deleting_an_artifact_and_applying_a_patch_do_not_deadlock(
+        self, client, admin_headers
+    ):
+        """One order for both operations, or the database picks a victim.
+
+        `delete_private_artifact` locks the artifact and then deletes it, and
+        `config_patch.artifact_id` is ON DELETE CASCADE, so the delete needs
+        the patch rows too:
+
+            delete:  artifact  -> config_patch (via cascade)
+            apply:   config_patch -> artifact
+
+        That is an ABBA cycle, and it is reachable: propose accepts any
+        artifact id, so a private artifact can carry an approved patch while
+        its owner deletes it. Account erasure meets the same relationship.
+
+        Postgres resolves it by aborting one transaction, so nothing is
+        corrupted — but "the loser gets a DeadlockDetected" is not the same as
+        two operations having an intentional order, which is the discipline
+        every other writer here follows.
+
+        Deterministic by construction: the delete is held after it has taken
+        the artifact lock and before the cascade, and the apply is only
+        released once it is genuinely blocked on a lock.
+        """
+        artifact = _private(client, admin_headers, extra={"field_c": "ORIGINAL"})
+        patch_id = self._proposed(client, admin_headers, artifact, [
+            {"op": "replace", "path": "/field_c", "value": "C"},
+        ])
+        runtime = get_runtime()
+        store = runtime.store
+        owner = store.get_artifact(artifact).owner_user_id
+
+        real_from_row = store._artifact_from_row
+        at_delete, release = threading.Event(), threading.Event()
+        armed = {"once": True}
+
+        def hooked(row):
+            result = real_from_row(row)
+            # One shot: the apply path also reads this artifact, and it must
+            # not be the caller that gets held here.
+            if armed["once"] and str(row.get("id")) == artifact:
+                armed["once"] = False
+                at_delete.set()
+                assert release.wait(timeout=60), "the apply never blocked"
+            return result
+
+        outcomes = {}
+
+        def run(name, fn):
+            try:
+                fn()
+                outcomes[name] = "ok"
+            except Exception as exc:  # noqa: BLE001 - the type is the result
+                outcomes[name] = type(exc).__name__
+
+        store._artifact_from_row = hooked
+        try:
+            b = threading.Thread(target=run, daemon=True, args=(
+                "delete",
+                lambda: store.delete_private_artifact(artifact, owner_user_id=owner),
+            ))
+            b.start()
+            assert at_delete.wait(timeout=60), "the delete never took the artifact lock"
+
+            a = threading.Thread(target=run, daemon=True, args=(
+                "apply", lambda: runtime.config_ops.apply_patch(patch_id),
+            ))
+            a.start()
+            assert _wait_until_a_backend_blocks(store), "the apply never reached a lock"
+
+            release.set()
+            b.join(timeout=90)
+            a.join(timeout=90)
+        finally:
+            release.set()
+            store._artifact_from_row = real_from_row
+
+        assert "DeadlockDetected" not in outcomes.values(), (
+            f"the two operations deadlocked instead of serializing: {outcomes}"
+        )
+        # Whichever won, the survivor must be coherent.
+        surviving = store.get_artifact(artifact)
+        if surviving is None:
+            assert outcomes.get("delete") == "ok", outcomes
+            assert outcomes.get("apply") != "ok", (
+                f"a patch applied to an artifact that was deleted: {outcomes}"
+            )
+        else:
+            assert surviving.schema["field_c"] == "C", outcomes
 
     @pytest.mark.slow
     def test_training_promotion_does_not_replay_its_starting_snapshot(
