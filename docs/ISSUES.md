@@ -14160,6 +14160,52 @@ graph ran node `first`; a dangling `next` ran only its source; duplicate ids
 left one node silently replacing the other. All three are accepted at
 `POST /v1/artifacts` with 201.
 
+### Streaming carried its own copy of the repair semantics
+
+`run_streaming` is a separate graph execution path, with the same entrypoint
+fallback and the same `if not node: continue`, and it never asked the new
+rule. So the row this tranche exists to protect — pre-existing or imported —
+failed closed in blocking chat and still ran a different graph in streaming
+chat. The engine witnesses only drove `run()`, so nothing said so.
+
+The familiar batch/streaming altitude split, and the fix keeps each path's
+vocabulary: blocking raises, streaming emits `validation_error` and stops
+before a token or a trace reaches anyone. The witness asserts that ordering,
+not merely that an error appears somewhere in the stream.
+
+### A reference has a shape, not only a target
+
+Checking that a reference *resolves* is half of it. The executor reads a list
+only for `next`: it inserts `after` as one pending node id and wraps
+`on_error` as one next-node id, so a list in either position arrives at
+`node_map.get(...)` as a list. Measured, `{"after": ["join"]}` and
+`{"on_error": ["join"]}` passed **both** admission layers with zero problems
+and then failed at execution.
+
+This is the second half of the same lesson. Those two fields are absent from
+the artifact kind schema, so nothing pinned their cardinality for exactly the
+reason nothing pinned their targets. `_EDGE_FIELDS` is a mapping now, naming
+per field whether a list is legal there.
+
+`branches[].next` was a live contradiction: the kind schema advertised
+string-or-array while the switch executor appends `branch["next"]` as one
+value and never flattens. SPEC §9 gives fan-out to `parallel`, so the schema
+was narrowed to match execution rather than execution taught to match the
+schema.
+
+### An id that cannot name a node
+
+`node_map` is keyed by id and drops falsy keys, so a node declared with an
+empty id disappears — the same silent removal a duplicate causes, and it was
+being skipped rather than reported. `id` now carries `minLength: 1` in the
+kind schema *and* is reported semantically, because the schema does not reach
+a row that predates it.
+
+An explicitly empty `entrypoint` was likewise treated as though the key were
+absent. Absent means "start at the first node"; written-empty means the
+operator named something, and it names no node. The two are told apart by
+`"entrypoint" in schema` rather than by truthiness.
+
 ### The edge fields had to be measured, and that is the whole lesson
 
 The executor consumes **five** node-reference fields:
@@ -14180,6 +14226,17 @@ workflow takes precisely when it can least afford to stop silently.
 
 The two mutations that drop them from the edge set kill only their own
 witnesses, which is what says the pair is separated rather than covered twice.
+
+Fifteen mutations, all killed. Two were retired rather than left surviving,
+both for the same reason: they added code that cannot execute. Re-adding the
+engine's entrypoint repair cannot fire once the check above it has refused
+such an entrypoint, and the streaming equivalent was identical in effect to
+streaming simply not asking. A mutation that changes no behaviour says the
+code it adds is dead, not that the tests are weak.
+
+Four anchors went stale across this tranche's two passes and the driver said
+so each time rather than reporting a survivor. That guard has now caught
+something in every pass of this campaign.
 
 ### Two altitudes, both load-bearing
 

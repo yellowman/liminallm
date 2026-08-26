@@ -348,11 +348,14 @@ class TestStreamingRefusesTheSameGraphs:
 
     @pytest.fixture
     def engine(self):
-        from tests.test_workflow_retry_timeout import (
-            MockLLM, MockRAG, MockRedisCache, MockRouter, MockStore,
-        )
-
         from liminallm.service.workflow import WorkflowEngine
+        from tests.test_workflow_retry_timeout import (
+            MockLLM,
+            MockRAG,
+            MockRedisCache,
+            MockRouter,
+            MockStore,
+        )
 
         return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
                               cache=MockRedisCache())

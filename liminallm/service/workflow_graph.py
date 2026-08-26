@@ -27,7 +27,17 @@ from typing import Any, Dict, Iterator, List, Tuple
 #   branches[].next     switch
 #   after               where a parallel fan-in continues
 #   on_error            taken instead of `next` when a tool call fails
-_EDGE_FIELDS = ("next", "after", "on_error")
+#
+# The cardinality is measured too, and it is not uniform. `next` is the only
+# field the executor reads as either a string or a list; it wraps `on_error`
+# as a single next-node id and inserts `after` as a single pending id, so a
+# list in either position arrives at `node_map.get(...)` as a list. Neither
+# field is in the artifact kind schema, so nothing else pins their shape.
+_EDGE_FIELDS: Dict[str, bool] = {
+    "next": True,      # a list is legal here
+    "after": False,
+    "on_error": False,
+}
 
 
 def _nodes(schema: Any) -> List[Dict[str, Any]]:
@@ -39,21 +49,23 @@ def _nodes(schema: Any) -> List[Dict[str, Any]]:
     return [n for n in nodes if isinstance(n, dict)]
 
 
-def _targets(node: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
-    """Every node reference this node declares, with where it was written."""
+def _references(node: Dict[str, Any]) -> Iterator[Tuple[str, Any, bool]]:
+    """Every node reference this node declares: where, what, and whether a
+    list is legal there."""
     node_id = node.get("id")
-    for field in _EDGE_FIELDS:
+    for field, list_ok in _EDGE_FIELDS.items():
         value = node.get(field)
-        # `next` is a string on ordinary nodes and a list on a parallel fan-out,
-        # and both spellings reach the executor, so both are edges here.
-        for target in value if isinstance(value, list) else [value]:
-            if target:
-                yield f"node {node_id!r} {field}", target
+        if value is None:
+            continue
+        yield f"node {node_id!r} {field}", value, list_ok
     branches = node.get("branches")
     if isinstance(branches, list):
         for index, branch in enumerate(branches):
-            if isinstance(branch, dict) and branch.get("next"):
-                yield f"node {node_id!r} branch {index}", branch["next"]
+            if isinstance(branch, dict) and branch.get("next") is not None:
+                # The switch executor appends `branch["next"]` as one value
+                # and does not flatten, so a list here is not fan-out — that
+                # is what `parallel` is for (SPEC §9).
+                yield f"node {node_id!r} branch {index}", branch["next"], False
 
 
 def graph_problems(schema: Any) -> List[str]:
@@ -74,9 +86,16 @@ def graph_problems(schema: Any) -> List[str]:
 
     declared: List[str] = []
     seen: set[str] = set()
-    for node in nodes:
+    for index, node in enumerate(nodes):
         node_id = node.get("id")
         if not isinstance(node_id, str) or not node_id:
+            # `node_map` is keyed by id and drops the falsy ones, so a node
+            # declared with an empty or non-string id disappears — the same
+            # silent removal a duplicate causes, and reported the same way
+            # rather than skipped.
+            problems.append(
+                f"node {index} has id {node_id!r}, which cannot name a node"
+            )
             continue
         if node_id in seen:
             # The dict comprehension that builds `node_map` keeps the last of
@@ -89,16 +108,27 @@ def graph_problems(schema: Any) -> List[str]:
     if not declared:
         return problems
 
-    entrypoint = schema.get("entrypoint") if isinstance(schema, dict) else None
-    # Only an *explicitly named* entrypoint has to resolve. Omitting it and
-    # starting at the first node is the engine's own behaviour; refusing that
-    # would be a different bug.
-    if entrypoint and entrypoint not in seen:
-        problems.append(f"entrypoint {entrypoint!r} is not a declared node")
+    # Only an *explicitly named* entrypoint has to resolve. Omitting the key
+    # and starting at the first node is the engine's own behaviour; refusing
+    # that would be a different bug. Present-but-empty is not omitted, though:
+    # the operator wrote something, and it names no node.
+    if isinstance(schema, dict) and "entrypoint" in schema:
+        entrypoint = schema["entrypoint"]
+        if not isinstance(entrypoint, str) or entrypoint not in seen:
+            problems.append(f"entrypoint {entrypoint!r} is not a declared node")
 
     for node in nodes:
-        for where, target in _targets(node):
-            if not isinstance(target, str) or target not in seen:
-                problems.append(f"{where} names {target!r}, which is not a declared node")
+        for where, value, list_ok in _references(node):
+            targets = value if isinstance(value, list) else [value]
+            if isinstance(value, list) and not list_ok:
+                problems.append(
+                    f"{where} is a list, and the executor reads one node id there"
+                )
+                continue
+            for target in targets:
+                if not isinstance(target, str) or target not in seen:
+                    problems.append(
+                        f"{where} names {target!r}, which is not a declared node"
+                    )
 
     return problems

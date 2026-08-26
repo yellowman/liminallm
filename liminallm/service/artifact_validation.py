@@ -18,7 +18,9 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"},
+                        # `node_map` is keyed by this and drops falsy keys,
+                        # so an empty id declares a node that then disappears.
+                        "id": {"type": "string", "minLength": 1},
                         "type": {"type": "string"},
                         "tool": {"type": "string"},
                         "inputs": {"type": "object"},
@@ -30,9 +32,13 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
                                 "type": "object",
                                 "properties": {
                                     "when": {},
-                                    "next": {
-                                        "anyOf": [{"type": "string"}, {"type": "array"}]
-                                    },
+                                    # One id, not a fan-out. The switch
+                                    # executor appends `branch["next"]` as a
+                                    # single value and never flattens a list,
+                                    # so advertising an array here promised
+                                    # something execution does not do —
+                                    # SPEC §9 gives fan-out to `parallel`.
+                                    "next": {"type": "string", "minLength": 1},
                                 },
                                 "required": ["when", "next"],
                             },

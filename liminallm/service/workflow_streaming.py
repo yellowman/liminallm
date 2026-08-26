@@ -29,6 +29,7 @@ from liminallm.service.broker import InvocationContext
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
+from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
     MAX_CONTEXT_SNIPPETS,
@@ -87,6 +88,20 @@ class WorkflowStreamingMixin:
             conversation_id, user_id=user_id, tenant_id=tenant_id
         )
 
+        # Before `node_map`, for the reason `run` checks there: this path
+        # carried its own copy of the repair semantics, so an invalid row
+        # failed closed in blocking chat and silently ran a different graph
+        # here. Same rule, this path's vocabulary — blocking raises, streaming
+        # emits and stops before a token or a trace reaches anyone.
+        problems = graph_problems(workflow_schema)
+        if problems:
+            yield self._error_event(
+                "validation_error",
+                "workflow graph is not consistent",
+                {"problems": problems},
+            )
+            return
+
         node_map = {
             n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")
         }
@@ -98,9 +113,9 @@ class WorkflowStreamingMixin:
             )
             return
 
+        # `graph_problems` has already refused an entrypoint that names
+        # nothing, so this only chooses a start when none was named.
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
-        if not entry or entry not in node_map:
-            entry = next(iter(node_map)) if node_map else None
 
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []
