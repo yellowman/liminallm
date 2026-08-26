@@ -425,6 +425,30 @@ class TestAnEdgeIsReadByTheNodeTypeThatDeclaresIt:
             {"id": "t", "tool": "llm.generic", "next": "side"}
         )) == []
 
+    def test_the_kind_schema_itself_names_the_four_node_types(self):
+        """The enum, on its own.
+
+        `graph_problems` refuses the same graph a moment after JSON Schema
+        does, so an end-to-end admission test cannot tell which layer said
+        no — measured, reverting the enum alone still returned 400. The kind
+        schema is the published contract that external tooling reads and that
+        SPEC §9 writes as an enum, so it gets a witness of its own.
+        """
+        from jsonschema import Draft202012Validator
+
+        from liminallm.service.artifact_validation import _ARTIFACT_SCHEMAS
+
+        validator = Draft202012Validator(_ARTIFACT_SCHEMAS["workflow"])
+        bad = self._one({"id": "x", "type": "swich", "tool": "llm.generic"})
+        assert list(validator.iter_errors(bad)), "the kind schema accepted 'swich'"
+        for good in ("tool_call", "switch", "parallel", "end"):
+            node = {"id": "x", "type": good, "tool": "llm.generic"}
+            if good == "switch":
+                node["branches"] = [{"when": "true", "next": "side"}]
+            if good == "parallel":
+                node["next"] = ["side"]
+            assert not list(validator.iter_errors(self._one(node))), good
+
     def test_admission_refuses_an_unknown_node_type(self, client, admin_headers):
         """SPEC §9's schema sketch already writes this as an enum. The kind
         schema said `{"type": "string"}`."""

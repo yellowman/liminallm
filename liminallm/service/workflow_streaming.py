@@ -167,79 +167,120 @@ class WorkflowStreamingMixin:
                 "llm.generic_chat_v1",
                 "agent.files_v1",
             }:
-                node_stream = (
-                    self._stream_agent_files_node(
-                        node,
-                        user_message=user_message,
-                        context_id=context_id,
-                        conversation_id=conversation_id,
-                        adapters=adapters,
-                        history=history,
-                        vars_scope=vars_scope,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        cancel_event=cancel_event,
-                    )
-                    if tool_name == "agent.files_v1"
-                    else self._stream_llm_node(
-                        node,
-                        user_message=user_message,
-                        context_id=context_id,
-                        conversation_id=conversation_id,
-                        adapters=adapters,
-                        history=history,
-                        vars_scope=vars_scope,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        cancel_event=cancel_event,
-                    )
+                # The control plane around the call is the blocking path's,
+                # shared rather than copied: an open breaker refuses the call
+                # (SPEC §18), and a call that fails takes `on_error` (SPEC §9).
+                # Both used to live only inside `_execute_node`, which this
+                # branch does not call — so an open breaker did not stop a
+                # streamed LLM call at all, and a graph declaring
+                # `tool -> recover` on failure ended the turn instead. Only
+                # token production below is streaming-specific.
+                tool_result = await self._circuit_open_result(
+                    node, tenant_id=tenant_id
                 )
-                async for event in node_stream:
-                    if event["event"] == "token":
-                        yield event
-                    elif event["event"] == "trace":
-                        # Tool-activity notices from the attachment agent pass
-                        # straight through for the UI to display.
-                        yield event
-                    elif event["event"] == "message_done":
-                        # Update state from completed message
-                        data = event.get("data", {})
-                        content = data.get("content", "")
-                        node_usage = data.get("usage", {})
-                        usage = self._merge_usage(usage, node_usage)
-                        for snippet in data.get("context_snippets") or []:
-                            if (
-                                snippet not in context_seen
-                                and len(context_snippets) < MAX_CONTEXT_SNIPPETS
-                            ):
-                                context_seen.add(snippet)
-                                context_snippets.append(snippet)
-                        entry: Dict[str, Any] = {
-                            "node": node_id,
-                            "status": "ok",
-                            "content": content,
-                            "usage": node_usage,
-                        }
-                        if data.get("tool_calls"):
-                            entry["tool_calls"] = data["tool_calls"]
-                        if data.get("injection_findings"):
-                            entry["injection_findings"] = data["injection_findings"]
-                        self._append_trace(workflow_trace, entry)
-                        # Emit trace event
-                        yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
-                    elif event["event"] == "error":
-                        yield event
-                        return
-                    elif event["event"] == "cancel_ack":
-                        yield event
-                        return
+                failure_event = None
 
-                # Move to next nodes
-                next_nodes = node.get("next")
-                if isinstance(next_nodes, str):
-                    pending.append(next_nodes)
-                elif isinstance(next_nodes, list):
-                    pending.extend([n for n in next_nodes if n])
+                if tool_result is None:
+                    node_stream = (
+                        self._stream_agent_files_node(
+                            node,
+                            user_message=user_message,
+                            context_id=context_id,
+                            conversation_id=conversation_id,
+                            adapters=adapters,
+                            history=history,
+                            vars_scope=vars_scope,
+                            user_id=user_id,
+                            tenant_id=tenant_id,
+                            cancel_event=cancel_event,
+                        )
+                        if tool_name == "agent.files_v1"
+                        else self._stream_llm_node(
+                            node,
+                            user_message=user_message,
+                            context_id=context_id,
+                            conversation_id=conversation_id,
+                            adapters=adapters,
+                            history=history,
+                            vars_scope=vars_scope,
+                            user_id=user_id,
+                            tenant_id=tenant_id,
+                            cancel_event=cancel_event,
+                        )
+                    )
+                    async for event in node_stream:
+                        if event["event"] == "token":
+                            yield event
+                        elif event["event"] == "trace":
+                            # Tool-activity notices from the attachment agent
+                            # pass straight through for the UI to display.
+                            yield event
+                        elif event["event"] == "message_done":
+                            # Update state from completed message
+                            data = event.get("data", {})
+                            content = data.get("content", "")
+                            node_usage = data.get("usage", {})
+                            usage = self._merge_usage(usage, node_usage)
+                            for snippet in data.get("context_snippets") or []:
+                                if (
+                                    snippet not in context_seen
+                                    and len(context_snippets) < MAX_CONTEXT_SNIPPETS
+                                ):
+                                    context_seen.add(snippet)
+                                    context_snippets.append(snippet)
+                            trace_entry: Dict[str, Any] = {
+                                "node": node_id,
+                                "status": "ok",
+                                "content": content,
+                                "usage": node_usage,
+                            }
+                            if data.get("tool_calls"):
+                                trace_entry["tool_calls"] = data["tool_calls"]
+                            if data.get("injection_findings"):
+                                trace_entry["injection_findings"] = data[
+                                    "injection_findings"
+                                ]
+                            self._append_trace(workflow_trace, trace_entry)
+                            # Emit trace event
+                            yield {
+                                "event": "trace",
+                                "data": {"workflow_trace": workflow_trace[-1]},
+                            }
+                        elif event["event"] == "error":
+                            failure_event = event
+                            tool_result = {
+                                "status": "error",
+                                "error": (event.get("data") or {}).get("message", ""),
+                            }
+                            break
+                        elif event["event"] == "cancel_ack":
+                            yield event
+                            return
+
+                if tool_result is not None:
+                    self._append_trace(
+                        workflow_trace, {"node": node_id, **tool_result}
+                    )
+                    yield {
+                        "event": "trace",
+                        "data": {"workflow_trace": workflow_trace[-1]},
+                    }
+                    if self._error_edge(node):
+                        pending.extend(self._successors(node, tool_result))
+                        continue
+                    # Nowhere declared to go. The stream ends where it always
+                    # did, rather than falling through to `next`: the chooser
+                    # answers `next` when no error edge exists, and handing a
+                    # failure to the success path gives it outputs the node
+                    # never produced.
+                    yield failure_event or self._error_event(
+                        "server_error",
+                        tool_result.get("content") or tool_result.get("error", ""),
+                        {"node_id": node_id, "tool": tool_name},
+                    )
+                    return
+
+                pending.extend(self._successors(node, {"status": "ok"}))
 
             else:
                 # Non-streaming node execution (switch, parallel, RAG, etc.)

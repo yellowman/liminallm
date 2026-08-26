@@ -196,6 +196,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
         self.tool_fetcher = AllowlistedFetcher(self.tool_network_policy)
         self._shutdown = False
 
+    # The tool-node control plane: what happens around a tool call, as
+    # opposed to the call itself. Three execution paths reach it — the
+    # blocking executor, its circuit-open branch, and the streaming path that
+    # produces tokens without calling either — and each copy of a decision is
+    # a place for the paths to disagree about the same graph. They did.
+
+    @staticmethod
+    def _error_edge(node: Dict[str, Any]) -> Optional[str]:
+        """Where this node says to go when its call fails, if it says.
+
+        One reader for the field, so that "does this graph declare a
+        recovery" and "which node is it" cannot drift apart.
+        """
+        err_next = node.get("on_error")
+        return err_next if isinstance(err_next, str) and err_next else None
+
     @staticmethod
     def _successors(node: Dict[str, Any], tool_result: Any) -> List[str]:
         """Where a tool node goes next, given how the call finished.
@@ -207,7 +223,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         the breaker was open. A failure is a failure however it arose.
         """
         if isinstance(tool_result, dict) and tool_result.get("status") == "error":
-            err_next = node.get("on_error")
+            err_next = WorkflowEngine._error_edge(node)
             if err_next:
                 return [err_next]
         next_nodes = node.get("next")
@@ -216,6 +232,32 @@ class WorkflowEngine(WorkflowStreamingMixin):
         if isinstance(next_nodes, list):
             return [n for n in next_nodes if n]
         return []
+
+    async def _circuit_open_result(
+        self, node: Dict[str, Any], *, tenant_id: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """The error result an open breaker owes this node, or ``None`` when
+        the call may proceed.
+
+        Its own method because the preflight used to live inside
+        `_execute_node`, and the streaming path enters `_stream_llm_node`
+        directly: an open breaker did not stop a streamed LLM call at all,
+        for the three tools every ordinary chat turn uses (SPEC §18).
+        """
+        tool_name = node.get("tool", "")
+        if not (self.cache and tool_name):
+            return None
+        is_open, _ = await self.cache.check_circuit_breaker(
+            tool_name, tenant_id=tenant_id
+        )
+        if not is_open:
+            return None
+        self.logger.warning("tool_circuit_open", tool=tool_name, tenant_id=tenant_id)
+        return {
+            "status": "error",
+            "content": "tool temporarily unavailable (circuit breaker open)",
+            "error": "circuit_breaker_open",
+        }
 
     def _error_event(
         self, code: str, message: str, details: dict | None = None
@@ -1867,34 +1909,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
             inputs["message"] = user_message
 
         # SPEC §18: Check circuit breaker before invoking tool
-        if self.cache and tool_name:
-            is_open, _ = await self.cache.check_circuit_breaker(
-                tool_name, tenant_id=tenant_id
-            )
-            if is_open:
-                self.logger.warning("tool_circuit_open", tool=tool_name, tenant_id=tenant_id)
-                tool_result = {
-                    "status": "error",
-                    "content": "tool temporarily unavailable (circuit breaker open)",
-                    "error": "circuit_breaker_open",
-                }
-                outputs = {}
-                node_id = node.get("id", "unknown")
-                # Through the same chooser as every other tool failure. This
-                # used to read `next` directly and return, so an open breaker
-                # took the success edge into nodes that assume outputs the
-                # failed node never produced.
-                next_nodes_list = self._successors(node, tool_result)
-                result_payload = {
-                    "node_id": node_id,
-                    "status": tool_result.get("status", "done"),
-                    "outputs": outputs,
-                }
-                if isinstance(tool_result, dict):
-                    for k in ("content", "usage", "context_snippets"):
-                        if k in tool_result:
-                            result_payload[k] = tool_result[k]
-                return result_payload, next_nodes_list
+        tool_result = await self._circuit_open_result(node, tenant_id=tenant_id)
+        if tool_result is not None:
+            # Through the same chooser as every other tool failure. This
+            # used to read `next` directly and return, so an open breaker
+            # took the success edge into nodes that assume outputs the
+            # failed node never produced.
+            next_nodes_list = self._successors(node, tool_result)
+            result_payload = {
+                "node_id": node.get("id", "unknown"),
+                "status": tool_result.get("status", "done"),
+                "outputs": {},
+            }
+            for k in ("content", "usage", "context_snippets"):
+                if k in tool_result:
+                    result_payload[k] = tool_result[k]
+            return result_payload, next_nodes_list
 
         try:
             tool_result = await self._invoke_tool(

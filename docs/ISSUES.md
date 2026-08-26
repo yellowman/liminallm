@@ -14204,6 +14204,48 @@ vocabulary: blocking raises, streaming emits `validation_error` and stops
 before a token or a trace reaches anyone. The witness asserts that ordering,
 not merely that an error appears somewhere in the stream.
 
+### And its own copy of the tool-node control plane
+
+Refusing the invalid graph was only the graph-shaped half. `run_streaming`
+streams three tools — `llm.generic`, `llm.generic_chat_v1`, `agent.files_v1`
+— without calling `_execute_node_with_retry`, so *neither* decision the
+blocking path makes around a tool call happened there:
+
+```
+circuit-breaker preflight   lives in _execute_node; the streaming branch
+                            enters _stream_llm_node directly
+on_error handoff            the branch read node["next"] itself and never
+                            consulted the chooser
+```
+
+Measured on `tool -> normal` with `on_error: recover`:
+
+```
+breaker forced open      generate_stream still called; ran tool -> normal,
+                         traced status "ok"
+backend raises early     no node traced at all; the turn ended on an error
+                         event, and `recover` never ran
+```
+
+The same graph on the blocking path takes `recover` in both cases. So the two
+execution paths disagreed about what the same published graph means — and the
+breaker, whose entire job is to stop calling a failing tool, did not apply to
+the one tool every ordinary chat turn uses.
+
+The fix shares the control plane rather than merging the paths. Token
+production stays streaming-specific, which is the reason that path exists;
+what moved is `_circuit_open_result` (the preflight, now a method both callers
+ask) and the existing `_successors` chooser. The two mutations separate:
+bypassing the preflight dies only on the open-breaker witnesses, and removing
+the handoff dies only on the two `on_error` ones.
+
+One deliberate asymmetry, with its own control. A streamed failure whose node
+declares *no* `on_error` still ends the stream as it always did, rather than
+being handed to the chooser: the chooser answers `next` when no error edge
+exists, so routing every failure through it would send a failed node down the
+success path — the same defect one file over. The witness is a mutation that
+removes the guard.
+
 ### A reference has a shape, not only a target
 
 Checking that a reference *resolves* is half of it. The executor reads a list
@@ -14223,6 +14265,51 @@ string-or-array while the switch executor appends `branch["next"]` as one
 value and never flattens. SPEC §9 gives fan-out to `parallel`, so the schema
 was narrowed to match execution rather than execution taught to match the
 schema.
+
+### And a reader, which is the node's own type
+
+Measuring the edge fields once was still not enough, because *which* fields a
+node reads is decided by its type, and the validator asked the question
+globally. Every node was allowed `next`, `after` and `on_error`; every node
+was allowed `branches`. So a graph could declare an edge, have the validator
+confirm it resolves, and have execution never look at it. All four of these
+reported zero problems:
+
+| declared | what executes |
+|---|---|
+| `end` with `next` | nothing; `end` stops the run |
+| `switch` with `next` | only `branches[].next` |
+| `tool_call` with `after` | only `next` / `on_error` |
+| `parallel` with `on_error` | only `next` / `after` |
+
+The first is the sharpest: publish `end -> side`, validation confirms the
+edge, execution stops at `end` and `side` never runs. A resolved edge that
+never executes is the same silent divergence as a dangling one — the operator
+reads the graph and the runtime reads something smaller.
+
+`_NODE_EDGES` is a per-node-type table now, and the field set it checks
+against is derived from the table, so adding a field to one type also asks
+every other type whether it reads it.
+
+The node type itself is that shape one level up. SPEC §9 names four and writes
+them as an enum; the kind schema said `{"type": "string"}`, and
+`_execute_node` runs anything it does not recognise as a `tool_call`. A node
+typed `"swich"` was therefore admitted with 201 and then traced
+`{"node": "x", "status": "ok"}` — it invoked the model. Both altitudes now
+name the four: the kind schema as an enum, and `graph_problems` semantically,
+because the schema does not reach a row that predates it.
+
+An absent `type` is read as `tool_call`, which is what `_execute_node` does
+with it. Requiring the key is admission's job; agreeing with execution is this
+altitude's, and being stricter than the runtime would be a different bug.
+
+**The rule found four existing test fixtures declaring node types this engine
+has never executed** — eleven uses of `llm_call` and four of `respond`, across
+storage, chat, admin and tool-authority tests. None of them execute the graph,
+so nothing had ever noticed. They were corrected to
+`{"type": "tool_call", "tool": "llm.generic"}` rather than the rule being
+loosened: a fixture that cannot run is not evidence about a system that runs
+graphs.
 
 ### An id that cannot name a node
 
@@ -14258,16 +14345,23 @@ workflow takes precisely when it can least afford to stop silently.
 The two mutations that drop them from the edge set kill only their own
 witnesses, which is what says the pair is separated rather than covered twice.
 
-Fifteen mutations, all killed. Two were retired rather than left surviving,
+Twenty-six mutations, all killed. Two were retired rather than left surviving,
 both for the same reason: they added code that cannot execute. Re-adding the
 engine's entrypoint repair cannot fire once the check above it has refused
 such an entrypoint, and the streaming equivalent was identical in effect to
 streaming simply not asking. A mutation that changes no behaviour says the
 code it adds is dead, not that the tests are weak.
 
-Four anchors went stale across this tranche's two passes and the driver said
+Nine anchors went stale across this tranche's four passes and the driver said
 so each time rather than reporting a survivor. That guard has now caught
 something in every pass of this campaign.
+
+**One mutation earned a witness rather than being explained away.** Reverting
+the node-type enum in the kind schema left the end-to-end admission test
+green, because `graph_problems` refuses the same graph a moment later. Two
+layers refusing for two reasons is correct; an unwitnessed layer is not. The
+enum is the published contract that external tooling reads, so it gets a
+witness that exercises the JSON Schema validator alone.
 
 ### Two altitudes, both load-bearing
 
@@ -14915,6 +15009,24 @@ creating traversal (M3) kills the self-descendant witness alone.
 one pointing at a missing element rather than the index the author wrote.
 Both sides now say the same thing, and the three tests that pinned the old
 wording were updated rather than worked around.
+
+## Observation, not this tranche: streamed failures never trip the breaker
+
+Found while sharing the tool-node control plane, and deliberately left where
+it was found.
+
+The streaming path now *reads* the circuit breaker before a streamed LLM call.
+It still never *writes* to it: `record_tool_failure` and `record_tool_success`
+are called only from `_execute_node`, so a tool that fails on every streamed
+turn never accumulates failures and the breaker never opens for it. In a
+deployment where chat streams — which is the ordinary case — the preflight can
+only ever fire on a breaker some other path opened.
+
+Kept out of the graph tranche on purpose. Its invariant is SPEC §18's failure
+accounting, not §9's "a workflow executes exactly the graph it declares", and
+the reds that would witness it are about counters over time rather than about
+which edge a turn took. Mixing them would blur an evidence boundary that is
+currently clean.
 
 ## Observation, not this tranche: a teardown race in the xdist lane
 

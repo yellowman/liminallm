@@ -215,7 +215,7 @@ class TestArtifacts:
                 "type": "workflow",
                 "schema": {
                     "kind": "workflow.chat",
-                    "nodes": [{"id": "start", "type": "llm_call"}],
+                    "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
                 },
             },
         )
@@ -236,7 +236,7 @@ class TestArtifacts:
                 "type": "workflow",
                 "schema": {
                     "kind": "workflow.chat",
-                    "nodes": [{"id": "start", "type": "llm_call"}],
+                    "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
                 },
             },
         )
@@ -283,7 +283,7 @@ class TestArtifacts:
                 "type": "workflow",
                 "schema": {
                     "kind": "workflow.chat",
-                    "nodes": [{"id": "start", "type": "llm_call"}],
+                    "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
                 },
             },
         )
@@ -342,7 +342,7 @@ class TestWorkflows:
                 "type": "workflow",
                 "schema": {
                     "kind": "workflow.chat",
-                    "nodes": [{"id": "start", "type": "llm_call"}],
+                    "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
                 },
             },
         )

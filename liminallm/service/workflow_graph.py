@@ -17,27 +17,43 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterator, List, Tuple
 
-# Every field the executor treats as naming a node, measured from
-# `WorkflowEngine` rather than taken from the artifact kind schema. `after`
-# and `on_error` are not in that schema at all, so reading it would have given
-# three of the five and looked complete.
+# What each node type reads, measured from `WorkflowEngine._execute_node`
+# rather than taken from the artifact kind schema. `after` and `on_error` are
+# not in that schema at all, so reading it would have given three of the five
+# edge kinds and looked complete.
 #
-#   entrypoint          run(), choosing where to start
-#   next                _execute_node, scalar or list, and parallel children
-#   branches[].next     switch
-#   after               where a parallel fan-in continues
+#   entrypoint          run(), choosing where to start — a graph-level field
+#   next                tool_call continuation, and parallel's children
 #   on_error            taken instead of `next` when a tool call fails
+#   after               where a parallel fan-in continues
+#   branches[].next     switch, and only switch
+#
+# The table is per node type because execution is. A resolved edge on a node
+# whose type never reads it is the same silent divergence as a dangling one:
+# `end` stops the run, so `{"type": "end", "next": "side"}` publishes a
+# continuation that validation confirms and execution ignores.
 #
 # The cardinality is measured too, and it is not uniform. `next` is the only
 # field the executor reads as either a string or a list; it wraps `on_error`
 # as a single next-node id and inserts `after` as a single pending id, so a
-# list in either position arrives at `node_map.get(...)` as a list. Neither
-# field is in the artifact kind schema, so nothing else pins their shape.
-_EDGE_FIELDS: Dict[str, bool] = {
-    "next": True,      # a list is legal here
-    "after": False,
-    "on_error": False,
+# list in either position arrives at `node_map.get(...)` as a list.
+_NODE_EDGES: Dict[str, Dict[str, bool]] = {
+    # node type -> field -> whether a list is legal in that field
+    "tool_call": {"next": True, "on_error": False},
+    "parallel": {"next": True, "after": False},
+    "switch": {},                       # `branches` only, below
+    "end": {},                          # nothing; `end` stops the run
 }
+
+# Only a switch reads them, so anywhere else they are decoration that looks
+# like control flow.
+_BRANCHING = "switch"
+
+# Derived, so adding a field to one node type also asks every other type
+# whether it reads it.
+_EDGE_FIELDS = tuple(
+    dict.fromkeys(field for edges in _NODE_EDGES.values() for field in edges)
+)
 
 
 def _nodes(schema: Any) -> List[Dict[str, Any]]:
@@ -49,23 +65,53 @@ def _nodes(schema: Any) -> List[Dict[str, Any]]:
     return [n for n in nodes if isinstance(n, dict)]
 
 
-def _references(node: Dict[str, Any]) -> Iterator[Tuple[str, Any, bool]]:
-    """Every node reference this node declares: where, what, and whether a
-    list is legal there."""
+def _node_type(node: Dict[str, Any]) -> Any:
+    """The type this node will execute as.
+
+    `_execute_node` reads `node.get("type", "tool_call")`, so an absent key is
+    a tool call and this altitude agrees with it. Requiring the key is
+    admission's job; agreeing with execution is this one's.
+    """
+    return node.get("type", "tool_call")
+
+
+def _unread_fields(node: Dict[str, Any], node_type: str) -> Iterator[str]:
+    """Edges this node declares that its own type never reads."""
     node_id = node.get("id")
-    for field, list_ok in _EDGE_FIELDS.items():
+    reads = _NODE_EDGES[node_type]
+    for field in _EDGE_FIELDS:
+        if field not in reads and node.get(field) is not None:
+            yield (
+                f"node {node_id!r} has type {node_type!r} and declares "
+                f"{field!r}, which a {node_type} node does not read"
+            )
+    if node_type != _BRANCHING and node.get("branches") is not None:
+        yield (
+            f"node {node_id!r} has type {node_type!r} and declares 'branches', "
+            f"which only a {_BRANCHING} node reads"
+        )
+
+
+def _references(
+    node: Dict[str, Any], node_type: str
+) -> Iterator[Tuple[str, Any, bool]]:
+    """Every node reference this node's type executes: where, what, and
+    whether a list is legal there."""
+    node_id = node.get("id")
+    for field, list_ok in _NODE_EDGES[node_type].items():
         value = node.get(field)
         if value is None:
             continue
         yield f"node {node_id!r} {field}", value, list_ok
-    branches = node.get("branches")
-    if isinstance(branches, list):
-        for index, branch in enumerate(branches):
-            if isinstance(branch, dict) and branch.get("next") is not None:
-                # The switch executor appends `branch["next"]` as one value
-                # and does not flatten, so a list here is not fan-out — that
-                # is what `parallel` is for (SPEC §9).
-                yield f"node {node_id!r} branch {index}", branch["next"], False
+    if node_type == _BRANCHING:
+        branches = node.get("branches")
+        if isinstance(branches, list):
+            for index, branch in enumerate(branches):
+                if isinstance(branch, dict) and branch.get("next") is not None:
+                    # The switch executor appends `branch["next"]` as one
+                    # value and does not flatten, so a list here is not
+                    # fan-out — that is what `parallel` is for (SPEC §9).
+                    yield f"node {node_id!r} branch {index}", branch["next"], False
 
 
 def graph_problems(schema: Any) -> List[str]:
@@ -118,7 +164,18 @@ def graph_problems(schema: Any) -> List[str]:
             problems.append(f"entrypoint {entrypoint!r} is not a declared node")
 
     for node in nodes:
-        for where, value, list_ok in _references(node):
+        node_type = _node_type(node)
+        if node_type not in _NODE_EDGES:
+            # `_execute_node` recognises `switch`, `parallel` and `end`, and
+            # runs everything else as a tool call — so a typo does not fail,
+            # it invokes. SPEC §9 names exactly these four.
+            problems.append(
+                f"node {node.get('id')!r} has type {node_type!r}, which is "
+                f"not a node type this engine executes"
+            )
+            continue
+        problems.extend(_unread_fields(node, node_type))
+        for where, value, list_ok in _references(node, node_type):
             targets = value if isinstance(value, list) else [value]
             if isinstance(value, list) and not list_ok:
                 problems.append(

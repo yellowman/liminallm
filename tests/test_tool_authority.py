@@ -91,7 +91,7 @@ def _graph() -> dict:
     return {
         "kind": "workflow.graph",
         "entrypoint": "start",
-        "nodes": [{"id": "start", "type": "respond"}],
+        "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
     }
 
 
@@ -294,7 +294,7 @@ class TestPrivateWorkflowsBelongToTheirOwner:
             {
                 "kind": "workflow.graph",
                 "entrypoint": "start",
-                "nodes": [{"id": "start", "type": "respond"}],
+                "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
             },
             owner_user_id=users["owner"].id,
             visibility="private",
@@ -312,7 +312,7 @@ class TestPrivateWorkflowsBelongToTheirOwner:
             {
                 "kind": "workflow.graph",
                 "entrypoint": "start",
-                "nodes": [{"id": "start", "type": "respond"}],
+                "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
             },
             owner_user_id=users["owner"].id,
             visibility="private",
@@ -334,7 +334,7 @@ class TestPrivateWorkflowsBelongToTheirOwner:
             {
                 "kind": "workflow.graph",
                 "entrypoint": "start",
-                "nodes": [{"id": "start", "type": "respond"}],
+                "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
             },
             owner_user_id=users["owner"].id,
             visibility="private",

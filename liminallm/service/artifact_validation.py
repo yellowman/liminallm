@@ -21,7 +21,13 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
                         # `node_map` is keyed by this and drops falsy keys,
                         # so an empty id declares a node that then disappears.
                         "id": {"type": "string", "minLength": 1},
-                        "type": {"type": "string"},
+                        # SPEC §9 writes this as an enum and names exactly
+                        # these four. Accepting any string meant `_execute_node`
+                        # — which runs anything it does not recognise as a
+                        # tool call — silently invoked a node typed `"swich"`.
+                        "type": {
+                            "enum": ["tool_call", "switch", "parallel", "end"]
+                        },
                         "tool": {"type": "string"},
                         "inputs": {"type": "object"},
                         "outputs": {"type": "array"},
