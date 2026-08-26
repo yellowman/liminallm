@@ -19,10 +19,24 @@ consumes five: `entrypoint`, `next` (scalar or list), `branches[].next`,
 all, so a validator written from the schema would have covered three of five
 and looked complete.
 
+Measuring them once was not enough, because *which* fields a node reads is
+decided by its type. Asking the question globally let a graph declare
+`end -> side`, have the validator confirm the edge resolves, and have
+execution stop at `end` — a resolved edge that never runs is the same silent
+divergence one level in. The node type is that shape again: `_execute_node`
+runs anything it does not recognise as a `tool_call`, so a node typed
+`"swich"` was admitted and then invoked its tool.
+
 Validation sits at two altitudes on purpose. Admission stops new invalid
 graphs entering; the engine checks again before it builds `node_map`, because
 a row can predate the check or arrive by import, and "repaired silently at
 execution" is the defect, not the fallback.
+
+Execution has two altitudes of its own, and the same rule has to hold on
+both. `run_streaming` streams three tools without calling the blocking
+executor, so the decisions the blocking path makes *around* a tool call — the
+circuit-breaker preflight and the `on_error` handoff — did not happen there
+at all.
 """
 
 from __future__ import annotations
@@ -282,10 +296,13 @@ class TestAReferenceHasTheShapeTheExecutorReads:
     their targets were.
     """
 
-    @pytest.mark.parametrize("field", ["after", "on_error"], ids=["after", "on_error"])
-    def test_a_list_where_the_executor_reads_one_id_is_a_problem(self, field):
-        problems = graph_problems(_graph(**{f"work__{field}": ["join"]}))
-        assert problems, f"{field} accepted a list the executor cannot use"
+    # Each field on the node type that actually reads it, so this measures
+    # cardinality and not "a tool_call has no `after`".
+    @pytest.mark.parametrize("where", ["fan__after", "work__on_error"],
+                             ids=["after", "on_error"])
+    def test_a_list_where_the_executor_reads_one_id_is_a_problem(self, where):
+        problems = graph_problems(_graph(**{where: ["join"]}))
+        assert problems, f"{where} accepted a list the executor cannot use"
 
     def test_a_scalar_next_and_a_list_next_are_both_fine(self):
         """`next` is the one field where the executor really does take both,
@@ -304,6 +321,179 @@ class TestAReferenceHasTheShapeTheExecutorReads:
     def test_a_non_string_reference_is_a_problem(self):
         for value in (7, {"id": "join"}, True):
             assert graph_problems(_graph(work__next=value)), value
+
+
+class TestAnEdgeIsReadByTheNodeTypeThatDeclaresIt:
+    """An edge that resolves is not the same as an edge that executes.
+
+    Which fields a node reads is decided by its type, and the validator asked
+    the question globally: every node was allowed `next`, `after` and
+    `on_error`, and every node was allowed `branches`. So a graph could
+    declare an edge, have the validator confirm it resolves, and have
+    execution never look at it. Measured before the fix, all four of these
+    reported no problems at all:
+
+    ==========================================  ==============================
+    declared                                    what executes
+    ==========================================  ==============================
+    `end` with `next`                           nothing; `end` stops the run
+    `switch` with `next`                        only `branches[].next`
+    `tool_call` with `after`                    only `next` / `on_error`
+    `parallel` with `on_error`                  only `next` / `after`
+    ==========================================  ==============================
+
+    The node type itself is the same shape one level up. SPEC §9 names four,
+    the kind schema accepted any string, and `_execute_node` treats anything
+    it does not recognise as a `tool_call` — so a node typed `"swich"` was
+    admitted and then silently invoked its tool. Verified: it was accepted at
+    admission and traced `{"node": "x", "status": "ok"}`.
+    """
+
+    def _one(self, node):
+        """That node plus somewhere for its edges to point."""
+        return {"kind": "workflow.chat", "entrypoint": node["id"],
+                "nodes": [node, {"id": "side", "type": "end"}]}
+
+    def test_an_end_node_declaring_next_is_a_problem(self):
+        """The sharpest one: publish `end -> side`, validation says the edge
+        resolves, execution stops at `end` and `side` never runs."""
+        problems = graph_problems(
+            self._one({"id": "stop", "type": "end", "next": "side"})
+        )
+        assert problems, "an `end` node advertised a continuation it never takes"
+
+    def test_a_switch_declaring_next_is_a_problem(self):
+        problems = graph_problems(self._one({
+            "id": "choose", "type": "switch", "next": "side",
+            "branches": [{"when": "true", "next": "side"}],
+        }))
+        assert problems, "a switch advertised an edge outside its branches"
+
+    def test_a_tool_call_declaring_after_is_a_problem(self):
+        """`after` is where a *parallel* fan-in continues. On a tool node the
+        executor never reads it."""
+        problems = graph_problems(self._one({
+            "id": "t", "type": "tool_call", "tool": "llm.generic",
+            "next": "side", "after": "side",
+        }))
+        assert problems, "a tool node advertised a parallel fan-in edge"
+
+    def test_a_parallel_declaring_on_error_is_a_problem(self):
+        """`on_error` is the tool-failure edge. A parallel node's failure
+        handling is `_execute_parallel_nodes`, which never looks at it."""
+        problems = graph_problems(self._one({
+            "id": "fan", "type": "parallel", "next": ["side"],
+            "after": "side", "on_error": "side",
+        }))
+        assert problems, "a parallel node advertised a tool-failure edge"
+
+    def test_branches_on_a_node_that_is_not_a_switch_is_a_problem(self):
+        """Same shape, the other direction: only `switch` reads `branches`."""
+        problems = graph_problems(self._one({
+            "id": "t", "type": "tool_call", "tool": "llm.generic",
+            "next": "side", "branches": [{"when": "true", "next": "side"}],
+        }))
+        assert problems, "a tool node advertised branches nothing reads"
+
+    def test_an_unknown_node_type_is_a_problem(self):
+        """SPEC §9 names four. `_execute_node` recognises `switch`, `parallel`
+        and `end`, and runs *everything else* as a tool call — so a typo does
+        not fail, it invokes."""
+        problems = graph_problems(self._one({
+            "id": "x", "type": "swich", "tool": "llm.generic", "next": "side",
+        }))
+        assert problems and any("swich" in p for p in problems), problems
+
+    @pytest.mark.parametrize("node", [
+        {"id": "t", "type": "tool_call", "tool": "llm.generic",
+         "next": "side", "on_error": "side"},
+        {"id": "t", "type": "tool_call", "tool": "llm.generic", "next": ["side"]},
+        {"id": "t", "type": "parallel", "next": ["side"], "after": "side"},
+        {"id": "t", "type": "switch", "branches": [{"when": "true", "next": "side"}]},
+        {"id": "t", "type": "end"},
+    ], ids=["tool", "tool-list", "parallel", "switch", "end"])
+    def test_each_type_may_declare_the_edges_it_reads(self, node):
+        """The control. A table that refuses everything passes every refusal
+        above, so each node type gets its own legal shape here."""
+        assert graph_problems(self._one(node)) == [], node
+
+    def test_a_node_with_no_type_is_read_as_the_executor_reads_it(self):
+        """`_execute_node` defaults a missing `type` to `tool_call`, so the
+        validator does too. Requiring the key is admission's job; this
+        altitude exists to agree with execution, not to be stricter than it."""
+        assert graph_problems(self._one(
+            {"id": "t", "tool": "llm.generic", "next": "side"}
+        )) == []
+
+    def test_admission_refuses_an_unknown_node_type(self, client, admin_headers):
+        """SPEC §9's schema sketch already writes this as an enum. The kind
+        schema said `{"type": "string"}`."""
+        schema = self._one({"id": "x", "type": "swich", "tool": "llm.generic",
+                            "next": "side"})
+        made = client.post("/v1/artifacts", headers=admin_headers, json={
+            "type": "workflow", "name": f"wg-{uuid.uuid4().hex[:6]}",
+            "schema": schema, "visibility": "private",
+        })
+        assert made.status_code == 400, made.text
+
+    def test_admission_refuses_an_end_node_that_declares_next(
+        self, client, admin_headers
+    ):
+        schema = self._one({"id": "stop", "type": "end", "next": "side"})
+        made = client.post("/v1/artifacts", headers=admin_headers, json={
+            "type": "workflow", "name": f"wg-{uuid.uuid4().hex[:6]}",
+            "schema": schema, "visibility": "private",
+        })
+        assert made.status_code == 400, made.text
+
+
+class TestTheEngineRefusesGraphsItsSchemaWouldNowRefuse:
+    """The runtime altitude for the node-semantics rule.
+
+    Schema tests alone would be the wrong evidence: the whole reason for a
+    second altitude is rows that never passed today's schema — written before
+    the enum existed, or imported. Those reach `run` directly.
+    """
+
+    @pytest.fixture
+    def engine(self):
+        from liminallm.service.workflow import WorkflowEngine
+        from tests.test_workflow_retry_timeout import (
+            MockLLM,
+            MockRAG,
+            MockRedisCache,
+            MockRouter,
+            MockStore,
+        )
+
+        return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
+                              cache=MockRedisCache())
+
+    @pytest.mark.parametrize("node", [
+        {"id": "x", "type": "swich", "tool": "llm.generic", "next": "side"},
+        {"id": "x", "type": "end", "next": "side"},
+    ], ids=["unknown-type", "ignored-field"])
+    @pytest.mark.asyncio
+    async def test_a_persisted_row_the_schema_would_refuse_fails_closed(
+        self, engine, monkeypatch, node
+    ):
+        schema = {"kind": "workflow.chat", "entrypoint": node["id"],
+                  "nodes": [node, {"id": "side", "type": "end"}]}
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        with pytest.raises(BadRequestError):
+            await engine.run("wf", None, "hello", None, user_id="u")
+
+    @pytest.mark.asyncio
+    async def test_streaming_refuses_them_too(self, engine, monkeypatch):
+        schema = {"kind": "workflow.chat", "entrypoint": "x", "nodes": [
+            {"id": "x", "type": "swich", "tool": "llm.generic", "next": "side"},
+            {"id": "side", "type": "end"},
+        ]}
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hello", None, user_id="u")]
+        assert events[0].get("event") == "error", events[:3]
+        assert events[0]["data"]["code"] == "validation_error", events[0]
 
 
 class TestANodeIdIsUsableAsAnId:
@@ -499,3 +689,164 @@ class TestAFailedToolTakesItsErrorEdge:
 
         assert "recover" in ran, f"a failing tool did not take its error edge: {ran}"
         assert "normal" not in ran, ran
+
+
+class TestAStreamedToolObeysTheSameControlPlane:
+    """The same rule, on the path that produces tokens.
+
+    `run_streaming` does not call `_execute_node_with_retry` for the three
+    tools it streams — `llm.generic`, `llm.generic_chat_v1`, `agent.files_v1`
+    — it enters `_stream_llm_node` directly. Both of the decisions the
+    blocking path makes around a tool call therefore did not happen here:
+
+    * the circuit-breaker preflight lives in `_execute_node`, so an open
+      breaker did not stop a streamed LLM call at all, and
+    * the continuation read `node["next"]` directly, so a graph declaring
+      `tool -> recover` on failure ended the turn with an error event and
+      never ran `recover`.
+
+    Measured before the fix: with the breaker forced open, `generate_stream`
+    was still called and the run traced `['tool', 'normal']` with
+    `status: ok`. The same graph on the blocking path traced `recover`.
+
+    Token production stays streaming-specific. What is shared is the control
+    plane around it, because a second copy of a decision is how the first one
+    went wrong.
+    """
+
+    BREAKER = TestAFailedToolTakesItsErrorEdge.BREAKER
+
+    @pytest.fixture
+    def engine(self):
+        from liminallm.service.workflow import WorkflowEngine
+        from tests.test_workflow_retry_timeout import (
+            MockLLM,
+            MockRAG,
+            MockRedisCache,
+            MockRouter,
+            MockStore,
+        )
+
+        return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
+                              cache=MockRedisCache())
+
+    @staticmethod
+    def _stream(engine, monkeypatch, *, schema, opens_breaker=False, raises=False):
+        """Install a streaming LLM and return the list its calls land in."""
+        calls: list = []
+
+        def generate_stream(*args, **kwargs):
+            calls.append("generate_stream")
+            if raises:
+                raise RuntimeError("backend down")
+            return iter([
+                {"event": "token", "data": "hi"},
+                {"event": "message_done",
+                 "data": {"content": "hi", "usage": {}}},
+            ])
+
+        async def open_breaker(tool_name, *, tenant_id=None):
+            return True, None
+
+        monkeypatch.setattr(engine.llm, "generate_stream", generate_stream,
+                            raising=False)
+        if opens_breaker:
+            monkeypatch.setattr(engine.cache, "check_circuit_breaker", open_breaker)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        return calls
+
+    @staticmethod
+    def _nodes_run(events):
+        return [
+            e["data"]["workflow_trace"].get("node")
+            for e in events
+            if e.get("event") == "trace" and "workflow_trace" in (e.get("data") or {})
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_open_circuit_never_starts_the_stream(
+        self, engine, monkeypatch
+    ):
+        """The preflight half, on its own so a mutation can reach it alone.
+
+        An open breaker means "stop calling this tool". Streaming called it
+        anyway, which is the failure the breaker exists to prevent — and it
+        did so for the one tool every ordinary chat turn uses.
+        """
+        calls = self._stream(engine, monkeypatch, schema=self.BREAKER,
+                             opens_breaker=True)
+        [e async for e in engine.run_streaming("wf", None, "hi", None, user_id="u")]
+        assert calls == [], (
+            "an open breaker did not stop the streamed call: the tool ran anyway"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_open_circuit_takes_on_error_not_next(
+        self, engine, monkeypatch
+    ):
+        """The handoff half, for a failure the breaker produced."""
+        self._stream(engine, monkeypatch, schema=self.BREAKER, opens_breaker=True)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+        ran = self._nodes_run(events)
+        assert "recover" in ran, f"the declared error edge was not taken: {ran}"
+        assert "normal" not in ran, (
+            f"a failed streamed node took the success edge: {ran}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_stream_that_fails_before_the_first_token_takes_on_error(
+        self, engine, monkeypatch
+    ):
+        """The handoff half, for a failure the backend produced.
+
+        Before the first token on purpose: what recovery means once partial
+        output has already reached the client is a separate question, and
+        this tranche does not answer it.
+        """
+        self._stream(engine, monkeypatch, schema=self.BREAKER, raises=True)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+        ran = self._nodes_run(events)
+        assert "recover" in ran, (
+            f"a stream that failed before producing anything ended the turn "
+            f"instead of taking its declared error edge: {ran}"
+        )
+        assert "normal" not in ran, ran
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_tool_that_succeeds_still_takes_next(
+        self, engine, monkeypatch
+    ):
+        """The control. Routing every streamed node to `on_error` would pass
+        both witnesses above and break every successful turn."""
+        calls = self._stream(engine, monkeypatch, schema=self.BREAKER)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+        ran = self._nodes_run(events)
+        assert calls == ["generate_stream"], calls
+        assert "normal" in ran, f"a successful stream took the error edge: {ran}"
+        assert "recover" not in ran, ran
+        assert any(e.get("event") == "token" for e in events), (
+            "tokens stopped reaching the client"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_failure_with_no_error_edge_still_stops_the_stream(
+        self, engine, monkeypatch
+    ):
+        """The other control, and the reason the fix is not "always call
+        `_successors`".
+
+        With no `on_error` declared, the chooser falls through to `next` — so
+        handing every failure to it would send a failed node down the
+        *success* path, into nodes that assume outputs it never produced.
+        A graph that names nowhere to go on failure ends where it always did.
+        """
+        schema = json.loads(json.dumps(self.BREAKER))
+        del schema["nodes"][0]["on_error"]
+        self._stream(engine, monkeypatch, schema=schema, raises=True)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+        assert any(e.get("event") == "error" for e in events), events
+        assert "normal" not in self._nodes_run(events), self._nodes_run(events)
