@@ -14487,6 +14487,51 @@ held and the suite hung. The seam has to be where no lock is held, which is
 before the store transaction opens — and that is version-agnostic, because
 the unfixed service has already computed its result by then.
 
+### The same stale write in every other artifact caller
+
+Fixing ConfigOps closed the race for one writer. It did not close the class,
+and I did not look — a reviewer did. `update_artifact` had the identical
+shape: `FOR UPDATE`, then validate and write the `schema` argument rather
+than a transformation of the row it had just locked. Six callers passed a
+precomputed document.
+
+Interleaved the other way round it is the *applied* ConfigOps patch that
+vanishes:
+
+```
+private PATCH reads schema N, computes N + D
+ConfigOps locks, reads N, writes N + C, marks the patch applied
+private PATCH takes the lock, writes its precomputed N + D
+-> C is gone, and its audit trail still says applied
+```
+
+Measured: `field_c` back to `ORIGINAL` with the patch row still `'applied'`.
+That is the campaign invariant itself, reached from the other side.
+
+`update_artifact` and `update_private_artifact` now take a `build_schema`
+callable, applied to the schema read under the lock. The private PATCH route
+builds there instead of before, which also moved the kind-prefix check inside
+the transaction, so a refusal writes nothing. `description` stopped being
+replayed: the route passes `None` when the request did not ask for one, which
+the store already reads as "leave it alone" — writing back the value you read
+reverts a concurrent change to it, the same staleness one column over.
+
+**Training's promotion was the worst of them.** `dict(adapter.schema)` came
+from a snapshot taken before the training run, so the window is minutes, not
+microseconds — long enough for a ConfigOps patch to be proposed, approved,
+applied, audited, and then erased when promotion finally took the lock. All
+five training call sites are builders now, each changing only the fields it
+owns.
+
+**My first promotion witness was vacuous, and the mutation caught it.** It
+applied the concurrent patch at the first `update_artifact` for that adapter
+— which is the pre-training vocab-size write. Training refreshes its snapshot
+afterwards, so by promotion time the document already contained the patch and
+the witness passed against the defect. The mutation that rebuilds from
+`adapter.schema` survived, which is the only reason I noticed. The seam is now
+inside the training run itself: after the last refresh, before promotion takes
+the lock.
+
 ### The fix broke two of this system's own patch producers
 
 Found by Bugbot on the pull request, confirmed by execution, and the only

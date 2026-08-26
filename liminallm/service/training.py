@@ -214,9 +214,10 @@ class TrainingService:
             )
             raise ConstraintViolation("adapter base incompatible", migration_plan)
         if runtime_base and not stored_base:
-            updated_schema = dict(adapter.schema)
-            updated_schema["base_model"] = runtime_base
-            self.store.update_artifact(adapter.id, updated_schema)
+            self.store.update_artifact(
+                adapter.id,
+                lambda locked: {**locked, "base_model": runtime_base},
+            )
             refreshed = self.store.get_artifact(adapter.id)
             return refreshed or adapter
         return adapter
@@ -276,13 +277,11 @@ class TrainingService:
                     migration_plan=migration_plan,
                 )
                 raise ConstraintViolation("adapter base incompatible", migration_plan)
-            needs_update = False
-            updated_schema = dict(adapter.schema)
             if runtime_base and not stored_base:
-                updated_schema["base_model"] = runtime_base
-                needs_update = True
-            if needs_update:
-                self.store.update_artifact(adapter.id, updated_schema)
+                self.store.update_artifact(
+                    adapter.id,
+                    lambda locked: {**locked, "base_model": runtime_base},
+                )
                 adapter = self.store.get_artifact(adapter.id) or adapter
             return adapter
 
@@ -311,7 +310,11 @@ class TrainingService:
         if resolved_mode in {AdapterMode.LOCAL, AdapterMode.HYBRID}:
             adapter_fs_dir = self._adapter_dir(user_id, adapter.id, adapter_schema)
             adapter_schema["fs_dir"] = str(adapter_fs_dir)
-        self.store.update_artifact(adapter.id, adapter_schema)
+        fs_dir = adapter_schema.get("fs_dir")
+        self.store.update_artifact(
+            adapter.id,
+            lambda locked: {**locked, "fs_dir": fs_dir} if fs_dir else locked,
+        )
         return self.store.get_artifact(adapter.id) or adapter
 
     def train_from_preferences(
@@ -403,9 +406,10 @@ class TrainingService:
         ) if holdout_entries else []
         vocab_size = self._vocab_size()
         if adapter.schema.get("vocab_size") != vocab_size:
-            adapter_schema = dict(adapter.schema)
-            adapter_schema["vocab_size"] = vocab_size
-            self.store.update_artifact(adapter.id, adapter_schema)
+            self.store.update_artifact(
+                adapter.id,
+                lambda locked: {**locked, "vocab_size": vocab_size},
+            )
             adapter = self.store.get_artifact(adapter.id) or adapter
             self._apply_adapter_vocab_size(adapter)
         # Reuse a job the worker already claimed; only create one when invoked
@@ -480,18 +484,30 @@ class TrainingService:
         # the prompt rung of the ladder).
         gate = self._promotion_gate(training_trace, holdout_count=len(holdout_entries))
         if gate["promoted"]:
-            updated_schema = dict(adapter.schema)
-            updated_schema["current_version"] = next_version
-            updated_schema["fs_dir"] = str(adapter_dir)
-            # Adapter ladder (SPEC §5.6): a prompt-born skill adapter that
-            # passes its first eval graduates to hybrid - trained weights
-            # with the prompt instructions kept as portable fallback.
-            if updated_schema.get("mode") == AdapterMode.PROMPT:
-                updated_schema["mode"] = AdapterMode.HYBRID
-                updated_schema.setdefault("lifecycle", {})
-                if isinstance(updated_schema["lifecycle"], dict):
-                    updated_schema["lifecycle"]["stage"] = "weights"
-            self.store.update_artifact(adapter.id, updated_schema)
+            def promote(locked: dict) -> dict:
+                """Change only what promotion owns, on the locked row.
+
+                `adapter` here was read before the training run, so rebuilding
+                from `adapter.schema` replays a document that can be minutes
+                stale — long enough for a ConfigOps patch to be applied,
+                audited, and then erased when promotion takes the lock.
+                """
+                updated_schema = dict(locked)
+                updated_schema["current_version"] = next_version
+                updated_schema["fs_dir"] = str(adapter_dir)
+                # Adapter ladder (SPEC §5.6): a prompt-born skill adapter that
+                # passes its first eval graduates to hybrid - trained weights
+                # with the prompt instructions kept as portable fallback.
+                if updated_schema.get("mode") == AdapterMode.PROMPT:
+                    updated_schema["mode"] = AdapterMode.HYBRID
+                    updated_schema.setdefault("lifecycle", {})
+                    if isinstance(updated_schema["lifecycle"], dict):
+                        updated_schema["lifecycle"] = {
+                            **updated_schema["lifecycle"], "stage": "weights",
+                        }
+                return updated_schema
+
+            self.store.update_artifact(adapter.id, promote)
             self._update_latest_symlink(adapter_dir, version_dir)
         else:
             # Quarantine the un-promoted weights. Leaving them in place as

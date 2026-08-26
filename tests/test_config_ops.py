@@ -576,6 +576,6 @@ class TestValidationIsAnchoredToTheArtifactsOwnType:
         with pytest.raises(ArtifactValidationError):
             store.update_artifact(
                 canonical_adapter.id,
-                {"kind": "tool.spec", "name": "x", "handler": "x"},
+                lambda _locked: {"kind": "tool.spec", "name": "x", "handler": "x"},
             )
         assert store.get_artifact(canonical_adapter.id).schema["kind"] == "adapter.lora"

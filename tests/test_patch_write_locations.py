@@ -1051,6 +1051,62 @@ class TestApplyIsOneReadModifyWrite:
         else:
             assert schema["field_d"] == "ORIGINAL", "a refused route call still wrote"
 
+    @pytest.mark.slow
+    def test_training_promotion_does_not_replay_its_starting_snapshot(
+        self, client, admin_headers, tmp_path, monkeypatch
+    ):
+        """The long-lived snapshot, at the real call site.
+
+        `train_from_preferences` reads the adapter, runs a training job, and
+        promotes. Promotion used to rebuild from `dict(adapter.schema)` — the
+        document read before the run — so anything committed during it was
+        erased when promotion finally took the lock. That window is minutes,
+        not the microseconds the API routes race over.
+        """
+        from liminallm.service.training import TrainingService
+        from tests.test_adapter_ladder import _make_cluster, _seed_user_with_events
+
+        store = get_runtime().store
+        training = TrainingService(store, str(tmp_path))
+        cluster = _make_cluster(store)
+        user, _ = _seed_user_with_events(store, f"pr_{uuid.uuid4().hex[:8]}@t.local",
+                                         cluster.id, 10)
+        adapter = training.ensure_user_adapter(user.id)
+
+        patch_id = self._proposed(client, admin_headers, adapter.id, [
+            {"op": "add", "path": "/landed_during_training", "value": "C"},
+        ])
+
+        done = {"raced": False}
+
+        def training_run(*args, **kwargs):
+            """Stands in for the job, and applies the patch while it runs.
+
+            The seam is here rather than on the first `update_artifact`,
+            because training writes to the adapter *before* the run — vocab
+            size, base model — and refreshes its snapshot afterwards. A patch
+            applied at one of those would already be in the document promotion
+            rebuilds from, and the witness would pass against the defect.
+            This is the real window: committed during the run, after the last
+            refresh, before promotion takes the lock.
+            """
+            done["raced"] = True
+            applied = client.post(f"/v1/config/patches/{patch_id}/apply",
+                                  headers=admin_headers, json={})
+            assert applied.status_code == 200, applied.text
+            return {"status": "ok", "eval_before": 1.0, "eval_after": 0.1}
+
+        monkeypatch.setattr(training, "_run_jax_optax_training", training_run)
+        result = training.train_from_preferences(user.id)
+
+        assert done["raced"], "the seam never fired, so this measured nothing"
+        assert result["eval_gate"]["promoted"] is True, result["eval_gate"]
+        schema = store.get_artifact(adapter.id).schema
+        assert schema.get("landed_during_training") == "C", (
+            "promotion replayed its starting snapshot over an applied patch"
+        )
+        assert schema.get("current_version"), "promotion did not record its version"
+
     def test_one_approved_patch_applies_exactly_once_in_sequence(
         self, client, admin_headers
     ):

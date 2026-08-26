@@ -3228,7 +3228,7 @@ class PostgresStore:
     def update_private_artifact(
         self,
         artifact_id: str,
-        schema: dict,
+        build_schema: Callable[[dict], dict],
         description: Optional[str] = None,
         *,
         owner_user_id: str,
@@ -3250,7 +3250,7 @@ class PostgresStore:
         """
         return self.update_artifact(
             artifact_id,
-            schema,
+            build_schema,
             description,
             version_author=version_author,
             change_note=change_note,
@@ -3261,7 +3261,7 @@ class PostgresStore:
     def update_artifact(
         self,
         artifact_id: str,
-        schema: dict,
+        build_schema: Callable[[dict], dict],
         description: Optional[str] = None,
         *,
         version_author: Optional[str] = None,
@@ -3269,6 +3269,20 @@ class PostgresStore:
         owner_user_id: Optional[str] = None,
         require_private: bool = False,
     ) -> Optional[Artifact]:
+        """Edit an artifact as one read-modify-write under the row lock.
+
+        `build_schema` receives the schema read under `FOR UPDATE` and returns
+        the replacement. It is a builder rather than a finished document
+        because every caller here is doing a read-modify-write, and taking the
+        document meant this lock serialized the write without covering the
+        read behind it: whatever committed in between was overwritten by a
+        result derived from an older row. `apply_config_patch` had the same
+        shape and the same race.
+
+        `description` keeps its own meaning — `None` is "leave it alone",
+        which is not the same as "write back what I read". A caller that
+        replays the description it read reverts a concurrent change to it.
+        """
         with self._connect() as conn, conn.transaction():
             # FOR UPDATE holds the artifact row for the transaction, so two
             # concurrent inserts cannot compute the same next_version.
@@ -3286,6 +3300,12 @@ class PostgresStore:
             ).fetchone()
             if not row:
                 return None
+            current_schema = row.get("schema")
+            if isinstance(current_schema, str):
+                current_schema = json.loads(current_schema or "{}")
+            schema = build_schema(
+                current_schema if isinstance(current_schema, dict) else {}
+            )
             # Against the row's own type, which required reading the row
             # first: choosing the validator from the incoming schema's `kind`
             # let a payload pick which rules it would be judged by, and an
