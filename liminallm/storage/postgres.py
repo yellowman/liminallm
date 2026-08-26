@@ -3803,23 +3803,38 @@ class PostgresStore:
         """
 
         with self._connect() as conn, conn.transaction():
-            # Patch first, then artifact. One order everywhere that takes both.
-            patch_row = conn.execute(
-                "SELECT * FROM config_patch WHERE id = %s FOR UPDATE", (patch.id,)
-            ).fetchone()
-            if not patch_row:
-                raise NotFoundError("patch not found", detail={"patch_id": patch.id})
-            if patch_row["status"] != "approved":
-                raise BadRequestError(
-                    "patch must be approved before applying",
-                    detail={"patch_id": patch.id, "current_status": patch_row["status"]},
-                )
-
+            # Artifact first, then the patch — the order every other writer
+            # here uses. `delete_private_artifact` locks the artifact and then
+            # deletes it, and `config_patch.artifact_id` is ON DELETE CASCADE,
+            # so the delete reaches the patch rows through the artifact.
+            # Taking them the other way round made an ABBA cycle that Postgres
+            # broke by aborting one transaction. Nothing was corrupted, but a
+            # deadlock victim is not an intentional order.
+            #
+            # `patch.artifact_id` is safe to look up before the patch row is
+            # locked because a patch never changes the artifact it targets;
+            # the identity is re-checked below anyway, under both locks.
             artifact_row = conn.execute(
                 "SELECT * FROM artifact WHERE id = %s FOR UPDATE", (patch.artifact_id,)
             ).fetchone()
             if not artifact_row:
                 raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
+
+            patch_row = conn.execute(
+                "SELECT * FROM config_patch WHERE id = %s FOR UPDATE", (patch.id,)
+            ).fetchone()
+            if not patch_row:
+                raise NotFoundError("patch not found", detail={"patch_id": patch.id})
+            if str(patch_row["artifact_id"]) != str(patch.artifact_id):
+                raise BadRequestError(
+                    "patch does not target this artifact",
+                    detail={"patch_id": patch.id, "artifact_id": patch.artifact_id},
+                )
+            if patch_row["status"] != "approved":
+                raise BadRequestError(
+                    "patch must be approved before applying",
+                    detail={"patch_id": patch.id, "current_status": patch_row["status"]},
+                )
 
             current_schema = artifact_row.get("schema")
             if isinstance(current_schema, str):

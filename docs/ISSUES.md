@@ -14487,6 +14487,52 @@ held and the suite hung. The seam has to be where no lock is held, which is
 before the store transaction opens — and that is version-agnostic, because
 the unfixed service has already computed its result by then.
 
+### Apply and delete took the two rows in opposite orders
+
+The fix for the lost update introduced a lock on the `config_patch` row, and
+put it in the wrong place. `apply_config_patch` took patch then artifact, with
+a comment claiming that was the universal order. It is not:
+`delete_private_artifact` takes the artifact and then deletes it, and
+`config_patch.artifact_id` is `ON DELETE CASCADE`, so the delete reaches the
+patch rows *through* the artifact.
+
+```
+delete:  artifact -> config_patch (via cascade)
+apply:   config_patch -> artifact
+```
+
+An ABBA cycle. Reachable rather than theoretical: propose accepts any artifact
+id, so a private artifact can carry an approved patch while its owner deletes
+it, and account erasure meets the same relationship. Measured:
+`{'apply': 'DeadlockDetected', 'delete': 'ok'}`.
+
+Postgres broke the cycle by aborting a transaction, so nothing was corrupted —
+which is why this was a MEDIUM and not a HIGH. But a deadlock victim is not
+the same as two operations having one intentional order, and every other
+writer here already takes the artifact first. `apply_config_patch` now does
+too, and re-checks the patch row's identity and status once both locks are
+held.
+
+Artifact-first did not cost the exactly-once property: two applies of one
+patch contend on the artifact first, the winner marks the patch, and the loser
+then takes the patch row and sees `applied`. The mutation that restores
+patch-first kills the deadlock witness alone, and both exactly-once witnesses
+survive it, which is what says so.
+
+**The witness is deterministic by construction rather than by timing.** The
+delete is held after it has taken the artifact lock and before the cascade —
+using the `_artifact_from_row` call that already sits between them, so no test
+hook was added to production code — and the apply is released only once
+`pg_stat_activity` shows a backend genuinely waiting on a lock. A sleep would
+have made the red probabilistic, and a probabilistic red is not a witness.
+
+**A process note that cost a real scare.** Interrupting the mutation driver
+mid-run left a mutation applied to `json_patch.py`: the restore lives in a
+`finally`, and a killed process never reaches it. The routine `git status`
+after every mutation run is what caught it. The driver now writes a marker
+naming what it has applied, so an interrupted run says so instead of leaving
+the tree quietly wrong.
+
 ### The same stale write in every other artifact caller
 
 Fixing ConfigOps closed the race for one writer. It did not close the class,
