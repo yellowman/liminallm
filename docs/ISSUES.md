@@ -14887,8 +14887,10 @@ wording were updated rather than worked around.
 
 ## Observation, not this tranche: a teardown race in the xdist lane
 
-Seen once in 2,917 tests and not reproduced — recorded because a one-sighting
-race that nobody writes down is a race that gets rediscovered.
+**Reproduced.** Recorded after one sighting because a one-sighting race that
+nobody writes down is a race that gets rediscovered; it recurred during the
+graph-integrity tranche, so it is intermittent rather than a one-off and now
+warrants its own concurrency/lifetime red.
 
 `test_a_replacement_cannot_be_undone_by_a_write_already_in_flight` failed under
 `make test-xdist` with `psycopg_pool.PoolClosed: the pool 'pool-1' is already
@@ -14907,9 +14909,29 @@ lane was green on the next run. It has no reach into the patch engine — the
 file never mentions `json_patch`, and the module's only call site in
 `routes.py` is the artifact PATCH route, not the upload route in the trace.
 
-Worth a look on its own terms: the shape is a background write racing
-teardown, which is a product question about that write's lifetime as much as a
-harness question.
+The second sighting carried a fuller trace, and it widens the shape rather
+than confirming it. The pool closes underneath a *live request* —
+`POST /v1/files/upload` — and two different call sites reach for a connection
+after that:
+
+```
+routes.upload_file
+  _publish -> store.contexts_covering_path  -> self._connect()
+  IdempotencyGuard.__aexit__
+    runtime._set_cached_idempotency_record
+      store.hold_live_user                  -> self._connect()
+```
+
+So this is not only a fire-and-forget write outliving its session: request
+work itself is still running when the pool goes. The test passes in isolation
+and logs the unhandled exception, which is why it can fail the lane without
+failing the assertion — an important detail for whoever picks this up, because
+grepping for the failing assertion will not find it.
+
+Worth a look on its own terms: the shape is a request outliving the pool it
+borrows from, which is a product question about shutdown ordering as much as a
+harness question. It is unrelated to the patch and graph tranches by
+reachability, and both lanes are green on a re-run.
 
 ## The isolation lesson from the live ConfigOps campaign
 
