@@ -998,6 +998,59 @@ class TestApplyIsOneReadModifyWrite:
             status = get_runtime().store.get_config_patch(patch_id).status
             assert status == "approved", f"a refused apply left the patch {status}"
 
+    def test_the_private_route_does_not_overwrite_a_concurrent_apply(
+        self, client, admin_headers
+    ):
+        """The same defect in the other direction, found by grepping the class.
+
+        Fixing ConfigOps closed the race for one writer. The ordinary private
+        PATCH route still reads the artifact, computes the whole new schema,
+        and hands it to a store method that locks the row and writes the
+        document it was given — so with the two writers interleaved the other
+        way round, it is the *applied* ConfigOps patch that disappears:
+
+            private PATCH reads schema N, computes N + D
+            ConfigOps locks, reads N, writes N + C, marks the patch applied
+            private PATCH takes the lock, writes its precomputed N + D
+            -> C is gone, and its audit trail still says applied
+
+        Which is the campaign invariant exactly: the patch says applied, a
+        version records it, and the serving configuration does not have it.
+        """
+        artifact = _private(client, admin_headers,
+                            extra={"field_c": "ORIGINAL", "field_d": "ORIGINAL"})
+        patch_id = self._proposed(client, admin_headers, artifact, [
+            {"op": "replace", "path": "/field_c", "value": "C"},
+        ])
+
+        store = get_runtime().store
+        real = store.update_private_artifact
+
+        def racing(*args, **kwargs):
+            # The route has computed its result and holds no lock here.
+            applied = client.post(f"/v1/config/patches/{patch_id}/apply",
+                                  headers=admin_headers, json={})
+            assert applied.status_code == 200, applied.text
+            return real(*args, **kwargs)
+
+        store.update_private_artifact = racing
+        try:
+            resp = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers,
+                                json={"patch": [{"op": "replace", "path": "/field_d",
+                                                 "value": "D"}]})
+        finally:
+            store.update_private_artifact = real
+
+        schema = _schema(artifact)
+        patch_status = get_runtime().store.get_config_patch(patch_id).status
+        assert schema["field_c"] == "C", (
+            f"the applied ConfigOps patch was overwritten; it is still {patch_status!r}"
+        )
+        if resp.status_code == 200:
+            assert schema["field_d"] == "D", "the route reported success"
+        else:
+            assert schema["field_d"] == "ORIGINAL", "a refused route call still wrote"
+
     def test_one_approved_patch_applies_exactly_once_in_sequence(
         self, client, admin_headers
     ):
