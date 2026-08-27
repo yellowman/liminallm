@@ -75,6 +75,12 @@ from liminallm.service.tokenizer_utils import (
     MAX_GENERATION_TOKENS,
     estimate_token_count,
 )
+from liminallm.service.tool_namespace import (
+    SYSTEM_SCOPE,
+    ResolvedWorkflow,
+    ToolDescriptor,
+    ToolResolutionScope,
+)
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
@@ -111,32 +117,6 @@ class ParallelNodeResult:
     # "ok" if all succeeded, "partial" if some failed, "error" if all failed,
     # "budget_exhausted" if the batch was refused before any of it began.
     status: str = "ok"
-
-
-@dataclass(frozen=True)
-class ToolDescriptor:
-    """A resolved tool and where its authority comes from.
-
-    `artifact_id`/`owner_user_id`/`owner_role` are read from the persisted
-    artifact row. SPEC §18 makes `privileged:true` a property of an
-    *admin-owned artifact*, so the authority cannot be read out of the spec
-    the caller supplied — a `privileged: true` key is only a claim until an
-    admin-owned row is standing behind it.
-    """
-
-    name: str
-    schema: dict
-    artifact_id: Optional[str]
-    owner_user_id: Optional[str]
-    owner_role: Optional[str]
-
-    @property
-    def privileged(self) -> bool:
-        return bool((self.schema or {}).get("privileged"))
-
-    @property
-    def admin_owned(self) -> bool:
-        return bool(self.artifact_id) and self.owner_role == "admin"
 
 
 class WorkflowEngine(WorkflowStreamingMixin):
@@ -373,6 +353,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         node_map: Dict[str, Dict[str, Any]],
         *,
         budget: ExecutionBudget,
+        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         user_message: str,
         context_id: Optional[str],
         conversation_id: Optional[str],
@@ -442,6 +423,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     vars_scope=local_vars,
                     user_id=user_id,
                     tenant_id=tenant_id,
+                    # The workflow's namespace, not the runner's — this is a
+                    # second descent into node execution, and the easiest
+                    # place to lose the scope the outer loop carries.
+                    tool_scope=tool_scope,
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
                     cancel_event=cancel_event,
@@ -531,20 +516,31 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
     ) -> dict:
-        workflow_schema = None
+        loaded = None
         if workflow_id:
-            workflow_schema = self._load_workflow_for(
+            loaded = self._load_workflow_for(
                 workflow_id, user_id=user_id, tenant_id=tenant_id
             )
-        if not workflow_schema:
+        if loaded is None:
             # The tool agent handles anything needing tools. It degrades to a
             # plain reply when it has no tools to offer, so the cost of a false
             # positive is a worker process; the cost of a false negative is a
             # capability the operator configured and the turn never sees.
+            #
+            # These two are synthesised, not published, so they have no
+            # publisher and no tenant: the global namespace is the only one
+            # they can mean.
             if self._turn_needs_tools(conversation_id, user_id):
-                workflow_schema = get_default_attachment_workflow_schema()
+                loaded = ResolvedWorkflow(
+                    get_default_attachment_workflow_schema(), SYSTEM_SCOPE
+                )
             else:
-                workflow_schema = self._default_workflow()
+                loaded = ResolvedWorkflow(self._default_workflow(), SYSTEM_SCOPE)
+        workflow_schema = loaded.schema
+        # Carried through every node, parallel child and retry below rather
+        # than rebuilt from the runner: a published workflow must name the
+        # same capability whoever runs it.
+        tool_scope = loaded.tool_scope
 
         # SPEC §9: workflow-level timeout_ms caps total wall clock
         workflow_timeout_ms = workflow_schema.get(
@@ -652,6 +648,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 vars_scope=vars_scope,
                 user_id=user_id,
                 tenant_id=tenant_id,
+                tool_scope=tool_scope,
                 workflow_start_time=workflow_start_time,
                 workflow_timeout_ms=workflow_timeout_ms,
             )
@@ -683,6 +680,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         parallel_node_ids,
                         node_map,
                         budget=budget,
+                        tool_scope=tool_scope,
                         user_message=user_message,
                         context_id=context_id,
                         conversation_id=conversation_id,
@@ -883,6 +881,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         vars_scope: Dict[str, Any],
         user_id: Optional[str],
         tenant_id: Optional[str],
+        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         workflow_start_time: float,
         workflow_timeout_ms: float,
         cancel_event: Optional[asyncio.Event] = None,
@@ -932,6 +931,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     vars_scope=vars_scope,
                     user_id=user_id,
                     tenant_id=tenant_id,
+                    tool_scope=tool_scope,
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
                     cancel_event=cancel_event,
@@ -993,6 +993,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         vars_scope: Dict[str, Any],
         user_id: Optional[str],
         tenant_id: Optional[str],
+        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         workflow_start_time: float,
         workflow_timeout_ms: float,
         cancel_event: Optional[asyncio.Event] = None,
@@ -1050,6 +1051,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         vars_scope=vars_scope,
                         user_id=user_id,
                         tenant_id=tenant_id,
+                        tool_scope=tool_scope,
                         invocation=invocation,
                     ),
                     timeout=node_timeout_ms / 1000.0,
@@ -1592,37 +1594,48 @@ class WorkflowEngine(WorkflowStreamingMixin):
         return registry
 
     def _resolve_tool(
-        self,
-        tool_name: str,
-        *,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-    ) -> Optional["ToolDescriptor"]:
-        """The tool this caller means by `tool_name`, with its provenance.
+        self, tool_name: str, scope: ToolResolutionScope
+    ) -> Optional[ToolDescriptor]:
+        """The one tool `tool_name` means in this workflow's namespace.
+
+        The scope is the *workflow's*, never the runner's. This used to scan
+        `list_artifacts` for the caller and take the first name match, so a
+        shared workflow calling `foo` ran whichever `foo` the runner happened
+        to own — one published workflow, a different capability per person.
 
         Provenance comes from the persisted artifact row — `owner_user_id` and
         the owner's role — never from fields inside `schema`, which is
         caller-authored data. A spec claiming `owner_user_id: <an admin>` is
         just a string someone typed.
-        """
-        for artifact in self.store.list_artifacts(
-            type_filter="tool", owner_user_id=user_id, tenant_id=tenant_id
-        ):
-            schema = artifact.schema if isinstance(artifact.schema, dict) else {}
-            if schema.get("name") != tool_name:
-                continue
-            return self._describe_tool(artifact)
-        schema = self.tool_registry.get(tool_name)
-        if schema is None:
-            return None
-        # A globally visible spec with no artifact behind it in this lookup:
-        # usable, but unattributed, so it can never be privileged.
-        return ToolDescriptor(
-            name=tool_name, schema=schema, artifact_id=None,
-            owner_user_id=None, owner_role=None,
-        )
 
-    def _describe_tool(self, artifact) -> "ToolDescriptor":
+        There is no cache in front of this and no fallback behind it. A
+        process-local registry built at startup used to answer for artifacts
+        that had since been deleted, which is a cache manufacturing authority
+        rather than accelerating a lookup.
+        """
+        descriptor, why = self.store.resolve_tool_spec(tool_name, scope)
+        if why is not None:
+            self.logger.warning(
+                "tool_reference_unresolved", tool=tool_name,
+                visibility=scope.visibility, reason=why,
+            )
+            return None
+        if not descriptor.executable:
+            self.logger.warning(
+                "tool_handler_not_executable", tool=tool_name,
+                handler=descriptor.handler,
+            )
+            return None
+        return descriptor
+
+    def _describe_tool(self, artifact) -> ToolDescriptor:
+        """Describe one artifact the caller already chose.
+
+        A different question from `_resolve_tool`, which asks what a *name*
+        means in a namespace. `POST /v1/tools/{id}/invoke` has already
+        authorized one exact row, so naming it again would let a name
+        collision run something else.
+        """
         owner_id = getattr(artifact, "owner_user_id", None)
         owner = self.store.get_user(owner_id) if owner_id else None
         return ToolDescriptor(
@@ -1938,6 +1951,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         vars_scope: Dict[str, Any],
         user_id: Optional[str],
         tenant_id: Optional[str],
+        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         invocation: Optional[Invocation] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         node_type = node.get("type", "tool_call")
@@ -1999,6 +2013,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 user_message,
                 user_id=user_id,
                 tenant_id=tenant_id,
+                tool_scope=tool_scope,
                 invocation=invocation,
             )
             # SPEC §18: Record success to reset failure counter
@@ -2080,14 +2095,23 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         descriptor: Optional[ToolDescriptor] = None,
         invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         if descriptor is None:
-            descriptor = self._resolve_tool(
-                tool_name, user_id=user_id, tenant_id=tenant_id
-            )
+            descriptor = self._resolve_tool(tool_name, tool_scope)
+        if descriptor is None:
+            # Fails closed: the reference named nothing this workflow can
+            # reach, or named a handler nothing runs. Admission refuses these,
+            # so reaching here means the row predates the check, was imported,
+            # or the tool has been retired since.
+            return {
+                "status": "error",
+                "content": f"unknown tool {tool_name}",
+                "error": "tool_reference_unresolved",
+            }
         tool_spec = descriptor.schema if descriptor else None
         # Issue 6.9: Apply hardcap per SPEC §18.3 (default 15s, hard cap 60s)
         raw_timeout = tool_spec.get("timeout_seconds", 15) if tool_spec else 15

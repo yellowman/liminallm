@@ -48,6 +48,7 @@ from liminallm.service.invocation import (
     current_invocation,
     payload_hash,
 )
+from liminallm.service.tool_namespace import ToolDescriptor
 
 
 def _unique(prefix: str) -> str:
@@ -124,7 +125,7 @@ class TestNoRetryBeforeThePriorTreeIsDead:
             # blocked on the capability below.
             "timeout_ms": 400,
         }
-        engine.tool_registry.setdefault("test.slow_tool", {"name": "test.slow_tool"})
+        _resolves_to(monkeypatch, engine, "test.slow_tool", {"name": "test.slow_tool"})
 
         pids_seen: list[int] = []
         live_at_start: list[list[int]] = []
@@ -425,7 +426,7 @@ class TestEverythingBrokerOwnedIsKilledAndReaped:
             "backoff_ms": 1,
             "timeout_ms": 200,
         }
-        engine.tool_registry.setdefault("test.undead", {"name": "test.undead"})
+        _resolves_to(monkeypatch, engine, "test.undead", {"name": "test.undead"})
         attempts = 0
         real_serve = engine._serve_invocation
 
@@ -1145,6 +1146,31 @@ def _slow_setsid_child(conn):
     conn.recv()
 
 
+def _resolves_to(monkeypatch, engine, name, spec):
+    """Make `name` resolve to `spec` for this test.
+
+    These tests exercise the invocation lease — spawn, kill, reap, retry —
+    with bodies that deliberately do not exist, so a real `tool.spec`
+    artifact would be refused for naming a handler nothing runs. That
+    refusal is correct; it is simply not what is under test here, so
+    resolution is stubbed explicitly rather than smuggled in through a cache.
+
+    They used to write into `engine.tool_registry`, which no longer decides
+    whether a tool exists.
+    """
+    real = engine._resolve_tool
+
+    def resolve(tool_name, scope):
+        if tool_name == name:
+            return ToolDescriptor(
+                name=name, schema=spec, artifact_id=None,
+                owner_user_id=None, owner_role=None,
+            )
+        return real(tool_name, scope)
+
+    monkeypatch.setattr(engine, "_resolve_tool", resolve)
+
+
 @contextmanager
 def _no_killpg(recorder):
     """Record any killpg target instead of signalling it."""
@@ -1409,10 +1435,10 @@ class TestTheWholePathStillWorks:
         """The report and the fact agree: `timeout` is returned, and the
         process it names is gone."""
         engine = runtime.workflow
-        engine.tool_registry["test.hang"] = {
+        _resolves_to(monkeypatch, engine, "test.hang", {
             "name": "test.hang",
             "timeout_seconds": 1,
-        }
+        })
         seen: list = []
         real_serve = engine._serve_invocation
 
@@ -1568,7 +1594,7 @@ class TestReapingIsConfirmedNotAssumed:
         # A body that *fails* — a retry is what the refusal has to stop, and
         # nothing retries a node that succeeded.
         tool = hostile_child.FAILING_WORKER_BODY_TOOL
-        engine.tool_registry.setdefault(tool, {"name": tool})
+        _resolves_to(monkeypatch, engine, tool, {"name": tool})
         undead = {"on": True}
         monkeypatch.setattr(
             invocation_module, "group_alive", lambda pgid: undead["on"]

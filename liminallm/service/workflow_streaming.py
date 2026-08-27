@@ -29,6 +29,7 @@ from liminallm.service.broker import InvocationContext
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
+from liminallm.service.tool_namespace import SYSTEM_SCOPE, ResolvedWorkflow
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
@@ -60,22 +61,28 @@ class WorkflowStreamingMixin:
         - {"event": "error", "data": {"code": "...", "message": "..."}}
         - {"event": "cancel_ack", "data": {}}
         """
-        workflow_schema = None
+        loaded = None
         if workflow_id:
             # Same ownership check as the blocking path: a workflow is an
             # artifact, and `workflow_id` comes from the request body. Loading
             # it by id alone let any authenticated user stream another user's
             # private workflow.
-            workflow_schema = self._load_workflow_for(
+            loaded = self._load_workflow_for(
                 workflow_id, user_id=user_id, tenant_id=tenant_id
             )
-        if not workflow_schema:
+        if loaded is None:
             # Same question the blocking path asks, and the same function, so
             # the two cannot answer it differently. See `_turn_needs_tools`.
             if self._turn_needs_tools(conversation_id, user_id):
-                workflow_schema = get_default_attachment_workflow_schema()
+                loaded = ResolvedWorkflow(
+                    get_default_attachment_workflow_schema(), SYSTEM_SCOPE
+                )
             else:
-                workflow_schema = self._default_workflow()
+                loaded = ResolvedWorkflow(self._default_workflow(), SYSTEM_SCOPE)
+        workflow_schema = loaded.schema
+        # The same namespace the blocking path uses. A published workflow must
+        # name the same capability whether or not the request asked to stream.
+        tool_scope = loaded.tool_scope
 
         workflow_timeout_ms = workflow_schema.get(
             "timeout_ms", DEFAULT_WORKFLOW_TIMEOUT_MS
@@ -168,13 +175,23 @@ class WorkflowStreamingMixin:
             node_type = node.get("type", "tool_call")
             tool_name = node.get("tool", "")
 
+            # Resolve before choosing a capability. This compared the
+            # reference *spelling* against a fixed list, so a tenant-shared
+            # spec overriding the name `llm.generic` streamed the model while
+            # the blocking path ran the override's real body: the `stream`
+            # flag decided which capability a published workflow executed.
+            # Deciding on the resolved handler also lets an aliased name whose
+            # handler *is* the LLM stream, which a spelling comparison could
+            # not express.
+            descriptor = (
+                self._resolve_tool(tool_name, tool_scope)
+                if node_type == "tool_call" and tool_name
+                else None
+            )
+
             # Handle streaming for LLM-based tools. The attachment agent streams
             # too: its tool rounds emit trace events, then the answer streams.
-            if node_type == "tool_call" and tool_name in {
-                "llm.generic",
-                "llm.generic_chat_v1",
-                "agent.files_v1",
-            }:
+            if descriptor is not None and descriptor.streamable:
                 # The control plane around the call is the blocking path's,
                 # shared rather than copied: an open breaker refuses the call
                 # (SPEC §18), and a call that fails takes `on_error` (SPEC §9).
@@ -208,7 +225,7 @@ class WorkflowStreamingMixin:
                             tenant_id=tenant_id,
                             cancel_event=cancel_event,
                         )
-                        if tool_name == "agent.files_v1"
+                        if descriptor.handler == "agent.files_v1"
                         else self._stream_llm_node(
                             node,
                             user_message=user_message,
@@ -309,6 +326,7 @@ class WorkflowStreamingMixin:
                     vars_scope=vars_scope,
                     user_id=user_id,
                     tenant_id=tenant_id,
+                    tool_scope=tool_scope,
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
                     cancel_event=cancel_event,
@@ -337,6 +355,7 @@ class WorkflowStreamingMixin:
                             parallel_node_ids,
                             node_map,
                             budget=budget,
+                            tool_scope=tool_scope,
                             user_message=user_message,
                             context_id=context_id,
                             conversation_id=conversation_id,

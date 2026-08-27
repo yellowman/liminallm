@@ -50,6 +50,7 @@ import uuid
 import pytest
 
 from liminallm.service.runtime import get_runtime
+from liminallm.service.tool_namespace import SYSTEM_SCOPE, ToolResolutionScope
 
 
 def _u(p):
@@ -110,7 +111,8 @@ class TestAdmissionValidatesAgainstTheExecutionAudience:
                 "workflow", _u("sharedwf"), _wf(name),
                 owner_user_id=u.id, visibility="shared",
             )
-        assert "tool" in str(exc.value).lower() or "reference" in str(exc.value).lower()
+        errors = " ".join(getattr(exc.value, "errors", []) or []).lower()
+        assert name.lower() in errors, errors
 
     def test_a_global_workflow_may_not_use_a_tenant_shared_tool(self, store):
         u = store.create_user(email=f"{_u('ga')}@t.local", tenant_id=_u("gt"))
@@ -136,7 +138,7 @@ class TestAdmissionValidatesAgainstTheExecutionAudience:
         """SPEC distinguishes ownerless system artifacts. A seeded global tool
         resolves and can never be privileged — do not manufacture an owner for
         it to satisfy `privileged`."""
-        d = engine._resolve_tool("llm.generic", user_id=None, tenant_id=None)
+        d = engine._resolve_tool("llm.generic", SYSTEM_SCOPE)
         assert d is not None, "the seeded builtin stopped resolving"
         assert d.owner_role is None, (
             f"an ownerless system tool acquired authority: {d.owner_role!r}"
@@ -238,7 +240,9 @@ class TestTheResolverIsNotAListing:
         _tool(store, name, "llm.generic", owner=u.id, visibility="private")
         for _ in range(110):
             _tool(store, _u("filler"), "llm.generic", owner=u.id, visibility="private")
-        d = engine._resolve_tool(name, user_id=u.id, tenant_id=u.tenant_id)
+        d = engine._resolve_tool(
+            name, ToolResolutionScope("private", u.id, u.tenant_id)
+        )
         assert d is not None, (
             "a visible, undeleted tool became unresolvable because a listing "
             "page filled up"
@@ -259,7 +263,9 @@ class TestTheResolverIsNotAListing:
             conn.execute("DELETE FROM artifact WHERE id = %s", (art.id,))
         assert store.get_artifact(art.id) is None, "the row survived"
 
-        d = engine._resolve_tool(name, user_id=u.id, tenant_id=u.tenant_id)
+        d = engine._resolve_tool(
+            name, ToolResolutionScope("private", u.id, u.tenant_id)
+        )
         assert d is None, (
             "a process-local cache proved a deleted artifact exists; Postgres "
             "is canonical and said it is gone"
@@ -288,12 +294,11 @@ class TestAHandlerMustBeExecutable:
         """Admission cannot instantiate a `WorkflowEngine` to ask what is
         executable, so the host handler names live in a pure module — and the
         engine's own map is checked against it, or the two lists drift."""
+        from liminallm.service import tool_worker
         from liminallm.service.tool_namespace import (
             EXECUTABLE_HANDLER_NAMES,
             HOST_TOOL_HANDLER_NAMES,
         )
-
-        from liminallm.service import tool_worker
         rt = get_runtime()
         assert set(rt.workflow._builtin_tool_handlers()) == set(
             HOST_TOOL_HANDLER_NAMES

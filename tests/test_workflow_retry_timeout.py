@@ -9,6 +9,11 @@ from unittest.mock import patch
 
 import pytest
 
+from liminallm.service.tool_namespace import (
+    SYSTEM_SCOPE,
+    ResolvedWorkflow,
+    ToolDescriptor,
+)
 from liminallm.service.workflow import (
     DEFAULT_BACKOFF_MS,
     DEFAULT_NODE_MAX_RETRIES,
@@ -18,6 +23,15 @@ from liminallm.service.workflow import (
     MAX_RETRIES_HARD_CAP,
     WorkflowEngine,
 )
+from liminallm.storage.common import get_default_tool_specs
+
+
+def _loaded(schema):
+    """What `get_latest_workflow` returns: a schema and the namespace its tool
+    references mean. These tests are about retry and timeout mechanics, so the
+    system namespace — the one the engine uses for workflows it synthesises
+    itself — is the right one."""
+    return ResolvedWorkflow(schema, SYSTEM_SCOPE)
 
 
 class MockStore:
@@ -26,6 +40,10 @@ class MockStore:
     def __init__(self):
         self.artifacts = []
         self.messages = []
+        #: Specs a test registers, standing in for artifact rows. The engine
+        #: resolves through the store now, so registering in the engine's
+        #: process cache no longer makes a tool exist.
+        self.tool_specs: dict = {}
 
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         return None
@@ -35,6 +53,45 @@ class MockStore:
 
     def list_semantic_clusters(self, user_id: Optional[str]) -> list:
         return []
+
+    def register_tool(self, name, handler="llm.generic", **extra):
+        self.tool_specs[name] = {"name": name, "handler": handler, **extra}
+
+    def resolve_tool_spec(self, name, scope):
+        """Resolve a default tool the way the real store would.
+
+        Built from `get_default_tool_specs()` — the same definition
+        `_ensure_default_artifacts` seeds from — rather than a table written
+        here, so this double cannot disagree with production about what a
+        default tool's handler is.
+
+        It differs from the real store in one way that is true of the thing it
+        stands for: seeded tools are ownerless, so `artifact_id` is None and
+        the descriptor can never be privileged. Tests needing real
+        provenance use the real store.
+        """
+        registered = self.tool_specs.get(name)
+        if registered is not None:
+            return (
+                ToolDescriptor(
+                    name=name, schema=registered, artifact_id=None,
+                    owner_user_id=None, owner_role=None,
+                ),
+                None,
+            )
+        for spec in get_default_tool_specs():
+            if spec.get("name") == name:
+                return (
+                    ToolDescriptor(
+                        name=name,
+                        schema=spec,
+                        artifact_id=None,
+                        owner_user_id=None,
+                        owner_role=None,
+                    ),
+                    None,
+                )
+        return None, "names no tool this workflow can reach"
 
 
 class MockLLM:
@@ -154,7 +211,7 @@ class TestWorkflowTimeout:
             patch.object(workflow_engine.store, "get_latest_workflow") as mock_workflow,
             patch("time.monotonic", mock_monotonic),
         ):
-            mock_workflow.return_value = {
+            mock_workflow.return_value = _loaded({
                 "kind": "workflow.chat",
                 "timeout_ms": 100,  # 100ms timeout
                 "entrypoint": "slow_node",
@@ -165,7 +222,7 @@ class TestWorkflowTimeout:
                         "tool": "llm.generic",
                     }
                 ],
-            }
+            })
 
             result = await workflow_engine.run(
                 "test-workflow",
@@ -184,7 +241,7 @@ class TestWorkflowTimeout:
     ):
         """Workflow should use default timeout when not specified in schema."""
         with patch.object(workflow_engine.store, "get_latest_workflow") as mock:
-            mock.return_value = {
+            mock.return_value = _loaded({
                 "kind": "workflow.chat",
                 # No timeout_ms specified
                 "entrypoint": "quick_node",
@@ -194,7 +251,7 @@ class TestWorkflowTimeout:
                         "type": "end",
                     }
                 ],
-            }
+            })
 
             # This should complete quickly without timing out
             result = await workflow_engine.run(
@@ -224,12 +281,12 @@ class TestWorkflowTimeout:
             patch.object(workflow_engine.store, "get_latest_workflow") as mock_workflow,
             patch("time.monotonic", mock_monotonic),
         ):
-            mock_workflow.return_value = {
+            mock_workflow.return_value = _loaded({
                 "kind": "workflow.chat",
                 "timeout_ms": 100,
                 "entrypoint": "node1",
                 "nodes": [{"id": "node1", "type": "tool_call", "tool": "llm.generic"}],
-            }
+            })
 
             result = await workflow_engine.run(
                 "test-workflow",
@@ -266,8 +323,9 @@ class TestRetryBackoff:
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -311,8 +369,9 @@ class TestRetryBackoff:
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": always_failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -358,8 +417,9 @@ class TestRetryBackoff:
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": always_failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -409,8 +469,9 @@ class TestRetryBackoff:
         ):
             mock_handlers.return_value = {"test.tool": always_failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -456,8 +517,9 @@ class TestRetryBackoff:
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": slow_failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -500,8 +562,9 @@ class TestRetryBackoff:
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -546,8 +609,9 @@ class TestRetryBackoff:
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": eventual_success}
 
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -606,8 +670,9 @@ class TestRetryTimeoutIntegration:
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -676,8 +741,9 @@ class TestTheWorkflowDeadlineIsRealWallClock:
             patch("asyncio.wait_for", capturing_wait_for),
         ):
             mock_handlers.return_value = {"test.tool": ok_tool}
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -743,8 +809,9 @@ class TestTheWorkflowDeadlineIsRealWallClock:
             patch("asyncio.wait_for", capturing_wait_for),
         ):
             mock_handlers.return_value = {"test.tool": ok_tool}
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -797,8 +864,9 @@ class TestTheWorkflowDeadlineIsRealWallClock:
             patch("asyncio.sleep", mock_sleep),
         ):
             mock_handlers.return_value = {"test.tool": slow_failing_tool}
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
@@ -844,8 +912,9 @@ class TestTheWorkflowDeadlineIsRealWallClock:
 
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": very_slow_tool}
-            workflow_engine.tool_registry["test.tool"] = {
+            workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
+                "handler": "llm.generic",
                 "timeout_seconds": 30,
             }
 
