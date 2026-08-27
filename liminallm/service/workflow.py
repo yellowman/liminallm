@@ -79,6 +79,7 @@ from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
     MAX_CONTEXT_SNIPPETS,
+    ExecutionBudget,
 )
 from liminallm.service.workflow_streaming import WorkflowStreamingMixin
 from liminallm.storage.common import get_default_attachment_workflow_schema
@@ -107,7 +108,9 @@ class ParallelNodeResult:
     merged_usage: Dict[str, Any]  # Summed token counts
     merged_snippets: List[str]  # Deduplicated context snippets
     failed_nodes: List[str]  # Node IDs that failed
-    status: str = "ok"  # "ok" if all succeeded, "partial" if some failed, "error" if all failed
+    # "ok" if all succeeded, "partial" if some failed, "error" if all failed,
+    # "budget_exhausted" if the batch was refused before any of it began.
+    status: str = "ok"
 
 
 @dataclass(frozen=True)
@@ -369,6 +372,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         node_ids: List[str],
         node_map: Dict[str, Dict[str, Any]],
         *,
+        budget: ExecutionBudget,
         user_message: str,
         context_id: Optional[str],
         conversation_id: Optional[str],
@@ -385,6 +389,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         Each node gets a copy of vars_scope to prevent conflicts.
         Results are namespaced by node ID.
+
+        The reservation is here rather than in the callers so that it sits
+        beside the `gather` it bounds, and so a third caller cannot forget it.
         """
         if not node_ids:
             return ParallelNodeResult(
@@ -394,6 +401,25 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 merged_snippets=[],
                 failed_nodes=[],
                 status="ok",
+            )
+
+        # Before the tasks are built, not while they run: a batch this run
+        # cannot afford must not begin any of it. Each entry costs one,
+        # including a repeated node id — each occurrence is an execution.
+        if not budget.reserve(len(node_ids)):
+            self.logger.warning(
+                "workflow_fanout_refused",
+                children=len(node_ids),
+                spent=budget.spent,
+                limit=budget.limit,
+            )
+            return ParallelNodeResult(
+                merged_outputs={},
+                merged_content="",
+                merged_usage={},
+                merged_snippets=[],
+                failed_nodes=[],
+                status="budget_exhausted",
             )
 
         async def execute_single_node(node_id: str) -> Tuple[str, Dict[str, Any], List[str]]:
@@ -562,15 +588,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
         usage: Dict[str, Any] = {}
 
         pending: List[str] = [entry] if entry else []
-        visited = 0
         max_steps = max(1, min(100, len(node_map) * 2 + 10))
         visited_nodes: Dict[str, int] = {}
         max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
-        # Which of the two budgets stopped the run, if either. Both used to
-        # fall through to the ordinary result, so a graph declaring more work
-        # than the runtime would do returned a success — see `_budget_result`.
-        budget: Optional[str] = None
-        reached_end = False
+        # One budget for the whole run, held by this loop and by the fan-out
+        # it dispatches. Every execution is reserved before it starts, so
+        # there is no longer any inferring afterwards whether the run stopped
+        # early: `exhausted` is set where the refusal happened.
+        budget = ExecutionBudget(max_steps)
+        exhausted: Optional[str] = None
 
         state_key = f"{conversation_id or 'anon'}:{workflow_id or 'default'}"
         await self._persist_workflow_state(
@@ -578,7 +604,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             {"status": "running", "started_at": datetime.now(timezone.utc).isoformat()},
         )
 
-        while pending and visited < max_steps:
+        while pending:
             # SPEC §9: Check workflow-level timeout before executing next node
             elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
             if elapsed_ms >= workflow_timeout_ms:
@@ -606,11 +632,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             node = node_map.get(node_id)
             if not node:
                 continue
-            visited += 1
+            if not budget.reserve():
+                exhausted = "workflow_step_limit"
+                break
             visited_nodes[node_id] = visited_nodes.get(node_id, 0) + 1
             if visited_nodes[node_id] > max_visits_per_node:
                 self.logger.warning("workflow_loop_detected", node=node_id)
-                budget = "workflow_node_revisit_limit"
+                exhausted = "workflow_node_revisit_limit"
                 break
 
             # SPEC §18.3: Execute node with retry and exponential backoff
@@ -654,6 +682,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     parallel_result = await self._execute_parallel_nodes(
                         parallel_node_ids,
                         node_map,
+                        budget=budget,
                         user_message=user_message,
                         context_id=context_id,
                         conversation_id=conversation_id,
@@ -665,6 +694,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         workflow_start_time=workflow_start_time,
                         workflow_timeout_ms=workflow_timeout_ms,
                     )
+
+                    if parallel_result.status == "budget_exhausted":
+                        # Refused before any child began, so there is nothing
+                        # to merge and nothing partially done to report.
+                        exhausted = "workflow_step_limit"
+                        break
 
                     # Merge parallel results into workflow state
                     self._append_trace(
@@ -738,29 +773,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     vars_scope=vars_scope,
                 )
             if result.get("status") == "end":
-                reached_end = True
                 break
 
-        # Exiting the loop with work still queued means the step budget ran
-        # out: the `while` condition is the only other way out, and reaching
-        # an `end` with siblings queued is a completion rather than a
-        # shortfall.
-        if budget is None and pending and not reached_end:
-            budget = "workflow_step_limit"
-        if budget is not None:
+        if exhausted is not None:
             self.logger.warning(
                 "workflow_budget_exhausted",
                 workflow_id=workflow_id,
-                reason=budget,
-                visited=visited,
+                reason=exhausted,
+                visited=budget.spent,
                 pending=len(pending),
             )
             await self._retire_workflow_state(state_key)
             return {
                 "status": "error",
                 "content": "workflow did not reach an end node",
-                "error": budget,
-                "visited": visited,
+                "error": exhausted,
+                "visited": budget.spent,
                 "max_steps": max_steps,
                 "routing_trace": routing_trace,
                 "workflow_trace": workflow_trace,

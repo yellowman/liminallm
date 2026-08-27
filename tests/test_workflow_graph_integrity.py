@@ -870,8 +870,13 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
         """The narrow control that keeps the step-budget rule honest.
 
         A list `next` can leave siblings queued when an `end` runs, so
-        "stopped with work pending" is not on its own the same thing as
-        "ran out of budget". The two are told apart by which one happened.
+        "stopped with work pending" is not the same thing as "ran out of
+        budget". This started as a control over an *inference* — the loop
+        used to conclude after the fact that leftover work meant exhaustion,
+        and this is the shape that inference got wrong. The reservation
+        replaced it: exhaustion is now recorded where the refusal happens, so
+        there is nothing left to infer. The control stays because the property
+        is still one a future change could break.
         """
         schema = {"kind": "workflow.chat", "entrypoint": "start", "nodes": [
             {"id": "start", "type": "tool_call", "tool": "llm.generic",

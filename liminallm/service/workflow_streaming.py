@@ -33,6 +33,7 @@ from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
     MAX_CONTEXT_SNIPPETS,
+    ExecutionBudget,
 )
 from liminallm.storage.common import get_default_attachment_workflow_schema
 
@@ -125,17 +126,16 @@ class WorkflowStreamingMixin:
         usage: Dict[str, Any] = {}
 
         pending: List[str] = [entry] if entry else []
-        visited = 0
         max_steps = max(1, min(100, len(node_map) * 2 + 10))
         visited_nodes: Dict[str, int] = {}
         max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
-        # Which of the two budgets stopped the run, if either. Both used to
-        # fall through to `message_done`, so a graph declaring more work than
-        # the runtime would do finished with a normal answer.
-        budget: Optional[str] = None
-        reached_end = False
+        # One budget for the whole run, shared with the fan-out this loop
+        # dispatches — `_execute_parallel_nodes` is the same method the
+        # blocking path calls, and its children were free to both.
+        budget = ExecutionBudget(max_steps)
+        exhausted: Optional[str] = None
 
-        while pending and visited < max_steps:
+        while pending:
             # Check for cancellation
             if cancel_event and cancel_event.is_set():
                 yield {"event": "cancel_ack", "data": {}}
@@ -156,11 +156,13 @@ class WorkflowStreamingMixin:
             if not node:
                 continue
 
-            visited += 1
+            if not budget.reserve():
+                exhausted = "workflow_step_limit"
+                break
             visited_nodes[node_id] = visited_nodes.get(node_id, 0) + 1
             if visited_nodes[node_id] > max_visits_per_node:
                 self.logger.warning("workflow_loop_detected", node=node_id)
-                budget = "workflow_node_revisit_limit"
+                exhausted = "workflow_node_revisit_limit"
                 break
 
             node_type = node.get("type", "tool_call")
@@ -334,6 +336,7 @@ class WorkflowStreamingMixin:
                         parallel_result = await self._execute_parallel_nodes(
                             parallel_node_ids,
                             node_map,
+                            budget=budget,
                             user_message=user_message,
                             context_id=context_id,
                             conversation_id=conversation_id,
@@ -346,6 +349,12 @@ class WorkflowStreamingMixin:
                             workflow_timeout_ms=workflow_timeout_ms,
                             cancel_event=cancel_event,
                         )
+
+                        if parallel_result.status == "budget_exhausted":
+                            # Refused before any child began, so there is
+                            # nothing to trace and nothing partially done.
+                            exhausted = "workflow_step_limit"
+                            break
 
                         # Record parallel execution in trace
                         self._append_trace(
@@ -410,27 +419,24 @@ class WorkflowStreamingMixin:
                     )
                     return
                 if result.get("status") == "end":
-                    reached_end = True
                     break
 
-        # Exiting the loop with work still queued means the step budget ran
-        # out, and the caller must not be handed a `message_done` for a run
-        # that stopped early. Same rule as the blocking path, said in the
+        # A run that stopped early must not be handed to the caller as a
+        # finished answer. Same rule as the blocking path, said in the
         # streaming vocabulary.
-        if budget is None and pending and not reached_end:
-            budget = "workflow_step_limit"
-        if budget is not None:
+        if exhausted is not None:
             self.logger.warning(
                 "workflow_budget_exhausted",
                 workflow_id=workflow_id,
-                reason=budget,
-                visited=visited,
+                reason=exhausted,
+                visited=budget.spent,
                 pending=len(pending),
             )
             yield self._error_event(
                 "server_error",
                 "workflow did not reach an end node",
-                {"reason": budget, "visited": visited, "max_steps": max_steps},
+                {"reason": exhausted, "visited": budget.spent,
+                 "max_steps": max_steps},
             )
             return
 

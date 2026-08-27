@@ -14437,6 +14437,48 @@ One narrow distinction keeps the step rule honest: reaching an `end` while
 siblings are still queued is a completion, not a shortfall, so the two are
 told apart by which one happened rather than by whether `pending` is empty.
 
+### The budget did not cover the work the run actually did
+
+`visited` was incremented only in the driving loop. A parallel child runs
+inside `_execute_parallel_nodes`, which touches neither `visited` nor
+`visited_nodes` — and which builds every child task before awaiting one
+`asyncio.gather`. The graph rules permit any number of leaf `tool_call`
+children and nothing caps fan-out, so the loop sees two visits and the run
+does hundreds. Measured, with the tool call stubbed so the count was the only
+variable:
+
+| graph | `max_steps` | tool invocations | reported |
+|---|---|---|---|
+| 152 nodes, 150 children | 100 | 150 | success |
+| 3 nodes, `"next": ["leaf"] * 150` | 16 | 150 | success |
+
+The second is the sharper one and the reason this is an availability finding
+rather than a bookkeeping one. Three nodes, a budget of sixteen, one repeated
+child id, and a hundred and fifty concurrent worker invocations — each entry
+in `parallel.next` is an execution, whatever it is named.
+
+`ExecutionBudget` is one object per run, held by the driving loop and by the
+fan-out it dispatches, and it lives in `workflow_limits` with the other
+shared limits so neither path can hold a different one. The reservation sits
+next to the `gather` it bounds rather than in the two callers, so a third
+caller cannot forget it, and it is taken *before* the tasks are built: an
+over-budget batch never begins any of it, rather than being cut off partway
+through.
+
+A fan-out constant like `maxItems: 16` would not have repaired the claim that
+`max_steps` bounds node executions — it would have replaced one unchecked
+number with another. Charging the children is what makes the rest of the run
+bounded too, and that half has its own witness: a fan-out of forty that fits,
+followed by a chain that only exceeds the budget once the children are
+counted.
+
+**The reservation replaced an inference, and that is a simplification.** The
+loop used to conclude after the fact that leftover pending work meant the
+step budget had run out. Now every execution is reserved where it happens, so
+the reason is recorded at the refusal and there is nothing to infer — the
+`reached_end` bookkeeping that the earlier finding required is gone with it,
+and so is the mutation that probed it.
+
 **Two of my own witnesses were vacuous, and mutations found both.**
 
 The control for that narrow distinction fanned out and then ended with
@@ -14488,16 +14530,19 @@ workflow takes precisely when it can least afford to stop silently.
 The two mutations that drop them from the edge set kill only their own
 witnesses, which is what says the pair is separated rather than covered twice.
 
-Thirty-nine mutations, all killed. Two were retired rather than left surviving,
+Forty-one mutations, all killed. Three were retired rather than left surviving,
 both for the same reason: they added code that cannot execute. Re-adding the
 engine's entrypoint repair cannot fire once the check above it has refused
 such an entrypoint, and the streaming equivalent was identical in effect to
 streaming simply not asking. A mutation that changes no behaviour says the
 code it adds is dead, not that the tests are weak.
 
-Fourteen anchors went stale across this tranche's six passes and the driver
+Sixteen anchors went stale across this tranche's seven passes and the driver
 said so each time rather than reporting a survivor. That guard has now caught
-something in every pass of this campaign.
+something in every pass of this campaign — including two on the last pass,
+where a rename would otherwise have quietly retired the budget-fallthrough
+mutations. The driver now takes mutation names on the command line, so a
+retarget is re-measured in seconds instead of by re-running the whole set.
 
 Several rules earned a **complementary pair** — one mutation that loses the
 rule and one that applies it too widely — because losing a rule and
