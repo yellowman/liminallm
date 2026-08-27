@@ -27,6 +27,11 @@ divergence one level in. The node type is that shape again: `_execute_node`
 runs anything it does not recognise as a `tool_call`, so a node typed
 `"swich"` was admitted and then invoked its tool.
 
+And once more along a third dimension: not what a node reads, but how it was
+reached. `_execute_parallel_nodes` discards a child's successor list, so a
+`switch` reached as a parallel child evaluates its branches and goes nowhere.
+The same node on the ordinary path continues normally.
+
 Validation sits at two altitudes on purpose. Admission stops new invalid
 graphs entering; the engine checks again before it builds `node_map`, because
 a row can predate the check or arrive by import, and "repaired silently at
@@ -52,6 +57,13 @@ from liminallm.service.workflow_graph import graph_problems
 
 # A graph that is valid under every rule here, and exercises all five edge
 # kinds so the positive controls are not narrower than the refusals.
+#
+# The parallel children were `work` and `other`, each declaring `next: "join"`
+# while `fan` also declared `after: "join"` — so the fixture looked like it
+# exercised a child's `next` when in fact `after` was doing all the work and
+# those two edges never contributed anything. A witness at the wrong altitude.
+# The children now declare nothing, which is what the executor actually
+# supports, and `work` keeps its `next`/`on_error` on the path that reads them.
 VALID = {
     "kind": "workflow.chat",
     "entrypoint": "start",
@@ -60,10 +72,11 @@ VALID = {
             {"when": "true", "next": "fan"},
             {"when": "false", "next": "work"},
         ]},
-        {"id": "fan", "type": "parallel", "next": ["work", "other"], "after": "join"},
+        {"id": "fan", "type": "parallel", "next": ["leaf", "other"], "after": "work"},
+        {"id": "leaf", "type": "tool_call", "tool": "llm.generic"},
+        {"id": "other", "type": "tool_call", "tool": "llm.generic"},
         {"id": "work", "type": "tool_call", "tool": "llm.generic",
          "next": "join", "on_error": "sorry"},
-        {"id": "other", "type": "tool_call", "tool": "llm.generic", "next": "join"},
         {"id": "join", "type": "tool_call", "tool": "llm.generic", "next": ["end"]},
         {"id": "sorry", "type": "end"},
         {"id": "end", "type": "end"},
@@ -471,6 +484,172 @@ class TestAnEdgeIsReadByTheNodeTypeThatDeclaresIt:
         assert made.status_code == 400, made.text
 
 
+class TestAParallelChildIsRunOnceAndItsSuccessorsDiscarded:
+    """The third dimension: not what a node reads, but how it was reached.
+
+    `_execute_parallel_nodes` calls `_execute_node_with_retry` and throws the
+    successor list away — `result, _ = await ...`. So the same node declaring
+    the same edge means one thing on the ordinary path and nothing at all as a
+    parallel child. Measured on the graph below, `graph_problems` returned
+    `[]` and the run traced `['fan', 'join']`: `choose` executed, returned
+    `['side']`, and `side` never ran.
+
+    Which is this tranche's invariant once more — a declared, resolving edge
+    that execution ignores — reached by a different route.
+
+    The narrow reading, and the one SPEC §9 supports ("fan-out to multiple
+    nodes, then join"): `parallel.next` names children that run once, and
+    `after` owns the continuation. Turning `parallel` into a recursive
+    subgraph executor is a SPEC decision, not a bug fix, so the rule here
+    refuses the graphs that would need it rather than inventing the semantics.
+    """
+
+    FAN = {
+        "kind": "workflow.chat",
+        "entrypoint": "fan",
+        "nodes": [
+            {"id": "fan", "type": "parallel", "next": ["choose"], "after": "join"},
+            {"id": "choose", "type": "switch",
+             "branches": [{"when": "true", "next": "side"}]},
+            {"id": "side", "type": "end"},
+            {"id": "join", "type": "end"},
+        ],
+    }
+
+    def _fan_to(self, child):
+        """A parallel whose one child is `child`."""
+        return {"kind": "workflow.chat", "entrypoint": "fan", "nodes": [
+            {"id": "fan", "type": "parallel", "next": [child["id"]], "after": "join"},
+            child,
+            {"id": "join", "type": "end"},
+            {"id": "side", "type": "end"},
+        ]}
+
+    def test_a_switch_as_a_parallel_child_is_a_problem(self):
+        """The clearest one, and it needs no tool at all: the branch target is
+        a real node, the branch resolves, and the executor discards it."""
+        problems = graph_problems(self.FAN)
+        assert problems and any("side" in p for p in problems), problems
+
+    def test_a_tool_call_child_carrying_next_is_a_problem(self):
+        assert graph_problems(self._fan_to({
+            "id": "kid", "type": "tool_call", "tool": "llm.generic", "next": "side",
+        }))
+
+    def test_a_tool_call_child_carrying_on_error_is_a_problem(self):
+        """`on_error` matters most here for the same reason it always does:
+        the recovery the operator declared is the one that vanishes."""
+        assert graph_problems(self._fan_to({
+            "id": "kid", "type": "tool_call", "tool": "llm.generic",
+            "on_error": "side",
+        }))
+
+    def test_a_nested_parallel_child_is_a_problem(self):
+        """Its own children and its `after` go the same way."""
+        assert graph_problems(self._fan_to({
+            "id": "kid", "type": "parallel", "next": ["side"], "after": "join",
+        }))
+
+    def test_a_child_that_declares_no_control_flow_is_fine(self):
+        """The control. A rule that refuses every parallel child passes all
+        four refusals above and breaks fan-out entirely."""
+        assert graph_problems(self._fan_to({
+            "id": "kid", "type": "tool_call", "tool": "llm.generic",
+        })) == []
+
+    def test_the_same_node_is_fine_when_it_is_reached_by_after(self):
+        """The control that says the rule is about the *context*, not the node.
+
+        `after` is inserted into `pending` and runs through the ordinary loop,
+        so its successors are scheduled normally. The identical node that is
+        refused as a child is accepted here.
+        """
+        assert graph_problems({
+            "kind": "workflow.chat", "entrypoint": "fan", "nodes": [
+                {"id": "fan", "type": "parallel", "next": ["leaf"], "after": "kid"},
+                {"id": "leaf", "type": "tool_call", "tool": "llm.generic"},
+                {"id": "kid", "type": "tool_call", "tool": "llm.generic",
+                 "next": "side", "on_error": "side"},
+                {"id": "side", "type": "end"},
+            ],
+        }) == []
+
+    def test_a_scalar_child_list_is_read_the_same_way(self):
+        """`_execute_node` wraps a string `next` on a parallel into one child,
+        so the rule has to look through both spellings."""
+        assert graph_problems({
+            "kind": "workflow.chat", "entrypoint": "fan", "nodes": [
+                {"id": "fan", "type": "parallel", "next": "kid", "after": "join"},
+                {"id": "kid", "type": "tool_call", "tool": "llm.generic",
+                 "next": "side"},
+                {"id": "side", "type": "end"},
+                {"id": "join", "type": "end"},
+            ],
+        })
+
+    @pytest.mark.asyncio
+    async def test_the_executor_really_does_discard_a_child_successor(
+        self, monkeypatch
+    ):
+        """The premise the rule is derived from, measured rather than assumed.
+
+        This runs the refused graph with the graph check disabled, so it pins
+        `_execute_parallel_nodes`'s behaviour and not the rule built on top of
+        it. If `parallel` ever becomes a recursive subgraph executor — a SPEC
+        decision — this fails and says the rule above needs revisiting.
+        """
+        from liminallm.service.workflow import WorkflowEngine
+        from tests.test_workflow_retry_timeout import (
+            MockLLM,
+            MockRAG,
+            MockRedisCache,
+            MockRouter,
+            MockStore,
+        )
+
+        engine = WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
+                                cache=MockRedisCache())
+        monkeypatch.setattr("liminallm.service.workflow.graph_problems",
+                            lambda schema: [])
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.FAN)
+
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
+        assert "side" not in ran, (
+            f"a parallel child's successor ran after all — the rule that "
+            f"refuses this graph is now measuring nothing: {ran}"
+        )
+
+    def test_admission_refuses_a_parallel_child_with_control_flow(
+        self, client, admin_headers
+    ):
+        made = client.post("/v1/artifacts", headers=admin_headers, json={
+            "type": "workflow", "name": f"wg-{uuid.uuid4().hex[:6]}",
+            "schema": self.FAN, "visibility": "private",
+        })
+        assert made.status_code == 400, made.text
+
+    @pytest.fixture
+    def engine(self):
+        from liminallm.service.workflow import WorkflowEngine
+        from tests.test_workflow_retry_timeout import (
+            MockLLM,
+            MockRAG,
+            MockRedisCache,
+            MockRouter,
+            MockStore,
+        )
+
+        return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
+                              cache=MockRedisCache())
+
+    @pytest.mark.asyncio
+    async def test_a_persisted_one_fails_closed(self, engine, monkeypatch):
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.FAN)
+        with pytest.raises(BadRequestError):
+            await engine.run("wf", None, "hello", None, user_id="u")
+
+
 class TestTheEngineRefusesGraphsItsSchemaWouldNowRefuse:
     """The runtime altitude for the node-semantics rule.
 
@@ -854,6 +1033,65 @@ class TestAStreamedToolObeysTheSameControlPlane:
         assert any(e.get("event") == "token" for e in events), (
             "tokens stopped reaching the client"
         )
+
+    # A node that recovers by streaming a second, distinguishable answer.
+    PARTIAL = {
+        "kind": "workflow.chat",
+        "entrypoint": "tool",
+        "nodes": [
+            {"id": "tool", "type": "tool_call", "tool": "llm.generic",
+             "next": "normal", "on_error": "recover"},
+            {"id": "normal", "type": "end"},
+            {"id": "recover", "type": "tool_call", "tool": "llm.generic",
+             "next": "fin"},
+            {"id": "fin", "type": "end"},
+        ],
+    }
+
+    @pytest.mark.asyncio
+    async def test_recovery_does_not_start_once_a_token_has_escaped(
+        self, engine, monkeypatch
+    ):
+        """The boundary the `on_error` handoff must not cross.
+
+        A token that has been yielded is already on the client's screen. If
+        recovery then streams a second answer, both land in one bubble —
+        measured, the client received `['PARTIAL ', 'RECOVERED ANSWER']` and
+        the run traced `['tool', 'recover', 'fin']`.
+
+        This file's own precedent is one function away: the attachment agent
+        tracks `emitted_tokens` for exactly this reason and, after partial
+        output, keeps the partial answer instead of starting another. The
+        streamed `on_error` handoff needs the same boundary.
+        """
+        calls = []
+
+        def generate_stream(*args, **kwargs):
+            calls.append(len(calls))
+            if len(calls) == 1:
+                def partial():
+                    yield {"event": "token", "data": "PARTIAL "}
+                    raise RuntimeError("backend died mid-stream")
+                return partial()
+            return iter([
+                {"event": "token", "data": "RECOVERED ANSWER"},
+                {"event": "message_done",
+                 "data": {"content": "RECOVERED ANSWER", "usage": {}}},
+            ])
+
+        monkeypatch.setattr(engine.llm, "generate_stream", generate_stream,
+                            raising=False)
+        monkeypatch.setattr(engine, "_load_workflow_for",
+                            lambda *a, **k: self.PARTIAL)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+
+        tokens = [e["data"] for e in events if e.get("event") == "token"]
+        assert tokens == ["PARTIAL "], (
+            f"a second answer was streamed into the same bubble: {tokens}"
+        )
+        assert "recover" not in self._nodes_run(events), self._nodes_run(events)
+        assert len(calls) == 1, f"the model was called again after partial output: {calls}"
 
     @pytest.mark.asyncio
     async def test_a_streamed_failure_with_no_error_edge_still_stops_the_stream(
