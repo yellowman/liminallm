@@ -347,6 +347,160 @@ class TestExecutionCarriesThePublicationScope:
             f"Bob's private tool captured a shared workflow: ran {ran}"
         )
 
+    @pytest.mark.asyncio
+    async def test_a_parallel_child_resolves_in_the_same_namespace(self, store):
+        """A second descent, and a second chance to lose the scope.
+
+        `_execute_parallel_nodes` calls `_execute_node_with_retry` itself,
+        carrying only the runner's `user_id` and `tenant_id`. Carrying
+        publication scope correctly through the driving loop and forgetting it
+        here would leave children resolving under the runner — measured, Bob's
+        child ran `agent.code_v1`.
+        """
+        from liminallm.service.workflow import WorkflowEngine
+        rt = get_runtime()
+        tenant = _u("par")
+        alice = store.create_user(email=f"{_u('pa')}@t.local", tenant_id=tenant)
+        bob = store.create_user(email=f"{_u('pb')}@t.local", tenant_id=tenant)
+
+        name = _u("foo")
+        _tool(store, name, "llm.generic", owner=alice.id, visibility="global")
+        _tool(store, name, "agent.code_v1", owner=bob.id, visibility="private")
+
+        wf = store.create_artifact(
+            "workflow", _u("parwf"),
+            {"kind": "workflow.chat", "entrypoint": "fan", "nodes": [
+                {"id": "fan", "type": "parallel", "next": ["leaf"], "after": "done"},
+                {"id": "leaf", "type": "tool_call", "tool": name},
+                {"id": "done", "type": "end"},
+            ]},
+            owner_user_id=alice.id, visibility="shared",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        ran = []
+        engine._tool_llm_generic = lambda *a, **k: (
+            ran.append("llm.generic") or {"status": "ok", "content": "x"}
+        )
+        engine._tool_agent_code = lambda *a, **k: (
+            ran.append("agent.code_v1") or {"status": "ok", "content": "x"}
+        )
+        await engine.run(wf.id, None, "hi", None,
+                         user_id=bob.id, tenant_id=bob.tenant_id)
+        assert ran == ["llm.generic"], (
+            f"a parallel child resolved under the runner: ran {ran}"
+        )
+
+
+class TestStreamingSelectsTheCapabilityAfterResolving:
+    """The `stream` flag must not change which capability a workflow runs.
+
+    `run_streaming` reads `node.get("tool")` and compares the *literal string*
+    against a hard-coded set before any tool artifact is resolved. So a
+    tenant-shared spec that overrides the name `llm.generic` with handler
+    `agent.code_v1` is honoured on one path and ignored on the other.
+
+    Measured on the same workflow and the same caller, and this one is live
+    on main rather than a hazard the fix would introduce:
+
+    ==========  ==========================================================
+    blocking    ran `agent.code_v1` — it already obeys the override
+    streaming   ran `generate_stream` — it never looked
+    ==========  ==========================================================
+
+    The fix is to resolve the descriptor first and decide streamability from
+    the resolved handler, not from the reference spelling. That also lets a
+    custom name whose handler *is* `llm.generic` stream, which the current
+    literal comparison cannot express.
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_paths_run_the_resolved_handler(self, store):
+        from liminallm.service.workflow import WorkflowEngine
+        rt = get_runtime()
+        alice = store.create_user(email=f"{_u('sa')}@t.local", tenant_id=_u("stt"))
+        # Overrides the seeded global builtin, for this tenant only.
+        _tool(store, "llm.generic", "agent.code_v1",
+              owner=alice.id, visibility="shared")
+        wf = store.create_artifact(
+            "workflow", _u("strwf"), _wf("llm.generic"),
+            owner_user_id=alice.id, visibility="shared",
+        )
+
+        def build():
+            engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+            ran = []
+            engine._tool_llm_generic = lambda *a, **k: (
+                ran.append("llm.generic") or {"status": "ok", "content": "x"}
+            )
+            engine._tool_agent_code = lambda *a, **k: (
+                ran.append("agent.code_v1") or {"status": "ok", "content": "x"}
+            )
+
+            def generate_stream(*a, **k):
+                ran.append("generate_stream")
+                return iter([
+                    {"event": "token", "data": "hi"},
+                    {"event": "message_done",
+                     "data": {"content": "hi", "usage": {}}},
+                ])
+
+            engine.llm.generate_stream = generate_stream
+            return engine, ran
+
+        engine, blocking_ran = build()
+        await engine.run(wf.id, None, "hi", None,
+                         user_id=alice.id, tenant_id=alice.tenant_id)
+
+        engine, streaming_ran = build()
+        [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None,
+            user_id=alice.id, tenant_id=alice.tenant_id)]
+
+        assert blocking_ran == ["agent.code_v1"], blocking_ran
+        assert streaming_ran == ["agent.code_v1"], (
+            f"the stream flag changed which capability ran: "
+            f"blocking={blocking_ran} streaming={streaming_ran}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_custom_name_whose_handler_is_the_llm_still_streams(self, store):
+        """The complement, and red today for its own reason.
+
+        A custom name whose handler *is* `llm.generic` is not on the
+        hard-coded list, so it never streams — measured, `generate_stream` was
+        not called at all. Deciding by resolved handler fixes that too.
+
+        It is the complement rather than a control because deleting the
+        special case entirely — never stream — would satisfy the test above
+        and fail this one.
+        """
+        from liminallm.service.workflow import WorkflowEngine
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('cn')}@t.local", tenant_id=_u("cnt"))
+        name = _u("my.chat")
+        _tool(store, name, "llm.generic", owner=u.id, visibility="private")
+        wf = store.create_artifact(
+            "workflow", _u("aliaswf"), _wf(name),
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        ran = []
+
+        def generate_stream(*a, **k):
+            ran.append("generate_stream")
+            return iter([
+                {"event": "token", "data": "hi"},
+                {"event": "message_done", "data": {"content": "hi", "usage": {}}},
+            ])
+
+        engine.llm.generate_stream = generate_stream
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert ran == ["generate_stream"], (
+            f"an aliased LLM tool did not stream: {ran}"
+        )
+        assert any(e.get("event") == "token" for e in events), events[-3:]
+
 
 class TestEveryAdmissionPathAsksTheQuestion:
     """Create is not the only door. A valid workflow can be patched into an
@@ -373,6 +527,59 @@ class TestEveryAdmissionPathAsksTheQuestion:
         assert resp.status_code == 400, resp.text
         kept = get_runtime().store.get_artifact(artifact)
         assert kept.schema["nodes"][0]["tool"] == "llm.generic", kept.schema
+
+    def test_configops_apply_refuses_before_it_changes_anything(self, store):
+        """The third door, and the one that writes an audit record.
+
+        `apply_config_patch` builds `new_schema`, shape-validates it, writes a
+        version and flips the patch to `applied`, all in one transaction while
+        holding the artifact then patch locks. Measured on a *global*
+        workflow patched to name Alice's *private* tool:
+
+            patch status       applied
+            workflow tool now  hidden_27c1362f
+
+        So the audit asserts an applied configuration that the runtime will
+        refuse. The refusal has to land before the version and before the
+        status transition, which is why this asserts all three and not merely
+        that apply raised.
+        """
+        from liminallm.service.config_ops import ConfigOpsService
+        rt = get_runtime()
+        alice = store.create_user(email=f"{_u('ca')}@t.local", tenant_id=_u("ct"))
+        private_name = _u("hidden")
+        _tool(store, private_name, "llm.generic",
+              owner=alice.id, visibility="private")
+
+        wf = store.create_artifact(
+            "workflow", _u("cowf"), _wf("llm.generic"),
+            owner_user_id=alice.id, visibility="global",
+        )
+        versions_before = len(store.list_artifact_versions(wf.id))
+
+        patch = store.record_config_patch(
+            artifact_id=wf.id,
+            proposer="system_llm",
+            patch={"ops": [{"op": "replace", "path": "/nodes/0/tool",
+                            "value": private_name}]},
+            justification="swap a global workflow onto a private tool",
+        )
+        store.update_config_patch_status(patch.id, "approved")
+
+        svc = ConfigOpsService(store, rt.llm, rt.router, rt.training)
+        with pytest.raises(Exception):
+            svc.apply_patch(patch.id, approver_user_id=alice.id)
+
+        after = store.get_artifact(wf.id)
+        assert after.schema["nodes"][0]["tool"] == "llm.generic", (
+            f"a refused apply still rewrote the workflow: {after.schema}"
+        )
+        assert len(store.list_artifact_versions(wf.id)) == versions_before, (
+            "a refused apply still wrote an artifact version"
+        )
+        assert store.get_config_patch(patch.id).status != "applied", (
+            "the audit records an applied configuration that was refused"
+        )
 
 
 class TestAFreshDatabaseStillBoots:
