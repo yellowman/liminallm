@@ -29,9 +29,11 @@ from liminallm.service.broker import InvocationContext
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
+from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
     MAX_CONTEXT_SNIPPETS,
+    ExecutionBudget,
 )
 from liminallm.storage.common import get_default_attachment_workflow_schema
 
@@ -87,6 +89,20 @@ class WorkflowStreamingMixin:
             conversation_id, user_id=user_id, tenant_id=tenant_id
         )
 
+        # Before `node_map`, for the reason `run` checks there: this path
+        # carried its own copy of the repair semantics, so an invalid row
+        # failed closed in blocking chat and silently ran a different graph
+        # here. Same rule, this path's vocabulary — blocking raises, streaming
+        # emits and stops before a token or a trace reaches anyone.
+        problems = graph_problems(workflow_schema)
+        if problems:
+            yield self._error_event(
+                "validation_error",
+                "workflow graph is not consistent",
+                {"problems": problems},
+            )
+            return
+
         node_map = {
             n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")
         }
@@ -98,9 +114,9 @@ class WorkflowStreamingMixin:
             )
             return
 
+        # `graph_problems` has already refused an entrypoint that names
+        # nothing, so this only chooses a start when none was named.
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
-        if not entry or entry not in node_map:
-            entry = next(iter(node_map)) if node_map else None
 
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []
@@ -110,12 +126,16 @@ class WorkflowStreamingMixin:
         usage: Dict[str, Any] = {}
 
         pending: List[str] = [entry] if entry else []
-        visited = 0
         max_steps = max(1, min(100, len(node_map) * 2 + 10))
         visited_nodes: Dict[str, int] = {}
         max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
+        # One budget for the whole run, shared with the fan-out this loop
+        # dispatches — `_execute_parallel_nodes` is the same method the
+        # blocking path calls, and its children were free to both.
+        budget = ExecutionBudget(max_steps)
+        exhausted: Optional[str] = None
 
-        while pending and visited < max_steps:
+        while pending:
             # Check for cancellation
             if cancel_event and cancel_event.is_set():
                 yield {"event": "cancel_ack", "data": {}}
@@ -136,10 +156,13 @@ class WorkflowStreamingMixin:
             if not node:
                 continue
 
-            visited += 1
+            if not budget.reserve():
+                exhausted = "workflow_step_limit"
+                break
             visited_nodes[node_id] = visited_nodes.get(node_id, 0) + 1
             if visited_nodes[node_id] > max_visits_per_node:
                 self.logger.warning("workflow_loop_detected", node=node_id)
+                exhausted = "workflow_node_revisit_limit"
                 break
 
             node_type = node.get("type", "tool_call")
@@ -152,79 +175,127 @@ class WorkflowStreamingMixin:
                 "llm.generic_chat_v1",
                 "agent.files_v1",
             }:
-                node_stream = (
-                    self._stream_agent_files_node(
-                        node,
-                        user_message=user_message,
-                        context_id=context_id,
-                        conversation_id=conversation_id,
-                        adapters=adapters,
-                        history=history,
-                        vars_scope=vars_scope,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        cancel_event=cancel_event,
-                    )
-                    if tool_name == "agent.files_v1"
-                    else self._stream_llm_node(
-                        node,
-                        user_message=user_message,
-                        context_id=context_id,
-                        conversation_id=conversation_id,
-                        adapters=adapters,
-                        history=history,
-                        vars_scope=vars_scope,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        cancel_event=cancel_event,
-                    )
+                # The control plane around the call is the blocking path's,
+                # shared rather than copied: an open breaker refuses the call
+                # (SPEC §18), and a call that fails takes `on_error` (SPEC §9).
+                # Both used to live only inside `_execute_node`, which this
+                # branch does not call — so an open breaker did not stop a
+                # streamed LLM call at all, and a graph declaring
+                # `tool -> recover` on failure ended the turn instead. Only
+                # token production below is streaming-specific.
+                tool_result = await self._circuit_open_result(
+                    node, tenant_id=tenant_id
                 )
-                async for event in node_stream:
-                    if event["event"] == "token":
-                        yield event
-                    elif event["event"] == "trace":
-                        # Tool-activity notices from the attachment agent pass
-                        # straight through for the UI to display.
-                        yield event
-                    elif event["event"] == "message_done":
-                        # Update state from completed message
-                        data = event.get("data", {})
-                        content = data.get("content", "")
-                        node_usage = data.get("usage", {})
-                        usage = self._merge_usage(usage, node_usage)
-                        for snippet in data.get("context_snippets") or []:
-                            if (
-                                snippet not in context_seen
-                                and len(context_snippets) < MAX_CONTEXT_SNIPPETS
-                            ):
-                                context_seen.add(snippet)
-                                context_snippets.append(snippet)
-                        entry: Dict[str, Any] = {
-                            "node": node_id,
-                            "status": "ok",
-                            "content": content,
-                            "usage": node_usage,
-                        }
-                        if data.get("tool_calls"):
-                            entry["tool_calls"] = data["tool_calls"]
-                        if data.get("injection_findings"):
-                            entry["injection_findings"] = data["injection_findings"]
-                        self._append_trace(workflow_trace, entry)
-                        # Emit trace event
-                        yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
-                    elif event["event"] == "error":
-                        yield event
-                        return
-                    elif event["event"] == "cancel_ack":
-                        yield event
-                        return
+                failure_event = None
+                # Once a token has reached the client it is on their screen,
+                # so recovery would append a second answer to the same bubble
+                # rather than replace the first. `_stream_agent_files_node`
+                # already keeps this boundary for the same reason; the
+                # `on_error` handoff needs it too.
+                emitted_tokens = False
 
-                # Move to next nodes
-                next_nodes = node.get("next")
-                if isinstance(next_nodes, str):
-                    pending.append(next_nodes)
-                elif isinstance(next_nodes, list):
-                    pending.extend([n for n in next_nodes if n])
+                if tool_result is None:
+                    node_stream = (
+                        self._stream_agent_files_node(
+                            node,
+                            user_message=user_message,
+                            context_id=context_id,
+                            conversation_id=conversation_id,
+                            adapters=adapters,
+                            history=history,
+                            vars_scope=vars_scope,
+                            user_id=user_id,
+                            tenant_id=tenant_id,
+                            cancel_event=cancel_event,
+                        )
+                        if tool_name == "agent.files_v1"
+                        else self._stream_llm_node(
+                            node,
+                            user_message=user_message,
+                            context_id=context_id,
+                            conversation_id=conversation_id,
+                            adapters=adapters,
+                            history=history,
+                            vars_scope=vars_scope,
+                            user_id=user_id,
+                            tenant_id=tenant_id,
+                            cancel_event=cancel_event,
+                        )
+                    )
+                    async for event in node_stream:
+                        if event["event"] == "token":
+                            emitted_tokens = True
+                            yield event
+                        elif event["event"] == "trace":
+                            # Tool-activity notices from the attachment agent
+                            # pass straight through for the UI to display.
+                            yield event
+                        elif event["event"] == "message_done":
+                            # Update state from completed message
+                            data = event.get("data", {})
+                            content = data.get("content", "")
+                            node_usage = data.get("usage", {})
+                            usage = self._merge_usage(usage, node_usage)
+                            for snippet in data.get("context_snippets") or []:
+                                if (
+                                    snippet not in context_seen
+                                    and len(context_snippets) < MAX_CONTEXT_SNIPPETS
+                                ):
+                                    context_seen.add(snippet)
+                                    context_snippets.append(snippet)
+                            trace_entry: Dict[str, Any] = {
+                                "node": node_id,
+                                "status": "ok",
+                                "content": content,
+                                "usage": node_usage,
+                            }
+                            if data.get("tool_calls"):
+                                trace_entry["tool_calls"] = data["tool_calls"]
+                            if data.get("injection_findings"):
+                                trace_entry["injection_findings"] = data[
+                                    "injection_findings"
+                                ]
+                            self._append_trace(workflow_trace, trace_entry)
+                            # Emit trace event
+                            yield {
+                                "event": "trace",
+                                "data": {"workflow_trace": workflow_trace[-1]},
+                            }
+                        elif event["event"] == "error":
+                            failure_event = event
+                            tool_result = {
+                                "status": "error",
+                                "error": (event.get("data") or {}).get("message", ""),
+                            }
+                            break
+                        elif event["event"] == "cancel_ack":
+                            yield event
+                            return
+
+                if tool_result is not None:
+                    self._append_trace(
+                        workflow_trace, {"node": node_id, **tool_result}
+                    )
+                    yield {
+                        "event": "trace",
+                        "data": {"workflow_trace": workflow_trace[-1]},
+                    }
+                    if self._error_edge(node) and not emitted_tokens:
+                        pending.extend(self._successors(node, tool_result))
+                        continue
+                    # Nowhere to go, or nowhere left to go. The stream ends
+                    # where it always did, rather than falling through to
+                    # `next`: the chooser answers `next` when no error edge
+                    # exists, and handing a failure to the success path gives
+                    # it outputs the node never produced.
+                    yield failure_event or self._error_event(
+                        "server_error",
+                        tool_result.get("content") or tool_result.get("error", ""),
+                        {"node_id": node_id, "tool": tool_name},
+                    )
+                    return
+
+                pending.extend(self._successors(node, {"status": "ok"}))
 
             else:
                 # Non-streaming node execution (switch, parallel, RAG, etc.)
@@ -265,6 +336,7 @@ class WorkflowStreamingMixin:
                         parallel_result = await self._execute_parallel_nodes(
                             parallel_node_ids,
                             node_map,
+                            budget=budget,
                             user_message=user_message,
                             context_id=context_id,
                             conversation_id=conversation_id,
@@ -277,6 +349,12 @@ class WorkflowStreamingMixin:
                             workflow_timeout_ms=workflow_timeout_ms,
                             cancel_event=cancel_event,
                         )
+
+                        if parallel_result.status == "budget_exhausted":
+                            # Refused before any child began, so there is
+                            # nothing to trace and nothing partially done.
+                            exhausted = "workflow_step_limit"
+                            break
 
                         # Record parallel execution in trace
                         self._append_trace(
@@ -342,6 +420,25 @@ class WorkflowStreamingMixin:
                     return
                 if result.get("status") == "end":
                     break
+
+        # A run that stopped early must not be handed to the caller as a
+        # finished answer. Same rule as the blocking path, said in the
+        # streaming vocabulary.
+        if exhausted is not None:
+            self.logger.warning(
+                "workflow_budget_exhausted",
+                workflow_id=workflow_id,
+                reason=exhausted,
+                visited=budget.spent,
+                pending=len(pending),
+            )
+            yield self._error_event(
+                "server_error",
+                "workflow did not reach an end node",
+                {"reason": exhausted, "visited": budget.spent,
+                 "max_steps": max_steps},
+            )
+            return
 
         if not content:
             content = "No response generated."

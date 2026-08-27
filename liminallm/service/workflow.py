@@ -75,9 +75,11 @@ from liminallm.service.tokenizer_utils import (
     MAX_GENERATION_TOKENS,
     estimate_token_count,
 )
+from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
     MAX_CONTEXT_SNIPPETS,
+    ExecutionBudget,
 )
 from liminallm.service.workflow_streaming import WorkflowStreamingMixin
 from liminallm.storage.common import get_default_attachment_workflow_schema
@@ -106,7 +108,9 @@ class ParallelNodeResult:
     merged_usage: Dict[str, Any]  # Summed token counts
     merged_snippets: List[str]  # Deduplicated context snippets
     failed_nodes: List[str]  # Node IDs that failed
-    status: str = "ok"  # "ok" if all succeeded, "partial" if some failed, "error" if all failed
+    # "ok" if all succeeded, "partial" if some failed, "error" if all failed,
+    # "budget_exhausted" if the batch was refused before any of it began.
+    status: str = "ok"
 
 
 @dataclass(frozen=True)
@@ -194,6 +198,69 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         self.tool_fetcher = AllowlistedFetcher(self.tool_network_policy)
         self._shutdown = False
+
+    # The tool-node control plane: what happens around a tool call, as
+    # opposed to the call itself. Three execution paths reach it — the
+    # blocking executor, its circuit-open branch, and the streaming path that
+    # produces tokens without calling either — and each copy of a decision is
+    # a place for the paths to disagree about the same graph. They did.
+
+    @staticmethod
+    def _error_edge(node: Dict[str, Any]) -> Optional[str]:
+        """Where this node says to go when its call fails, if it says.
+
+        One reader for the field, so that "does this graph declare a
+        recovery" and "which node is it" cannot drift apart.
+        """
+        err_next = node.get("on_error")
+        return err_next if isinstance(err_next, str) and err_next else None
+
+    @staticmethod
+    def _successors(node: Dict[str, Any], tool_result: Any) -> List[str]:
+        """Where a tool node goes next, given how the call finished.
+
+        One place, because there were two. `on_error` replaces `next`
+        entirely when the call failed — and the circuit-open path had its own
+        copy that read `next` and never looked at `on_error`, so a graph
+        declaring `tool -> recover` on failure ran `tool -> normal` whenever
+        the breaker was open. A failure is a failure however it arose.
+        """
+        if isinstance(tool_result, dict) and tool_result.get("status") == "error":
+            err_next = WorkflowEngine._error_edge(node)
+            if err_next:
+                return [err_next]
+        next_nodes = node.get("next")
+        if isinstance(next_nodes, str):
+            return [next_nodes]
+        if isinstance(next_nodes, list):
+            return [n for n in next_nodes if n]
+        return []
+
+    async def _circuit_open_result(
+        self, node: Dict[str, Any], *, tenant_id: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """The error result an open breaker owes this node, or ``None`` when
+        the call may proceed.
+
+        Its own method because the preflight used to live inside
+        `_execute_node`, and the streaming path enters `_stream_llm_node`
+        directly: an open breaker did not stop a streamed LLM call at all,
+        for the three tools every ordinary chat turn uses (SPEC §18).
+        """
+        tool_name = node.get("tool", "")
+        if not (self.cache and tool_name):
+            return None
+        is_open, _ = await self.cache.check_circuit_breaker(
+            tool_name, tenant_id=tenant_id
+        )
+        if not is_open:
+            return None
+        self.logger.warning("tool_circuit_open", tool=tool_name, tenant_id=tenant_id)
+        return {
+            "status": "error",
+            "content": "tool temporarily unavailable (circuit breaker open)",
+            "error": "circuit_breaker_open",
+        }
 
     def _error_event(
         self, code: str, message: str, details: dict | None = None
@@ -305,6 +372,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         node_ids: List[str],
         node_map: Dict[str, Dict[str, Any]],
         *,
+        budget: ExecutionBudget,
         user_message: str,
         context_id: Optional[str],
         conversation_id: Optional[str],
@@ -321,6 +389,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         Each node gets a copy of vars_scope to prevent conflicts.
         Results are namespaced by node ID.
+
+        The reservation is here rather than in the callers so that it sits
+        beside the `gather` it bounds, and so a third caller cannot forget it.
         """
         if not node_ids:
             return ParallelNodeResult(
@@ -330,6 +401,25 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 merged_snippets=[],
                 failed_nodes=[],
                 status="ok",
+            )
+
+        # Before the tasks are built, not while they run: a batch this run
+        # cannot afford must not begin any of it. Each entry costs one,
+        # including a repeated node id — each occurrence is an execution.
+        if not budget.reserve(len(node_ids)):
+            self.logger.warning(
+                "workflow_fanout_refused",
+                children=len(node_ids),
+                spent=budget.spent,
+                limit=budget.limit,
+            )
+            return ParallelNodeResult(
+                merged_outputs={},
+                merged_content="",
+                merged_usage={},
+                merged_snippets=[],
+                failed_nodes=[],
+                status="budget_exhausted",
             )
 
         async def execute_single_node(node_id: str) -> Tuple[str, Dict[str, Any], List[str]]:
@@ -469,14 +559,25 @@ class WorkflowEngine(WorkflowStreamingMixin):
             conversation_id, user_id=user_id, tenant_id=tenant_id
         )
 
+        # Before `node_map`, because building it is where two of these stop
+        # being visible: duplicate ids collapse into one key, and a dangling
+        # `entrypoint` used to be replaced with whatever node came first.
+        # Admission checks this too; a row can still predate that check or
+        # arrive by import, and repairing such a row silently is the defect.
+        problems = graph_problems(workflow_schema)
+        if problems:
+            raise BadRequestError(
+                "workflow graph is not consistent", detail={"problems": problems}
+            )
+
         node_map = {
             n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")
         }
         if not node_map:
             raise BadRequestError("workflow has no nodes to execute")
+        # `graph_problems` has already refused an entrypoint that names
+        # nothing, so this only chooses a start when none was named.
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
-        if not entry or entry not in node_map:
-            entry = next(iter(node_map)) if node_map else None
 
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []
@@ -487,10 +588,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
         usage: Dict[str, Any] = {}
 
         pending: List[str] = [entry] if entry else []
-        visited = 0
         max_steps = max(1, min(100, len(node_map) * 2 + 10))
         visited_nodes: Dict[str, int] = {}
         max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
+        # One budget for the whole run, held by this loop and by the fan-out
+        # it dispatches. Every execution is reserved before it starts, so
+        # there is no longer any inferring afterwards whether the run stopped
+        # early: `exhausted` is set where the refusal happened.
+        budget = ExecutionBudget(max_steps)
+        exhausted: Optional[str] = None
 
         state_key = f"{conversation_id or 'anon'}:{workflow_id or 'default'}"
         await self._persist_workflow_state(
@@ -498,7 +604,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             {"status": "running", "started_at": datetime.now(timezone.utc).isoformat()},
         )
 
-        while pending and visited < max_steps:
+        while pending:
             # SPEC §9: Check workflow-level timeout before executing next node
             elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
             if elapsed_ms >= workflow_timeout_ms:
@@ -526,10 +632,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             node = node_map.get(node_id)
             if not node:
                 continue
-            visited += 1
+            if not budget.reserve():
+                exhausted = "workflow_step_limit"
+                break
             visited_nodes[node_id] = visited_nodes.get(node_id, 0) + 1
             if visited_nodes[node_id] > max_visits_per_node:
                 self.logger.warning("workflow_loop_detected", node=node_id)
+                exhausted = "workflow_node_revisit_limit"
                 break
 
             # SPEC §18.3: Execute node with retry and exponential backoff
@@ -573,6 +682,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     parallel_result = await self._execute_parallel_nodes(
                         parallel_node_ids,
                         node_map,
+                        budget=budget,
                         user_message=user_message,
                         context_id=context_id,
                         conversation_id=conversation_id,
@@ -584,6 +694,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         workflow_start_time=workflow_start_time,
                         workflow_timeout_ms=workflow_timeout_ms,
                     )
+
+                    if parallel_result.status == "budget_exhausted":
+                        # Refused before any child began, so there is nothing
+                        # to merge and nothing partially done to report.
+                        exhausted = "workflow_step_limit"
+                        break
 
                     # Merge parallel results into workflow state
                     self._append_trace(
@@ -658,6 +774,27 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 )
             if result.get("status") == "end":
                 break
+
+        if exhausted is not None:
+            self.logger.warning(
+                "workflow_budget_exhausted",
+                workflow_id=workflow_id,
+                reason=exhausted,
+                visited=budget.spent,
+                pending=len(pending),
+            )
+            await self._retire_workflow_state(state_key)
+            return {
+                "status": "error",
+                "content": "workflow did not reach an end node",
+                "error": exhausted,
+                "visited": budget.spent,
+                "max_steps": max_steps,
+                "routing_trace": routing_trace,
+                "workflow_trace": workflow_trace,
+                "context_snippets": context_snippets,
+                "vars": vars_scope,
+            }
 
         if not content:
             content = "No response generated."
@@ -1834,36 +1971,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
             inputs["message"] = user_message
 
         # SPEC §18: Check circuit breaker before invoking tool
-        if self.cache and tool_name:
-            is_open, _ = await self.cache.check_circuit_breaker(
-                tool_name, tenant_id=tenant_id
-            )
-            if is_open:
-                self.logger.warning("tool_circuit_open", tool=tool_name, tenant_id=tenant_id)
-                tool_result = {
-                    "status": "error",
-                    "content": "tool temporarily unavailable (circuit breaker open)",
-                    "error": "circuit_breaker_open",
-                }
-                outputs = {}
-                node_id = node.get("id", "unknown")
-                next_nodes = node.get("next")
-                if isinstance(next_nodes, str):
-                    next_nodes_list = [next_nodes]
-                elif isinstance(next_nodes, list):
-                    next_nodes_list = [n for n in next_nodes if n]
-                else:
-                    next_nodes_list = []
-                result_payload = {
-                    "node_id": node_id,
-                    "status": tool_result.get("status", "done"),
-                    "outputs": outputs,
-                }
-                if isinstance(tool_result, dict):
-                    for k in ("content", "usage", "context_snippets"):
-                        if k in tool_result:
-                            result_payload[k] = tool_result[k]
-                return result_payload, next_nodes_list
+        tool_result = await self._circuit_open_result(node, tenant_id=tenant_id)
+        if tool_result is not None:
+            # Through the same chooser as every other tool failure. This
+            # used to read `next` directly and return, so an open breaker
+            # took the success edge into nodes that assume outputs the
+            # failed node never produced.
+            next_nodes_list = self._successors(node, tool_result)
+            result_payload = {
+                "node_id": node.get("id", "unknown"),
+                "status": tool_result.get("status", "done"),
+                "outputs": {},
+            }
+            for k in ("content", "usage", "context_snippets"):
+                if k in tool_result:
+                    result_payload[k] = tool_result[k]
+            return result_payload, next_nodes_list
 
         try:
             tool_result = await self._invoke_tool(
@@ -1930,17 +2053,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 for k, v in tool_result.items()
                 if k not in {"usage", "context_snippets", "_failure_recorded"}
             }
-        next_nodes = node.get("next")
-        if isinstance(next_nodes, str):
-            next_nodes_list: List[str] = [next_nodes]
-        elif isinstance(next_nodes, list):
-            next_nodes_list = [n for n in next_nodes if n]
-        else:
-            next_nodes_list = []
-        if isinstance(tool_result, dict) and tool_result.get("status") == "error":
-            err_next = node.get("on_error")
-            if err_next:
-                next_nodes_list = [err_next]
+        next_nodes_list = self._successors(node, tool_result)
         result_payload: Dict[str, Any] = {
             "status": (
                 tool_result.get("status", "ok")

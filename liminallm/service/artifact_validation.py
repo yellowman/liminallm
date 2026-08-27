@@ -4,6 +4,8 @@ from typing import Any, Dict
 
 from jsonschema import Draft202012Validator
 
+from liminallm.service.workflow_graph import graph_problems
+
 _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
     "workflow": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -16,8 +18,16 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"},
-                        "type": {"type": "string"},
+                        # `node_map` is keyed by this and drops falsy keys,
+                        # so an empty id declares a node that then disappears.
+                        "id": {"type": "string", "minLength": 1},
+                        # SPEC §9 writes this as an enum and names exactly
+                        # these four. Accepting any string meant `_execute_node`
+                        # — which runs anything it does not recognise as a
+                        # tool call — silently invoked a node typed `"swich"`.
+                        "type": {
+                            "enum": ["tool_call", "switch", "parallel", "end"]
+                        },
                         "tool": {"type": "string"},
                         "inputs": {"type": "object"},
                         "outputs": {"type": "array"},
@@ -28,9 +38,13 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
                                 "type": "object",
                                 "properties": {
                                     "when": {},
-                                    "next": {
-                                        "anyOf": [{"type": "string"}, {"type": "array"}]
-                                    },
+                                    # One id, not a fan-out. The switch
+                                    # executor appends `branch["next"]` as a
+                                    # single value and never flattens a list,
+                                    # so advertising an array here promised
+                                    # something execution does not do —
+                                    # SPEC §9 gives fan-out to `parallel`.
+                                    "next": {"type": "string", "minLength": 1},
                                 },
                                 "required": ["when", "next"],
                             },
@@ -181,3 +195,11 @@ def validate_artifact(type_: str, schema: Dict[str, Any]) -> None:
     if errors:
         messages = [e.message for e in errors]
         raise ArtifactValidationError("artifact validation failed", messages)
+    if type_ == "workflow":
+        # Shape first, then whether the graph matches itself: JSON Schema can
+        # say `next` is a string, and cannot say the string names a node that
+        # exists. Kept out of the schema because two of the five edge fields
+        # the executor reads are not in it, so the two would drift apart.
+        problems = graph_problems(schema)
+        if problems:
+            raise ArtifactValidationError("workflow graph is not consistent", problems)

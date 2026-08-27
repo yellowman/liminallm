@@ -257,7 +257,7 @@ class TestArtifactOperations:
             name="Test Artifact",
             schema={
                 "kind": "workflow.chat",
-                "nodes": [{"id": "start", "type": "llm_call"}],
+                "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
             },
             owner_user_id=test_user.id,
         )
@@ -287,7 +287,7 @@ class TestArtifactOperations:
             name="Workflow 1",
             schema={
                 "kind": "workflow.chat",
-                "nodes": [{"id": "start", "type": "llm_call"}],
+                "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
             },
             owner_user_id=test_user.id,
         )
@@ -317,7 +317,7 @@ class TestArtifactOperations:
             name="Updateable",
             schema={
                 "kind": "workflow.chat",
-                "nodes": [{"id": "start", "type": "llm_call"}],
+                "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
                 "version": 1,
             },
             owner_user_id=test_user.id,
@@ -325,7 +325,7 @@ class TestArtifactOperations:
 
         new_schema = {
             "kind": "workflow.chat",
-            "nodes": [{"id": "start", "type": "llm_call"}],
+            "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
             "version": 2,
         }
         updated = store.update_artifact(artifact.id, lambda _locked: new_schema)
@@ -339,7 +339,7 @@ class TestArtifactOperations:
             name="Versioned",
             schema={
                 "kind": "workflow.chat",
-                "nodes": [{"id": "start", "type": "llm_call"}],
+                "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
                 "version": 1,
             },
             owner_user_id=test_user.id,
@@ -349,7 +349,7 @@ class TestArtifactOperations:
         for version in (2, 3):
             store.update_artifact(artifact.id, lambda _locked, v=version: {
                 "kind": "workflow.chat",
-                "nodes": [{"id": "start", "type": "llm_call"}],
+                "nodes": [{"id": "start", "type": "tool_call", "tool": "llm.generic"}],
                 "version": v,
             })
 

@@ -14142,6 +14142,459 @@ Six mutations, all applied and all killed, and the two new ones land where
 they should: classifying the source by basename kills only the two
 direct-source cases, and removing the queue's check kills only the queue case.
 
+## A workflow did not execute the graph it declared
+
+Reference validation, part one. Found by asking the engine what it does with
+a reference that names nothing, rather than what the schema says about it.
+
+Three ways the executor quietly ran a different graph from the published one:
+
+```
+entrypoint names nowhere   ran `next(iter(node_map))` — whatever came first
+next names nowhere         `if not node: continue`, continuation vanished
+two nodes share an id      the node_map dict comprehension kept the last
+```
+
+Measured against the engine, not read: `entrypoint: "nowhere"` on a two-node
+graph ran node `first`; a dangling `next` ran only its source; duplicate ids
+left one node silently replacing the other. All three are accepted at
+`POST /v1/artifacts` with 201.
+
+### An open circuit took the success edge
+
+The validator says a workflow executes the graph it declares. The graph here
+is valid; what was wrong is which edge execution chose.
+
+`on_error` replaces `next` when a tool call fails — except on the
+circuit-breaker path, which built its own error result, read `next`, and
+returned before reaching the swap. Measured on a graph declaring
+`tool -> normal` with `on_error: recover`, breaker forced open:
+
+```
+expected  tool -> recover
+actual    tool -> normal
+```
+
+So an open breaker sent the turn down the *success* path, into nodes that
+assume outputs the failed node never produced. Two copies of "where does this
+node go next" is what made it possible, so there is one `_successors` now and
+both callers use it.
+
+**My own docstring asserted the behaviour that path did not have.** I read
+that branch while measuring the edge fields, recorded its `next` handling,
+and then wrote "taken instead of `next` when a tool call fails" as though it
+were universal. Which is what a comment is worth as evidence.
+
+**A second witness came from a mutation, not from review.** Removing
+`on_error` from the chooser entirely killed only the circuit-open witness —
+so the primary path, a tool that simply fails, was resting on the breaker
+case to notice. It has its own witness now, and the two mutations separate:
+restoring the early-return copy kills one, removing the rule kills both.
+
+### Streaming carried its own copy of the repair semantics
+
+`run_streaming` is a separate graph execution path, with the same entrypoint
+fallback and the same `if not node: continue`, and it never asked the new
+rule. So the row this tranche exists to protect — pre-existing or imported —
+failed closed in blocking chat and still ran a different graph in streaming
+chat. The engine witnesses only drove `run()`, so nothing said so.
+
+The familiar batch/streaming altitude split, and the fix keeps each path's
+vocabulary: blocking raises, streaming emits `validation_error` and stops
+before a token or a trace reaches anyone. The witness asserts that ordering,
+not merely that an error appears somewhere in the stream.
+
+### And its own copy of the tool-node control plane
+
+Refusing the invalid graph was only the graph-shaped half. `run_streaming`
+streams three tools — `llm.generic`, `llm.generic_chat_v1`, `agent.files_v1`
+— without calling `_execute_node_with_retry`, so *neither* decision the
+blocking path makes around a tool call happened there:
+
+```
+circuit-breaker preflight   lives in _execute_node; the streaming branch
+                            enters _stream_llm_node directly
+on_error handoff            the branch read node["next"] itself and never
+                            consulted the chooser
+```
+
+Measured on `tool -> normal` with `on_error: recover`:
+
+```
+breaker forced open      generate_stream still called; ran tool -> normal,
+                         traced status "ok"
+backend raises early     no node traced at all; the turn ended on an error
+                         event, and `recover` never ran
+```
+
+The same graph on the blocking path takes `recover` in both cases. So the two
+execution paths disagreed about what the same published graph means — and the
+breaker, whose entire job is to stop calling a failing tool, did not apply to
+the one tool every ordinary chat turn uses.
+
+The fix shares the control plane rather than merging the paths. Token
+production stays streaming-specific, which is the reason that path exists;
+what moved is `_circuit_open_result` (the preflight, now a method both callers
+ask) and the existing `_successors` chooser. The two mutations separate:
+bypassing the preflight dies only on the open-breaker witnesses, and removing
+the handoff dies only on the two `on_error` ones.
+
+One deliberate asymmetry, with its own control. A streamed failure whose node
+declares *no* `on_error` still ends the stream as it always did, rather than
+being handed to the chooser: the chooser answers `next` when no error edge
+exists, so routing every failure through it would send a failed node down the
+success path — the same defect one file over. The witness is a mutation that
+removes the guard.
+
+### The handoff had a boundary the first fix walked straight past
+
+Its own test said recovery after partial output was a separate question this
+tranche did not answer. The implementation answered it by accident: tokens are
+yielded as they arrive, so a node that streamed some output and *then* failed
+still took `on_error`. Measured — the client received both answers:
+
+```
+failed node emitted   "PARTIAL "
+then errored
+recovery emitted      "RECOVERED ANSWER"
+```
+
+One bubble, two answers, and a trace reading `['tool', 'recover', 'fin']`.
+
+The correct policy was already in the same file, one function away.
+`_stream_agent_files_node` tracks `emitted_tokens` for exactly this reason and,
+after partial output, keeps the partial answer rather than gluing a second one
+after it. The streamed `on_error` handoff now keeps the same boundary: zero
+tokens and an error edge means take it; one token or more means the stream
+terminates as it always did. A token that has been yielded is on the reader's
+screen, and nothing downstream can take it back.
+
+Two mutations, each killing only its own case: removing the guard kills the
+partial-output witness alone, and marking every node as having emitted kills
+only the zero-token recovery witnesses. Without the second, "never recover"
+would have passed the first.
+
+### A reference has a shape, not only a target
+
+Checking that a reference *resolves* is half of it. The executor reads a list
+only for `next`: it inserts `after` as one pending node id and wraps
+`on_error` as one next-node id, so a list in either position arrives at
+`node_map.get(...)` as a list. Measured, `{"after": ["join"]}` and
+`{"on_error": ["join"]}` passed **both** admission layers with zero problems
+and then failed at execution.
+
+This is the second half of the same lesson. Those two fields are absent from
+the artifact kind schema, so nothing pinned their cardinality for exactly the
+reason nothing pinned their targets. `_EDGE_FIELDS` is a mapping now, naming
+per field whether a list is legal there.
+
+`branches[].next` was a live contradiction: the kind schema advertised
+string-or-array while the switch executor appends `branch["next"]` as one
+value and never flattens. SPEC §9 gives fan-out to `parallel`, so the schema
+was narrowed to match execution rather than execution taught to match the
+schema.
+
+### And a reader, which is the node's own type
+
+Measuring the edge fields once was still not enough, because *which* fields a
+node reads is decided by its type, and the validator asked the question
+globally. Every node was allowed `next`, `after` and `on_error`; every node
+was allowed `branches`. So a graph could declare an edge, have the validator
+confirm it resolves, and have execution never look at it. All four of these
+reported zero problems:
+
+| declared | what executes |
+|---|---|
+| `end` with `next` | nothing; `end` stops the run |
+| `switch` with `next` | only `branches[].next` |
+| `tool_call` with `after` | only `next` / `on_error` |
+| `parallel` with `on_error` | only `next` / `after` |
+
+The first is the sharpest: publish `end -> side`, validation confirms the
+edge, execution stops at `end` and `side` never runs. A resolved edge that
+never executes is the same silent divergence as a dangling one — the operator
+reads the graph and the runtime reads something smaller.
+
+`_NODE_EDGES` is a per-node-type table now, and the field set it checks
+against is derived from the table, so adding a field to one type also asks
+every other type whether it reads it.
+
+The node type itself is that shape one level up. SPEC §9 names four and writes
+them as an enum; the kind schema said `{"type": "string"}`, and
+`_execute_node` runs anything it does not recognise as a `tool_call`. A node
+typed `"swich"` was therefore admitted with 201 and then traced
+`{"node": "x", "status": "ok"}` — it invoked the model. Both altitudes now
+name the four: the kind schema as an enum, and `graph_problems` semantically,
+because the schema does not reach a row that predates it.
+
+An absent `type` is read as `tool_call`, which is what `_execute_node` does
+with it. Requiring the key is admission's job; agreeing with execution is this
+altitude's, and being stricter than the runtime would be a different bug.
+
+**The rule found four existing test fixtures declaring node types this engine
+has never executed** — eleven uses of `llm_call` and four of `respond`, across
+storage, chat, admin and tool-authority tests. None of them execute the graph,
+so nothing had ever noticed. They were corrected to
+`{"type": "tool_call", "tool": "llm.generic"}` rather than the rule being
+loosened: a fixture that cannot run is not evidence about a system that runs
+graphs.
+
+### And a third dimension: how the node was reached
+
+What a node type reads is not the whole answer either, because
+`_execute_parallel_nodes` calls `_execute_node_with_retry` and throws the
+successor list away:
+
+```python
+result, _ = await self._execute_node_with_retry(...)
+```
+
+So the same node declaring the same edge means one thing on the ordinary path
+and nothing at all as a parallel child. Measured:
+
+```
+fan:     parallel next=["choose"] after="join"
+choose:  switch true -> side
+side:    end
+join:    end
+
+graph_problems   []
+runtime          fan -> choose -> join;  `side` never ran
+```
+
+`choose` executed and returned `['side']`, and the parallel discarded it. The
+same shape covers a `tool_call` child's `next` and `on_error`, and a nested
+parallel's own children and `after`.
+
+The narrow reading is the one SPEC §9 supports — "fan-out to multiple nodes,
+then join" — so `parallel.next` names children that run once and `after` owns
+the continuation. Making `parallel` a recursive subgraph executor is a
+specification decision, not a bug fix, so validation refuses the graphs that
+would need one instead of inventing the semantics. The check derives from the
+same `_NODE_EDGES` table: whatever a child's own type would read is what the
+parallel discards.
+
+**The permanent `VALID` fixture was the warning sign, and it was missed.** Its
+parallel fanned into `work` and `other`, both declaring `next: "join"`, while
+the parallel itself declared `after: "join"`. The fixture therefore looked like
+it exercised a child's `next` when `after` was producing that continuation on
+its own and the two child edges contributed nothing. A positive control that
+passes for a reason other than the one it claims is a witness at the wrong
+altitude — the same failure mode as three vacuous witnesses earlier in this
+campaign, in a fixture rather than a test.
+
+**One witness pins the premise rather than the rule.** The reason to refuse
+these graphs is that the executor discards a child's successors, so a test
+runs the refused graph with the graph check disabled and asserts `side` never
+executes. If `parallel` ever becomes recursive, that test fails and says the
+rule above needs revisiting — rather than the rule quietly outliving its
+justification.
+
+**And `end` slipped through the first version of the rule**, because that rule
+asked what edges a child declares and `end` declares none. Its meaning is its
+status, not an edge: on the ordinary path `status == "end"` stops the
+workflow, and `_execute_parallel_nodes` reads only `"error"` out of a child's
+status, so an `end` child is an ordinary success the parent walks past.
+Measured — `graph_problems` returned `[]` and the run traced
+`['fan', 'side']`. The node named `end` ended nothing.
+
+So the rule states the whole thing positively now: a parallel child is a leaf
+`tool_call`. That is what SPEC §9.1 describes — `parallel` is "fan-out to
+multiple nodes, then join", and `end` "produces the final response", which
+belongs on the `after` continuation where the ordinary loop can see it. The
+two halves separate under mutation: admitting `end` kills only the `end`
+witness, and dropping the discarded-edge loop kills only the `tool_call`
+children carrying `next` or `on_error`.
+
+## The runtime declared less work than the graph did
+
+Same sentence as the whole graph tranche, with the runtime rather than the
+graph on the wrong side of it.
+
+Two budgets bound a workflow run, and neither is wrong to exist:
+
+| budget | value |
+|---|---|
+| `max_steps` | `min(100, len(node_map) * 2 + 10)` total node visits |
+| `max_visits_per_node` | `max(2, ceil(max_steps / len(node_map)))` |
+
+What was wrong is what happened on exhaustion. The step budget is the `while`
+condition, so the loop stopped with work still pending; the visit budget
+logged `workflow_loop_detected` and `break`. Both then fell through to the
+ordinary result. Nothing pins node count at admission, so this is reachable
+with a perfectly valid acyclic graph:
+
+```
+101-node switch chain   100 nodes ran, the `end` node never did,
+                        status None, content "No response generated."
+loop with a dead exit   stopped at the guard, same placeholder success
+streaming, both         message_done, no error event
+```
+
+The budgets stay. Exhausting one now returns `status: "error"` with the
+budget named, and streaming emits an error event instead of `message_done`.
+One narrow distinction keeps the step rule honest: reaching an `end` while
+siblings are still queued is a completion, not a shortfall, so the two are
+told apart by which one happened rather than by whether `pending` is empty.
+
+### The budget did not cover the work the run actually did
+
+`visited` was incremented only in the driving loop. A parallel child runs
+inside `_execute_parallel_nodes`, which touches neither `visited` nor
+`visited_nodes` — and which builds every child task before awaiting one
+`asyncio.gather`. The graph rules permit any number of leaf `tool_call`
+children and nothing caps fan-out, so the loop sees two visits and the run
+does hundreds. Measured, with the tool call stubbed so the count was the only
+variable:
+
+| graph | `max_steps` | tool invocations | reported |
+|---|---|---|---|
+| 152 nodes, 150 children | 100 | 150 | success |
+| 3 nodes, `"next": ["leaf"] * 150` | 16 | 150 | success |
+
+The second is the sharper one and the reason this is an availability finding
+rather than a bookkeeping one. Three nodes, a budget of sixteen, one repeated
+child id, and a hundred and fifty concurrent worker invocations — each entry
+in `parallel.next` is an execution, whatever it is named.
+
+`ExecutionBudget` is one object per run, held by the driving loop and by the
+fan-out it dispatches, and it lives in `workflow_limits` with the other
+shared limits so neither path can hold a different one. The reservation sits
+next to the `gather` it bounds rather than in the two callers, so a third
+caller cannot forget it, and it is taken *before* the tasks are built: an
+over-budget batch never begins any of it, rather than being cut off partway
+through.
+
+A fan-out constant like `maxItems: 16` would not have repaired the claim that
+`max_steps` bounds node executions — it would have replaced one unchecked
+number with another. Charging the children is what makes the rest of the run
+bounded too, and that half has its own witness: a fan-out of forty that fits,
+followed by a chain that only exceeds the budget once the children are
+counted.
+
+**The reservation replaced an inference, and that is a simplification.** The
+loop used to conclude after the fact that leftover pending work meant the
+step budget had run out. Now every execution is reserved where it happens, so
+the reason is recorded at the refusal and there is nothing to infer — the
+`reached_end` bookkeeping that the earlier finding required is gone with it,
+and so is the mutation that probed it.
+
+**Two of my own witnesses were vacuous, and mutations found both.**
+
+The control for that narrow distinction fanned out and then ended with
+`pending` already empty, so it never exercised "ended while siblings are
+queued" at all — the mutation that removes the distinction survived, which is
+the only reason it came to light. It uses a list `next` now, and asserts the
+trace, so the premise is checked rather than assumed.
+
+The cycle fixture had two nodes and was witnessing the *step* budget, not the
+visit guard. Measured rather than reasoned about afterwards: with
+`max_steps = min(100, 2n + 10)` and `max_visits = max(2, ceil(max_steps/n))`,
+a two-node cycle reaches its eighth visit at step 15 and the step budget has
+already stopped it at 14. Three nodes puts the visit guard at step 13 of 16.
+Asserting *which* budget ran out is what said so — without that, both
+witnesses would have measured one mechanism twice while looking like coverage
+of two.
+
+### An id that cannot name a node
+
+`node_map` is keyed by id and drops falsy keys, so a node declared with an
+empty id disappears — the same silent removal a duplicate causes, and it was
+being skipped rather than reported. `id` now carries `minLength: 1` in the
+kind schema *and* is reported semantically, because the schema does not reach
+a row that predates it.
+
+An explicitly empty `entrypoint` was likewise treated as though the key were
+absent. Absent means "start at the first node"; written-empty means the
+operator named something, and it names no node. The two are told apart by
+`"entrypoint" in schema` rather than by truthiness.
+
+### The edge fields had to be measured, and that is the whole lesson
+
+The executor consumes **five** node-reference fields:
+
+| field | read at | in the artifact kind schema? |
+|---|---|---|
+| `entrypoint` | choosing where to start | yes |
+| `next`, scalar or list | ordinary nodes and parallel children | yes |
+| `branches[].next` | switch | yes |
+| `after` | where a parallel fan-in continues | **no** |
+| `on_error` | taken instead of `next` when a tool call fails | **no** |
+
+Writing the validator from the kind schema is the obvious move and would have
+covered three of five while looking complete. `after` and `on_error` are not
+in that schema at all — nothing else in the system knows they exist — and
+`on_error` is the one that matters most, because it is the transition a
+workflow takes precisely when it can least afford to stop silently.
+
+The two mutations that drop them from the edge set kill only their own
+witnesses, which is what says the pair is separated rather than covered twice.
+
+Forty-one mutations, all killed. Three were retired rather than left surviving,
+both for the same reason: they added code that cannot execute. Re-adding the
+engine's entrypoint repair cannot fire once the check above it has refused
+such an entrypoint, and the streaming equivalent was identical in effect to
+streaming simply not asking. A mutation that changes no behaviour says the
+code it adds is dead, not that the tests are weak.
+
+Sixteen anchors went stale across this tranche's seven passes and the driver
+said so each time rather than reporting a survivor. That guard has now caught
+something in every pass of this campaign — including two on the last pass,
+where a rename would otherwise have quietly retired the budget-fallthrough
+mutations. The driver now takes mutation names on the command line, so a
+retarget is re-measured in seconds instead of by re-running the whole set.
+
+Several rules earned a **complementary pair** — one mutation that loses the
+rule and one that applies it too widely — because losing a rule and
+over-applying it are both wrong, and only one of them fails loudly. The
+parallel-child rule extended to the `after` target kills the control that says
+the rule is about the context and not the node. Marking every streamed node as
+having emitted a token kills the zero-token recovery witnesses, which "never
+recover" would otherwise have satisfied.
+
+**The interruption guard earned itself back.** The driver was killed by a
+tool timeout partway through a run, so the `finally` that restores the file
+never executed and `workflow_graph.py` was left mutated. The marker file
+written before each mutation named which one and which file, so the residue
+was found and reverted in one step instead of being discovered later as an
+inexplicable failure. That guard exists because an earlier interruption in
+this campaign was found by luck.
+
+**One mutation earned a witness rather than being explained away.** Reverting
+the node-type enum in the kind schema left the end-to-end admission test
+green, because `graph_problems` refuses the same graph a moment later. Two
+layers refusing for two reasons is correct; an unwitnessed layer is not. The
+enum is the published contract that external tooling reads, so it gets a
+witness that exercises the JSON Schema validator alone.
+
+### Two altitudes, both load-bearing
+
+`graph_problems` is pure and returns every problem rather than the first, so
+each caller raises in its own vocabulary: admission gives
+`ArtifactValidationError`, the engine `BadRequestError`. Admission stops new
+invalid graphs; the engine checks again before building `node_map`, because a
+row can predate the check or arrive by import, and silently repairing such a
+row at execution *is* the defect.
+
+Unlike the operand rule in the patch tranche, these two are not redundant:
+the mutation removing each kills only its own witnesses.
+
+### A mutation retired rather than left surviving
+
+Re-adding the engine's old "replace a dangling entrypoint with the first
+node" fallback survived — because it cannot fire once the check above it has
+refused such an entrypoint. A mutation that changes no behaviour says the code
+it adds is dead, not that the tests are weak, so it was retired with that
+reasoning recorded instead of being counted as a survivor.
+
+### A control that was measuring the harness
+
+One witness asserted that the workflows this system synthesises for itself
+still *run*. They do not, under the mock engine those tests use — its default
+node returns an error, and it did so with the change stashed too. The property
+that belongs here is that the built-in graphs are not *refused*, and a second
+witness checks them against the rule directly, with no harness in the way.
+
 ## A patch that named nowhere reported that it had landed
 
 Found by driving ConfigOps against §10 on a running instance. A published
@@ -14761,10 +15214,52 @@ one pointing at a missing element rather than the index the author wrote.
 Both sides now say the same thing, and the three tests that pinned the old
 wording were updated rather than worked around.
 
+## Observation, not this tranche: two carry-overs from the graph work
+
+Both found during the graph tranche, both deliberately left out of it.
+
+**A refused fan-out leaves its parent out of the trace.** When
+`_execute_parallel_nodes` refuses a batch for budget, the `parallel` node
+itself has already executed — it is what produced the child list — but the
+caller sees `budget_exhausted` and breaks before appending that parent to
+`workflow_trace`. The failure the caller reports is honest, and the run
+correctly fails closed, so this is a ledger completeness question rather than
+a correctness one. It belongs wherever `workflow_trace` is qualified as a
+complete execution ledger, which no tranche has done yet.
+
+**One witness is written to expire.**
+`test_an_ordinary_tool_failure_also_takes_on_error` uses `no.such.tool.v1` to
+manufacture an ordinary runtime failure, because tool names are not
+reference-validated. Once they are, that graph will be refused before it
+executes and the witness becomes invalid by design. The replacement is a real
+resolvable tool forced to return an error — not a weakened reference rule.
+Recorded here rather than fixed early, because the witness is measuring the
+right thing today and the change belongs with the rule that invalidates it.
+
+## Observation, not this tranche: streamed failures never trip the breaker
+
+Found while sharing the tool-node control plane, and deliberately left where
+it was found.
+
+The streaming path now *reads* the circuit breaker before a streamed LLM call.
+It still never *writes* to it: `record_tool_failure` and `record_tool_success`
+are called only from `_execute_node`, so a tool that fails on every streamed
+turn never accumulates failures and the breaker never opens for it. In a
+deployment where chat streams — which is the ordinary case — the preflight can
+only ever fire on a breaker some other path opened.
+
+Kept out of the graph tranche on purpose. Its invariant is SPEC §18's failure
+accounting, not §9's "a workflow executes exactly the graph it declares", and
+the reds that would witness it are about counters over time rather than about
+which edge a turn took. Mixing them would blur an evidence boundary that is
+currently clean.
+
 ## Observation, not this tranche: a teardown race in the xdist lane
 
-Seen once in 2,917 tests and not reproduced — recorded because a one-sighting
-race that nobody writes down is a race that gets rediscovered.
+**Reproduced.** Recorded after one sighting because a one-sighting race that
+nobody writes down is a race that gets rediscovered; it recurred during the
+graph-integrity tranche, so it is intermittent rather than a one-off and now
+warrants its own concurrency/lifetime red.
 
 `test_a_replacement_cannot_be_undone_by_a_write_already_in_flight` failed under
 `make test-xdist` with `psycopg_pool.PoolClosed: the pool 'pool-1' is already
@@ -14783,9 +15278,29 @@ lane was green on the next run. It has no reach into the patch engine — the
 file never mentions `json_patch`, and the module's only call site in
 `routes.py` is the artifact PATCH route, not the upload route in the trace.
 
-Worth a look on its own terms: the shape is a background write racing
-teardown, which is a product question about that write's lifetime as much as a
-harness question.
+The second sighting carried a fuller trace, and it widens the shape rather
+than confirming it. The pool closes underneath a *live request* —
+`POST /v1/files/upload` — and two different call sites reach for a connection
+after that:
+
+```
+routes.upload_file
+  _publish -> store.contexts_covering_path  -> self._connect()
+  IdempotencyGuard.__aexit__
+    runtime._set_cached_idempotency_record
+      store.hold_live_user                  -> self._connect()
+```
+
+So this is not only a fire-and-forget write outliving its session: request
+work itself is still running when the pool goes. The test passes in isolation
+and logs the unhandled exception, which is why it can fail the lane without
+failing the assertion — an important detail for whoever picks this up, because
+grepping for the failing assertion will not find it.
+
+Worth a look on its own terms: the shape is a request outliving the pool it
+borrows from, which is a product question about shutdown ordering as much as a
+harness question. It is unrelated to the patch and graph tranches by
+reachability, and both lanes are green on a re-run.
 
 ## The isolation lesson from the live ConfigOps campaign
 
