@@ -40,6 +40,12 @@ chain ran 100 nodes and returned a success. A graph that declares more work
 than the runtime will do is the same divergence as one whose edges the runtime
 ignores; the budgets stay, and exhausting one is an error.
 
+And the budget has to cover the work that actually happens. A parallel child
+runs inside `_execute_parallel_nodes`, which the driving loop's counter never
+sees, and every child launches at once — so a three-node graph repeating one
+child id ran 150 concurrent tool invocations against a budget of 16 and
+reported success.
+
 Validation sits at two altitudes on purpose. Admission stops new invalid
 graphs entering; the engine checks again before it builds `node_map`, because
 a row can predate the check or arrive by import, and "repaired silently at
@@ -881,6 +887,192 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
         # already empty, so it exercised nothing and a mutation said so.
         assert ran == ["start", "fin"], ran
         assert out.get("status") != "error", out
+
+
+class TestFanOutIsChargedToTheSameBudget:
+    """The budget bounds node executions, and a parallel child is one.
+
+    `visited` was incremented only in the driving loop. A parallel child runs
+    inside `_execute_parallel_nodes`, which touches neither `visited` nor
+    `visited_nodes` — and builds every child task before awaiting a single
+    `asyncio.gather`. The validator permits any number of leaf `tool_call`
+    children, and nothing caps fan-out. So the loop sees:
+
+    ==============  =========================================================
+    visit 1         `fan`, which returns `status: "parallel"`
+    (uncounted)     every child, launched at once
+    visit 2         `after`
+    ==============  =========================================================
+
+    Measured, with the tool call itself stubbed so the count is the only
+    variable:
+
+    ===========================  ==============  =========================
+    graph                        `max_steps`     tool invocations
+    ===========================  ==============  =========================
+    152 nodes, 150 children      100             150, reported success
+    3 nodes, `["leaf"] * 150`    16              150, reported success
+    ===========================  ==============  =========================
+
+    The second is the sharper one. Three nodes, a budget of sixteen, and one
+    repeated child id — each occurrence is an execution, so a graph that
+    names one node ran a hundred and fifty concurrent tool calls. These are
+    real worker invocations, not bookkeeping.
+
+    The fix is the budget rather than a fan-out constant: a reservation taken
+    before the batch starts, so an over-budget fan-out never begins any of
+    it, and children charged so what follows is bounded by what they spent.
+    """
+
+    @staticmethod
+    def _fan(children, chain=0):
+        """One parallel with `children` leaves, then `chain` switch nodes."""
+        nodes = [{"id": "fan", "type": "parallel",
+                  "next": [f"leaf{i:03d}" for i in range(children)],
+                  "after": "c000" if chain else "done"}]
+        nodes += [{"id": f"leaf{i:03d}", "type": "tool_call", "tool": "llm.generic"}
+                  for i in range(children)]
+        nodes += [
+            {"id": f"c{i:03d}", "type": "switch", "branches": [
+                {"when": "true", "next": f"c{i + 1:03d}" if i + 1 < chain else "done"},
+            ]}
+            for i in range(chain)
+        ]
+        nodes.append({"id": "done", "type": "end"})
+        return {"kind": "workflow.chat", "entrypoint": "fan", "nodes": nodes}
+
+    # One node id, repeated. Each entry is an execution, so this is a
+    # three-node graph that asks for a hundred and fifty of them.
+    REPEATED = {
+        "kind": "workflow.chat", "entrypoint": "fan",
+        "nodes": [
+            {"id": "fan", "type": "parallel", "next": ["leaf"] * 150,
+             "after": "done"},
+            {"id": "leaf", "type": "tool_call", "tool": "llm.generic"},
+            {"id": "done", "type": "end"},
+        ],
+    }
+
+    @pytest.fixture
+    def engine(self):
+        from liminallm.service.workflow import WorkflowEngine
+        from tests.test_workflow_retry_timeout import (
+            MockLLM,
+            MockRAG,
+            MockRedisCache,
+            MockRouter,
+            MockStore,
+        )
+
+        return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
+                              cache=MockRedisCache())
+
+    @staticmethod
+    def _count_invocations(engine, monkeypatch):
+        """Stub the tool call itself, so a fan-out is cheap and still counted.
+
+        Counting here rather than at `_execute_node_with_retry` on purpose:
+        this is the boundary where a node execution becomes a real worker
+        invocation, which is what the budget exists to bound. It is also the
+        one place both paths share — streaming special-cases `llm.generic` in
+        its driving loop but not for parallel children.
+        """
+        calls = []
+
+        async def fake_invoke(tool, inputs, adapters, history, context_id,
+                              conversation_id, user_message, **kw):
+            calls.append(tool)
+            return {"status": "ok", "content": "x"}
+
+        monkeypatch.setattr(engine, "_invoke_tool", fake_invoke)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_a_fan_out_past_the_budget_never_starts(self, engine, monkeypatch):
+        schema = self._fan(150)
+        assert graph_problems(schema) == [], "the premise: nothing refuses this"
+        calls = self._count_invocations(engine, monkeypatch)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        assert calls == [], (
+            f"{len(calls)} tool invocations began inside a 100-execution "
+            f"budget — the reservation must refuse the batch before it starts"
+        )
+        assert out.get("status") == "error", out.get("content")
+        assert out.get("error") == "workflow_step_limit", out.get("error")
+
+    @pytest.mark.asyncio
+    async def test_the_same_holds_when_one_child_id_is_repeated(
+        self, engine, monkeypatch
+    ):
+        """Each entry in `parallel.next` is an execution, not each distinct
+        id. A three-node graph asked for a hundred and fifty."""
+        calls = self._count_invocations(engine, monkeypatch)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.REPEATED)
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        assert calls == [], f"{len(calls)} invocations from a three-node graph"
+        assert out.get("status") == "error", out.get("content")
+
+    @pytest.mark.asyncio
+    async def test_children_are_charged_so_what_follows_is_bounded(
+        self, engine, monkeypatch
+    ):
+        """The other half. Reserving before the batch stops an over-large
+        fan-out; *charging* it is what keeps the rest of the run inside the
+        same budget.
+
+        This fan-out fits. What follows it does not, once the children are
+        counted — and completes if they are free.
+        """
+        schema = self._fan(40, chain=70)
+        assert graph_problems(schema) == []
+        calls = self._count_invocations(engine, monkeypatch)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        assert len(calls) == 40, f"the fan-out itself should fit: {len(calls)}"
+        assert out.get("status") == "error", (
+            f"the chain after a charged fan-out ran past the budget: "
+            f"{out.get('content')!r}"
+        )
+        assert out.get("error") == "workflow_step_limit", out.get("error")
+
+    @pytest.mark.asyncio
+    async def test_streaming_refuses_the_same_fan_out(self, engine, monkeypatch):
+        schema = self._fan(150)
+        calls = self._count_invocations(engine, monkeypatch)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+        assert calls == [], f"{len(calls)} invocations began on the streaming path"
+        errors = [e for e in events if e.get("event") == "error"]
+        assert errors, events[-3:]
+        assert errors[0]["data"]["details"]["reason"] == "workflow_step_limit", errors
+        assert not any(e.get("event") == "message_done" for e in events), events[-3:]
+
+    @pytest.mark.asyncio
+    async def test_a_small_fan_out_still_runs_every_child(self, engine, monkeypatch):
+        """The control. Refusing every parallel passes all four above, and
+        fan-out is the feature."""
+        schema = self._fan(3)
+        calls = self._count_invocations(engine, monkeypatch)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        assert len(calls) == 3, calls
+        assert out.get("status") != "error", out
+
+    @pytest.mark.asyncio
+    async def test_a_small_fan_out_still_streams(self, engine, monkeypatch):
+        """The streaming control."""
+        schema = self._fan(3)
+        calls = self._count_invocations(engine, monkeypatch)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+        assert len(calls) == 3, calls
+        assert not any(e.get("event") == "error" for e in events), events
+        assert any(e.get("event") == "message_done" for e in events), events[-3:]
 
 
 class TestTheEngineRefusesGraphsItsSchemaWouldNowRefuse:
