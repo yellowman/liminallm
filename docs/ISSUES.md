@@ -15214,6 +15214,28 @@ one pointing at a missing element rather than the index the author wrote.
 Both sides now say the same thing, and the three tests that pinned the old
 wording were updated rather than worked around.
 
+## Observation, not this tranche: two carry-overs from the graph work
+
+Both found during the graph tranche, both deliberately left out of it.
+
+**A refused fan-out leaves its parent out of the trace.** When
+`_execute_parallel_nodes` refuses a batch for budget, the `parallel` node
+itself has already executed — it is what produced the child list — but the
+caller sees `budget_exhausted` and breaks before appending that parent to
+`workflow_trace`. The failure the caller reports is honest, and the run
+correctly fails closed, so this is a ledger completeness question rather than
+a correctness one. It belongs wherever `workflow_trace` is qualified as a
+complete execution ledger, which no tranche has done yet.
+
+**One witness is written to expire.**
+`test_an_ordinary_tool_failure_also_takes_on_error` uses `no.such.tool.v1` to
+manufacture an ordinary runtime failure, because tool names are not
+reference-validated. Once they are, that graph will be refused before it
+executes and the witness becomes invalid by design. The replacement is a real
+resolvable tool forced to return an error — not a weakened reference rule.
+Recorded here rather than fixed early, because the witness is measuring the
+right thing today and the change belongs with the rule that invalidates it.
+
 ## Observation, not this tranche: streamed failures never trip the breaker
 
 Found while sharing the tool-node control plane, and deliberately left where
