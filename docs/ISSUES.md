@@ -14390,6 +14390,70 @@ executes. If `parallel` ever becomes recursive, that test fails and says the
 rule above needs revisiting — rather than the rule quietly outliving its
 justification.
 
+**And `end` slipped through the first version of the rule**, because that rule
+asked what edges a child declares and `end` declares none. Its meaning is its
+status, not an edge: on the ordinary path `status == "end"` stops the
+workflow, and `_execute_parallel_nodes` reads only `"error"` out of a child's
+status, so an `end` child is an ordinary success the parent walks past.
+Measured — `graph_problems` returned `[]` and the run traced
+`['fan', 'side']`. The node named `end` ended nothing.
+
+So the rule states the whole thing positively now: a parallel child is a leaf
+`tool_call`. That is what SPEC §9.1 describes — `parallel` is "fan-out to
+multiple nodes, then join", and `end` "produces the final response", which
+belongs on the `after` continuation where the ordinary loop can see it. The
+two halves separate under mutation: admitting `end` kills only the `end`
+witness, and dropping the discarded-edge loop kills only the `tool_call`
+children carrying `next` or `on_error`.
+
+## The runtime declared less work than the graph did
+
+Same sentence as the whole graph tranche, with the runtime rather than the
+graph on the wrong side of it.
+
+Two budgets bound a workflow run, and neither is wrong to exist:
+
+| budget | value |
+|---|---|
+| `max_steps` | `min(100, len(node_map) * 2 + 10)` total node visits |
+| `max_visits_per_node` | `max(2, ceil(max_steps / len(node_map)))` |
+
+What was wrong is what happened on exhaustion. The step budget is the `while`
+condition, so the loop stopped with work still pending; the visit budget
+logged `workflow_loop_detected` and `break`. Both then fell through to the
+ordinary result. Nothing pins node count at admission, so this is reachable
+with a perfectly valid acyclic graph:
+
+```
+101-node switch chain   100 nodes ran, the `end` node never did,
+                        status None, content "No response generated."
+loop with a dead exit   stopped at the guard, same placeholder success
+streaming, both         message_done, no error event
+```
+
+The budgets stay. Exhausting one now returns `status: "error"` with the
+budget named, and streaming emits an error event instead of `message_done`.
+One narrow distinction keeps the step rule honest: reaching an `end` while
+siblings are still queued is a completion, not a shortfall, so the two are
+told apart by which one happened rather than by whether `pending` is empty.
+
+**Two of my own witnesses were vacuous, and mutations found both.**
+
+The control for that narrow distinction fanned out and then ended with
+`pending` already empty, so it never exercised "ended while siblings are
+queued" at all — the mutation that removes the distinction survived, which is
+the only reason it came to light. It uses a list `next` now, and asserts the
+trace, so the premise is checked rather than assumed.
+
+The cycle fixture had two nodes and was witnessing the *step* budget, not the
+visit guard. Measured rather than reasoned about afterwards: with
+`max_steps = min(100, 2n + 10)` and `max_visits = max(2, ceil(max_steps/n))`,
+a two-node cycle reaches its eighth visit at step 15 and the step budget has
+already stopped it at 14. Three nodes puts the visit guard at step 13 of 16.
+Asserting *which* budget ran out is what said so — without that, both
+witnesses would have measured one mechanism twice while looking like coverage
+of two.
+
 ### An id that cannot name a node
 
 `node_map` is keyed by id and drops falsy keys, so a node declared with an
@@ -14424,14 +14488,14 @@ workflow takes precisely when it can least afford to stop silently.
 The two mutations that drop them from the edge set kill only their own
 witnesses, which is what says the pair is separated rather than covered twice.
 
-Thirty-one mutations, all killed. Two were retired rather than left surviving,
+Thirty-nine mutations, all killed. Two were retired rather than left surviving,
 both for the same reason: they added code that cannot execute. Re-adding the
 engine's entrypoint repair cannot fire once the check above it has refused
 such an entrypoint, and the streaming equivalent was identical in effect to
 streaming simply not asking. A mutation that changes no behaviour says the
 code it adds is dead, not that the tests are weak.
 
-Eleven anchors went stale across this tranche's five passes and the driver
+Fourteen anchors went stale across this tranche's six passes and the driver
 said so each time rather than reporting a survivor. That guard has now caught
 something in every pass of this campaign.
 
@@ -14442,6 +14506,14 @@ parallel-child rule extended to the `after` target kills the control that says
 the rule is about the context and not the node. Marking every streamed node as
 having emitted a token kills the zero-token recovery witnesses, which "never
 recover" would otherwise have satisfied.
+
+**The interruption guard earned itself back.** The driver was killed by a
+tool timeout partway through a run, so the `finally` that restores the file
+never executed and `workflow_graph.py` was left mutated. The marker file
+written before each mutation named which one and which file, so the residue
+was found and reverted in one step instead of being discovered later as an
+inexplicable failure. That guard exists because an earlier interruption in
+this campaign was found by luck.
 
 **One mutation earned a witness rather than being explained away.** Reverting
 the node-type enum in the kind schema left the end-to-end admission test

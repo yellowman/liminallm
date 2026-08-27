@@ -114,19 +114,32 @@ def _references(
                     yield f"node {node_id!r} branch {index}", branch["next"], False
 
 
-def _discarded_by_parallel(
+# What a parallel child may be. `_execute_parallel_nodes` runs each child
+# exactly once, and it looks at the result for outputs rather than for control
+# flow: it discards the successor list, and it reads only `"error"` out of the
+# child's status. So a child carries no control flow of its own in either
+# direction. `switch` and nested `parallel` lose the edges they declare, and
+# `end` loses the one thing that makes it an `end` — on the ordinary path
+# `status == "end"` stops the workflow, and as a child it is just a successful
+# node the parent continues past.
+#
+# SPEC §9.1: `end` produces the final response, and `parallel` is "fan-out to
+# multiple nodes, then join". So a child does work and returns a result, which
+# is what fan-out is for, and termination belongs on the `after` continuation
+# where the ordinary loop can see it.
+_PARALLEL_CHILD = "tool_call"
+
+
+def _parallel_child_problems(
     node: Dict[str, Any], node_type: str, by_id: Dict[str, Dict[str, Any]]
 ) -> Iterator[str]:
-    """Control flow a child of this node declares and the parallel throws away.
+    """Control flow a child of this node carries and the parallel throws away.
 
-    A third dimension: not what a node reads, but how it was reached.
-    `_execute_parallel_nodes` calls `_execute_node_with_retry` and discards the
-    successor list, so a child's `next`, `on_error`, `branches[].next` or
-    nested children resolve at validation and then execute as nothing.
+    A third dimension: not what a node reads, but how it was reached. Two
+    rules, because there are two ways to carry it — a type whose semantics the
+    parallel drops, and an edge the parallel discards.
 
-    The narrow reading of SPEC §9 — "fan-out to multiple nodes, then join" —
-    is that `parallel.next` names children that run once and `after` owns the
-    continuation. Making `parallel` a recursive subgraph executor instead is a
+    Making `parallel` a recursive subgraph executor instead would be a
     specification decision, so this refuses the graphs that would need one
     rather than inventing the semantics.
     """
@@ -147,6 +160,13 @@ def _discarded_by_parallel(
         child_type = _node_type(child)
         if child_type not in _NODE_EDGES:
             continue          # an unusable type is already reported as one
+        if child_type != _PARALLEL_CHILD:
+            yield (
+                f"node {child_id!r} has type {child_type!r} and is a parallel "
+                f"child of {parent_id!r}, where only a {_PARALLEL_CHILD} node "
+                f"runs the way it reads"
+            )
+            continue
         for where, value, _list_ok in _references(child, child_type):
             yield (
                 f"{where} names {value!r}, which never runs: {child_id!r} is "
@@ -220,7 +240,7 @@ def graph_problems(schema: Any) -> List[str]:
             )
             continue
         problems.extend(_unread_fields(node, node_type))
-        problems.extend(_discarded_by_parallel(node, node_type, by_id))
+        problems.extend(_parallel_child_problems(node, node_type, by_id))
         for where, value, list_ok in _references(node, node_type):
             targets = value if isinstance(value, list) else [value]
             if isinstance(value, list) and not list_ok:

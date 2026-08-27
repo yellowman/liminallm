@@ -566,6 +566,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
         max_steps = max(1, min(100, len(node_map) * 2 + 10))
         visited_nodes: Dict[str, int] = {}
         max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
+        # Which of the two budgets stopped the run, if either. Both used to
+        # fall through to the ordinary result, so a graph declaring more work
+        # than the runtime would do returned a success — see `_budget_result`.
+        budget: Optional[str] = None
+        reached_end = False
 
         state_key = f"{conversation_id or 'anon'}:{workflow_id or 'default'}"
         await self._persist_workflow_state(
@@ -605,6 +610,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             visited_nodes[node_id] = visited_nodes.get(node_id, 0) + 1
             if visited_nodes[node_id] > max_visits_per_node:
                 self.logger.warning("workflow_loop_detected", node=node_id)
+                budget = "workflow_node_revisit_limit"
                 break
 
             # SPEC §18.3: Execute node with retry and exponential backoff
@@ -732,7 +738,35 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     vars_scope=vars_scope,
                 )
             if result.get("status") == "end":
+                reached_end = True
                 break
+
+        # Exiting the loop with work still queued means the step budget ran
+        # out: the `while` condition is the only other way out, and reaching
+        # an `end` with siblings queued is a completion rather than a
+        # shortfall.
+        if budget is None and pending and not reached_end:
+            budget = "workflow_step_limit"
+        if budget is not None:
+            self.logger.warning(
+                "workflow_budget_exhausted",
+                workflow_id=workflow_id,
+                reason=budget,
+                visited=visited,
+                pending=len(pending),
+            )
+            await self._retire_workflow_state(state_key)
+            return {
+                "status": "error",
+                "content": "workflow did not reach an end node",
+                "error": budget,
+                "visited": visited,
+                "max_steps": max_steps,
+                "routing_trace": routing_trace,
+                "workflow_trace": workflow_trace,
+                "context_snippets": context_snippets,
+                "vars": vars_scope,
+            }
 
         if not content:
             content = "No response generated."

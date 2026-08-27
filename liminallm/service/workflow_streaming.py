@@ -129,6 +129,11 @@ class WorkflowStreamingMixin:
         max_steps = max(1, min(100, len(node_map) * 2 + 10))
         visited_nodes: Dict[str, int] = {}
         max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
+        # Which of the two budgets stopped the run, if either. Both used to
+        # fall through to `message_done`, so a graph declaring more work than
+        # the runtime would do finished with a normal answer.
+        budget: Optional[str] = None
+        reached_end = False
 
         while pending and visited < max_steps:
             # Check for cancellation
@@ -155,6 +160,7 @@ class WorkflowStreamingMixin:
             visited_nodes[node_id] = visited_nodes.get(node_id, 0) + 1
             if visited_nodes[node_id] > max_visits_per_node:
                 self.logger.warning("workflow_loop_detected", node=node_id)
+                budget = "workflow_node_revisit_limit"
                 break
 
             node_type = node.get("type", "tool_call")
@@ -404,7 +410,29 @@ class WorkflowStreamingMixin:
                     )
                     return
                 if result.get("status") == "end":
+                    reached_end = True
                     break
+
+        # Exiting the loop with work still queued means the step budget ran
+        # out, and the caller must not be handed a `message_done` for a run
+        # that stopped early. Same rule as the blocking path, said in the
+        # streaming vocabulary.
+        if budget is None and pending and not reached_end:
+            budget = "workflow_step_limit"
+        if budget is not None:
+            self.logger.warning(
+                "workflow_budget_exhausted",
+                workflow_id=workflow_id,
+                reason=budget,
+                visited=visited,
+                pending=len(pending),
+            )
+            yield self._error_event(
+                "server_error",
+                "workflow did not reach an end node",
+                {"reason": budget, "visited": visited, "max_steps": max_steps},
+            )
+            return
 
         if not content:
             content = "No response generated."

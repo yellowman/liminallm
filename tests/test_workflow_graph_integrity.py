@@ -371,9 +371,14 @@ class TestAnEdgeIsReadByTheNodeTypeThatDeclaresIt:
     """
 
     def _one(self, node):
-        """That node plus somewhere for its edges to point."""
-        return {"kind": "workflow.chat", "entrypoint": node["id"],
-                "nodes": [node, {"id": "side", "type": "end"}]}
+        """That node, somewhere for its edges to point, and a legal parallel
+        child — so a case about `parallel` measures the field under test and
+        not the separate rule about what a child may be."""
+        return {"kind": "workflow.chat", "entrypoint": node["id"], "nodes": [
+            node,
+            {"id": "side", "type": "end"},
+            {"id": "leaf", "type": "tool_call", "tool": "llm.generic"},
+        ]}
 
     def test_an_end_node_declaring_next_is_a_problem(self):
         """The sharpest one: publish `end -> side`, validation says the edge
@@ -403,7 +408,7 @@ class TestAnEdgeIsReadByTheNodeTypeThatDeclaresIt:
         """`on_error` is the tool-failure edge. A parallel node's failure
         handling is `_execute_parallel_nodes`, which never looks at it."""
         problems = graph_problems(self._one({
-            "id": "fan", "type": "parallel", "next": ["side"],
+            "id": "fan", "type": "parallel", "next": ["leaf"],
             "after": "side", "on_error": "side",
         }))
         assert problems, "a parallel node advertised a tool-failure edge"
@@ -429,7 +434,7 @@ class TestAnEdgeIsReadByTheNodeTypeThatDeclaresIt:
         {"id": "t", "type": "tool_call", "tool": "llm.generic",
          "next": "side", "on_error": "side"},
         {"id": "t", "type": "tool_call", "tool": "llm.generic", "next": ["side"]},
-        {"id": "t", "type": "parallel", "next": ["side"], "after": "side"},
+        {"id": "t", "type": "parallel", "next": ["leaf"], "after": "side"},
         {"id": "t", "type": "switch", "branches": [{"when": "true", "next": "side"}]},
         {"id": "t", "type": "end"},
     ], ids=["tool", "tool-list", "parallel", "switch", "end"])
@@ -733,12 +738,24 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
         nodes.append({"id": f"n{n}", "type": "end"})
         return {"kind": "workflow.chat", "entrypoint": "n0", "nodes": nodes}
 
+    # A loop whose exit condition never fires — the graph the visit guard
+    # exists for. Three nodes, not two, and that is measured rather than
+    # chosen: with `max_steps = min(100, 2n + 10)` and
+    # `max_visits = max(2, ceil(max_steps / n))`, a two-node cycle reaches its
+    # eighth visit at step 15 and the step budget has already stopped it at
+    # 14. At three nodes the visit guard fires at step 13 of 16. The first
+    # version of this fixture had two nodes and was quietly witnessing the
+    # step budget twice; asserting *which* budget ran out is what said so.
     CYCLE = {
         "kind": "workflow.chat",
         "entrypoint": "a",
         "nodes": [
             {"id": "a", "type": "switch", "branches": [{"when": "true", "next": "b"}]},
-            {"id": "b", "type": "switch", "branches": [{"when": "true", "next": "a"}]},
+            {"id": "b", "type": "switch", "branches": [
+                {"when": "false", "next": "out"},
+                {"when": "true", "next": "a"},
+            ]},
+            {"id": "out", "type": "end"},
         ],
     }
 
@@ -770,6 +787,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
             f"a run that stopped with work pending reported success: "
             f"{out.get('content')!r}"
         )
+        assert out.get("error") == "workflow_step_limit", out.get("error")
         ran = [e.get("node") for e in out.get("workflow_trace") or []]
         assert "n100" not in ran, "the premise changed: the chain now completes"
 
@@ -783,6 +801,11 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
             f"a run stopped by the loop guard reported success: "
             f"{out.get('content')!r}"
         )
+        # Which budget, not merely that one ran out. The step-limit fallback
+        # would otherwise cover this case too — a visit-limit break also
+        # leaves work pending — and the two mechanisms would share one
+        # witness while looking separately covered.
+        assert out.get("error") == "workflow_node_revisit_limit", out.get("error")
 
     @pytest.mark.asyncio
     async def test_a_chain_inside_the_budget_still_completes(self, engine, monkeypatch):
@@ -802,7 +825,9 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
                             lambda *a, **k: self._chain(100))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hi", None, user_id="u")]
-        assert any(e.get("event") == "error" for e in events), events[-3:]
+        errors = [e for e in events if e.get("event") == "error"]
+        assert errors, events[-3:]
+        assert errors[0]["data"]["details"]["reason"] == "workflow_step_limit", errors
         assert not any(e.get("event") == "message_done" for e in events), (
             "the stream reported a finished answer after stopping early"
         )
@@ -814,7 +839,10 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
         monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.CYCLE)
         events = [e async for e in engine.run_streaming(
             "wf", None, "hi", None, user_id="u")]
-        assert any(e.get("event") == "error" for e in events), events[-3:]
+        errors = [e for e in events if e.get("event") == "error"]
+        assert errors, events[-3:]
+        assert errors[0]["data"]["details"]["reason"] == (
+            "workflow_node_revisit_limit"), errors
         assert not any(e.get("event") == "message_done" for e in events), events[-3:]
 
     @pytest.mark.asyncio
@@ -840,12 +868,18 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
         "ran out of budget". The two are told apart by which one happened.
         """
         schema = {"kind": "workflow.chat", "entrypoint": "start", "nodes": [
-            {"id": "start", "type": "parallel", "next": ["leaf"], "after": "fin"},
-            {"id": "leaf", "type": "tool_call", "tool": "llm.generic"},
+            {"id": "start", "type": "tool_call", "tool": "llm.generic",
+             "next": ["fin", "other"]},
             {"id": "fin", "type": "end"},
+            {"id": "other", "type": "tool_call", "tool": "llm.generic"},
         ]}
         monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
         out = await engine.run("wf", None, "hello", None, user_id="u")
+        ran = [e.get("node") for e in out.get("workflow_trace") or []]
+        # The premise: `fin` really did run with `other` still queued. The
+        # first shape written here fanned out and then ended with `pending`
+        # already empty, so it exercised nothing and a mutation said so.
+        assert ran == ["start", "fin"], ran
         assert out.get("status") != "error", out
 
 
