@@ -30,7 +30,15 @@ runs anything it does not recognise as a `tool_call`, so a node typed
 And once more along a third dimension: not what a node reads, but how it was
 reached. `_execute_parallel_nodes` discards a child's successor list, so a
 `switch` reached as a parallel child evaluates its branches and goes nowhere.
-The same node on the ordinary path continues normally.
+The same node on the ordinary path continues normally. `end` is the same
+shape without declaring any edge at all: its meaning *is* its status, and the
+parallel executor reads only `"error"` out of a child's status.
+
+The last file in the rule is the runtime's own. Two budgets bound a run, and
+on exhaustion both fell through to the ordinary result — so a valid 101-node
+chain ran 100 nodes and returned a success. A graph that declares more work
+than the runtime will do is the same divergence as one whose edges the runtime
+ignores; the budgets stay, and exhausting one is an error.
 
 Validation sits at two altitudes on purpose. Admission stops new invalid
 graphs entering; the engine checks again before it builds `node_map`, because
@@ -529,7 +537,43 @@ class TestAParallelChildIsRunOnceAndItsSuccessorsDiscarded:
         """The clearest one, and it needs no tool at all: the branch target is
         a real node, the branch resolves, and the executor discards it."""
         problems = graph_problems(self.FAN)
-        assert problems and any("side" in p for p in problems), problems
+        assert problems and any("choose" in p for p in problems), problems
+
+    def test_an_end_as_a_parallel_child_is_a_problem(self):
+        """`end` declares no edges, so the discarded-successor rule passes it
+        cleanly — and `end` is the one node type whose meaning is its status.
+
+        On the ordinary path `status == "end"` stops the workflow.
+        `_execute_parallel_nodes` reads only `"error"` out of a child's
+        status, so `"end"` is an ordinary successful child and the parent
+        walks on to its `after`. Measured on the graph below,
+        `graph_problems` returned `[]` and the run traced
+        `['fan', 'side']` — the node named `end` ended nothing.
+
+        SPEC §9.1: `end` produces the final response. That belongs where the
+        ordinary loop can see it.
+        """
+        problems = graph_problems({
+            "kind": "workflow.chat", "entrypoint": "fan", "nodes": [
+                {"id": "fan", "type": "parallel", "next": ["stop"],
+                 "after": "side"},
+                {"id": "stop", "type": "end"},
+                {"id": "side", "type": "end"},
+            ],
+        })
+        assert problems and any("stop" in p for p in problems), problems
+
+    def test_an_end_reached_by_after_is_the_normal_place_for_it(self):
+        """The control for the rule above, and the shape it steers operators
+        towards: termination belongs on the continuation."""
+        assert graph_problems({
+            "kind": "workflow.chat", "entrypoint": "fan", "nodes": [
+                {"id": "fan", "type": "parallel", "next": ["leaf"],
+                 "after": "stop"},
+                {"id": "leaf", "type": "tool_call", "tool": "llm.generic"},
+                {"id": "stop", "type": "end"},
+            ],
+        }) == []
 
     def test_a_tool_call_child_carrying_next_is_a_problem(self):
         assert graph_problems(self._fan_to({
@@ -648,6 +692,161 @@ class TestAParallelChildIsRunOnceAndItsSuccessorsDiscarded:
         monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.FAN)
         with pytest.raises(BadRequestError):
             await engine.run("wf", None, "hello", None, user_id="u")
+
+
+class TestAnExhaustedExecutionBudgetIsNotSuccess:
+    """The invariant one last time, with the runtime rather than the graph on
+    the wrong side of it.
+
+    Two budgets bound a run, and neither is wrong to exist:
+
+    ==============================  ==========================================
+    `max_steps`                     `min(100, len(node_map) * 2 + 10)` total
+    `max_visits_per_node`           `max(2, ceil(max_steps / len(node_map)))`
+    ==============================  ==========================================
+
+    What was wrong is what happened on exhaustion. The step budget is the
+    `while` condition, so the loop simply stopped with work still pending; the
+    visit budget logged `workflow_loop_detected` and `break`. Both then fell
+    through to the ordinary result — blocking returned a normal answer,
+    streaming emitted `message_done`.
+
+    Nothing pins node count at admission, so this is reachable with a
+    perfectly valid acyclic graph. Measured on a 101-node switch chain: 100
+    nodes ran, the `end` node never did, and the caller received a success
+    whose content was the placeholder "No response generated." A two-node
+    cycle did the same through the visit budget after 14 steps.
+
+    Which is this tranche's sentence exactly: the configuration says more work
+    remains, the runtime silently omits it, and the caller is told it worked.
+    The budgets stay. Exhausting one is now an error.
+    """
+
+    @staticmethod
+    def _chain(n):
+        """`n` switch nodes in a line, then an `end`. `n + 1` nodes."""
+        nodes = [
+            {"id": f"n{i}", "type": "switch",
+             "branches": [{"when": "true", "next": f"n{i + 1}"}]}
+            for i in range(n)
+        ]
+        nodes.append({"id": f"n{n}", "type": "end"})
+        return {"kind": "workflow.chat", "entrypoint": "n0", "nodes": nodes}
+
+    CYCLE = {
+        "kind": "workflow.chat",
+        "entrypoint": "a",
+        "nodes": [
+            {"id": "a", "type": "switch", "branches": [{"when": "true", "next": "b"}]},
+            {"id": "b", "type": "switch", "branches": [{"when": "true", "next": "a"}]},
+        ],
+    }
+
+    @pytest.fixture
+    def engine(self):
+        from liminallm.service.workflow import WorkflowEngine
+        from tests.test_workflow_retry_timeout import (
+            MockLLM,
+            MockRAG,
+            MockRedisCache,
+            MockRouter,
+            MockStore,
+        )
+
+        return WorkflowEngine(MockStore(), MockLLM(), MockRouter(), MockRAG(),
+                              cache=MockRedisCache())
+
+    @pytest.mark.asyncio
+    async def test_the_step_budget_is_reachable_with_a_valid_graph(self, engine):
+        """The premise: nothing refuses this graph, at either altitude."""
+        assert graph_problems(self._chain(100)) == []
+
+    @pytest.mark.asyncio
+    async def test_a_chain_past_the_step_budget_is_an_error(self, engine, monkeypatch):
+        monkeypatch.setattr(engine, "_load_workflow_for",
+                            lambda *a, **k: self._chain(100))
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        assert out.get("status") == "error", (
+            f"a run that stopped with work pending reported success: "
+            f"{out.get('content')!r}"
+        )
+        ran = [e.get("node") for e in out.get("workflow_trace") or []]
+        assert "n100" not in ran, "the premise changed: the chain now completes"
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_past_the_visit_budget_is_an_error(self, engine, monkeypatch):
+        """The other mechanism. It exits by `break`, not by the loop
+        condition, so it needs its own witness."""
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.CYCLE)
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        assert out.get("status") == "error", (
+            f"a run stopped by the loop guard reported success: "
+            f"{out.get('content')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_chain_inside_the_budget_still_completes(self, engine, monkeypatch):
+        """The control. Erroring on every run passes both witnesses above."""
+        monkeypatch.setattr(engine, "_load_workflow_for",
+                            lambda *a, **k: self._chain(3))
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        assert out.get("status") != "error", out
+        ran = [e.get("node") for e in out.get("workflow_trace") or []]
+        assert ran == ["n0", "n1", "n2", "n3"], ran
+
+    @pytest.mark.asyncio
+    async def test_streaming_errors_on_the_step_budget_and_does_not_finish(
+        self, engine, monkeypatch
+    ):
+        monkeypatch.setattr(engine, "_load_workflow_for",
+                            lambda *a, **k: self._chain(100))
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+        assert any(e.get("event") == "error" for e in events), events[-3:]
+        assert not any(e.get("event") == "message_done" for e in events), (
+            "the stream reported a finished answer after stopping early"
+        )
+
+    @pytest.mark.asyncio
+    async def test_streaming_errors_on_the_visit_budget_too(
+        self, engine, monkeypatch
+    ):
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.CYCLE)
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+        assert any(e.get("event") == "error" for e in events), events[-3:]
+        assert not any(e.get("event") == "message_done" for e in events), events[-3:]
+
+    @pytest.mark.asyncio
+    async def test_streaming_inside_the_budget_still_finishes(
+        self, engine, monkeypatch
+    ):
+        """The streaming control."""
+        monkeypatch.setattr(engine, "_load_workflow_for",
+                            lambda *a, **k: self._chain(3))
+        events = [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u")]
+        assert any(e.get("event") == "message_done" for e in events), events[-3:]
+        assert not any(e.get("event") == "error" for e in events), events
+
+    @pytest.mark.asyncio
+    async def test_an_end_reached_with_others_still_pending_is_not_an_error(
+        self, engine, monkeypatch
+    ):
+        """The narrow control that keeps the step-budget rule honest.
+
+        A list `next` can leave siblings queued when an `end` runs, so
+        "stopped with work pending" is not on its own the same thing as
+        "ran out of budget". The two are told apart by which one happened.
+        """
+        schema = {"kind": "workflow.chat", "entrypoint": "start", "nodes": [
+            {"id": "start", "type": "parallel", "next": ["leaf"], "after": "fin"},
+            {"id": "leaf", "type": "tool_call", "tool": "llm.generic"},
+            {"id": "fin", "type": "end"},
+        ]}
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        out = await engine.run("wf", None, "hello", None, user_id="u")
+        assert out.get("status") != "error", out
 
 
 class TestTheEngineRefusesGraphsItsSchemaWouldNowRefuse:
