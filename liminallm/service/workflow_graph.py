@@ -114,6 +114,47 @@ def _references(
                     yield f"node {node_id!r} branch {index}", branch["next"], False
 
 
+def _discarded_by_parallel(
+    node: Dict[str, Any], node_type: str, by_id: Dict[str, Dict[str, Any]]
+) -> Iterator[str]:
+    """Control flow a child of this node declares and the parallel throws away.
+
+    A third dimension: not what a node reads, but how it was reached.
+    `_execute_parallel_nodes` calls `_execute_node_with_retry` and discards the
+    successor list, so a child's `next`, `on_error`, `branches[].next` or
+    nested children resolve at validation and then execute as nothing.
+
+    The narrow reading of SPEC §9 — "fan-out to multiple nodes, then join" —
+    is that `parallel.next` names children that run once and `after` owns the
+    continuation. Making `parallel` a recursive subgraph executor instead is a
+    specification decision, so this refuses the graphs that would need one
+    rather than inventing the semantics.
+    """
+    if node_type != "parallel":
+        return
+    children = node.get("next")
+    # `_execute_node` wraps a string into one child, so both spellings mean
+    # the same thing here.
+    if isinstance(children, str):
+        children = [children]
+    if not isinstance(children, list):
+        return
+    parent_id = node.get("id")
+    for child_id in children:
+        child = by_id.get(child_id) if isinstance(child_id, str) else None
+        if child is None:
+            continue          # a dangling child is already reported as one
+        child_type = _node_type(child)
+        if child_type not in _NODE_EDGES:
+            continue          # an unusable type is already reported as one
+        for where, value, _list_ok in _references(child, child_type):
+            yield (
+                f"{where} names {value!r}, which never runs: {child_id!r} is "
+                f"a parallel child of {parent_id!r}, and the parallel "
+                f"executor discards a child's successors"
+            )
+
+
 def graph_problems(schema: Any) -> List[str]:
     """Every way the declared graph fails to match itself.
 
@@ -154,6 +195,10 @@ def graph_problems(schema: Any) -> List[str]:
     if not declared:
         return problems
 
+    # Keyed the way `node_map` is, last of a duplicate pair winning, so the
+    # parallel-child rule below looks at the node the executor would run.
+    by_id = {n["id"]: n for n in nodes if isinstance(n.get("id"), str) and n["id"]}
+
     # Only an *explicitly named* entrypoint has to resolve. Omitting the key
     # and starting at the first node is the engine's own behaviour; refusing
     # that would be a different bug. Present-but-empty is not omitted, though:
@@ -175,6 +220,7 @@ def graph_problems(schema: Any) -> List[str]:
             )
             continue
         problems.extend(_unread_fields(node, node_type))
+        problems.extend(_discarded_by_parallel(node, node_type, by_id))
         for where, value, list_ok in _references(node, node_type):
             targets = value if isinstance(value, list) else [value]
             if isinstance(value, list) and not list_ok:

@@ -14246,6 +14246,34 @@ exists, so routing every failure through it would send a failed node down the
 success path — the same defect one file over. The witness is a mutation that
 removes the guard.
 
+### The handoff had a boundary the first fix walked straight past
+
+Its own test said recovery after partial output was a separate question this
+tranche did not answer. The implementation answered it by accident: tokens are
+yielded as they arrive, so a node that streamed some output and *then* failed
+still took `on_error`. Measured — the client received both answers:
+
+```
+failed node emitted   "PARTIAL "
+then errored
+recovery emitted      "RECOVERED ANSWER"
+```
+
+One bubble, two answers, and a trace reading `['tool', 'recover', 'fin']`.
+
+The correct policy was already in the same file, one function away.
+`_stream_agent_files_node` tracks `emitted_tokens` for exactly this reason and,
+after partial output, keeps the partial answer rather than gluing a second one
+after it. The streamed `on_error` handoff now keeps the same boundary: zero
+tokens and an error edge means take it; one token or more means the stream
+terminates as it always did. A token that has been yielded is on the reader's
+screen, and nothing downstream can take it back.
+
+Two mutations, each killing only its own case: removing the guard kills the
+partial-output witness alone, and marking every node as having emitted kills
+only the zero-token recovery witnesses. Without the second, "never recover"
+would have passed the first.
+
 ### A reference has a shape, not only a target
 
 Checking that a reference *resolves* is half of it. The executor reads a list
@@ -14311,6 +14339,57 @@ so nothing had ever noticed. They were corrected to
 loosened: a fixture that cannot run is not evidence about a system that runs
 graphs.
 
+### And a third dimension: how the node was reached
+
+What a node type reads is not the whole answer either, because
+`_execute_parallel_nodes` calls `_execute_node_with_retry` and throws the
+successor list away:
+
+```python
+result, _ = await self._execute_node_with_retry(...)
+```
+
+So the same node declaring the same edge means one thing on the ordinary path
+and nothing at all as a parallel child. Measured:
+
+```
+fan:     parallel next=["choose"] after="join"
+choose:  switch true -> side
+side:    end
+join:    end
+
+graph_problems   []
+runtime          fan -> choose -> join;  `side` never ran
+```
+
+`choose` executed and returned `['side']`, and the parallel discarded it. The
+same shape covers a `tool_call` child's `next` and `on_error`, and a nested
+parallel's own children and `after`.
+
+The narrow reading is the one SPEC §9 supports — "fan-out to multiple nodes,
+then join" — so `parallel.next` names children that run once and `after` owns
+the continuation. Making `parallel` a recursive subgraph executor is a
+specification decision, not a bug fix, so validation refuses the graphs that
+would need one instead of inventing the semantics. The check derives from the
+same `_NODE_EDGES` table: whatever a child's own type would read is what the
+parallel discards.
+
+**The permanent `VALID` fixture was the warning sign, and it was missed.** Its
+parallel fanned into `work` and `other`, both declaring `next: "join"`, while
+the parallel itself declared `after: "join"`. The fixture therefore looked like
+it exercised a child's `next` when `after` was producing that continuation on
+its own and the two child edges contributed nothing. A positive control that
+passes for a reason other than the one it claims is a witness at the wrong
+altitude — the same failure mode as three vacuous witnesses earlier in this
+campaign, in a fixture rather than a test.
+
+**One witness pins the premise rather than the rule.** The reason to refuse
+these graphs is that the executor discards a child's successors, so a test
+runs the refused graph with the graph check disabled and asserts `side` never
+executes. If `parallel` ever becomes recursive, that test fails and says the
+rule above needs revisiting — rather than the rule quietly outliving its
+justification.
+
 ### An id that cannot name a node
 
 `node_map` is keyed by id and drops falsy keys, so a node declared with an
@@ -14345,16 +14424,24 @@ workflow takes precisely when it can least afford to stop silently.
 The two mutations that drop them from the edge set kill only their own
 witnesses, which is what says the pair is separated rather than covered twice.
 
-Twenty-six mutations, all killed. Two were retired rather than left surviving,
+Thirty-one mutations, all killed. Two were retired rather than left surviving,
 both for the same reason: they added code that cannot execute. Re-adding the
 engine's entrypoint repair cannot fire once the check above it has refused
 such an entrypoint, and the streaming equivalent was identical in effect to
 streaming simply not asking. A mutation that changes no behaviour says the
 code it adds is dead, not that the tests are weak.
 
-Nine anchors went stale across this tranche's four passes and the driver said
-so each time rather than reporting a survivor. That guard has now caught
+Eleven anchors went stale across this tranche's five passes and the driver
+said so each time rather than reporting a survivor. That guard has now caught
 something in every pass of this campaign.
+
+Several rules earned a **complementary pair** — one mutation that loses the
+rule and one that applies it too widely — because losing a rule and
+over-applying it are both wrong, and only one of them fails loudly. The
+parallel-child rule extended to the `after` target kills the control that says
+the rule is about the context and not the node. Marking every streamed node as
+having emitted a token kills the zero-token recovery witnesses, which "never
+recover" would otherwise have satisfied.
 
 **One mutation earned a witness rather than being explained away.** Reverting
 the node-type enum in the kind schema left the end-to-end admission test

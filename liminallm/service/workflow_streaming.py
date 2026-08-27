@@ -179,6 +179,12 @@ class WorkflowStreamingMixin:
                     node, tenant_id=tenant_id
                 )
                 failure_event = None
+                # Once a token has reached the client it is on their screen,
+                # so recovery would append a second answer to the same bubble
+                # rather than replace the first. `_stream_agent_files_node`
+                # already keeps this boundary for the same reason; the
+                # `on_error` handoff needs it too.
+                emitted_tokens = False
 
                 if tool_result is None:
                     node_stream = (
@@ -210,6 +216,7 @@ class WorkflowStreamingMixin:
                     )
                     async for event in node_stream:
                         if event["event"] == "token":
+                            emitted_tokens = True
                             yield event
                         elif event["event"] == "trace":
                             # Tool-activity notices from the attachment agent
@@ -265,14 +272,14 @@ class WorkflowStreamingMixin:
                         "event": "trace",
                         "data": {"workflow_trace": workflow_trace[-1]},
                     }
-                    if self._error_edge(node):
+                    if self._error_edge(node) and not emitted_tokens:
                         pending.extend(self._successors(node, tool_result))
                         continue
-                    # Nowhere declared to go. The stream ends where it always
-                    # did, rather than falling through to `next`: the chooser
-                    # answers `next` when no error edge exists, and handing a
-                    # failure to the success path gives it outputs the node
-                    # never produced.
+                    # Nowhere to go, or nowhere left to go. The stream ends
+                    # where it always did, rather than falling through to
+                    # `next`: the chooser answers `next` when no error edge
+                    # exists, and handing a failure to the success path gives
+                    # it outputs the node never produced.
                     yield failure_event or self._error_event(
                         "server_error",
                         tool_result.get("content") or tool_result.get("error", ""),
