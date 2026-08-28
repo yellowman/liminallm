@@ -2050,3 +2050,106 @@ class TestTheCanonicalOutputCoversEveryStreamableHandler:
             f"the control half: the blocking result should satisfy its own "
             f"schema: {blocking.get('workflow_trace')}"
         )
+
+
+class TestAnAbortedHandleSendsNothing:
+    """The SDK retries transport errors, and the socket shutdown that kills
+    one blocked request reads as exactly that — so without a refusal at the
+    send seam, aborting request one *started* request two, blocked in the
+    same place. The refusal is what bounds teardown to the request already
+    in flight rather than the SDK's whole retry budget: after an abort, the
+    client must not open another connection at all.
+    """
+
+    def test_no_connection_is_opened_after_an_abort(self):
+        import socket as socketmod
+        import threading
+
+        from liminallm.service.model_backend import (
+            ArmingClient,
+            StreamAborted,
+            StreamAbortHandle,
+            _stream_handle,
+        )
+
+        accepts = []
+        srv = socketmod.socket()
+        srv.setsockopt(socketmod.SOL_SOCKET, socketmod.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+
+        def count():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                accepts.append(1)
+                conn.close()
+
+        threading.Thread(target=count, daemon=True).start()
+        port = srv.getsockname()[1]
+
+        handle = StreamAbortHandle()
+        handle.abort()
+        client = ArmingClient(timeout=5.0)
+        try:
+            with _stream_handle(handle):
+                with pytest.raises(StreamAborted):
+                    client.post(f"http://127.0.0.1:{port}/v1/x", json={})
+            assert not accepts, (
+                "an aborted stream's client opened a fresh connection: the "
+                "abort of one request started the next"
+            )
+        finally:
+            client.close()
+            srv.close()
+
+
+class TestTheChatGateRefusesASocketlessResponse:
+    """The gemini socketless witness proves `_arm_or_refuse` itself; this
+    proves the OpenAI-compatible chat branch actually consults it. A stream
+    whose response exposes no socket must be refused before any token —
+    mutation showed removing that branch's gate was invisible to every
+    other test, because the SDK witnesses either run over real sockets
+    (armed at connect) or use fakes with no response object at all.
+    """
+
+    def test_a_socketless_chat_response_is_refused(self):
+        import httpx
+
+        from liminallm.service.model_backend import ApiAdapterBackend
+
+        backend = ApiAdapterBackend("m", api_key="t", base_url="http://127.0.0.1:9")
+        backend._responses_ok = False  # pin the chat branch
+
+        class FakeStream:
+            #: A real httpx response, but with no network_stream behind it —
+            #: the shape a socketless transport hands the SDK.
+            response = httpx.Response(200)
+
+            def __iter__(self):
+                from types import SimpleNamespace as NS
+                return iter([
+                    NS(choices=[NS(delta=NS(content="hi"))], usage=None),
+                ])
+
+            def close(self):
+                pass
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                return FakeStream()
+
+        class FakeClient:
+            chat = type("Chat", (), {"completions": FakeCompletions()})()
+
+        backend.client = FakeClient()
+        backend._active_api_key = "t"  # keep _ensure_client from rebuilding
+        events = list(
+            backend.generate_stream([{"role": "user", "content": "x"}], [])
+        )
+        assert not [e for e in events if e.get("event") == "token"], (
+            f"a socketless chat response streamed anyway: {events}"
+        )
+        assert events and events[-1]["event"] == "error", events

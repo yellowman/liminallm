@@ -15673,3 +15673,33 @@ before the node even started. Pre-existing, unrelated to the streaming
 seams, and its own fix: the probe belongs off the loop with a budget
 fallback while it resolves. The witnesses pin `_context_window` to keep
 it out of their measurement.
+
+### The mutation tranche for the round: 32 written, 32 killed
+
+Three needed intervention, and each earned its keep:
+
+* The chat-branch arm-or-refuse mutation first **broke the build instead of
+  measuring** — its anchor's first match was a *prefix* of the responses
+  branch's block, whose `return True` lost its `return`. Re-anchored, it
+  then **survived**: no witness exercised a socketless response through the
+  SDK chat branch, because the SDK witnesses run over real sockets or fakes
+  with no response object. It now has one, and dies to it.
+* The "attempt reconstructs the result" mutation was **dead code** — with
+  both handlers always emitting `tool_result`, a reconstruction fallback is
+  unreachable and no test can see it. Retired, replaced by the two
+  measurable sides of the seam: each handler's emission removed separately,
+  killed by the canonical witness and by six streaming controls.
+* The send-refusal mutation **survived its first run** because the
+  attach-kills-new-connections path makes the refusal redundant for
+  eventual teardown — the abort still wins, just after the SDK's whole
+  retry budget. What the refusal actually buys is that an aborted client
+  opens no further connection at all; the witness now asserts exactly that
+  (a counting server sees zero accepts after an abort), deterministically.
+
+One gap accepted and named rather than witnessed: the responses-branch
+call site of `_arm_or_refuse` has no socketless witness of its own. The
+gate function is killed through the gemini witness and the chat branch
+through its new one; the responses branch shares both mechanisms and its
+gate call is structural. A socketless witness through
+`_stream_via_responses` would need a second SDK-shaped fake for marginal
+return; recorded here so the decision is visible.
