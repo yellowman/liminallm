@@ -1737,3 +1737,316 @@ class TestTheStreamedResultCarriesItsGrounding:
             f"the streamed turn dropped its grounding: "
             f"{done[-1]['data'].get('context_snippets')}"
         )
+
+
+def _never_headers_server():
+    """A provider that accepts the TCP connection and never sends a byte.
+
+    The reader is then blocked *entering* the stream — before any response
+    object, and before `attach_response` has a socket to arm.
+    """
+    import socket as socketmod
+    import threading
+    import time as _time
+
+    srv = socketmod.socket()
+    srv.setsockopt(socketmod.SOL_SOCKET, socketmod.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+
+    def silent():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(
+                target=lambda c=conn: _time.sleep(30), daemon=True
+            ).start()
+
+    threading.Thread(target=silent, daemon=True).start()
+    return srv, srv.getsockname()[1]
+
+
+class TestCancellationIsProvenForTheWholeAttempt:
+    """`supports_stream_cancel` promises an interrupt for the attempt, not
+    for the part of it that happens after response headers arrive.
+
+    Two gaps, both before `attach_response` succeeds. A provider that accepts
+    the connection and stalls pre-headers leaves the producer blocked with no
+    socket armed, so `abort()` records a flag and interrupts nothing — and
+    `close()` then forgot the producer, so the workflow returned its timeout
+    while the provider operation ran on. And a transport that exposes no
+    socket armed nothing, silently, while the backend stayed advertised as
+    cancellable. Same waiter-versus-work defect, moved earlier in the HTTP
+    lifecycle.
+    """
+
+    def _engine_with(self, store, llm, tag, node_extra):
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u(tag)}@t.local", tenant_id=_u(tag))
+        wf = store.create_artifact(
+            "workflow", _u(f"{tag}wf"),
+            {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
+                {"id": "call", "type": "tool_call", "tool": "llm.generic",
+                 **node_extra},
+                {"id": "fin", "type": "end"},
+            ]},
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, llm, rt.router, rt.rag, cache=rt.cache)
+        held = {}
+        opener = engine.invocations.open
+
+        def spy(*a, **k):
+            held["invocation"] = inv = opener(*a, **k)
+            return inv
+
+        engine.invocations.open = spy
+        return engine, wf, u, held
+
+    @pytest.mark.asyncio
+    async def test_a_preheaders_stall_is_dead_when_the_timeout_returns(
+        self, store
+    ):
+        """Gemini path: the node times out at 400ms; when `run_streaming`
+        returns, the producer — and with it the provider operation — must
+        already be dead, not running until the client's own 60s timeout."""
+        import time as _time
+
+        from liminallm.service.gemini_backend import GeminiBackend
+        from liminallm.service.llm import LLMService
+
+        srv, port = _never_headers_server()
+        try:
+            llm = LLMService(
+                "gemini-test",
+                backend=GeminiBackend(
+                    "gemini-test", api_key="k",
+                    base_url=f"http://127.0.0.1:{port}",
+                ),
+            )
+            # Pin the window: `context_window` is lazily probed against the
+            # provider on the prompt-budget path, and against this stalled
+            # one that probe blocks for the client's read timeout. A real
+            # engine finding, but a pre-existing one — this witness measures
+            # the streamed producer, not the probe.
+            llm.backend._context_window = 8192
+            engine, wf, u, held = self._engine_with(
+                store, llm, "ph",
+                {"timeout_ms": 400, "max_retries": 0, "next": "fin"},
+            )
+            start = _time.monotonic()
+            [e async for e in engine.run_streaming(
+                wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+            elapsed = _time.monotonic() - start
+            assert elapsed < 5.0, (
+                f"the turn took {elapsed:.2f}s against a 400ms node timeout"
+            )
+            alive = held["invocation"].resources.live_producers()
+            assert not alive, (
+                f"the workflow returned its timeout while the provider "
+                f"operation ran on: producers still alive: {alive}"
+            )
+        finally:
+            srv.close()
+
+    @pytest.mark.asyncio
+    async def test_the_sdk_path_is_dead_when_the_timeout_returns(self, store):
+        """The OpenAI-compatible path, which additionally retries: killing
+        one blocked request must not let the SDK start a fresh one that
+        blocks in the same place."""
+        import time as _time
+
+        from liminallm.service.llm import LLMService
+        from liminallm.service.model_backend import ApiAdapterBackend
+
+        srv, port = _never_headers_server()
+        try:
+            backend = ApiAdapterBackend(
+                "m", api_key="t", base_url=f"http://127.0.0.1:{port}"
+            )
+            backend._responses_ok = False
+            backend._context_window = 8192  # same probe pin as the test above
+            llm = LLMService("m", backend=backend)
+            engine, wf, u, held = self._engine_with(
+                store, llm, "ps",
+                {"timeout_ms": 400, "max_retries": 0, "next": "fin"},
+            )
+            start = _time.monotonic()
+            [e async for e in engine.run_streaming(
+                wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+            elapsed = _time.monotonic() - start
+            assert elapsed < 5.0, (
+                f"the turn took {elapsed:.2f}s against a 400ms node timeout"
+            )
+            alive = held["invocation"].resources.live_producers()
+            assert not alive, (
+                f"the workflow returned its timeout while the provider "
+                f"operation ran on: producers still alive: {alive}"
+            )
+        finally:
+            srv.close()
+
+    @pytest.mark.asyncio
+    async def test_a_socketless_transport_cannot_stream_unarmed(self):
+        """A transport that exposes no socket arms nothing. The stream must
+        refuse before the first token, or prove its death on stop — silence
+        plus `supports_stream_cancel = True` is the one forbidden pairing."""
+        import threading
+
+        import httpx
+
+        from liminallm.service.gemini_backend import GeminiBackend
+        from liminallm.service.node_attempt import StreamPump
+
+        release = threading.Event()
+
+        class BlockingByteStream(httpx.SyncByteStream):
+            """One SSE chunk, then a read that only an interrupt would end."""
+
+            def __iter__(self):
+                yield (b'data: {"candidates":[{"content":{"parts":'
+                       b'[{"text":"hi"}]}}]}\n\n')
+                release.wait(8.0)
+
+            def close(self):
+                release.set()
+
+        class SocketlessTransport(httpx.BaseTransport):
+            def handle_request(self, request):
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=BlockingByteStream(),
+                )
+
+        backend = GeminiBackend(
+            "gemini-test", api_key="k",
+            transport=SocketlessTransport(),
+        )
+        assert backend.supports_stream_cancel is True
+        pump = StreamPump(
+            lambda: backend.generate_stream(
+                [{"role": "user", "content": "x"}], []
+            ),
+            label="socketless",
+        ).start()
+        events = pump.events()
+        first = await asyncio.wait_for(events.__anext__(), 5.0)
+        got_token = first.get("event") == "token"
+        dead = await pump.wait_dead(2.0)
+        await events.aclose()
+        assert (not got_token) or dead, (
+            "an unarmed stream produced tokens and then could not be "
+            "stopped: the first event was "
+            f"{first!r} and the producer survived `stop()`"
+        )
+
+
+class TestTheCanonicalOutputCoversEveryStreamableHandler:
+    """`agent.files_v1` streams too, and its blocking result carries
+    `artifacts` and `injection_findings` beside the four keys the streamed
+    reconstruction kept. A strict schema for the real result must get the
+    same verdict on both transports — the previous fix repaired exactly
+    `llm.generic` and left the same defect one handler over.
+    """
+
+    AGENT_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string"},
+            "usage": {"type": "object"},
+            "context_snippets": {"type": "array"},
+            "tool_calls": {"type": "array"},
+            "artifacts": {"type": "array"},
+            "injection_findings": {"type": "array"},
+        },
+        "required": [
+            "content", "usage", "context_snippets", "tool_calls",
+            "artifacts", "injection_findings",
+        ],
+        "additionalProperties": False,
+    }
+
+    #: What the worker's agent loop returns — the blocking tool result.
+    RESULT = {
+        "content": "the answer",
+        "usage": {"total_tokens": 3},
+        "context_snippets": ["s1"],
+        "tool_calls": [{"tool": "file_search", "arguments": {}}],
+        "artifacts": ["artifact-1"],
+        "injection_findings": [],
+    }
+
+    @pytest.mark.asyncio
+    async def test_one_result_one_schema_one_verdict(self, store, monkeypatch):
+        from liminallm.service.llm import LLMService
+        from liminallm.service.model_backend import StubBackend
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('ag')}@t.local", tenant_id=_u("agt"))
+        name = _u("my.agent")
+        _tool(store, name, "agent.files_v1", owner=u.id, visibility="private",
+              output_schema=self.AGENT_SCHEMA)
+        wf = store.create_artifact(
+            "workflow", _u("agwf"), _wf(name),
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(
+            store, LLMService("t", backend=StubBackend()), rt.router, rt.rag,
+            cache=rt.cache,
+        )
+
+        # One completed tool result, handed to both transports at the same
+        # seam. Blocking gets it whole; streaming gets the `stream_final`
+        # variant and finishes the last turn itself.
+        def serve(_invocation, _tool_name, plan, _context, _limits, **_kw):
+            if plan.get("stream_final"):
+                return {
+                    **{k: v for k, v in self.RESULT.items() if k != "content"},
+                    "messages": [{"role": "user", "content": "q"}],
+                    "content": "",
+                }
+            return dict(self.RESULT)
+
+        monkeypatch.setattr(engine, "_serve_invocation", serve)
+        monkeypatch.setattr(
+            engine, "_build_agent_context",
+            lambda *a, **k: (
+                [{"role": "user", "content": "q"}],
+                [{"type": "function", "function": {"name": "file_search"}}],
+                None, [], ["s1"],
+            ),
+        )
+        engine.llm.stream_messages = lambda *a, **k: iter([
+            {"event": "token", "data": "the answer"},
+            {"event": "message_done",
+             "data": {"content": "the answer", "usage": {"total_tokens": 3}}},
+        ])
+
+        blocking = await engine.run(
+            wf.id, None, "q", None, user_id=u.id, tenant_id=u.tenant_id)
+        blocking_ok = not any(
+            entry.get("status") == "error"
+            for entry in blocking.get("workflow_trace", [])
+        )
+
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "q", None, user_id=u.id, tenant_id=u.tenant_id)]
+        streaming_ok = not any(e.get("event") == "error" for e in events)
+
+        assert blocking_ok == streaming_ok, (
+            f"one result, one schema, two verdicts: blocking "
+            f"{'passed' if blocking_ok else 'failed'} and streaming "
+            f"{'passed' if streaming_ok else 'failed'} — the streamed "
+            f"reconstruction dropped fields the tool produced. "
+            f"streaming events: {[e for e in events if e.get('event') == 'error']}"
+        )
+        assert blocking_ok, (
+            f"the control half: the blocking result should satisfy its own "
+            f"schema: {blocking.get('workflow_trace')}"
+        )
