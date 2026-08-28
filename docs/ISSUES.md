@@ -15473,3 +15473,107 @@ said instead of a bare error appended to it.
 A streamed refusal reports its own code. `validation_error` and `forbidden`
 flattened to `server_error` told the caller to retry something that would fail
 identically.
+
+## The cancel capability was fail-open, and the lease was missing
+
+Review of the previous entry's green found two HIGHs and one MEDIUM. All
+three were real; each was reproduced before the fix. The shape of the first
+two is worth recording because both were *unprovable claims defaulting to
+true* — the exact opposite of how this codebase treats authority.
+
+### `stream_is_cancellable` claimed an ability the shipped backends lack
+
+The default was "cancellable unless declared otherwise", on the theory that
+any generator stops between events. The shipped network backends block
+*inside* an event: the OpenAI-compatible SDK in synchronous chunk iteration
+under a 30s client timeout, native Gemini in `iter_lines()` under a 60s
+one. A stop flag is read between events, so a `timeout_ms: 200` stopped
+the waiter at 200ms while the provider request ran on for up to the
+provider's own timeout — precisely the waiter-versus-work distinction the
+refactor claimed to have closed.
+
+Measured before choosing the fix, with a local provider that stalls
+mid-stream:
+
+```
+resp.close                   reader still blocked after 4s
+client.close                 reader still blocked after 4s
+network_stream.close         reader still blocked after 4s
+raw socket .close()          reader still blocked after 4s
+raw socket .shutdown(RDWR)   reader returns immediately
+```
+
+`close()` drops a reference to the descriptor; the blocked `recv` holds its
+own. `shutdown()` tears the connection down under it. The same handle is
+reachable through both SDKs (`response.extensions["network_stream"]
+.get_extra_info("socket")`), verified by execution against a stall server
+on both.
+
+So the capability now fails closed — undeclared means no, and the node runs
+on the ordinary executor with its answer in the final `message_done` — and
+a declaration is backed by a real interrupt: `StreamAbortHandle` carries
+the in-flight response's socket, `CancellableStream.abort()` shuts it down,
+and `StreamPump.stop()` aborts the read in flight rather than only the next
+one. One incidental defect fell out: `LLMService.generate_stream` wrapped
+the backend's iterator in a `yield from` generator, which hid the abort.
+
+Each declaring network backend now has a witness against a stalling
+provider: first token through, stop, producer confirmably dead in a
+fraction of the stall.
+
+The fallback rationale was also overclaimed. "The ordinary executor runs
+the body in a worker a kill really does end" is false for host tools:
+`llm.generic` runs in the parent's serve thread, and killing the worker
+does not interrupt a blocked parent-side generation. What is actually
+promised — and now witnessed — is that the deadline binds: the node fails
+at `timeout_ms`, the late body runs on as bounded authorityless work, its
+answer is not delivered, and a retry is refused until the previous attempt
+is confirmed dead.
+
+### A streamed attempt was not an `Invocation` attempt
+
+`begin_attempt`/`end_attempt` never ran on the streamed path. The worker
+spawn opens the lease for blocking attempts; streaming spawned no worker
+and opened nothing. Producer liveness looked like the lease — the
+peak-concurrency witness proved attempt two never overlaps attempt one —
+but liveness answers "is it running beside me", not "may it run at all".
+
+The concrete bad state, reproduced: after a pre-token failure the driver
+calls `revoke("retry")`; `Invocation.revoke` finds `_current is None`,
+reads that as "nothing has started", and deliberately cancels the whole
+execution so a pre-spawn revoke cannot be forgotten. The streamed retry
+then called the provider anyway — two calls with `invocation.cancelled`
+true during the second, and three after an explicit cancel, because
+nothing on the path asked.
+
+The driver now opens a lease per attempt for attempt kinds that carry none
+of their own (`NodeAttempt.needs_lease` — streamed yes, blocking no), ends
+it on every way out, and treats `LeaseRevoked` from `begin_attempt` as the
+cancellation it is. A cancelled execution gets no further provider calls,
+and `revoke("retry")` is attempt-scoped again.
+
+### Streaming validated a different object than blocking
+
+Blocking validates the tool's own result — `{content, usage,
+context_snippets}` for `llm.generic`. Streaming validated a reconstruction
+with a `status` key the tool never produced, so a strict schema
+(`additionalProperties: false`) written for the real output passed
+blocking and failed streaming. Reproduced with one schema and one output.
+
+`tool_postflight` is now extracted from `_invoke_tool` and both paths feed
+it the raw tool-result shape; the node's `status` is added after
+validation. The streamed node also reports its grounding now — its
+`message_done` previously came straight from the backend, which never saw
+the retrieval, so the streamed turn's `context_snippets` were empty where
+the blocking turn's were not.
+
+### Test doubles, again
+
+Two streaming doubles (`_FailsMidStreamBackend`, `_FetchingBackend`)
+declared nothing and would have silently stopped exercising the streamed
+path under the fail-closed default. Both now declare the capability
+explicitly, with a comment saying why that is honest for an in-memory
+generator. The §V rule stands: a hand-written double answers capability
+questions by not having the attribute, and every capability the engine
+learns to ask about is a question every double answers wrong until
+someone notices.
