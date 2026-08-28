@@ -57,6 +57,9 @@ def _backend(client) -> APIBackend:
     b._active_api_key = "k"
     b._responses_ok = None
     b.client = client
+    # None on purpose: streaming prefers `_stream_client` and falls back to
+    # `.client` exactly so a hand-installed double stays on the path it fakes.
+    b._stream_client = None
     b.provider = "openai"
     from liminallm.config import get_provider_capabilities
 

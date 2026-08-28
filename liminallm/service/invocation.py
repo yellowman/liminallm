@@ -41,7 +41,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol
 
 from liminallm.logging import get_logger
 
@@ -266,6 +266,32 @@ class _Child:
     leader_reaped: bool = False
 
 
+class Producer(Protocol):
+    """Work this execution started in a thread of *this* process.
+
+    A worker is a process and a kill ends it. A streamed producer is a thread,
+    and nothing ends a Python thread from outside — so it is asked to stop and
+    then asked whether it did, and an execution is not torn down until it says
+    yes. Registering it here rather than beside the streaming path is the whole
+    point: one revoke reaches everything an attempt started, whatever kind of
+    thing it is.
+
+    A producer may additionally expose `cancellation_proven() -> bool` —
+    true when a stop can interrupt its read in flight, not only its next
+    event. Terminal teardown waits for exactly those; see `live_producers`.
+    """
+
+    def stop(self) -> None: ...
+
+    def alive(self) -> bool: ...
+
+
+@dataclass
+class _Producer:
+    producer: Producer
+    label: str
+
+
 class ResourceRegistry:
     """Everything a logical execution spawned or created, so it can be undone.
 
@@ -274,12 +300,73 @@ class ResourceRegistry:
     children the broker starts on the worker's behalf are the *parent's*
     children — not in the worker's group, and they survive killing it — so they
     are registered one by one and killed one by one.
+
+    In-process producers are the third kind, and they are not children at all.
+    See `Producer`.
     """
 
     def __init__(self) -> None:
         self._children: Dict[int, _Child] = {}
+        self._producers: List[_Producer] = []
         self._paths: List[str] = []
         self._lock = threading.RLock()
+
+    def add_producer(self, producer: Producer, label: str) -> None:
+        with self._lock:
+            self._producers.append(_Producer(producer=producer, label=label))
+
+    def stop_producers(self) -> int:
+        """Ask every producer to stop. Returns how many were still running.
+
+        A request, not a kill — see `Producer`. `live_producers` is the answer
+        about whether it was honoured.
+        """
+        stopped = 0
+        with self._lock:
+            producers = list(self._producers)
+        for entry in producers:
+            if not entry.producer.alive():
+                continue
+            stopped += 1
+            try:
+                entry.producer.stop()
+            except Exception as exc:  # noqa: BLE001 - stopping is best effort
+                logger.warning(
+                    "producer_stop_failed", producer=entry.label, error=str(exc)
+                )
+        return stopped
+
+    def live_producers(self, *, proven_only: bool = False) -> List[str]:
+        """Producers that have not returned yet, by label.
+
+        `proven_only` narrows to producers whose cancellation is proven —
+        an interrupt is armed, so their death after a stop is prompt. The
+        terminal teardown waits on exactly that set: a proven claim is
+        cashed rather than forgotten, and an unproven producer is not
+        allowed to hold the caller for a read nothing can end.
+        """
+        with self._lock:
+            producers = list(self._producers)
+        alive = [
+            entry.label
+            for entry in producers
+            if entry.producer.alive()
+            and (not proven_only or self._proven(entry.producer))
+        ]
+        if not alive:
+            with self._lock:
+                self._producers = [
+                    entry for entry in self._producers if entry.producer.alive()
+                ]
+        return alive
+
+    @staticmethod
+    def _proven(producer: "Producer") -> bool:
+        check = getattr(producer, "cancellation_proven", None)
+        try:
+            return bool(check()) if callable(check) else False
+        except Exception:  # noqa: BLE001 - an exotic producer answers "no"
+            return False
 
     def add_child(
         self,
@@ -357,6 +444,7 @@ class ResourceRegistry:
         `os.kill` whenever the target does not lead the expected group, which
         is precisely what a reissued pid looks like.
         """
+        self.stop_producers()
         signalled: List[int] = []
         for child in self.children():
             if child.leader_reaped:
@@ -672,13 +760,30 @@ class Invocation:
             self._revoke_reason = reason
         self.revoke(reason)
 
-    def terminate(self, *, timeout: float = TERMINATION_TIMEOUT_SECONDS) -> bool:
+    def terminate(
+        self,
+        *,
+        timeout: float = TERMINATION_TIMEOUT_SECONDS,
+        producers: bool = True,
+    ) -> bool:
         """Kill and reap the whole tree. True once nothing of it is left.
 
         A retry calls this and honours the answer. That is the entire contract:
         attempt *n+1* may not start while attempt *n* still has a process, or
         the two share a working directory, a sandbox child, and an idea of
         whose output is whose.
+
+        `producers=False` narrows the *wait* to producers whose cancellation
+        is proven — never the stop, which `kill_all` has already done. The
+        retry precondition needs every producer dead and must pay for it;
+        ending the execution waits only where the wait is cheap: an armed
+        stream's abort interrupts the read in flight, so its death is prompt,
+        and the workflow must not report a timeout while that provider
+        operation still runs. A producer with nothing armed cannot be made
+        to return, and holding the caller for it would hand back the very
+        stall the timeout refused — it stays a daemon thread with its stop
+        flag set, excluded from this wait, and the streamed path refuses to
+        produce tokens through such a stream in the first place.
 
         The scratch goes with the processes, and `workdir` is cleared with it.
         Keeping the directory across attempts would hand the retry a
@@ -691,7 +796,14 @@ class Invocation:
         self.resources.kill_all()
         deadline = time.monotonic() + timeout
         while True:
+            # Producers count as alive for exactly the reason children do. A
+            # thread still inside `next()` is still writing the answer the next
+            # attempt is about to replace, and "nothing of it is left" is false
+            # while it is.
             alive = self.resources.live_children()
+            alive = alive + self.resources.live_producers(
+                proven_only=not producers
+            )
             if not alive:
                 self.resources.cleanup_paths()
                 self.session.pop("workdir", None)
@@ -720,7 +832,7 @@ class Invocation:
                 return
             self._closed = True
         self.cancel("closed")
-        self.terminate()
+        self.terminate(producers=False)
         self.resources.cleanup_paths()
         registry = self.registry
         if registry is not None:

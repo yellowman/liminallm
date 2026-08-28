@@ -32,6 +32,11 @@ from liminallm.service.embeddings import (
     validated_embedding,
 )
 from liminallm.service.errors import BadRequestError, NotFoundError
+from liminallm.service.tool_namespace import (
+    ResolvedWorkflow,
+    ToolDescriptor,
+    ToolResolutionScope,
+)
 from liminallm.storage.common import (
     blend_centroid,
     clamp_success_score,
@@ -691,20 +696,10 @@ class PostgresStore:
         """Seed default artifacts using common schema definitions."""
         existing = self.list_artifacts()
 
-        # Seed default chat workflow if not present
-        if not any(artifact.name == "default_chat_workflow" for artifact in existing):
-            default_schema = get_default_chat_workflow_schema()
-            self.create_artifact(
-                "workflow",
-                "default_chat_workflow",
-                default_schema,
-                "LLM-only chat workflow defined as data.",
-                visibility="global",
-                version_author="system_llm",
-                change_note="Seeded default workflow",
-            )
-
-        # Seed default tool specs if not present
+        # Tools first: the default workflow references four of them, and a
+        # workflow is now refused if it names a tool its audience cannot
+        # reach. Seeded the other way round, a fresh database rejected its own
+        # defaults.
         seeded_tools = {
             art.schema.get("name")
             for art in existing
@@ -721,6 +716,19 @@ class PostgresStore:
                 visibility="global",
                 version_author="system_llm",
                 change_note="Seeded default tool spec",
+            )
+
+        # Seed default chat workflow if not present
+        if not any(artifact.name == "default_chat_workflow" for artifact in existing):
+            default_schema = get_default_chat_workflow_schema()
+            self.create_artifact(
+                "workflow",
+                "default_chat_workflow",
+                default_schema,
+                "LLM-only chat workflow defined as data.",
+                visibility="global",
+                version_author="system_llm",
+                change_note="Seeded default workflow",
             )
 
     # preference events
@@ -2691,6 +2699,148 @@ class PostgresStore:
             )
         return conversations
 
+    # tool references
+    def _resolve_tool_spec(
+        self, conn, name: str, scope: ToolResolutionScope
+    ) -> Tuple[Optional[ToolDescriptor], Optional[str]]:
+        """The one tool spec `name` means in `scope`, or why it means none.
+
+        A point query, not a page of `list_artifacts`. That listing returns
+        100 rows ordered `created_at DESC`, which gave "first matching name"
+        two accidental meanings: a referenced tool could fall off the page and
+        become unresolvable while visible and undeleted, and two rows sharing
+        a name were separated by whichever was newer. Neither is an authority
+        rule, and there is no name-uniqueness constraint to lean on.
+
+        Takes the caller's connection rather than opening one. Admission runs
+        inside transactions already holding the artifact and patch rows, and
+        reaching for a second pool slot there would put a resource order
+        beside the lock order those transactions were fixed to respect.
+
+        Referenced rows are read, not locked. A tool retired after admission is
+        a later configuration change and the runtime check is what catches it;
+        a lifetime lock here would buy a guarantee nothing asked for.
+        """
+        for tier in scope.tiers:
+            if tier == "private":
+                # An ownerless row cannot be shown to be anyone's.
+                if not scope.owner_user_id:
+                    continue
+                predicate = "a.visibility = 'private' AND a.owner_user_id = %s"
+                params: List[Any] = [name, scope.owner_user_id]
+            elif tier == "shared":
+                # `shared` is scoped through the owner's tenant — `artifact`
+                # has no tenant column — so an ownerless shared row reaches no
+                # tenant, exactly as listing already treats it.
+                if not scope.tenant_id:
+                    continue
+                predicate = "a.visibility = 'shared' AND u.tenant_id = %s"
+                params = [name, scope.tenant_id]
+            else:
+                predicate = "a.visibility = 'global'"
+                params = [name]
+            rows = conn.execute(
+                "SELECT a.id, a.schema, a.owner_user_id, u.role AS owner_role "  # nosec B608 - fragments are source literals; values are always bound via %s
+                "FROM artifact a LEFT JOIN app_user u ON u.id = a.owner_user_id "
+                "WHERE a.type = 'tool' AND a.schema->>'name' = %s AND " + predicate,
+                tuple(params),
+            ).fetchall()
+            if not rows:
+                continue
+            if len(rows) > 1:
+                # Fail closed rather than let the row order pick a body.
+                return None, "names more than one tool spec"
+            row = rows[0]
+            schema = row["schema"]
+            if isinstance(schema, str):
+                schema = json.loads(schema or "{}")
+            owner_id = row["owner_user_id"]
+            return (
+                ToolDescriptor(
+                    name=name,
+                    schema=schema if isinstance(schema, dict) else {},
+                    artifact_id=str(row["id"]),
+                    owner_user_id=str(owner_id) if owner_id else None,
+                    owner_role=row["owner_role"],
+                ),
+                None,
+            )
+        return None, "names no tool this workflow can reach"
+
+    def resolve_tool_spec(
+        self, name: str, scope: ToolResolutionScope
+    ) -> Tuple[Optional[ToolDescriptor], Optional[str]]:
+        """`_resolve_tool_spec` for callers outside a transaction.
+
+        Canonical state every time. There is deliberately no cache in front of
+        this: a process-local one built at startup used to answer for an
+        artifact that had since been deleted, which is a cache creating
+        authority rather than accelerating a lookup.
+        """
+        with self._connect() as conn:
+            return self._resolve_tool_spec(conn, name, scope)
+
+    def _tool_reference_problems(
+        self, conn, type_: str, schema: Any, scope: ToolResolutionScope
+    ) -> List[str]:
+        """Every `nodes[].tool` this workflow declares that it cannot execute.
+
+        Two stages of one claim: the name must resolve to exactly one spec in
+        this workflow's namespace, and that spec must name a handler something
+        can actually run.
+        """
+        if type_ != "workflow" or not isinstance(schema, dict):
+            return []
+        nodes = schema.get("nodes")
+        if not isinstance(nodes, list):
+            return []
+        problems: List[str] = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if node.get("type", "tool_call") != "tool_call":
+                continue
+            name = node.get("tool")
+            if not isinstance(name, str) or not name:
+                continue  # shape is the kind schema's job
+            descriptor, why = self._resolve_tool_spec(conn, name, scope)
+            if why is not None:
+                problems.append(f"node {node.get('id')!r} tool {name!r} {why}")
+            elif not descriptor.executable:
+                problems.append(
+                    f"node {node.get('id')!r} tool {name!r} names handler "
+                    f"{descriptor.handler!r}, which nothing executes"
+                )
+        return problems
+
+    def _check_tool_references(
+        self, conn, type_: str, schema: Any, *, owner_user_id, visibility: str
+    ) -> None:
+        """Refuse a workflow that names tools its own audience cannot reach.
+
+        The scope is the artifact's, never the caller's. Asking "can the
+        publisher resolve this?" admits a shared workflow calling the author's
+        private tool — valid for exactly one person, and known at publication
+        time not to work for the audience it declares.
+        """
+        scope = ToolResolutionScope(
+            visibility=visibility,
+            owner_user_id=owner_user_id,
+            tenant_id=self._tenant_of(conn, owner_user_id),
+        )
+        problems = self._tool_reference_problems(conn, type_, schema, scope)
+        if problems:
+            self.logger.warning("tool_reference_validation_failed", errors=problems)
+            raise ArtifactValidationError("artifact validation failed", problems)
+
+    def _tenant_of(self, conn, user_id) -> Optional[str]:
+        if not user_id:
+            return None
+        row = conn.execute(
+            "SELECT tenant_id FROM app_user WHERE id = %s", (user_id,)
+        ).fetchone()
+        return row["tenant_id"] if row else None
+
     # artifacts
     def list_artifacts(
         self,
@@ -3177,6 +3327,13 @@ class PostgresStore:
         artifact_id = str(uuid.uuid4())
         try:
             with self._connect() as conn, conn.transaction():
+                # Inside the transaction, so the references are checked against
+                # one snapshot, and before `_persist_payload`, so a refusal
+                # leaves no row, no version and no payload behind.
+                self._check_tool_references(
+                    conn, type_, schema,
+                    owner_user_id=owner_user_id, visibility=visibility,
+                )
                 # Taken before the canonical directory exists, so orphan
                 # discovery cannot see a payload whose row is still on its way
                 # and record a retirement for an artifact that is about to be
@@ -3317,6 +3474,14 @@ class PostgresStore:
             except ArtifactValidationError as exc:
                 self.logger.warning("artifact_validation_failed", errors=exc.errors)
                 raise
+            # The row's own audience, taken from the locked row rather than
+            # from the caller: a private workflow may name its owner's private
+            # tool, and the same edit on a shared one may not.
+            self._check_tool_references(
+                conn, row["type"], schema,
+                owner_user_id=row["owner_user_id"],
+                visibility=row["visibility"],
+            )
             versions = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s",
                 (artifact_id,),
@@ -3487,13 +3652,19 @@ class PostgresStore:
         *,
         user_id: Optional[str],
         tenant_id: Optional[str] = None,
-    ) -> Optional[dict]:
+    ) -> Optional[ResolvedWorkflow]:
         """The newest version of a workflow this caller may run, or None.
 
         `user_id` is required rather than optional: `workflow_id` arrives in
         a request body, so without it, naming another user's private workflow
         runs it. A keyword with no default means a caller cannot omit the
         question by accident.
+
+        Returns the schema *and the namespace its tool references mean*. This
+        used to return the schema alone, and the owner and visibility it had
+        already read were discarded — so execution had nothing left but the
+        runner's identity to resolve references with, and a shared workflow
+        ran whichever `foo` the runner happened to own.
         """
         artifact = self.get_artifact(workflow_id)
         if artifact is None:
@@ -3535,7 +3706,18 @@ class PostgresStore:
             except Exception as exc:
                 self.logger.warning("workflow_schema_parse_failed", error=str(exc))
                 schema = {}
-        return schema
+        # The artifact's own audience, not the caller's: the checks above have
+        # already established this caller may *run* it, which is a different
+        # question from what its references mean.
+        owner = self.get_user(owner_id) if owner_id else None
+        return ResolvedWorkflow(
+            schema=schema if isinstance(schema, dict) else {},
+            tool_scope=ToolResolutionScope(
+                visibility=visibility,
+                owner_user_id=owner_id,
+                tenant_id=getattr(owner, "tenant_id", None),
+            ),
+        )
 
     def list_adapter_router_state(
         self, user_id: Optional[str] = None
@@ -3858,6 +4040,15 @@ class PostgresStore:
             # Inside the transaction and before `_persist_payload`, so a
             # refusal leaves no row, no version and no payload behind.
             validate_artifact(artifact_row["type"], new_schema)  # type: ignore[arg-type]
+            # Same door, third entrance. Without this an approved patch could
+            # swap a published workflow onto a tool its audience cannot reach,
+            # write a version, and mark itself `applied` — an audit record
+            # asserting a configuration the runtime then refuses.
+            self._check_tool_references(
+                conn, artifact_row["type"], new_schema,
+                owner_user_id=artifact_row["owner_user_id"],
+                visibility=artifact_row["visibility"],
+            )
 
             versions = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s",

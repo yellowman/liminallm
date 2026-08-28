@@ -344,6 +344,10 @@ class TestBothPathsCarryTheMapToTheRound:
                     vars_scope={},
                     user_id=None,
                     tenant_id=None,
+                    # The node body no longer opens its own execution: the
+                    # attempt driver owns one across the node's retries, and
+                    # the streamed producer is registered on it.
+                    invocation=engine.invocations.open(uuid.uuid4().hex),
                 )
                 async for _event in agen:
                     pass

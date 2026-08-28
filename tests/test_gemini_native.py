@@ -127,6 +127,32 @@ def _payload(text="answer", calls=(), thoughts=0):
             "usageMetadata": meta}
 
 
+class _FakeSocket:
+    """Just enough socket for `StreamAbortHandle` to arm on."""
+
+    def shutdown(self, _how):
+        pass
+
+
+class _FakeNetStream:
+    def get_extra_info(self, name):
+        return _FakeSocket() if name == "socket" else None
+
+
+def _armed(response: httpx.Response) -> httpx.Response:
+    """Give a mocked streaming response the interrupt handle production has.
+
+    Streaming now fails closed on a network response whose socket cannot be
+    reached — the backend advertises `supports_stream_cancel`, and a stream
+    that cannot arm the interrupt refuses rather than streaming on a claim
+    it cannot keep. A `MockTransport` response has no real socket, so the
+    streaming tests declare a fake one; without it they would be testing the
+    refusal, not the wire format.
+    """
+    response.extensions["network_stream"] = _FakeNetStream()
+    return response
+
+
 def _backend(handler) -> GeminiBackend:
     return GeminiBackend(
         "gemini-2.5-flash", api_key="g-key",
@@ -233,8 +259,8 @@ def test_sse_streaming_yields_tokens_then_usage():
     def handler(request):
         assert "streamGenerateContent" in str(request.url)
         assert "alt=sse" in str(request.url)
-        return httpx.Response(200, content=sse.encode(),
-                              headers={"Content-Type": "text/event-stream"})
+        return _armed(httpx.Response(200, content=sse.encode(),
+                                     headers={"Content-Type": "text/event-stream"}))
 
     events = list(_backend(handler).generate_stream([{"role": "user", "content": "hi"}], []))
 
@@ -510,8 +536,8 @@ def test_the_streaming_usage_fallback_uses_the_shared_estimator():
 
     def handler(request):
         body = f'data: {json.dumps({"candidates": [{"content": {"parts": [{"text": cjk}]}}]})}\n\n'
-        return httpx.Response(200, content=body.encode(),
-                              headers={"content-type": "text/event-stream"})
+        return _armed(httpx.Response(200, content=body.encode(),
+                                     headers={"content-type": "text/event-stream"}))
 
     events = list(_backend(handler).generate_stream([{"role": "user", "content": "hi"}], []))
     usage = events[-1]["data"]["usage"]
@@ -532,8 +558,8 @@ def test_the_stream_also_retries_once_without_the_rejected_thinking_config():
         if "generationConfig" in body:
             return httpx.Response(400, json={"error": {
                 "message": "Unknown name \"thinking_config\" at 'generation_config'"}})
-        return httpx.Response(200, content=f"data: {chunk}\n\n".encode(),
-                              headers={"content-type": "text/event-stream"})
+        return _armed(httpx.Response(200, content=f"data: {chunk}\n\n".encode(),
+                                       headers={"content-type": "text/event-stream"}))
 
     backend = GeminiBackend(
         "gemini-1.0-pro", api_key="k", reasoning_effort="high",

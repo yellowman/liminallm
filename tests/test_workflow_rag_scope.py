@@ -1,7 +1,10 @@
-import pytest
 from types import SimpleNamespace
 
+import pytest
+
+from liminallm.service.tool_namespace import ToolDescriptor
 from liminallm.service.workflow import WorkflowEngine
+from liminallm.storage.common import get_default_tool_specs
 
 
 class RecordingRAG:
@@ -49,6 +52,20 @@ class StubRouter:
 class StubStore:
     def list_artifacts(self, type_filter=None, **kwargs):
         return []
+
+    def resolve_tool_spec(self, name, scope):
+        """Resolve a default tool from the definition production seeds from,
+        so this double cannot disagree with it about a handler."""
+        for spec in get_default_tool_specs():
+            if spec.get("name") == name:
+                return (
+                    ToolDescriptor(
+                        name=name, schema=spec, artifact_id=None,
+                        owner_user_id=None, owner_role=None,
+                    ),
+                    None,
+                )
+        return None, "names no tool this workflow can reach"
 
     def list_semantic_clusters(self, user_id=None):
         return []

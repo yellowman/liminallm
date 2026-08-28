@@ -67,7 +67,19 @@ import pytest
 
 from liminallm.service.errors import BadRequestError
 from liminallm.service.runtime import get_runtime
+from liminallm.service.tool_namespace import SYSTEM_SCOPE, ResolvedWorkflow
 from liminallm.service.workflow_graph import graph_problems
+
+
+def _loaded(schema):
+    """What `_load_workflow_for` returns: a schema and the namespace its tool
+    references mean.
+
+    These graphs are about structure rather than about which tool a name
+    reaches, so they run in the system namespace — the same one the engine
+    uses for the workflows it synthesises for itself.
+    """
+    return ResolvedWorkflow(schema, SYSTEM_SCOPE)
 
 # A graph that is valid under every rule here, and exercises all five edge
 # kinds so the positive controls are not narrower than the refusals.
@@ -260,7 +272,7 @@ class TestTheEngineRefusesRatherThanRepairs:
         self, engine, monkeypatch, changes, what
     ):
         monkeypatch.setattr(engine, "_load_workflow_for",
-                            lambda *a, **k: _graph(**changes))
+                            lambda *a, **k: _loaded(_graph(**changes)))
         with pytest.raises(BadRequestError):
             await engine.run("wf", None, "hello", None, user_id="u")
 
@@ -268,7 +280,7 @@ class TestTheEngineRefusesRatherThanRepairs:
     async def test_duplicate_ids_fail_closed(self, engine, monkeypatch):
         schema = json.loads(json.dumps(VALID))
         schema["nodes"].append({"id": "work", "type": "end"})
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
         with pytest.raises(BadRequestError):
             await engine.run("wf", None, "hello", None, user_id="u")
 
@@ -276,7 +288,7 @@ class TestTheEngineRefusesRatherThanRepairs:
     async def test_a_valid_graph_still_runs(self, engine, monkeypatch):
         """The control at this altitude. Refusing every graph would pass all
         five refusals above."""
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: VALID)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(VALID))
         out = await engine.run("wf", None, "hello", None, user_id="u")
         assert out.get("status") != "error", out
 
@@ -666,7 +678,7 @@ class TestAParallelChildIsRunOnceAndItsSuccessorsDiscarded:
                                 cache=MockRedisCache())
         monkeypatch.setattr("liminallm.service.workflow.graph_problems",
                             lambda schema: [])
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.FAN)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(self.FAN))
 
         out = await engine.run("wf", None, "hello", None, user_id="u")
         ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
@@ -700,7 +712,7 @@ class TestAParallelChildIsRunOnceAndItsSuccessorsDiscarded:
 
     @pytest.mark.asyncio
     async def test_a_persisted_one_fails_closed(self, engine, monkeypatch):
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.FAN)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(self.FAN))
         with pytest.raises(BadRequestError):
             await engine.run("wf", None, "hello", None, user_id="u")
 
@@ -787,7 +799,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
     @pytest.mark.asyncio
     async def test_a_chain_past_the_step_budget_is_an_error(self, engine, monkeypatch):
         monkeypatch.setattr(engine, "_load_workflow_for",
-                            lambda *a, **k: self._chain(100))
+                            lambda *a, **k: _loaded(self._chain(100)))
         out = await engine.run("wf", None, "hello", None, user_id="u")
         assert out.get("status") == "error", (
             f"a run that stopped with work pending reported success: "
@@ -801,7 +813,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
     async def test_a_cycle_past_the_visit_budget_is_an_error(self, engine, monkeypatch):
         """The other mechanism. It exits by `break`, not by the loop
         condition, so it needs its own witness."""
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.CYCLE)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(self.CYCLE))
         out = await engine.run("wf", None, "hello", None, user_id="u")
         assert out.get("status") == "error", (
             f"a run stopped by the loop guard reported success: "
@@ -817,7 +829,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
     async def test_a_chain_inside_the_budget_still_completes(self, engine, monkeypatch):
         """The control. Erroring on every run passes both witnesses above."""
         monkeypatch.setattr(engine, "_load_workflow_for",
-                            lambda *a, **k: self._chain(3))
+                            lambda *a, **k: _loaded(self._chain(3)))
         out = await engine.run("wf", None, "hello", None, user_id="u")
         assert out.get("status") != "error", out
         ran = [e.get("node") for e in out.get("workflow_trace") or []]
@@ -828,7 +840,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
         self, engine, monkeypatch
     ):
         monkeypatch.setattr(engine, "_load_workflow_for",
-                            lambda *a, **k: self._chain(100))
+                            lambda *a, **k: _loaded(self._chain(100)))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hi", None, user_id="u")]
         errors = [e for e in events if e.get("event") == "error"]
@@ -842,7 +854,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
     async def test_streaming_errors_on_the_visit_budget_too(
         self, engine, monkeypatch
     ):
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.CYCLE)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(self.CYCLE))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hi", None, user_id="u")]
         errors = [e for e in events if e.get("event") == "error"]
@@ -857,7 +869,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
     ):
         """The streaming control."""
         monkeypatch.setattr(engine, "_load_workflow_for",
-                            lambda *a, **k: self._chain(3))
+                            lambda *a, **k: _loaded(self._chain(3)))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hi", None, user_id="u")]
         assert any(e.get("event") == "message_done" for e in events), events[-3:]
@@ -884,7 +896,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
             {"id": "fin", "type": "end"},
             {"id": "other", "type": "tool_call", "tool": "llm.generic"},
         ]}
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
         out = await engine.run("wf", None, "hello", None, user_id="u")
         ran = [e.get("node") for e in out.get("workflow_trace") or []]
         # The premise: `fin` really did run with `other` still queued. The
@@ -997,7 +1009,7 @@ class TestFanOutIsChargedToTheSameBudget:
         schema = self._fan(150)
         assert graph_problems(schema) == [], "the premise: nothing refuses this"
         calls = self._count_invocations(engine, monkeypatch)
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
 
         out = await engine.run("wf", None, "hello", None, user_id="u")
         assert calls == [], (
@@ -1014,7 +1026,7 @@ class TestFanOutIsChargedToTheSameBudget:
         """Each entry in `parallel.next` is an execution, not each distinct
         id. A three-node graph asked for a hundred and fifty."""
         calls = self._count_invocations(engine, monkeypatch)
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: self.REPEATED)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(self.REPEATED))
         out = await engine.run("wf", None, "hello", None, user_id="u")
         assert calls == [], f"{len(calls)} invocations from a three-node graph"
         assert out.get("status") == "error", out.get("content")
@@ -1033,7 +1045,7 @@ class TestFanOutIsChargedToTheSameBudget:
         schema = self._fan(40, chain=70)
         assert graph_problems(schema) == []
         calls = self._count_invocations(engine, monkeypatch)
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
 
         out = await engine.run("wf", None, "hello", None, user_id="u")
         assert len(calls) == 40, f"the fan-out itself should fit: {len(calls)}"
@@ -1047,7 +1059,7 @@ class TestFanOutIsChargedToTheSameBudget:
     async def test_streaming_refuses_the_same_fan_out(self, engine, monkeypatch):
         schema = self._fan(150)
         calls = self._count_invocations(engine, monkeypatch)
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hi", None, user_id="u")]
         assert calls == [], f"{len(calls)} invocations began on the streaming path"
@@ -1062,7 +1074,7 @@ class TestFanOutIsChargedToTheSameBudget:
         fan-out is the feature."""
         schema = self._fan(3)
         calls = self._count_invocations(engine, monkeypatch)
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
         out = await engine.run("wf", None, "hello", None, user_id="u")
         assert len(calls) == 3, calls
         assert out.get("status") != "error", out
@@ -1072,7 +1084,7 @@ class TestFanOutIsChargedToTheSameBudget:
         """The streaming control."""
         schema = self._fan(3)
         calls = self._count_invocations(engine, monkeypatch)
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hi", None, user_id="u")]
         assert len(calls) == 3, calls
@@ -1112,7 +1124,7 @@ class TestTheEngineRefusesGraphsItsSchemaWouldNowRefuse:
     ):
         schema = {"kind": "workflow.chat", "entrypoint": node["id"],
                   "nodes": [node, {"id": "side", "type": "end"}]}
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
         with pytest.raises(BadRequestError):
             await engine.run("wf", None, "hello", None, user_id="u")
 
@@ -1122,7 +1134,7 @@ class TestTheEngineRefusesGraphsItsSchemaWouldNowRefuse:
             {"id": "x", "type": "swich", "tool": "llm.generic", "next": "side"},
             {"id": "side", "type": "end"},
         ]}
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hello", None, user_id="u")]
         assert events[0].get("event") == "error", events[:3]
@@ -1194,7 +1206,7 @@ class TestStreamingRefusesTheSameGraphs:
         self, engine, monkeypatch, changes
     ):
         monkeypatch.setattr(engine, "_load_workflow_for",
-                            lambda *a, **k: _graph(**changes))
+                            lambda *a, **k: _loaded(_graph(**changes)))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hello", None, user_id="u")]
 
@@ -1212,7 +1224,7 @@ class TestStreamingRefusesTheSameGraphs:
     async def test_streaming_refuses_duplicate_ids(self, engine, monkeypatch):
         schema = json.loads(json.dumps(VALID))
         schema["nodes"].append({"id": "work", "type": "end"})
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hello", None, user_id="u")]
         assert events[0].get("event") == "error", events[:3]
@@ -1220,7 +1232,7 @@ class TestStreamingRefusesTheSameGraphs:
     @pytest.mark.asyncio
     async def test_streaming_still_runs_a_valid_graph(self, engine, monkeypatch):
         """The control at this altitude."""
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: VALID)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(VALID))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hello", None, user_id="u")]
         assert events, "the stream produced nothing at all"
@@ -1278,7 +1290,7 @@ class TestAFailedToolTakesItsErrorEdge:
 
         monkeypatch.setattr(engine.cache, "check_circuit_breaker", open_breaker)
         monkeypatch.setattr(engine, "_load_workflow_for",
-                            lambda *a, **k: self.BREAKER)
+                            lambda *a, **k: _loaded(self.BREAKER))
 
         out = await engine.run("wf", None, "hello", None, user_id="u")
         ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
@@ -1294,7 +1306,7 @@ class TestAFailedToolTakesItsErrorEdge:
         """The control. Routing every tool node to `on_error` would pass the
         witness above and break every successful turn."""
         monkeypatch.setattr(engine, "_load_workflow_for",
-                            lambda *a, **k: self.BREAKER)
+                            lambda *a, **k: _loaded(self.BREAKER))
         out = await engine.run("wf", None, "hello", None, user_id="u")
         ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
         assert "normal" in ran, f"a successful tool call took the error edge: {ran}"
@@ -1315,7 +1327,7 @@ class TestAFailedToolTakesItsErrorEdge:
         """
         schema = json.loads(json.dumps(self.BREAKER))
         schema["nodes"][0]["tool"] = "no.such.tool.v1"
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
 
         out = await engine.run("wf", None, "hello", None, user_id="u")
         ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
@@ -1385,7 +1397,7 @@ class TestAStreamedToolObeysTheSameControlPlane:
                             raising=False)
         if opens_breaker:
             monkeypatch.setattr(engine.cache, "check_circuit_breaker", open_breaker)
-        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: schema)
+        monkeypatch.setattr(engine, "_load_workflow_for", lambda *a, **k: _loaded(schema))
         return calls
 
     @staticmethod
@@ -1512,7 +1524,7 @@ class TestAStreamedToolObeysTheSameControlPlane:
         monkeypatch.setattr(engine.llm, "generate_stream", generate_stream,
                             raising=False)
         monkeypatch.setattr(engine, "_load_workflow_for",
-                            lambda *a, **k: self.PARTIAL)
+                            lambda *a, **k: _loaded(self.PARTIAL))
         events = [e async for e in engine.run_streaming(
             "wf", None, "hi", None, user_id="u")]
 

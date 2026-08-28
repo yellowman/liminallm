@@ -9,12 +9,14 @@ import os
 import tempfile
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import (
     Any,
+    AsyncIterator,
     Callable,
     Dict,
     List,
@@ -59,6 +61,12 @@ from liminallm.service.invocation import (
 )
 from liminallm.service.llm import LLMService
 from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW, active_adapters
+from liminallm.service.node_attempt import (
+    BlockingNodeAttempt,
+    NodeAttempt,
+    NodeOutcome,
+    bounded,
+)
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import (
@@ -74,6 +82,13 @@ from liminallm.service.sandbox import (
 from liminallm.service.tokenizer_utils import (
     MAX_GENERATION_TOKENS,
     estimate_token_count,
+)
+from liminallm.service.tool_namespace import (
+    SYSTEM_SCOPE,
+    ResolvedWorkflow,
+    ToolDescriptor,
+    ToolResolutionScope,
+    resolve_executable_handler,
 )
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
@@ -111,32 +126,6 @@ class ParallelNodeResult:
     # "ok" if all succeeded, "partial" if some failed, "error" if all failed,
     # "budget_exhausted" if the batch was refused before any of it began.
     status: str = "ok"
-
-
-@dataclass(frozen=True)
-class ToolDescriptor:
-    """A resolved tool and where its authority comes from.
-
-    `artifact_id`/`owner_user_id`/`owner_role` are read from the persisted
-    artifact row. SPEC §18 makes `privileged:true` a property of an
-    *admin-owned artifact*, so the authority cannot be read out of the spec
-    the caller supplied — a `privileged: true` key is only a claim until an
-    admin-owned row is standing behind it.
-    """
-
-    name: str
-    schema: dict
-    artifact_id: Optional[str]
-    owner_user_id: Optional[str]
-    owner_role: Optional[str]
-
-    @property
-    def privileged(self) -> bool:
-        return bool((self.schema or {}).get("privileged"))
-
-    @property
-    def admin_owned(self) -> bool:
-        return bool(self.artifact_id) and self.owner_role == "admin"
 
 
 class WorkflowEngine(WorkflowStreamingMixin):
@@ -373,6 +362,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         node_map: Dict[str, Dict[str, Any]],
         *,
         budget: ExecutionBudget,
+        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         user_message: str,
         context_id: Optional[str],
         conversation_id: Optional[str],
@@ -442,6 +432,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     vars_scope=local_vars,
                     user_id=user_id,
                     tenant_id=tenant_id,
+                    # The workflow's namespace, not the runner's — this is a
+                    # second descent into node execution, and the easiest
+                    # place to lose the scope the outer loop carries.
+                    tool_scope=tool_scope,
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
                     cancel_event=cancel_event,
@@ -531,20 +525,31 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
     ) -> dict:
-        workflow_schema = None
+        loaded = None
         if workflow_id:
-            workflow_schema = self._load_workflow_for(
+            loaded = self._load_workflow_for(
                 workflow_id, user_id=user_id, tenant_id=tenant_id
             )
-        if not workflow_schema:
+        if loaded is None:
             # The tool agent handles anything needing tools. It degrades to a
             # plain reply when it has no tools to offer, so the cost of a false
             # positive is a worker process; the cost of a false negative is a
             # capability the operator configured and the turn never sees.
+            #
+            # These two are synthesised, not published, so they have no
+            # publisher and no tenant: the global namespace is the only one
+            # they can mean.
             if self._turn_needs_tools(conversation_id, user_id):
-                workflow_schema = get_default_attachment_workflow_schema()
+                loaded = ResolvedWorkflow(
+                    get_default_attachment_workflow_schema(), SYSTEM_SCOPE
+                )
             else:
-                workflow_schema = self._default_workflow()
+                loaded = ResolvedWorkflow(self._default_workflow(), SYSTEM_SCOPE)
+        workflow_schema = loaded.schema
+        # Carried through every node, parallel child and retry below rather
+        # than rebuilt from the runner: a published workflow must name the
+        # same capability whoever runs it.
+        tool_scope = loaded.tool_scope
 
         # SPEC §9: workflow-level timeout_ms caps total wall clock
         workflow_timeout_ms = workflow_schema.get(
@@ -652,6 +657,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 vars_scope=vars_scope,
                 user_id=user_id,
                 tenant_id=tenant_id,
+                tool_scope=tool_scope,
                 workflow_start_time=workflow_start_time,
                 workflow_timeout_ms=workflow_timeout_ms,
             )
@@ -683,6 +689,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         parallel_node_ids,
                         node_map,
                         budget=budget,
+                        tool_scope=tool_scope,
                         user_message=user_message,
                         context_id=context_id,
                         conversation_id=conversation_id,
@@ -883,6 +890,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         vars_scope: Dict[str, Any],
         user_id: Optional[str],
         tenant_id: Optional[str],
+        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         workflow_start_time: float,
         workflow_timeout_ms: float,
         cancel_event: Optional[asyncio.Event] = None,
@@ -918,24 +926,33 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         try:
             async with self._cancel_revokes(invocation, cancel_event):
-                return await self._attempt_node(
+                outcome = await self._run_node_attempts(
                     node,
                     invocation=invocation,
                     node_id=node_id,
                     max_retries=max_retries,
                     backoff_ms=backoff_ms,
-                    user_message=user_message,
-                    context_id=context_id,
-                    conversation_id=conversation_id,
-                    adapters=adapters,
-                    history=history,
-                    vars_scope=vars_scope,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
+                    make_attempt=lambda: BlockingNodeAttempt(
+                        partial(
+                            self._execute_node,
+                            node,
+                            user_message=user_message,
+                            context_id=context_id,
+                            conversation_id=conversation_id,
+                            adapters=adapters,
+                            history=history,
+                            vars_scope=vars_scope,
+                            user_id=user_id,
+                            tenant_id=tenant_id,
+                            tool_scope=tool_scope,
+                            invocation=invocation,
+                        )
+                    ),
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
                     cancel_event=cancel_event,
                 )
+                return outcome.result, outcome.next_nodes
         finally:
             # Reached on success, failure, timeout and cancellation alike. An
             # execution that ends any other way leaves a live sandbox child and
@@ -977,7 +994,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
             if watcher is not None:
                 watcher.cancel()
 
-    async def _attempt_node(
+    async def _run_node_attempts(self, node: Dict[str, Any], **kwargs) -> NodeOutcome:
+        """`_drive_node_attempts` for a caller with no use for stream events."""
+        outcome: Optional[NodeOutcome] = None
+        async with aclosing(self._drive_node_attempts(node, **kwargs)) as driver:
+            async for item in driver:
+                if isinstance(item, NodeOutcome):
+                    outcome = item
+        # Every path out of the driver yields an outcome before it returns.
+        return outcome
+
+    async def _drive_node_attempts(
         self,
         node: Dict[str, Any],
         *,
@@ -985,75 +1012,125 @@ class WorkflowEngine(WorkflowStreamingMixin):
         node_id: str,
         max_retries: int,
         backoff_ms: float,
-        user_message: str,
-        context_id: Optional[str],
-        conversation_id: Optional[str],
-        adapters: List[dict],
-        history: List[Any],
-        vars_scope: Dict[str, Any],
-        user_id: Optional[str],
-        tenant_id: Optional[str],
+        make_attempt: Callable[[], NodeAttempt],
         workflow_start_time: float,
         workflow_timeout_ms: float,
         cancel_event: Optional[asyncio.Event] = None,
-    ) -> Tuple[Dict[str, Any], List[str]]:
-        """The attempt loop of one logical execution."""
+    ) -> AsyncIterator[Any]:
+        """The attempt loop of one logical execution, whatever produced it.
+
+        Yields the attempt's stream events as they arrive, then exactly one
+        `NodeOutcome`, last. A blocking attempt produces no events, so its loop
+        is this same code with the `async for` doing nothing — which is the
+        point: the retry cap, the backoff, the three-way node deadline and the
+        workflow deadline are SPEC §9.2 properties of the node, and a second
+        copy of them beside the streaming path is a second chance to disagree.
+        """
         last_error: Optional[Exception] = None
         attempt = 0
+        previous: Optional[NodeAttempt] = None
+        emitted = False
 
         while attempt <= max_retries:
-            if attempt and not await self._previous_attempt_is_dead(
+            if previous is not None and not await self._previous_attempt_is_dead(
                 invocation, node_id, attempt
             ):
-                return (
-                    {
+                yield NodeOutcome(
+                    result={
                         "status": "error",
-                        "error": "tool_worker_unreaped",
+                        "error": previous.unreaped_error,
                         "attempts": attempt,
                     },
-                    [],
+                    emitted=emitted,
                 )
+                return
             # Check workflow timeout before each attempt
             elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
             remaining_ms = workflow_timeout_ms - elapsed_ms
             if remaining_ms <= 0:
-                return (
-                    {
+                yield NodeOutcome(
+                    result={
                         "status": "error",
                         "error": "workflow_timeout_during_retry",
                         "retries_exhausted": True,
                         "attempts": attempt,
                     },
-                    [],
-            )
+                    emitted=emitted,
+                )
+                return
 
+            start_ms = time.monotonic() * 1000
+            # Three bounds, and the attempt gets the smallest. The node's
+            # own ask is the least authoritative of them: SPEC §18.3 caps
+            # it at MAX_NODE_TIMEOUT_SECONDS, and the workflow's remaining
+            # budget caps it again, because "timeout_ms caps total wall
+            # clock" is only true if no single attempt may outlive it.
+            node_timeout_ms = min(
+                node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS),
+                MAX_NODE_TIMEOUT_SECONDS * 1000,
+                remaining_ms,
+            )
+            current = make_attempt()
+            previous = current
+            lease = None
+            if current.needs_lease:
+                # §18.3: authority is fresh per attempt. The worker spawn
+                # opens its own lease; an in-process attempt has nobody else
+                # to open one, and without it two things were wrong at once —
+                # a retry ran with no authority of its own, and a revoke that
+                # found no current attempt cancelled the whole execution and
+                # was then ignored by the attempt that followed.
+                try:
+                    lease = invocation.begin_attempt()
+                except LeaseRevoked:
+                    # Cancelled. Not an error to retry through: the caller
+                    # said the answer is no longer wanted.
+                    yield NodeOutcome(
+                        result={
+                            "status": "error",
+                            "error": "workflow_cancelled",
+                            "cancelled": True,
+                        },
+                        emitted=emitted,
+                    )
+                    return
             try:
-                start_ms = time.monotonic() * 1000
-                # Three bounds, and the attempt gets the smallest. The node's
-                # own ask is the least authoritative of them: SPEC §18.3 caps
-                # it at MAX_NODE_TIMEOUT_SECONDS, and the workflow's remaining
-                # budget caps it again, because "timeout_ms caps total wall
-                # clock" is only true if no single attempt may outlive it.
-                node_timeout_ms = min(
-                    node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS),
-                    MAX_NODE_TIMEOUT_SECONDS * 1000,
-                    remaining_ms,
+                deadline = (
+                    asyncio.get_running_loop().time() + node_timeout_ms / 1000.0
                 )
-                result, next_nodes = await asyncio.wait_for(
-                    self._execute_node(
-                        node,
-                        user_message=user_message,
-                        context_id=context_id,
-                        conversation_id=conversation_id,
-                        adapters=adapters,
-                        history=history,
-                        vars_scope=vars_scope,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        invocation=invocation,
-                    ),
-                    timeout=node_timeout_ms / 1000.0,
-                )
+                async for event in bounded(current.events(), deadline):
+                    if event.get("event") == "token":
+                        emitted = True
+                    yield event
+                # A blocking attempt runs its body inside `result()`, so the
+                # leftover deadline is its node timeout — and its `events()`
+                # is empty, so the leftover is effectively the whole budget.
+                # A streamed attempt's outcome is already computed once its
+                # events have ended; when they consumed the entire budget
+                # (ended inside `bounded`'s terminal grace), `wait_for` with
+                # a zero timeout would refuse a coroutine that only needs to
+                # return a field, and report a completed, client-delivered
+                # answer as a node timeout.
+                #
+                # The exception is exactly that narrow, and the attempt says
+                # so itself: only a result that is *already computed* may be
+                # collected after the clock has crossed zero. The first
+                # version awaited `result()` unbounded for every attempt
+                # type, and for a blocking attempt that is where the body
+                # starts — so a node whose budget was spent (`timeout_ms: 0`
+                # is admissible) began its tool body after its deadline and
+                # ran it with no bound at all.
+                result_budget = deadline - asyncio.get_running_loop().time()
+                if result_budget > 0:
+                    outcome = await asyncio.wait_for(
+                        current.result(), timeout=result_budget
+                    )
+                elif current.result_ready_after_events:
+                    outcome = await current.result()
+                else:
+                    raise asyncio.TimeoutError()
+                result, next_nodes = outcome.result, outcome.next_nodes
+                emitted = emitted or outcome.emitted
 
                 result["latency_ms"] = (time.monotonic() * 1000) - start_ms
 
@@ -1061,7 +1138,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 if result.get("status") != "error" or node.get("on_error"):
                     if attempt > 0:
                         result["retry_attempts"] = attempt
-                    return result, next_nodes
+                    yield NodeOutcome(
+                        result=result,
+                        next_nodes=next_nodes,
+                        failure_event=outcome.failure_event,
+                        emitted=emitted,
+                    )
+                    return
 
                 # Node returned an error status - treat as retryable
                 last_error = Exception(
@@ -1101,6 +1184,30 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     error=str(exc),
                 )
 
+            finally:
+                # On every way out of the attempt — success, timeout, failure.
+                # The lease closes here so `_previous_attempt_is_dead` waits
+                # on a flag somebody actually sets; producer-thread death is
+                # confirmed separately, by `terminate` counting producers.
+                if lease is not None:
+                    invocation.end_attempt(lease)
+
+            # A retry is only meaningful before the first token. After it, the
+            # answer is on the user's screen: a second attempt would append a
+            # second answer to the same bubble rather than replace the first,
+            # and so would an `on_error` edge. Failure past that point is
+            # terminal, and `emitted` is how the caller knows not to recover.
+            if emitted:
+                yield NodeOutcome(
+                    result={
+                        "status": "error",
+                        "error": str(last_error) if last_error else "stream failed",
+                        "attempts": attempt + 1,
+                    },
+                    emitted=True,
+                )
+                return
+
             attempt += 1
 
             # If we have more retries, apply exponential backoff
@@ -1127,28 +1234,24 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         attempt=attempt,
                         backoff_ms=sleep_ms,
                     )
+                    cancelled = NodeOutcome(
+                        result={
+                            "status": "error",
+                            "error": "workflow_cancelled",
+                            "cancelled": True,
+                        },
+                        emitted=emitted,
+                    )
                     if cancel_event and cancel_event.is_set():
-                        return (
-                            {
-                                "status": "error",
-                                "error": "workflow_cancelled",
-                                "cancelled": True,
-                            },
-                            [],
-                        )
+                        yield cancelled
+                        return
                     if cancel_event:
                         try:
                             await asyncio.wait_for(
                                 cancel_event.wait(), timeout=sleep_ms / 1000.0
                             )
-                            return (
-                                {
-                                    "status": "error",
-                                    "error": "workflow_cancelled",
-                                    "cancelled": True,
-                                },
-                                [],
-                            )
+                            yield cancelled
+                            return
                         except asyncio.TimeoutError:
                             pass
                     else:
@@ -1161,14 +1264,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
             attempts=attempt,
             error=str(last_error),
         )
-        return (
-            {
+        yield NodeOutcome(
+            result={
                 "status": "error",
                 "error": str(last_error) if last_error else "unknown error",
                 "retries_exhausted": True,
                 "attempts": attempt,
             },
-            [],
+            emitted=emitted,
         )
 
     async def _previous_attempt_is_dead(
@@ -1592,37 +1695,119 @@ class WorkflowEngine(WorkflowStreamingMixin):
         return registry
 
     def _resolve_tool(
-        self,
-        tool_name: str,
-        *,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-    ) -> Optional["ToolDescriptor"]:
-        """The tool this caller means by `tool_name`, with its provenance.
+        self, tool_name: str, scope: ToolResolutionScope
+    ) -> Optional[ToolDescriptor]:
+        """The one tool `tool_name` means in this workflow's namespace.
+
+        The scope is the *workflow's*, never the runner's. This used to scan
+        `list_artifacts` for the caller and take the first name match, so a
+        shared workflow calling `foo` ran whichever `foo` the runner happened
+        to own — one published workflow, a different capability per person.
 
         Provenance comes from the persisted artifact row — `owner_user_id` and
         the owner's role — never from fields inside `schema`, which is
         caller-authored data. A spec claiming `owner_user_id: <an admin>` is
         just a string someone typed.
-        """
-        for artifact in self.store.list_artifacts(
-            type_filter="tool", owner_user_id=user_id, tenant_id=tenant_id
-        ):
-            schema = artifact.schema if isinstance(artifact.schema, dict) else {}
-            if schema.get("name") != tool_name:
-                continue
-            return self._describe_tool(artifact)
-        schema = self.tool_registry.get(tool_name)
-        if schema is None:
-            return None
-        # A globally visible spec with no artifact behind it in this lookup:
-        # usable, but unattributed, so it can never be privileged.
-        return ToolDescriptor(
-            name=tool_name, schema=schema, artifact_id=None,
-            owner_user_id=None, owner_role=None,
-        )
 
-    def _describe_tool(self, artifact) -> "ToolDescriptor":
+        There is no cache in front of this and no fallback behind it. A
+        process-local registry built at startup used to answer for artifacts
+        that had since been deleted, which is a cache manufacturing authority
+        rather than accelerating a lookup.
+        """
+        descriptor, why = self.store.resolve_tool_spec(tool_name, scope)
+        if why is not None:
+            self.logger.warning(
+                "tool_reference_unresolved", tool=tool_name,
+                visibility=scope.visibility, reason=why,
+            )
+            return None
+        if not descriptor.executable:
+            self.logger.warning(
+                "tool_handler_not_executable", tool=tool_name,
+                handler=descriptor.handler,
+            )
+            return None
+        return descriptor
+
+    def tool_preflight(
+        self,
+        descriptor: Optional[ToolDescriptor],
+        inputs: Dict[str, Any],
+        *,
+        user_id: Optional[str],
+        tool_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Everything a resolved tool must pass before any body runs, or
+        ``None`` when it passes.
+
+        Shared because it was not. This lived inside `_invoke_tool`, and the
+        streaming path never called it: `_stream_llm_node` takes a node, so an
+        ordinary user's own private spec claiming `privileged: true` was
+        refused on the blocking path and streamed the model on the other.
+        Token production is what streaming may specialise; deciding whether
+        the call is allowed at all is not.
+        """
+        tool_spec = descriptor.schema if descriptor else None
+        validation_errors = self._validate_tool_payload(
+            inputs,
+            tool_spec.get("input_schema") if tool_spec else None,
+            phase="input",
+            tool_name=tool_name,
+        )
+        if validation_errors:
+            return {
+                "status": "error",
+                "content": "tool input validation failed",
+                "error": "validation_error",
+                "details": {"errors": validation_errors},
+            }
+        # SPEC §18: a privileged tool requires an admin-owned *artifact* and
+        # an admin caller. Asking only about the caller is not enough: any
+        # authenticated user can author `privileged: true` through
+        # /v1/artifacts, and an admin invoking it would be handed the
+        # privileged sandbox for someone else's definition. Ownership comes
+        # from the persisted row; a spec that names an owner quotes itself.
+        if descriptor is not None and descriptor.privileged:
+            user = self.store.get_user(user_id) if user_id else None
+            role = user.role if user else None
+            if not descriptor.admin_owned:
+                self.logger.warning(
+                    "privileged_tool_denied",
+                    tool=tool_name,
+                    user_id=user_id,
+                    reason="artifact is not admin-owned",
+                    artifact_id=descriptor.artifact_id,
+                    owner_user_id=descriptor.owner_user_id,
+                )
+                return {
+                    "status": "error",
+                    "error": "forbidden",
+                    "content": (
+                        f"privileged tool {tool_name!r} requires an admin-owned "
+                        "artifact (SPEC §18)"
+                    ),
+                }
+            try:
+                get_tool_sandbox_config(tool_spec, user_role=role)
+            except PrivilegedToolError as exc:
+                self.logger.warning(
+                    "privileged_tool_denied",
+                    tool=tool_name,
+                    user_id=user_id,
+                    role=role,
+                    reason="caller is not an admin",
+                )
+                return {"status": "error", "content": str(exc), "error": "forbidden"}
+        return None
+
+    def _describe_tool(self, artifact) -> ToolDescriptor:
+        """Describe one artifact the caller already chose.
+
+        A different question from `_resolve_tool`, which asks what a *name*
+        means in a namespace. `POST /v1/tools/{id}/invoke` has already
+        authorized one exact row, so naming it again would let a name
+        collision run something else.
+        """
         owner_id = getattr(artifact, "owner_user_id", None)
         owner = self.store.get_user(owner_id) if owner_id else None
         return ToolDescriptor(
@@ -1938,6 +2123,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         vars_scope: Dict[str, Any],
         user_id: Optional[str],
         tenant_id: Optional[str],
+        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         invocation: Optional[Invocation] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         node_type = node.get("type", "tool_call")
@@ -1999,6 +2185,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 user_message,
                 user_id=user_id,
                 tenant_id=tenant_id,
+                tool_scope=tool_scope,
                 invocation=invocation,
             )
             # SPEC §18: Record success to reset failure counter
@@ -2080,65 +2267,32 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         descriptor: Optional[ToolDescriptor] = None,
         invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         if descriptor is None:
-            descriptor = self._resolve_tool(
-                tool_name, user_id=user_id, tenant_id=tenant_id
-            )
+            descriptor = self._resolve_tool(tool_name, tool_scope)
+        if descriptor is None:
+            # Fails closed: the reference named nothing this workflow can
+            # reach, or named a handler nothing runs. Admission refuses these,
+            # so reaching here means the row predates the check, was imported,
+            # or the tool has been retired since.
+            return {
+                "status": "error",
+                "content": f"unknown tool {tool_name}",
+                "error": "tool_reference_unresolved",
+            }
         tool_spec = descriptor.schema if descriptor else None
         # Issue 6.9: Apply hardcap per SPEC §18.3 (default 15s, hard cap 60s)
         raw_timeout = tool_spec.get("timeout_seconds", 15) if tool_spec else 15
         timeout = min(raw_timeout, MAX_NODE_TIMEOUT_SECONDS)
-        validation_errors = self._validate_tool_payload(
-            inputs, tool_spec.get("input_schema") if tool_spec else None, phase="input", tool_name=tool_name
+        refusal = self.tool_preflight(
+            descriptor, inputs, user_id=user_id, tool_name=tool_name
         )
-        if validation_errors:
-            return {
-                "status": "error",
-                "content": "tool input validation failed",
-                "error": "validation_error",
-                "details": {"errors": validation_errors},
-            }
-        # SPEC §18: a privileged tool requires an admin-owned *artifact* and
-        # an admin caller. Asking only about the caller is not enough: any
-        # authenticated user can author `privileged: true` through
-        # /v1/artifacts, and an admin invoking it would be handed the
-        # privileged sandbox for someone else's definition. Ownership comes
-        # from the persisted row; a spec that names an owner quotes itself.
-        if descriptor is not None and descriptor.privileged:
-            user = self.store.get_user(user_id) if user_id else None
-            role = user.role if user else None
-            if not descriptor.admin_owned:
-                self.logger.warning(
-                    "privileged_tool_denied",
-                    tool=tool_name,
-                    user_id=user_id,
-                    reason="artifact is not admin-owned",
-                    artifact_id=descriptor.artifact_id,
-                    owner_user_id=descriptor.owner_user_id,
-                )
-                return {
-                    "status": "error",
-                    "error": "forbidden",
-                    "content": (
-                        f"privileged tool {tool_name!r} requires an admin-owned "
-                        "artifact (SPEC §18)"
-                    ),
-                }
-            try:
-                get_tool_sandbox_config(tool_spec, user_role=role)
-            except PrivilegedToolError as exc:
-                self.logger.warning(
-                    "privileged_tool_denied",
-                    tool=tool_name,
-                    user_id=user_id,
-                    role=role,
-                    reason="caller is not an admin",
-                )
-                return {"status": "error", "content": str(exc), "error": "forbidden"}
+        if refusal is not None:
+            return refusal
 
         # One logical execution. A node's retry loop passes the same one back,
         # so the second attempt replays the first's ledger; a direct invocation
@@ -2209,21 +2363,43 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 await asyncio.to_thread(invocation.close)
         if preamble:
             result.setdefault("context_snippets", []).insert(0, preamble)
+        sanitized, refusal = self.tool_postflight(
+            result, tool_spec, tool_name=tool_name
+        )
+        return refusal or sanitized
+
+    def tool_postflight(
+        self,
+        result: Dict[str, Any],
+        tool_spec: Optional[dict],
+        *,
+        tool_name: str,
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """The tool's output sanitized and checked, and the refusal if it
+        failed. `(sanitized, None)` or `(sanitized, refusal)`.
+
+        One function on both paths, fed the result in the shape the tool
+        produced — for `llm.generic`, `{content, usage, context_snippets}`.
+        SPEC §9.2 validates the tool output, so no caller may validate a
+        wrapper of its own instead: streaming validated a reconstruction with
+        a `status` key the tool never emitted, and a strict schema written
+        for the real output passed blocking and failed streaming.
+        """
         sanitized = self._sanitize_html_untrusted(result)
         output_errors = self._validate_tool_payload(
             sanitized,
-            tool_spec.get("output_schema") if tool_spec else None,
+            (tool_spec or {}).get("output_schema"),
             phase="output",
             tool_name=tool_name,
         )
         if output_errors:
-            return {
+            return sanitized, {
                 "status": "error",
                 "content": "tool output validation failed",
                 "error": "validation_error",
                 "details": {"errors": output_errors},
             }
-        return sanitized
+        return sanitized, None
 
     def _plan_invocation(
         self,
@@ -2305,18 +2481,16 @@ class WorkflowEngine(WorkflowStreamingMixin):
     ) -> str:
         """The body this tool runs, following a spec's `handler` alias.
 
-        A `tool.spec` artifact may name a builtin as its handler, and the spec
-        that matters is the authorized row's — a private tool is resolved for
-        its caller and never enters the shared registry (SPEC §18), so reading
-        the alias out of the registry alone would leave it unresolved and the
-        tool would answer "unknown".
+        The resolved row's `handler` decides, through the one function
+        admission also asks. This checked `tool_name in BODY_NAMES` first, so
+        a spec named `notes.search_v1` with handler `llm.generic` ran the
+        notes body — the reference's spelling beat the row that was resolved,
+        and admission had approved the other one.
+
+        A caller with no spec keeps the literal name, which is how a builtin
+        stays reachable when nothing is persisted behind it.
         """
-        if tool_name in tool_worker.BODY_NAMES:
-            return tool_name
-        alias = (tool_spec or self.tool_registry.get(tool_name) or {}).get("handler")
-        if alias in tool_worker.BODY_NAMES or alias in self._builtin_tool_handlers():
-            return alias
-        return tool_name
+        return resolve_executable_handler(tool_name, tool_spec) or tool_name
 
     def _worker_limits(self, tool_spec: Optional[dict]) -> Dict[str, int]:
         """SPEC §18: the rlimits this tool's worker runs under.

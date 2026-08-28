@@ -48,6 +48,7 @@ from liminallm.service.invocation import (
     current_invocation,
     payload_hash,
 )
+from liminallm.service.tool_namespace import ToolDescriptor
 
 
 def _unique(prefix: str) -> str:
@@ -124,7 +125,7 @@ class TestNoRetryBeforeThePriorTreeIsDead:
             # blocked on the capability below.
             "timeout_ms": 400,
         }
-        engine.tool_registry.setdefault("test.slow_tool", {"name": "test.slow_tool"})
+        _resolves_to(monkeypatch, engine, "test.slow_tool", {"name": "test.slow_tool"})
 
         pids_seen: list[int] = []
         live_at_start: list[list[int]] = []
@@ -425,7 +426,7 @@ class TestEverythingBrokerOwnedIsKilledAndReaped:
             "backoff_ms": 1,
             "timeout_ms": 200,
         }
-        engine.tool_registry.setdefault("test.undead", {"name": "test.undead"})
+        _resolves_to(monkeypatch, engine, "test.undead", {"name": "test.undead"})
         attempts = 0
         real_serve = engine._serve_invocation
 
@@ -1145,6 +1146,31 @@ def _slow_setsid_child(conn):
     conn.recv()
 
 
+def _resolves_to(monkeypatch, engine, name, spec):
+    """Make `name` resolve to `spec` for this test.
+
+    These tests exercise the invocation lease — spawn, kill, reap, retry —
+    with bodies that deliberately do not exist, so a real `tool.spec`
+    artifact would be refused for naming a handler nothing runs. That
+    refusal is correct; it is simply not what is under test here, so
+    resolution is stubbed explicitly rather than smuggled in through a cache.
+
+    They used to write into `engine.tool_registry`, which no longer decides
+    whether a tool exists.
+    """
+    real = engine._resolve_tool
+
+    def resolve(tool_name, scope):
+        if tool_name == name:
+            return ToolDescriptor(
+                name=name, schema=spec, artifact_id=None,
+                owner_user_id=None, owner_role=None,
+            )
+        return real(tool_name, scope)
+
+    monkeypatch.setattr(engine, "_resolve_tool", resolve)
+
+
 @contextmanager
 def _no_killpg(recorder):
     """Record any killpg target instead of signalling it."""
@@ -1255,33 +1281,34 @@ class TestTheWorkerCarriesNoAuthority:
     def test_a_spec_handler_alias_reaches_its_worker_body(self, runtime):
         """A `tool.spec` naming a worker-side builtin as its handler resolves
         to it. Without this the alias falls through to `tool.host`, which looks
-        in the map the body was deliberately moved out of."""
+        in the map the body was deliberately moved out of.
+
+        The spec is passed rather than looked up: every caller resolves the
+        descriptor first, and the process registry is no longer a resolution
+        source — it once answered for artifacts that had been deleted.
+        """
         engine = runtime.workflow
-        engine.tool_registry["custom.analyse"] = {
-            "name": "custom.analyse",
-            "handler": "code.python_v1",
-        }
-        engine.tool_registry["custom.chat"] = {
-            "name": "custom.chat",
-            "handler": "llm.generic",
-        }
-        try:
-            assert engine._resolve_worker_tool("custom.analyse") == "code.python_v1"
-            assert engine._resolve_worker_tool("code.python_v1") == "code.python_v1"
-            # A host body's alias resolves too, so `tool.host` is asked for the
-            # body rather than for the name that pointed at it.
-            assert engine._resolve_worker_tool("custom.chat") == "llm.generic"
-            # And the authorized row's spec wins over the shared registry: a
-            # private tool never enters it.
-            assert (
-                engine._resolve_worker_tool(
-                    "not.registered", {"handler": "notes.search_v1"}
-                )
-                == "notes.search_v1"
+        assert engine._resolve_worker_tool(
+            "custom.analyse", {"handler": "code.python_v1"}
+        ) == "code.python_v1"
+        # A name that is itself a body still resolves with no spec at all.
+        assert engine._resolve_worker_tool("code.python_v1") == "code.python_v1"
+        # A host body's alias resolves too, so `tool.host` is asked for the
+        # body rather than for the name that pointed at it.
+        assert engine._resolve_worker_tool(
+            "custom.chat", {"handler": "llm.generic"}
+        ) == "llm.generic"
+        # The authorized row's spec decides, including when its own name
+        # happens to match a different body.
+        assert (
+            engine._resolve_worker_tool(
+                "not.registered", {"handler": "notes.search_v1"}
             )
-        finally:
-            engine.tool_registry.pop("custom.analyse", None)
-            engine.tool_registry.pop("custom.chat", None)
+            == "notes.search_v1"
+        )
+        assert engine._resolve_worker_tool(
+            "notes.search_v1", {"handler": "llm.generic"}
+        ) == "llm.generic"
 
 
 # ---------------------------------------------------------------------------
@@ -1409,10 +1436,10 @@ class TestTheWholePathStillWorks:
         """The report and the fact agree: `timeout` is returned, and the
         process it names is gone."""
         engine = runtime.workflow
-        engine.tool_registry["test.hang"] = {
+        _resolves_to(monkeypatch, engine, "test.hang", {
             "name": "test.hang",
             "timeout_seconds": 1,
-        }
+        })
         seen: list = []
         real_serve = engine._serve_invocation
 
@@ -1568,7 +1595,7 @@ class TestReapingIsConfirmedNotAssumed:
         # A body that *fails* — a retry is what the refusal has to stop, and
         # nothing retries a node that succeeded.
         tool = hostile_child.FAILING_WORKER_BODY_TOOL
-        engine.tool_registry.setdefault(tool, {"name": tool})
+        _resolves_to(monkeypatch, engine, tool, {"name": tool})
         undead = {"on": True}
         monkeypatch.setattr(
             invocation_module, "group_alive", lambda pgid: undead["on"]

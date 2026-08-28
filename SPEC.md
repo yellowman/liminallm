@@ -1375,6 +1375,11 @@ timeout numbers are §18.3's — the sketch describes the fields):
 
 - `vars` is a `dict[str, Any]` scoped to a workflow execution; tool outputs merge into `vars` by key.
 - tool inputs are resolved by templating from `input` + `vars` (e.g., `${vars.intent}`); missing keys cause a node failure.
+- a `tool_call` node whose resolved inputs carry no `message` receives the
+  caller's turn as `message`. the fallback applies before input-schema
+  validation and identically on the blocking and streaming paths:
+  validation judges the inputs the node executes with, and one node must
+  get one verdict whichever transport runs it.
 - **error handling:** node failure retries up to `max_retries` with
   exponential backoff — defaults and kernel hard caps per §18.3, the one
   normative home for those numbers; exhausted retries emit an `error`

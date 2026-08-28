@@ -21,6 +21,11 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import httpx
 
 from liminallm.logging import get_logger
+from liminallm.service.model_backend import (
+    CancellableStream,
+    StreamAbortHandle,
+    _arm_or_refuse,
+)
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import estimate_token_count
 
@@ -282,6 +287,7 @@ class GeminiBackend:
         self._temperature = temperature
         self._transport = transport
         self._client: Optional[httpx.Client] = None
+        self._stream_client: Optional[httpx.Client] = None
         self._context_window: Optional[int] = None
         # None = not yet contradicted, False = this model predates
         # thinkingConfig and 400s on it (sticky for the process).
@@ -296,6 +302,27 @@ class GeminiBackend:
                 transport=self._transport,
             )
         return self._client
+
+    def _http_stream(self) -> httpx.Client:
+        """The client streams go through: a pool that keeps nothing idle.
+
+        Streaming's abort handle arms on the `connect_tcp.complete` trace
+        event, and a pooled keep-alive connection skips it — measured: the
+        context-window probe's GET on `_http()` left an idle connection,
+        the streaming POST was satisfied on that same socket, and the
+        handle never armed, so the abort chain built on `armed` collapsed.
+        `Connection: close` did not prevent it (it governs retention after
+        a request, not selection before). With zero keep-alive nothing is
+        ever idle, so every stream connects fresh and the trace fires;
+        blocking calls keep the pooled `_http()` client and its reuse.
+        """
+        if self._stream_client is None:
+            self._stream_client = httpx.Client(
+                timeout=httpx.Timeout(60.0, connect=10.0),
+                transport=self._transport,
+                limits=httpx.Limits(max_keepalive_connections=0),
+            )
+        return self._stream_client
 
     def _url(self, model: str, verb: str) -> str:
         return f"{self._base_url}/v1beta/models/{model}:{verb}"
@@ -468,6 +495,12 @@ class GeminiBackend:
             "usage": usage_dict(payload),
         }
 
+    #: The stream below attaches its response's socket to the abort handle,
+    #: so a read blocked mid-stream can be interrupted from another thread.
+    #: Declared only because that handle exists — see
+    #: `ModelBackend.generate_stream`.
+    supports_stream_cancel = True
+
     def generate_stream(
         self,
         messages: List[dict],
@@ -478,6 +511,17 @@ class GeminiBackend:
         """SSE over streamGenerateContent?alt=sse: each `data:` line is a
         chunk whose candidate parts carry text deltas; the last one carries
         usageMetadata."""
+        handle = StreamAbortHandle()
+        return CancellableStream(
+            self._generate_stream_impl(messages, adapters, handle), handle
+        )
+
+    def _generate_stream_impl(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        abort_handle: StreamAbortHandle,
+    ) -> Iterator[dict]:
         body, applied = self._request_body(messages, adapters)
         url = self._url(self.base_model, "streamGenerateContent") + "?alt=sse"
         full_content = ""
@@ -487,14 +531,29 @@ class GeminiBackend:
             # a 400 blaming thinkingConfig, which _drop_rejected_thinking has
             # then removed from the body for good.
             for attempt in (1, 2):
-                with self._http().stream(
-                    "POST", url, headers=self._headers(), json=body,
+                # Through the streaming client, whose pool keeps nothing
+                # idle — see `_http_stream`. The trace hands the abort
+                # handle its socket before the request is written, so a
+                # provider that stalls pre-headers is still interruptible.
+                with self._http_stream().stream(
+                    "POST", url,
+                    headers=self._headers(),
+                    json=body,
+                    extensions={"trace": abort_handle.trace},
                 ) as resp:
                     if attempt == 1 and resp.status_code == 400:
                         resp.read()
                         if self._drop_rejected_thinking(body, 400, resp.text):
                             continue
                     resp.raise_for_status()
+                    # After status handling, before any token: an error
+                    # response never streams, so the fail-closed rule guards
+                    # exactly the thing it exists for — producing tokens
+                    # through a stream whose interrupt is not in hand.
+                    refusal = _arm_or_refuse(abort_handle, resp)
+                    if refusal is not None:
+                        yield refusal
+                        return
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data:"):
                             continue

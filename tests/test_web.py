@@ -415,6 +415,11 @@ class _InjectionHandler(http.server.BaseHTTPRequestHandler):
 class _FetchingBackend:
     """Backend that calls web_fetch once on a given URL, then answers."""
 
+    #: In-memory generator, never blocks — honest under the fail-closed
+    #: streaming-cancel contract, and without it a streamed turn would take
+    #: the non-streaming fallback instead of the path under test.
+    supports_stream_cancel = True
+
     def __init__(self, url):
         self.url = url
 
