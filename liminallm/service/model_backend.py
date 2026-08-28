@@ -1728,6 +1728,14 @@ class LocalJaxLoRABackend:
     # Modes compatible with this backend
     COMPATIBLE_MODES = {AdapterMode.LOCAL, AdapterMode.HYBRID, AdapterMode.PROMPT}
 
+    #: This backend cannot be held to a node timeout. `generate_stream` runs
+    #: the whole forward pass in `generate` before its first yield, so there is
+    #: no point between events at which a stop request could be honoured — and
+    #: no way to interrupt a JAX call from another thread. Declaring it sends
+    #: streamed nodes down the ordinary executor, which runs the body in a
+    #: worker process that a kill does end.
+    supports_stream_cancel = False
+
     #: This backend loads LoRA weights itself, so a promoted hybrid adapter
     #: is carried by its weights here and by its prompt on API backends
     #: (SPEC §5.0.1). LLMService reads this to decide which.

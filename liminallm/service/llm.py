@@ -131,6 +131,25 @@ class LLMService:
         backend_flag = getattr(self.backend, "supports_tools", None)
         return bool(backend_flag) if backend_flag is not None else True
 
+    @property
+    def stream_is_cancellable(self) -> bool:
+        """Whether a streamed node can be held to its timeout.
+
+        The baseline contract is weak on purpose: a producer that yields
+        events can be stopped between them, which is all `StreamPump` needs to
+        return promptly once the answer is flowing. A backend declares itself
+        out when even that is false — `LocalJaxLoRABackend` runs the whole
+        forward pass before its first yield, so a node's `timeout_ms` could
+        not be honoured however the iteration were scheduled.
+
+        SPEC §9.2 makes the timeout part of the node contract, so a backend
+        that cannot meet it does not get to stream: the caller falls back to
+        the ordinary node executor, which runs the body in a worker process
+        that a kill really does end, and sends the finished answer over SSE.
+        """
+        declared = getattr(self.backend, "supports_stream_cancel", None)
+        return True if declared is None else bool(declared)
+
     def generate_with_tools(
         self,
         messages: List[dict],

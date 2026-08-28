@@ -9,12 +9,14 @@ import os
 import tempfile
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from typing import (
     Any,
+    AsyncIterator,
     Callable,
     Dict,
     List,
@@ -59,6 +61,12 @@ from liminallm.service.invocation import (
 )
 from liminallm.service.llm import LLMService
 from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW, active_adapters
+from liminallm.service.node_attempt import (
+    BlockingNodeAttempt,
+    NodeAttempt,
+    NodeOutcome,
+    bounded,
+)
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import (
@@ -918,25 +926,33 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         try:
             async with self._cancel_revokes(invocation, cancel_event):
-                return await self._attempt_node(
+                outcome = await self._run_node_attempts(
                     node,
                     invocation=invocation,
                     node_id=node_id,
                     max_retries=max_retries,
                     backoff_ms=backoff_ms,
-                    user_message=user_message,
-                    context_id=context_id,
-                    conversation_id=conversation_id,
-                    adapters=adapters,
-                    history=history,
-                    vars_scope=vars_scope,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                    tool_scope=tool_scope,
+                    make_attempt=lambda: BlockingNodeAttempt(
+                        partial(
+                            self._execute_node,
+                            node,
+                            user_message=user_message,
+                            context_id=context_id,
+                            conversation_id=conversation_id,
+                            adapters=adapters,
+                            history=history,
+                            vars_scope=vars_scope,
+                            user_id=user_id,
+                            tenant_id=tenant_id,
+                            tool_scope=tool_scope,
+                            invocation=invocation,
+                        )
+                    ),
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
                     cancel_event=cancel_event,
                 )
+                return outcome.result, outcome.next_nodes
         finally:
             # Reached on success, failure, timeout and cancellation alike. An
             # execution that ends any other way leaves a live sandbox child and
@@ -978,7 +994,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
             if watcher is not None:
                 watcher.cancel()
 
-    async def _attempt_node(
+    async def _run_node_attempts(self, node: Dict[str, Any], **kwargs) -> NodeOutcome:
+        """`_drive_node_attempts` for a caller with no use for stream events."""
+        outcome: Optional[NodeOutcome] = None
+        async with aclosing(self._drive_node_attempts(node, **kwargs)) as driver:
+            async for item in driver:
+                if isinstance(item, NodeOutcome):
+                    outcome = item
+        # Every path out of the driver yields an outcome before it returns.
+        return outcome
+
+    async def _drive_node_attempts(
         self,
         node: Dict[str, Any],
         *,
@@ -986,77 +1012,80 @@ class WorkflowEngine(WorkflowStreamingMixin):
         node_id: str,
         max_retries: int,
         backoff_ms: float,
-        user_message: str,
-        context_id: Optional[str],
-        conversation_id: Optional[str],
-        adapters: List[dict],
-        history: List[Any],
-        vars_scope: Dict[str, Any],
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-        tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
+        make_attempt: Callable[[], NodeAttempt],
         workflow_start_time: float,
         workflow_timeout_ms: float,
         cancel_event: Optional[asyncio.Event] = None,
-    ) -> Tuple[Dict[str, Any], List[str]]:
-        """The attempt loop of one logical execution."""
+    ) -> AsyncIterator[Any]:
+        """The attempt loop of one logical execution, whatever produced it.
+
+        Yields the attempt's stream events as they arrive, then exactly one
+        `NodeOutcome`, last. A blocking attempt produces no events, so its loop
+        is this same code with the `async for` doing nothing — which is the
+        point: the retry cap, the backoff, the three-way node deadline and the
+        workflow deadline are SPEC §9.2 properties of the node, and a second
+        copy of them beside the streaming path is a second chance to disagree.
+        """
         last_error: Optional[Exception] = None
         attempt = 0
+        previous: Optional[NodeAttempt] = None
+        emitted = False
 
         while attempt <= max_retries:
-            if attempt and not await self._previous_attempt_is_dead(
+            if previous is not None and not await self._previous_attempt_is_dead(
                 invocation, node_id, attempt
             ):
-                return (
-                    {
+                yield NodeOutcome(
+                    result={
                         "status": "error",
-                        "error": "tool_worker_unreaped",
+                        "error": previous.unreaped_error,
                         "attempts": attempt,
                     },
-                    [],
+                    emitted=emitted,
                 )
+                return
             # Check workflow timeout before each attempt
             elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
             remaining_ms = workflow_timeout_ms - elapsed_ms
             if remaining_ms <= 0:
-                return (
-                    {
+                yield NodeOutcome(
+                    result={
                         "status": "error",
                         "error": "workflow_timeout_during_retry",
                         "retries_exhausted": True,
                         "attempts": attempt,
                     },
-                    [],
-            )
+                    emitted=emitted,
+                )
+                return
 
+            start_ms = time.monotonic() * 1000
+            # Three bounds, and the attempt gets the smallest. The node's
+            # own ask is the least authoritative of them: SPEC §18.3 caps
+            # it at MAX_NODE_TIMEOUT_SECONDS, and the workflow's remaining
+            # budget caps it again, because "timeout_ms caps total wall
+            # clock" is only true if no single attempt may outlive it.
+            node_timeout_ms = min(
+                node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS),
+                MAX_NODE_TIMEOUT_SECONDS * 1000,
+                remaining_ms,
+            )
+            current = make_attempt()
+            previous = current
             try:
-                start_ms = time.monotonic() * 1000
-                # Three bounds, and the attempt gets the smallest. The node's
-                # own ask is the least authoritative of them: SPEC §18.3 caps
-                # it at MAX_NODE_TIMEOUT_SECONDS, and the workflow's remaining
-                # budget caps it again, because "timeout_ms caps total wall
-                # clock" is only true if no single attempt may outlive it.
-                node_timeout_ms = min(
-                    node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS),
-                    MAX_NODE_TIMEOUT_SECONDS * 1000,
-                    remaining_ms,
+                deadline = (
+                    asyncio.get_running_loop().time() + node_timeout_ms / 1000.0
                 )
-                result, next_nodes = await asyncio.wait_for(
-                    self._execute_node(
-                        node,
-                        user_message=user_message,
-                        context_id=context_id,
-                        conversation_id=conversation_id,
-                        adapters=adapters,
-                        history=history,
-                        vars_scope=vars_scope,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        tool_scope=tool_scope,
-                        invocation=invocation,
-                    ),
-                    timeout=node_timeout_ms / 1000.0,
+                async for event in bounded(current.events(), deadline):
+                    if event.get("event") == "token":
+                        emitted = True
+                    yield event
+                outcome = await asyncio.wait_for(
+                    current.result(),
+                    timeout=max(deadline - asyncio.get_running_loop().time(), 0),
                 )
+                result, next_nodes = outcome.result, outcome.next_nodes
+                emitted = emitted or outcome.emitted
 
                 result["latency_ms"] = (time.monotonic() * 1000) - start_ms
 
@@ -1064,7 +1093,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 if result.get("status") != "error" or node.get("on_error"):
                     if attempt > 0:
                         result["retry_attempts"] = attempt
-                    return result, next_nodes
+                    yield NodeOutcome(
+                        result=result,
+                        next_nodes=next_nodes,
+                        failure_event=outcome.failure_event,
+                        emitted=emitted,
+                    )
+                    return
 
                 # Node returned an error status - treat as retryable
                 last_error = Exception(
@@ -1104,6 +1139,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     error=str(exc),
                 )
 
+            # A retry is only meaningful before the first token. After it, the
+            # answer is on the user's screen: a second attempt would append a
+            # second answer to the same bubble rather than replace the first,
+            # and so would an `on_error` edge. Failure past that point is
+            # terminal, and `emitted` is how the caller knows not to recover.
+            if emitted:
+                yield NodeOutcome(
+                    result={
+                        "status": "error",
+                        "error": str(last_error) if last_error else "stream failed",
+                        "attempts": attempt + 1,
+                    },
+                    emitted=True,
+                )
+                return
+
             attempt += 1
 
             # If we have more retries, apply exponential backoff
@@ -1130,28 +1181,24 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         attempt=attempt,
                         backoff_ms=sleep_ms,
                     )
+                    cancelled = NodeOutcome(
+                        result={
+                            "status": "error",
+                            "error": "workflow_cancelled",
+                            "cancelled": True,
+                        },
+                        emitted=emitted,
+                    )
                     if cancel_event and cancel_event.is_set():
-                        return (
-                            {
-                                "status": "error",
-                                "error": "workflow_cancelled",
-                                "cancelled": True,
-                            },
-                            [],
-                        )
+                        yield cancelled
+                        return
                     if cancel_event:
                         try:
                             await asyncio.wait_for(
                                 cancel_event.wait(), timeout=sleep_ms / 1000.0
                             )
-                            return (
-                                {
-                                    "status": "error",
-                                    "error": "workflow_cancelled",
-                                    "cancelled": True,
-                                },
-                                [],
-                            )
+                            yield cancelled
+                            return
                         except asyncio.TimeoutError:
                             pass
                     else:
@@ -1164,14 +1211,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
             attempts=attempt,
             error=str(last_error),
         )
-        return (
-            {
+        yield NodeOutcome(
+            result={
                 "status": "error",
                 "error": str(last_error) if last_error else "unknown error",
                 "retries_exhausted": True,
                 "attempts": attempt,
             },
-            [],
+            emitted=emitted,
         )
 
     async def _previous_attempt_is_dead(

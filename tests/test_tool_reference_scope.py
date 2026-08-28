@@ -1012,3 +1012,196 @@ class TestAFreshDatabaseStillBoots:
         }
         missing = [t for t in referenced if t not in names]
         assert not missing, f"the default workflow references unseeded tools: {missing}"
+
+
+class TestAStreamedAttemptCanBeStopped:
+    """The half of the node contract that a stream makes hard.
+
+    A worker is a process and a kill ends it. A streamed producer is a thread,
+    and `asyncio.wait_for` cancels the waiter rather than the work: the loop
+    gets control back and the thread keeps producing the answer the next
+    attempt is about to replace. So each property below is about the producer,
+    not about the coroutine that was waiting for it.
+    """
+
+    @staticmethod
+    def _aliased(store, owner, **spec_extra):
+        name = _u("my.chat")
+        _tool(store, name, "llm.generic", owner=owner.id, visibility="private",
+              **spec_extra)
+        return name
+
+    def _engine_for(self, store, node, tag, **spec_extra):
+        """An engine and a private workflow whose one node is `node`."""
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u(tag)}@t.local", tenant_id=_u(tag))
+        name = self._aliased(store, u, **spec_extra)
+        wf = store.create_artifact(
+            "workflow", _u(f"{tag}wf"),
+            {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
+                {"id": "call", "type": "tool_call", "tool": name, **node},
+                {"id": "fin", "type": "end"},
+            ]},
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        return engine, wf, u
+
+    @pytest.mark.asyncio
+    async def test_a_failure_after_the_first_token_is_not_retried(self, store):
+        """SPEC §18.3 allows the retry; the transport forbids it.
+
+        A second attempt would append a second answer to a bubble that already
+        holds the first, so the boundary is the first token, not the budget.
+        """
+        engine, wf, u = self._engine_for(
+            store, {"max_retries": 2, "backoff_ms": 10, "next": "fin"}, "aft"
+        )
+        attempts = []
+
+        def generate_stream(*a, **k):
+            attempts.append(1)
+            yield {"event": "token", "data": "half"}
+            raise RuntimeError("cut off mid-sentence")
+
+        engine.llm.generate_stream = generate_stream
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert len(attempts) == 1, (
+            f"the node retried after a token had reached the client: "
+            f"{len(attempts)} attempts"
+        )
+        assert [e for e in events if e.get("event") == "token"], events
+        assert [e for e in events if e.get("event") == "error"], events[-2:]
+
+    @pytest.mark.asyncio
+    async def test_a_timed_out_producer_is_told_to_stop(self, store):
+        """Not merely abandoned. The producer must see the stop, or the node
+        timeout is a description of what the caller stopped waiting for."""
+        import threading
+        import time as _time
+
+        engine, wf, u = self._engine_for(
+            store, {"timeout_ms": 150, "max_retries": 0, "next": "fin"}, "stp"
+        )
+        stopped = threading.Event()
+
+        def generate_stream(*a, **k):
+            try:
+                for _ in range(50):
+                    _time.sleep(0.02)
+                    yield {"event": "token", "data": "."}
+            finally:
+                # Reached when the pump breaks out of its loop and closes the
+                # iterator, which is the stop request arriving.
+                stopped.set()
+
+        engine.llm.generate_stream = generate_stream
+        [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert stopped.wait(5.0), (
+            "the producer was never told to stop; the timeout cancelled the "
+            "waiter and left the thread producing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_retry_waits_for_the_previous_producer(self, store):
+        """Two producers for one node is not a retry, it is a race whose
+        winner writes the answer."""
+        import threading
+        import time as _time
+
+        engine, wf, u = self._engine_for(
+            store,
+            {"timeout_ms": 120, "max_retries": 1, "backoff_ms": 1, "next": "fin"},
+            "wait",
+        )
+        live = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def generate_stream(*a, **k):
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+            try:
+                # Past its own timeout, and not interruptible until the sleep
+                # returns — the case the confirmation exists for.
+                _time.sleep(0.4)
+                yield {"event": "token", "data": "late"}
+            finally:
+                with lock:
+                    live -= 1
+
+        engine.llm.generate_stream = generate_stream
+        [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert peak == 1, (
+            f"{peak} producers ran at once for one node; the retry started "
+            f"beside the attempt it replaced"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_node_with_an_output_schema_holds_its_tokens(self, store):
+        """SPEC §9.2 validates outputs, and a token already on the screen
+        cannot be withdrawn. So a node with a schema streams nothing until its
+        finished answer passes — the refusal is not enough on its own."""
+        engine, wf, u = self._engine_for(
+            store, {"next": "fin"}, "hold",
+            output_schema={"type": "object", "required": ["impossible_field"]},
+        )
+        engine.llm.generate_stream = lambda *a, **k: iter([
+            {"event": "token", "data": "hi"},
+            {"event": "message_done", "data": {"content": "hi", "usage": {}}},
+        ])
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert not [e for e in events if e.get("event") == "token"], (
+            f"a node whose output its schema forbids still streamed: {events}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_valid_output_still_reaches_the_client(self, store):
+        """The complement. Holding tokens back must not mean losing them."""
+        engine, wf, u = self._engine_for(
+            store, {"next": "fin"}, "pass",
+            output_schema={"type": "object", "required": ["content"]},
+        )
+        engine.llm.generate_stream = lambda *a, **k: iter([
+            {"event": "token", "data": "hi"},
+            {"event": "message_done", "data": {"content": "hi", "usage": {}}},
+        ])
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert [e for e in events if e.get("event") == "token"], events
+        assert not [e for e in events if e.get("event") == "error"], events
+
+    @pytest.mark.asyncio
+    async def test_a_backend_that_cannot_be_stopped_does_not_stream(self, store):
+        """`LocalJaxLoRABackend` runs the whole forward pass before its first
+        yield, so no scheduling makes `timeout_ms` enforceable against it. The
+        answer still arrives — through the executor that runs the body in a
+        worker a kill does end."""
+        engine, wf, u = self._engine_for(store, {"next": "fin"}, "nc")
+        engine.llm.backend.supports_stream_cancel = False
+        streamed = []
+        engine.llm.generate_stream = lambda *a, **k: (
+            streamed.append(1) or iter([
+                {"event": "token", "data": "hi"},
+                {"event": "message_done", "data": {"content": "hi", "usage": {}}},
+            ])
+        )
+        try:
+            events = [e async for e in engine.run_streaming(
+                wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        finally:
+            del engine.llm.backend.supports_stream_cancel
+        assert not streamed, "a backend that cannot be stopped was streamed anyway"
+        assert not [e for e in events if e.get("event") == "error"], events
+        done = [e for e in events if e.get("event") == "message_done"]
+        assert done and done[-1]["data"].get("content"), (
+            f"the fallback produced no answer: {events[-2:]}"
+        )

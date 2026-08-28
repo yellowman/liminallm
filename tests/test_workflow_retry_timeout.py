@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
+from liminallm.service.llm import LLMService
+from liminallm.service.model_backend import StubBackend
 from liminallm.service.tool_namespace import (
     SYSTEM_SCOPE,
     ResolvedWorkflow,
@@ -94,8 +96,19 @@ class MockStore:
         return None, "names no tool this workflow can reach"
 
 
-class MockLLM:
-    """Mock LLM service."""
+class MockLLM(LLMService):
+    """The real service over the stub backend.
+
+    A hand-written stand-in with one `generate` on it answered every capability
+    question by not having the attribute, so tests here could not see a
+    capability the engine now asks about — `stream_is_cancellable`, which the
+    real property resolves from the backend. Subclassing keeps the one
+    behaviour these tests do rely on (a canned completion) while the rest of
+    the interface stays the real one.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("test-model", backend=StubBackend())
 
     def generate(self, prompt: str, **kwargs) -> dict:
         return {"content": "test response", "usage": {"tokens": 10}}
