@@ -8771,3 +8771,16 @@ a ready result with the budget exactly spent — has no deterministic
 witness, because forcing events to end inside the terminal grace requires
 landing in a millisecond window. The blocking half carries the mutations;
 the streamed half is the two-line collection of a stored field.
+
+### The admission-proof control was itself vacuous, and for the campaign's oldest reason
+
+Review caught it before merge: the driver-level witness's `BlockingShaped`
+fake omitted `result_ready_after_events` — the very field the branch under
+test reads. The driver raised `AttributeError` inside the `elif`, the
+generic handler recorded a failed attempt, and `assert not started` passed
+because the fake crashed, not because the refusal ran. The §V rule, again:
+a double built from belief about an interface encodes the belief. One line
+adds the field, and the assertion now demands the specific `node_timeout`
+error, so a crash on a missing protocol field can never again read as the
+intended refusal. ND1 re-run: killed by both witnesses, now on the path
+they claim.

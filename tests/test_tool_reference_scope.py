@@ -2597,6 +2597,14 @@ class TestABlockingBodyNeverStartsAfterItsDeadline:
         class BlockingShaped:
             unreaped_error = "tool_worker_unreaped"
             needs_lease = False
+            #: The field the exhausted-budget branch reads. Its first version
+            #: omitted it, and the witness went vacuous: the driver raised
+            #: `AttributeError` inside the `elif`, the generic handler turned
+            #: that into an ordinary failed attempt, and `assert not started`
+            #: passed because the fake crashed — not because the intended
+            #: refusal ran. The §V rule again: a double built from belief
+            #: about an interface encodes the belief.
+            result_ready_after_events = False
 
             async def events(self):
                 return
@@ -2626,3 +2634,10 @@ class TestABlockingBodyNeverStartsAfterItsDeadline:
             "exhausted, and awaited it unbounded"
         )
         assert outcome.result.get("status") == "error", outcome.result
+        # The specific error, not merely an error: this is what separates
+        # the intended branch (`result_ready_after_events` false → timeout)
+        # from a fake that crashed on a missing protocol field and was
+        # written off as a failed attempt.
+        assert "node_timeout" in str(outcome.result.get("error", "")), (
+            f"the driver refused for the wrong reason: {outcome.result}"
+        )
