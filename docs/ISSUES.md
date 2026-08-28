@@ -15703,3 +15703,64 @@ through its new one; the responses branch shares both mechanisms and its
 gate call is structural. A socketless witness through
 `_stream_via_responses` would need a second SDK-shaped fake for marginal
 return; recorded here so the decision is visible.
+
+## A pooled keep-alive connection bypassed the arming mechanism
+
+Fifth round, one HIGH, and it was a false primitive inside the previous
+fix. The arming design assumed `Connection: close` on a streaming request
+guarantees a fresh TCP connection, hence a `connect_tcp.complete` trace
+event, hence an armed abort handle. The header does no such thing: it
+governs whether the connection is retained *after* the request, not
+whether an already-idle pooled connection satisfies it.
+
+Measured on httpx 0.28.1 (in the supported range): warm a client with one
+request, send the next with `Connection: close` — the server sees it on
+the same socket. No connect event fires, the handle never arms, and the
+whole chain built on `armed` follows it down: `abort()` interrupts
+nothing, `cancellation_proven` is false, the terminal teardown excludes
+the producer from its wait, and the workflow returns its timeout while
+the provider request runs on. The original waiter-versus-work defect,
+reintroduced by the fix's own transport assumption.
+
+Production-reachable, not contrived: Gemini's context-window probe GETs
+through the same `_http()` client streaming used, so the first turn's
+budget computation warmed exactly the pool the stream then drew from. The
+cold-pool witnesses had pinned `_context_window` — which is precisely the
+request that warms that pool — so the arming premise was true in the
+tests artificially.
+
+The primitive that holds, probe-proven before building on it:
+`httpx.Limits(max_keepalive_connections=0)`. A pool that retains nothing
+has nothing idle to reuse, so every request connects fresh and the trace
+fires — `[1, 2]` connections in the probe where `Connection: close` gave
+`[1, 1]`.
+
+The green:
+
+* `ArmingClient` forces zero keep-alive in its constructor — the class is
+  the no-reuse guarantee. The `Connection: close` injection is removed
+  rather than kept as a second mechanism, for the reason mutation keeps
+  teaching: two authorities for one property make both unmeasurable.
+* The OpenAI-compatible backend splits its SDK client: blocking calls
+  keep the pooled client and its connection reuse; streams go through a
+  second SDK client over `ArmingClient`. A dedicated client alone would
+  not have been enough — the first stream's completed connection would
+  idle in that pool and disarm the second stream the same way.
+* Gemini streams through `_http_stream()` — same transport injection,
+  zero keep-alive — while `_http()` keeps pooling for generate and the
+  probe.
+
+Witness structure, because the reviewer's framing was exactly right about
+what the previous witnesses proved: the cold-pool witnesses show what
+happens when the arming premise holds; the new ones witness the premise.
+End to end, the real window probe runs unpinned, warms the pool, and the
+streaming POST stalls on the same socket — the producer must be dead when
+the 400ms timeout returns. At the client, a handle-bound SDK request and
+a second gemini stream-client request must each open a fresh connection
+against a deliberately warmed server. Four no-reuse mutations pair with
+them: each client's limits removed, and each streaming call site pointed
+back at the shared pooled client.
+
+The performance cost is deliberate and small: one TCP+TLS handshake per
+streamed node, on calls that run for seconds, in exchange for the node
+timeout meaning what it says.
