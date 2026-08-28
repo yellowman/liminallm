@@ -2740,7 +2740,7 @@ class PostgresStore:
                 predicate = "a.visibility = 'global'"
                 params = [name]
             rows = conn.execute(
-                "SELECT a.id, a.schema, a.owner_user_id, u.role AS owner_role "
+                "SELECT a.id, a.schema, a.owner_user_id, u.role AS owner_role "  # nosec B608 - fragments are source literals; values are always bound via %s
                 "FROM artifact a LEFT JOIN app_user u ON u.id = a.owner_user_id "
                 "WHERE a.type = 'tool' AND a.schema->>'name' = %s AND " + predicate,
                 tuple(params),
