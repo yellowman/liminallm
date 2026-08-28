@@ -15323,3 +15323,153 @@ is the one the rewritten witnesses use.
 Two rules earned here, both cheap: give every case its own fixture when a
 case can corrupt shared state, and assert on the field rather than on the
 serialized document.
+
+## A streamed node skipped the node contract, not just the preflight
+
+Tranche 2, the last of the streaming seams. Earlier passes moved the breaker,
+the `on_error` handoff and `tool_preflight` onto the streamed path, and the
+claim at the time was that streaming specialises token production and nothing
+above it. That claim was too strong. SPEC §9.2 makes retries, backoff, the
+per-node timeout and output-schema validation properties of a *node*, and
+§18.3 fixes their numbers; the streamable branch had none of them, because it
+never called `_execute_node_with_retry` — the branch directly below it did.
+
+Measured on one aliased tool that resolves to `llm.generic` and therefore
+streams, so the same node ran both ways:
+
+```
+property           blocking       streaming
+max_retries: 1     2 attempts     1 attempt
+timeout_ms: 200    enforced       node ran 1.51s and completed normally
+output_schema      status error   tokens emitted, no error at all
+```
+
+### The timeout could not be enforced at all, and why
+
+`_stream_llm_node` iterated `llm.generate_stream` — a synchronous iterator —
+directly on the event loop. Two defects in one line: the model ran on the
+loop, so every other request the worker was serving waited on this one's
+tokens; and nothing was watching the clock, so `timeout_ms` described nothing.
+
+Moving the iteration off the loop does not by itself fix the second.
+`asyncio.to_thread(next, iterator)` hands one item to one pool thread and
+leaves nobody owning the iterator between items: cancelling the await returns
+control to the loop and leaves the thread inside `next()`, still producing the
+answer the next attempt is about to replace, and the pool loses a worker per
+cancelled stream. `asyncio` can cancel the waiter; it cannot kill the thread.
+
+So the abstraction has to include termination, not merely execution
+elsewhere. `StreamPump` owns the iterator on a thread for its whole life,
+carries events across on the loop's own queue (`call_soon_threadsafe`, so
+there is no thread hop per token), and honours a stop flag between events.
+
+### One driver, because two loops is two answers
+
+`_attempt_node` became `_drive_node_attempts`, parameterized by a
+`NodeAttempt` factory and yielding the attempt's stream events before its one
+`NodeOutcome`. Blocking supplies a coroutine body and produces no events;
+streaming supplies a token producer. Neither owns retry policy. The retry cap,
+the backoff, the three-way node deadline (node ask, §18.3 hard cap, workflow
+remainder) and the workflow deadline now exist once.
+
+That is also why the mutation set below has no "streaming loses its backoff"
+entry: after this change there is no such mutation to write.
+
+### Stopping is one authority, and mutation proved it
+
+A streamed producer registers on the `Invocation` as a `Producer`, so a revoke
+reaches worker processes and in-process producers through the same call, and
+`terminate` counts both. The existing retry precondition — attempt *n+1* may
+not start while attempt *n* is alive — then covers streams with no second
+mechanism.
+
+The first draft also stopped the pump in `_pumped`'s own `finally`. Both
+routes worked, and mutation found the cost: removing *either* changed nothing
+any test could see, because the other still stopped it. Two authorities for
+one stop is the shape this tranche exists to remove, so the local one went.
+
+`close` drops producers from the *wait* only, never from the stop. A producer
+blocked inside a read owns no process and no scratch path, and holding the
+caller for it would defeat the timeout that stopped it — the node correctly
+failed at 201ms and the turn still took 1.53s until this was separated.
+
+### Retry stops at the first token
+
+SPEC §18.3 allows the retry; the transport forbids it. Once a token is on the
+user's screen a second attempt appends a second answer rather than replacing
+the first, and so would an `on_error` edge. `NodeOutcome.emitted` carries that
+boundary out to the caller, which already drew the same line for the
+attachment agent.
+
+The same reasoning decides buffering. A validated output cannot be
+incremental: tokens already sent cannot be withdrawn when the finished answer
+violates its schema. A node whose tool declares an `output_schema` therefore
+holds its tokens until the answer passes; a node without one streams exactly
+as it did before.
+
+### Cancellable streaming is a declared backend capability
+
+`LLMService.stream_is_cancellable` reads `supports_stream_cancel` off the
+backend and defaults to true, because the baseline contract is weak on
+purpose: "the producer stops between events" is met by any generator.
+
+`LocalJaxLoRABackend` declares itself out. It runs the whole forward pass
+inside `generate` before its first yield, so there is no point between events
+at which a stop could be honoured, and no way to interrupt a JAX call from
+another thread — no scheduling makes `timeout_ms` enforceable against it.
+Streamed nodes on such a backend fall back to the ordinary executor, which
+runs the body in a worker process that a kill does end, and the answer reaches
+the client in the final `message_done`. Later than a stream, under the
+contract SPEC §9.2 requires.
+
+### Two test-quality findings, both from mutation
+
+`MockLLM` was a hand-written stand-in with a single `generate` on it. It
+answered every capability question by not having the attribute, so seven
+tests could not see one the engine had started asking about. It is now
+`LLMService` over `StubBackend` — the rule from §V that a double is built from
+the real object, earned again.
+
+The stop witness was vacuous on its first writing. Its producer yielded 50
+items at 20ms and the assertion waited 5s, so the `finally` fired when the
+loop ran out whether or not anything had asked it to stop; the mutation that
+removes the stop survived. An unbounded producer makes the wait mean what it
+says.
+
+### The mutation set: 17 written, 17 killed
+
+```
+retry cap on the streamed path                    killed
+node deadline on the streamed path                killed
+output validation on the streamed path            killed
+retry after the first token                       killed
+a revoke no longer reaches producers              killed (after repair)
+a producer does not count as alive                killed
+the retry stops asking whether the last died      killed
+backoff not applied                               killed
+workflow remainder stops capping the node         killed (2 witnesses)
+the §18.3 hard cap stops capping the node         killed
+tokens not held while a schema is pending         killed
+a failed output releases the tokens it held       killed
+a non-cancellable backend is streamed anyway      killed
+every backend claims it can be stopped            killed
+a mid-stream failure ends with a bare error       killed
+a streamed refusal reported as a server fault     killed
+```
+
+### Also fixed, found while in here
+
+`_stream_agent_files_node` opened an execution of its own, so its tool rounds
+and the node's retries were two logical executions of one node. It now takes
+the driver's. Its final turn used `to_thread` for the *call* and then iterated
+the result on the loop, which is where the tokens actually arrive; it goes
+through the same pump.
+
+A backend failure now reaches that node as an event rather than an exception,
+because it happens on a thread. Its error branch hands a post-token failure to
+the same handler as before, so the turn is still closed with what was actually
+said instead of a bare error appended to it.
+
+A streamed refusal reports its own code. `validation_error` and `forbidden`
+flattened to `server_error` told the caller to retry something that would fail
+identically.

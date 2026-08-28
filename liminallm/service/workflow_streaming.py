@@ -711,24 +711,24 @@ class WorkflowStreamingMixin:
         label: str,
         cancel_event: Optional[asyncio.Event],
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Drive a synchronous token producer off the loop, and stop it here.
+        """Drive a synchronous token producer off the loop.
 
-        The `finally` is what makes the timeout real. `asyncio.wait_for` around
-        this generator cancels the await inside it and nothing else; the pump
-        is stopped because closing the generator runs this block, and the
-        registration on the invocation is the second route to the same stop
-        for the paths that revoke instead.
+        The registration is the whole of the stop. `asyncio.wait_for` around
+        this generator cancels the await inside it and nothing else, so what
+        actually stops the thread is the execution being revoked — on the node
+        timeout, on a cancel, before a retry, and on the way out. Stopping the
+        pump here as well was a second route to the same stop, and mutation
+        found it: with two, removing either changed nothing that any test
+        could see. One authority for what an attempt started, which is the
+        `Invocation`.
         """
         pump = StreamPump(factory, label=label).start()
         invocation.resources.add_producer(pump, f"stream:{label}")
-        try:
-            async for event in pump.events():
-                if cancel_event and cancel_event.is_set():
-                    yield {"event": "cancel_ack", "data": {}}
-                    return
-                yield event
-        finally:
-            pump.stop()
+        async for event in pump.events():
+            if cancel_event and cancel_event.is_set():
+                yield {"event": "cancel_ack", "data": {}}
+                return
+            yield event
 
     async def _stream_agent_files_node(
         self,

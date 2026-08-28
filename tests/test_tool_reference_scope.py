@@ -1079,7 +1079,12 @@ class TestAStreamedAttemptCanBeStopped:
     @pytest.mark.asyncio
     async def test_a_timed_out_producer_is_told_to_stop(self, store):
         """Not merely abandoned. The producer must see the stop, or the node
-        timeout is a description of what the caller stopped waiting for."""
+        timeout is a description of what the caller stopped waiting for.
+
+        The producer never ends by itself. A bounded one made this vacuous —
+        mutation found it: the loop ran out during the wait, so the `finally`
+        fired whether or not anything had asked it to stop.
+        """
         import threading
         import time as _time
 
@@ -1090,7 +1095,7 @@ class TestAStreamedAttemptCanBeStopped:
 
         def generate_stream(*a, **k):
             try:
-                for _ in range(50):
+                while True:
                     _time.sleep(0.02)
                     yield {"event": "token", "data": "."}
             finally:
