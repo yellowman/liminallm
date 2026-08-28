@@ -758,6 +758,171 @@ class TestTheHandlerNamesTheBody:
         ) is None
 
 
+class TestAStreamedNodeObeysTheNodeContract:
+    """SPEC §9.2 and §18.3 apply to a streamed tool node too.
+
+    §9.2: per-node `max_retries`, `backoff_ms` and `timeout_ms` are
+    overridable, a node past its timeout fails, and tool inputs *and outputs*
+    are JSON-Schema validated. §18.3 is the single normative home for the
+    numbers — 2 retries by default, hard cap 3, 1s then 4s backoff, 15s node
+    timeout capped at 60s.
+
+    The streamable branch does not call `_execute_node_with_retry`; the branch
+    directly below it does. Measured on one aliased tool that resolves to
+    `llm.generic` and therefore streams:
+
+    ==================  ==============  ==============================
+    property            blocking        streaming
+    ==================  ==============  ==============================
+    `max_retries: 1`    2 attempts      1 attempt
+    `timeout_ms: 200`   enforced        node ran 1.51s and completed
+    `output_schema`     status error    tokens emitted, no error
+    ==================  ==============  ==============================
+
+    So the earlier claim that streaming specialises token production and
+    nothing above it was too strong: the whole node contract above it was
+    being skipped, not just the two things `tool_preflight` now covers.
+
+    Retry and timeout are separate normative properties and get separate
+    witnesses. Retrying a stream is only meaningful before the first token —
+    after that a retry would emit a second answer, which is the boundary
+    `emitted_tokens` already draws.
+    """
+
+    @staticmethod
+    def _aliased(store, owner, **spec_extra):
+        """A tool that resolves to `llm.generic`, so it takes the streamed
+        path under a name of its own."""
+        name = _u("my.chat")
+        _tool(store, name, "llm.generic", owner=owner.id, visibility="private",
+              **spec_extra)
+        return name
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_node_retries_per_policy(self, store):
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('rt')}@t.local", tenant_id=_u("rtt"))
+        name = self._aliased(store, u)
+        wf = store.create_artifact(
+            "workflow", _u("rwf"),
+            {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
+                {"id": "call", "type": "tool_call", "tool": name,
+                 "max_retries": 1, "backoff_ms": 10, "next": "fin"},
+                {"id": "fin", "type": "end"},
+            ]},
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        attempts = []
+
+        def generate_stream(*a, **k):
+            attempts.append(1)
+            raise RuntimeError("backend down")
+
+        engine.llm.generate_stream = generate_stream
+        [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert len(attempts) == 2, (
+            f"`max_retries: 1` means two attempts; the streamed node made "
+            f"{len(attempts)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_node_past_its_timeout_fails(self, store):
+        """A synchronous stream iterator that blocks must not outlive the
+        node's `timeout_ms`. It also blocks the event loop while it does."""
+        import time as _time
+
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('to')}@t.local", tenant_id=_u("tot"))
+        name = self._aliased(store, u)
+        wf = store.create_artifact(
+            "workflow", _u("twf"),
+            {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
+                {"id": "call", "type": "tool_call", "tool": name,
+                 "timeout_ms": 200, "max_retries": 0, "next": "fin"},
+                {"id": "fin", "type": "end"},
+            ]},
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+
+        def generate_stream(*a, **k):
+            def slow():
+                _time.sleep(1.5)
+                yield {"event": "token", "data": "late"}
+                yield {"event": "message_done",
+                       "data": {"content": "late", "usage": {}}}
+
+            return slow()
+
+        engine.llm.generate_stream = generate_stream
+        start = _time.monotonic()
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        elapsed = _time.monotonic() - start
+        assert elapsed < 1.0, (
+            f"a node with `timeout_ms: 200` ran for {elapsed:.2f}s; the "
+            f"iterator was never interrupted"
+        )
+        assert not any(e.get("event") == "token" for e in events), events
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_nodes_output_is_validated(self, store):
+        """SPEC §9.2 validates outputs as well as inputs, and an aliased tool
+        with an `output_schema` now legitimately reaches the streamed path."""
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('os')}@t.local", tenant_id=_u("ost"))
+        name = self._aliased(store, u, output_schema={
+            "type": "object", "required": ["impossible_field"],
+        })
+        wf = store.create_artifact(
+            "workflow", _u("owf"), _wf(name),
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        engine.llm.generate_stream = lambda *a, **k: iter([
+            {"event": "token", "data": "hi"},
+            {"event": "message_done", "data": {"content": "hi", "usage": {}}},
+        ])
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        codes = [e["data"].get("code") for e in events
+                 if e.get("event") == "error"]
+        assert "validation_error" in codes, (
+            f"a streamed node returned output its schema forbids: {events[-2:]}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_streamed_node_still_streams(self, store):
+        """The control. Enforcing the node contract must not stop tokens
+        reaching the client on the path that exists to produce them."""
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('ok')}@t.local", tenant_id=_u("okt"))
+        wf = store.create_artifact(
+            "workflow", _u("okwf3"), _wf("llm.generic"),
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        engine.llm.generate_stream = lambda *a, **k: iter([
+            {"event": "token", "data": "hi"},
+            {"event": "message_done", "data": {"content": "hi", "usage": {}}},
+        ])
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert any(e.get("event") == "token" for e in events), events
+        assert any(e.get("event") == "message_done" for e in events), events[-3:]
+        assert not any(e.get("event") == "error" for e in events), events
+
+
 class TestAmbiguityThatAppearsLater:
     """Admission cannot be the only altitude that refuses two rows.
 
