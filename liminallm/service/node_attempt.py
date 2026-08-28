@@ -226,6 +226,14 @@ class NodeAttempt(Protocol):
     #: death, so the log names the thing that would not stop.
     unreaped_error: str
 
+    #: Whether `result()` is already computed once `events()` has ended.
+    #: True for a streamed attempt — its work happened while the events
+    #: drained, and `result()` only returns the stored outcome. False for a
+    #: blocking attempt — its body *starts* inside `result()`. The driver
+    #: may collect a ready result after the clock has crossed zero; it must
+    #: never start un-begun work there.
+    result_ready_after_events: bool
+
     #: Whether the driver must open an `Attempt` lease for this try (SPEC
     #: §18.3: authority is fresh per attempt). True for attempts whose work
     #: runs in this process; False when the body spawns a worker, because the
@@ -247,6 +255,8 @@ class BlockingNodeAttempt:
     unreaped_error = "tool_worker_unreaped"
     #: The worker spawn calls `begin_attempt` itself, per §18.3.
     needs_lease = False
+    #: The body runs inside `result()`; nothing exists before it is awaited.
+    result_ready_after_events = False
 
     def __init__(self, run: Callable[[], Any]) -> None:
         self._run = run
@@ -291,6 +301,8 @@ class StreamedNodeAttempt:
     #: started", cancelled the whole execution, and the next attempt called
     #: the provider anyway because nothing here asked.
     needs_lease = True
+    #: `_drain` stores the outcome before it finishes; `result()` reads it.
+    result_ready_after_events = True
 
     def __init__(
         self,

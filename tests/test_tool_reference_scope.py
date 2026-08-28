@@ -46,6 +46,7 @@ handler executability.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 
 import pytest
@@ -2530,3 +2531,98 @@ class TestBothPreflightsSeeTheSameInputs:
             f"{delivered} events streamed past an already-expired deadline"
         )
         await agen.aclose()
+
+
+class TestABlockingBodyNeverStartsAfterItsDeadline:
+    """Review finding on `4d389f0`. The finished-stream repair generalized
+    the streamed exception to every attempt type: with the budget spent
+    after the event phase, the driver awaited `result()` unbounded. For a
+    streamed attempt that collects an already-computed field; for a
+    blocking attempt `result()` is where the tool body *starts* — so work
+    began after its deadline, unbounded, which SPEC's binding per-node
+    timeout exists to forbid. `timeout_ms: 0` is admissible today and
+    makes the route deterministic: empty events, terminal grace, spent
+    budget, unbounded body.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_ms_zero_runs_nothing(self, store):
+        """End to end on the blocking path: a node with no budget must not
+        start its body, let alone run it to completion."""
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('zb')}@t.local", tenant_id=_u("zbt"))
+        wf = store.create_artifact(
+            "workflow", _u("zbwf"),
+            {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
+                {"id": "call", "type": "tool_call", "tool": "llm.generic",
+                 "timeout_ms": 0, "max_retries": 0, "next": "fin"},
+                {"id": "fin", "type": "end"},
+            ]},
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        started = []
+
+        def generate(*a, **k):
+            started.append(1)
+            return {"content": "ran anyway", "usage": {}}
+
+        engine.llm.generate = generate
+        out = await engine.run(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)
+        assert not started, (
+            "a node with timeout_ms: 0 started its tool body after its "
+            "deadline — the exhausted-budget branch ran it unbounded"
+        )
+        errors = [e for e in out.get("workflow_trace", [])
+                  if e.get("status") == "error"]
+        assert errors and "timeout" in str(errors[0].get("error", "")), errors
+
+    @pytest.mark.asyncio
+    async def test_the_driver_itself_refuses_an_unstarted_body(self, store):
+        """The same property at the driver, with the node dict handed
+        straight in — so admission hygiene (a future `minimum: 1` on
+        `timeout_ms`) cannot make this witness pass while the driver stays
+        wrong. The attempt is blocking-shaped: empty events, a body that
+        only runs inside `result()` and records that it started."""
+        from liminallm.service.workflow import WorkflowEngine
+        from liminallm.service.node_attempt import NodeOutcome
+
+        rt = get_runtime()
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        started = []
+
+        class BlockingShaped:
+            unreaped_error = "tool_worker_unreaped"
+            needs_lease = False
+
+            async def events(self):
+                return
+                yield  # pragma: no cover - makes this an async generator
+
+            async def result(self):
+                started.append(1)
+                await asyncio.sleep(0.05)
+                return NodeOutcome(result={"status": "ok", "content": "late"})
+
+        invocation = engine.invocations.open(uuid.uuid4().hex)
+        try:
+            outcome = await engine._run_node_attempts(
+                {"id": "n", "timeout_ms": 0, "max_retries": 0},
+                invocation=invocation,
+                node_id="n",
+                max_retries=0,
+                backoff_ms=1,
+                make_attempt=BlockingShaped,
+                workflow_start_time=time.monotonic(),
+                workflow_timeout_ms=60000,
+            )
+        finally:
+            invocation.close()
+        assert not started, (
+            "the driver started a blocking body with its budget already "
+            "exhausted, and awaited it unbounded"
+        )
+        assert outcome.result.get("status") == "error", outcome.result

@@ -8737,3 +8737,37 @@ identically on both transports — validation judges the inputs the node
 executes with.
 
 The tranche now stands at 39 mutations, 39 killed.
+
+## The finished-stream repair let blocking work start after its deadline
+
+Review finding on `4d389f0`, a HIGH the previous fix introduced. The
+exhausted-budget branch collected `result()` unbounded for *every*
+attempt type. For a streamed attempt that is correct — its outcome is
+already computed once its events end, and `wait_for(…, 0)` would refuse a
+coroutine that only returns a field. For a blocking attempt it is where
+the body *starts*: empty events, terminal grace, spent budget, and a tool
+body beginning after its deadline with no bound at all. `timeout_ms: 0`
+is admissible today (the artifact validator says nothing about node
+timing fields) and makes the route deterministic; the reviewer also
+reproduced it with microseconds of remaining budget, so admission hygiene
+alone cannot close it — ordinary scheduling can spend the last fraction
+of a positive budget between the event phase and `result()`.
+
+The fix makes the streamed exception's premise explicit on the attempt
+itself: `result_ready_after_events` — true for a streamed attempt, false
+for a blocking one, declared beside `needs_lease`. Only an
+already-materialized result may be collected after the clock crosses
+zero; an unstarted body raises the timeout the driver already handles.
+
+Two witnesses, both failing first: `timeout_ms: 0` end to end on the
+blocking path (the body's start is recorded; it must never run), and the
+same property at the driver with the node dict handed straight in — so a
+future `minimum: 1` at admission cannot make the witness pass while the
+driver stays wrong. One mutation (the branch generalized again) dies to
+both.
+
+One asymmetry accepted and named: the branch's streamed half — collecting
+a ready result with the budget exactly spent — has no deterministic
+witness, because forcing events to end inside the terminal grace requires
+landing in a millisecond window. The blocking half carries the mutations;
+the streamed half is the two-line collection of a stored field.

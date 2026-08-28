@@ -1111,13 +1111,24 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # a zero timeout would refuse a coroutine that only needs to
                 # return a field, and report a completed, client-delivered
                 # answer as a node timeout.
+                #
+                # The exception is exactly that narrow, and the attempt says
+                # so itself: only a result that is *already computed* may be
+                # collected after the clock has crossed zero. The first
+                # version awaited `result()` unbounded for every attempt
+                # type, and for a blocking attempt that is where the body
+                # starts — so a node whose budget was spent (`timeout_ms: 0`
+                # is admissible) began its tool body after its deadline and
+                # ran it with no bound at all.
                 result_budget = deadline - asyncio.get_running_loop().time()
                 if result_budget > 0:
                     outcome = await asyncio.wait_for(
                         current.result(), timeout=result_budget
                     )
-                else:
+                elif current.result_ready_after_events:
                     outcome = await current.result()
+                else:
+                    raise asyncio.TimeoutError()
                 result, next_nodes = outcome.result, outcome.next_nodes
                 emitted = emitted or outcome.emitted
 
