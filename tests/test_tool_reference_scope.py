@@ -2355,3 +2355,30 @@ class TestAWarmedPoolCannotDisarmTheStream:
                 client.close()
         finally:
             srv.close()
+
+
+class TestTheStreamingPoolKeepsNothingIdle:
+    """The gemini half of the premise witness. A separate streaming client
+    is not enough on its own: the first stream's completed connection would
+    sit idle in *that* client's pool and disarm the second stream the same
+    way the probe's connection disarmed the first. Nothing idle, ever."""
+
+    def test_a_second_request_on_the_stream_client_connects_fresh(self):
+        from liminallm.service.gemini_backend import GeminiBackend
+
+        srv, port, connections = _keepalive_then_stall_server(b'{"ok": true}')
+        try:
+            backend = GeminiBackend(
+                "gemini-test", api_key="k",
+                base_url=f"http://127.0.0.1:{port}",
+            )
+            client = backend._http_stream()
+            client.get(f"http://127.0.0.1:{port}/one")
+            assert connections == [1]
+            client.get(f"http://127.0.0.1:{port}/two")
+            assert len(connections) == 2, (
+                f"the streaming client kept its first connection idle and "
+                f"reused it: server saw {connections}"
+            )
+        finally:
+            srv.close()

@@ -297,16 +297,28 @@ _STREAM_HANDLE = threading.local()
 
 
 class ArmingClient(httpx.Client):
-    """An httpx client that arms the current thread's stream handle.
+    """An httpx client on which every streaming request can arm its handle.
 
-    Given to the OpenAI SDK as its `http_client`. For requests sent while a
-    `StreamAbortHandle` is bound to the thread, it injects the handle's trace
-    (arming at connect), forces `Connection: close` so a pooled connection
-    cannot skip the connect event and open the pre-headers gap again, and
+    Given to the OpenAI SDK as the *streaming* client's transport, never the
+    blocking one. For requests sent while a `StreamAbortHandle` is bound to
+    the thread, it injects the handle's trace (arming at connect) and
     refuses to send at all once the handle is aborted — the SDK retries
     transport errors, and without the refusal the abort of one request
     started the next.
+
+    The pool keeps no idle connections, and that is the arming guarantee.
+    The first version forced `Connection: close` instead, which governs
+    retention *after* a request, not whether an already-idle pooled
+    connection satisfies it — measured: a warmed client served the
+    close-headered streaming request on the pooled socket, no connect event
+    fired, and the handle never armed. With `max_keepalive_connections=0`
+    nothing is ever idle, so every request connects fresh and the trace has
+    a connect to arm on.
     """
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs["limits"] = httpx.Limits(max_keepalive_connections=0)
+        super().__init__(**kwargs)
 
     def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
         handle = getattr(_STREAM_HANDLE, "handle", None)
@@ -315,7 +327,6 @@ class ArmingClient(httpx.Client):
                 raise StreamAborted("stream aborted; not sending a request")
             request.extensions = dict(request.extensions)
             request.extensions.setdefault("trace", handle.trace)
-            request.headers["connection"] = "close"
         return super().send(request, **kwargs)
 
 
@@ -1098,6 +1109,9 @@ class ApiAdapterBackend:
         # this provider only ships chat/completions (sticky for the process).
         self._responses_ok: Optional[bool] = None
         self.client = None
+        #: The SDK client streams go through — over `ArmingClient`, whose
+        #: pool keeps nothing idle so every stream connects fresh and arms.
+        self._stream_client = None
         self._ensure_client()
         # Infer provider from adapter_mode if not specified
         self.provider = provider or self._infer_provider(adapter_mode)
@@ -1145,6 +1159,7 @@ class ApiAdapterBackend:
 
         if not _OpenAIClient:
             self.client = None
+            self._stream_client = None
             return
 
         # Allow runtime rotation by picking up environment updates. The env var
@@ -1155,18 +1170,27 @@ class ApiAdapterBackend:
 
         if not active_key:
             self.client = None
+            self._stream_client = None
             return
 
-        # Rebuild the client if credentials changed
+        # Rebuild the clients if credentials changed
         if not self.client or self._active_api_key != active_key:
             self.client = _OpenAIClient(
                 api_key=active_key,
                 base_url=self._base_url,
                 timeout=self._client_timeout,
-                # The SDK builds its requests internally, so this client is
-                # the only seam through which a stream's abort handle can arm
-                # itself at connect. Inert for every request sent without a
-                # handle bound to the thread — all blocking calls.
+            )
+            # Streaming gets its own SDK client over `ArmingClient`, and only
+            # streaming: the arming guarantee is a pool that keeps nothing
+            # idle, and one shared client let a blocking call's keep-alive
+            # connection satisfy the next streaming request — no connect
+            # event, no armed handle, and the abort chain built on `armed`
+            # collapsed. The SDK builds its requests internally, so the
+            # client is the only seam the handle's trace can enter through.
+            self._stream_client = _OpenAIClient(
+                api_key=active_key,
+                base_url=self._base_url,
+                timeout=self._client_timeout,
                 http_client=ArmingClient(timeout=self._client_timeout),
             )
             self._active_api_key = active_key
@@ -1482,8 +1506,11 @@ class ApiAdapterBackend:
         kwargs = self._responses_kwargs(model, processed["extra_body"])
         try:
             if abort_handle is not None:
+                # Same client split as the chat branch: the no-idle pool is
+                # what guarantees the connect event this handle arms on.
+                sdk = self._stream_client or self.client
                 with _stream_handle(abort_handle):
-                    stream = self.client.responses.create(
+                    stream = sdk.responses.create(
                         input=items, stream=True, **kwargs
                     )
                 refusal = _arm_or_refuse(
@@ -1593,8 +1620,15 @@ class ApiAdapterBackend:
 
         if self.client:
             try:
+                # The streaming client, whose pool keeps nothing idle — a
+                # blocking call's keep-alive connection must not satisfy this
+                # request, or no connect event fires and the handle never
+                # arms. Falling back to `self.client` keeps hand-installed
+                # test doubles (which set only `.client`) on the path they
+                # fake; production always has both or neither.
+                sdk = self._stream_client or self.client
                 with _stream_handle(abort_handle):
-                    stream = self.client.chat.completions.create(
+                    stream = sdk.chat.completions.create(
                         model=target_model,
                         messages=augmented_messages,
                         **self._sampling_params(target_model),

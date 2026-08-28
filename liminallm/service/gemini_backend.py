@@ -287,6 +287,7 @@ class GeminiBackend:
         self._temperature = temperature
         self._transport = transport
         self._client: Optional[httpx.Client] = None
+        self._stream_client: Optional[httpx.Client] = None
         self._context_window: Optional[int] = None
         # None = not yet contradicted, False = this model predates
         # thinkingConfig and 400s on it (sticky for the process).
@@ -301,6 +302,27 @@ class GeminiBackend:
                 transport=self._transport,
             )
         return self._client
+
+    def _http_stream(self) -> httpx.Client:
+        """The client streams go through: a pool that keeps nothing idle.
+
+        Streaming's abort handle arms on the `connect_tcp.complete` trace
+        event, and a pooled keep-alive connection skips it — measured: the
+        context-window probe's GET on `_http()` left an idle connection,
+        the streaming POST was satisfied on that same socket, and the
+        handle never armed, so the abort chain built on `armed` collapsed.
+        `Connection: close` did not prevent it (it governs retention after
+        a request, not selection before). With zero keep-alive nothing is
+        ever idle, so every stream connects fresh and the trace fires;
+        blocking calls keep the pooled `_http()` client and its reuse.
+        """
+        if self._stream_client is None:
+            self._stream_client = httpx.Client(
+                timeout=httpx.Timeout(60.0, connect=10.0),
+                transport=self._transport,
+                limits=httpx.Limits(max_keepalive_connections=0),
+            )
+        return self._stream_client
 
     def _url(self, model: str, verb: str) -> str:
         return f"{self._base_url}/v1beta/models/{model}:{verb}"
@@ -509,13 +531,13 @@ class GeminiBackend:
             # a 400 blaming thinkingConfig, which _drop_rejected_thinking has
             # then removed from the body for good.
             for attempt in (1, 2):
-                # `Connection: close` so a pooled connection cannot skip the
-                # connect event the trace arms on; the trace hands the abort
+                # Through the streaming client, whose pool keeps nothing
+                # idle — see `_http_stream`. The trace hands the abort
                 # handle its socket before the request is written, so a
                 # provider that stalls pre-headers is still interruptible.
-                with self._http().stream(
+                with self._http_stream().stream(
                     "POST", url,
-                    headers={**self._headers(), "connection": "close"},
+                    headers=self._headers(),
                     json=body,
                     extensions={"trace": abort_handle.trace},
                 ) as resp:
