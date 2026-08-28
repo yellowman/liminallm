@@ -2144,7 +2144,13 @@ class TestTheChatGateRefusesASocketlessResponse:
         class FakeClient:
             chat = type("Chat", (), {"completions": FakeCompletions()})()
 
+        # On the client streaming actually uses. The first version faked
+        # only `.client`, and when streaming moved to `_stream_client` the
+        # witness went vacuous — it passed on a connection-refused error
+        # from the real client, gate or no gate, and the gate's mutation
+        # survived.
         backend.client = FakeClient()
+        backend._stream_client = FakeClient()
         backend._active_api_key = "t"  # keep _ensure_client from rebuilding
         events = list(
             backend.generate_stream([{"role": "user", "content": "x"}], [])
