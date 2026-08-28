@@ -2153,3 +2153,205 @@ class TestTheChatGateRefusesASocketlessResponse:
             f"a socketless chat response streamed anyway: {events}"
         )
         assert events and events[-1]["event"] == "error", events
+
+
+def _keepalive_then_stall_server(first_json: bytes):
+    """One persistent connection: answer the first request with `first_json`
+    and keep the connection alive, then read the next request on the SAME
+    socket and stall before sending any response.
+
+    The pool-warming shape: `Connection: close` on the second request does
+    not help, because the header governs retention after a request, not
+    whether an already-idle pooled connection satisfies it.
+    """
+    import socket as socketmod
+    import threading
+    import time as _time
+
+    srv = socketmod.socket()
+    srv.setsockopt(socketmod.SOL_SOCKET, socketmod.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    connections: List[int] = []
+
+    def read_request(conn) -> bool:
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return False
+            data += chunk
+        head, rest = data.split(b"\r\n\r\n", 1)
+        length = 0
+        for line in head.decode(errors="replace").split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                length = int(line.split(":", 1)[1])
+        got = len(rest)
+        while got < length:
+            more = conn.recv(65536)
+            if not more:
+                return False
+            got += len(more)
+        return True
+
+    def handle(conn, idx):
+        try:
+            if not read_request(conn):
+                return
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n%s" % (len(first_json), first_json)
+            )
+            # The next request on this same socket gets silence.
+            if read_request(conn):
+                _time.sleep(20)
+        except OSError:
+            pass
+
+    def loop():
+        idx = 0
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            idx += 1
+            connections.append(idx)
+            threading.Thread(target=handle, args=(conn, idx), daemon=True).start()
+
+    threading.Thread(target=loop, daemon=True).start()
+    return srv, srv.getsockname()[1], connections
+
+
+class TestAWarmedPoolCannotDisarmTheStream:
+    """The arming mechanism assumed every streaming request opens a fresh
+    connection. A pooled keep-alive connection breaks that: the request is
+    satisfied on the already-idle socket, no `connect_tcp.complete` fires,
+    the handle stays unarmed — and the whole chain built on `armed` follows
+    it down: abort interrupts nothing, `cancellation_proven` is false, the
+    terminal teardown excludes the producer from its wait, and the workflow
+    returns its timeout while the provider request runs on.
+
+    Production-reachable, not contrived: Gemini's context-window probe GETs
+    through the same client streaming uses, so the first turn's budget
+    computation warms exactly the pool the stream then draws from.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_window_probe_must_not_disarm_the_stream(self, store):
+        """End to end: the real probe warms the pool, the streaming POST
+        arrives on the same socket and stalls pre-headers. No pinning —
+        the pin in the cold-pool witnesses is exactly what made the arming
+        premise artificially true."""
+        import time as _time
+
+        from liminallm.service.gemini_backend import GeminiBackend
+        from liminallm.service.llm import LLMService
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        srv, port, connections = _keepalive_then_stall_server(
+            b'{"name": "models/gemini-test", "inputTokenLimit": 8192}'
+        )
+        try:
+            llm = LLMService(
+                "gemini-test",
+                backend=GeminiBackend(
+                    "gemini-test", api_key="k",
+                    base_url=f"http://127.0.0.1:{port}",
+                ),
+            )
+            u = store.create_user(email=f"{_u('wp')}@t.local", tenant_id=_u("wpt"))
+            wf = store.create_artifact(
+                "workflow", _u("wpwf"),
+                {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
+                    {"id": "call", "type": "tool_call", "tool": "llm.generic",
+                     "timeout_ms": 400, "max_retries": 0, "next": "fin"},
+                    {"id": "fin", "type": "end"},
+                ]},
+                owner_user_id=u.id, visibility="private",
+            )
+            engine = WorkflowEngine(store, llm, rt.router, rt.rag, cache=rt.cache)
+            held = {}
+            opener = engine.invocations.open
+
+            def spy(*a, **k):
+                held["invocation"] = inv = opener(*a, **k)
+                return inv
+
+            engine.invocations.open = spy
+            start = _time.monotonic()
+            [e async for e in engine.run_streaming(
+                wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+            elapsed = _time.monotonic() - start
+            assert elapsed < 5.0, (
+                f"the turn took {elapsed:.2f}s against a 400ms node timeout"
+            )
+            assert llm.backend._context_window == 8192, (
+                "the control half: the probe itself must have run and warmed "
+                "the pool, or this witnesses nothing"
+            )
+            alive = held["invocation"].resources.live_producers()
+            assert not alive, (
+                f"the stream reused the probe's pooled connection, was never "
+                f"armed, and outlived its timeout: producers alive {alive}, "
+                f"connections seen by the server: {connections}"
+            )
+        finally:
+            srv.close()
+
+    def test_a_stream_request_never_reuses_a_warmed_connection(self):
+        """The premise itself, at the client: after an ordinary request has
+        warmed the pool, a handle-bound streaming request must open a fresh
+        connection — and therefore arm. Witnessing only the cold-pool case
+        proved what happens when the premise happens to hold."""
+        from liminallm.service.model_backend import (
+            ArmingClient,
+            StreamAbortHandle,
+            _stream_handle,
+        )
+
+        srv, port, connections = _keepalive_then_stall_server(b'{"ok": true}')
+        try:
+            client = ArmingClient(timeout=5.0)
+            client.get(f"http://127.0.0.1:{port}/warm")
+            assert connections == [1], "the warm request must have connected"
+
+            handle = StreamAbortHandle()
+            import threading
+
+            done = threading.Event()
+
+            def stream_request():
+                try:
+                    with _stream_handle(handle):
+                        client.post(f"http://127.0.0.1:{port}/stream", json={})
+                except Exception:
+                    pass
+                finally:
+                    done.set()
+
+            t = threading.Thread(target=stream_request, daemon=True)
+            t.start()
+            # Give the request time to be sent (and stall server-side).
+            for _ in range(100):
+                if handle.armed or done.is_set():
+                    break
+                import time as _time
+
+                _time.sleep(0.02)
+            try:
+                assert len(connections) == 2, (
+                    f"the streaming request was satisfied on the warmed "
+                    f"pooled connection: server saw {connections}"
+                )
+                assert handle.armed, (
+                    "no connect event fired for the streaming request, so "
+                    "the abort handle never armed"
+                )
+            finally:
+                handle.abort()
+                done.wait(3.0)
+                client.close()
+        finally:
+            srv.close()
