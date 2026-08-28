@@ -2388,3 +2388,145 @@ class TestTheStreamingPoolKeepsNothingIdle:
             )
         finally:
             srv.close()
+
+
+class TestAFinishedStreamIsFinished:
+    """Bugbot finding on #186. The deadline governs waiting for events; a
+    stream that has already delivered its final event has nothing left to
+    time out. `bounded` checked the clock before asking the iterator, so
+    the post-final-event pull raised `TimeoutError` where the iterator
+    would have raised `StopAsyncIteration` — and the driver then treated a
+    completed, client-delivered answer as a node timeout. With no tokens
+    emitted (an empty completion) that even retried, so a second answer
+    could follow one the client had already received.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_completed_stream_ends_instead_of_timing_out(self):
+        from liminallm.service.node_attempt import bounded
+
+        async def one_answer():
+            yield {"event": "message_done", "data": {"content": "hi"}}
+
+        loop = asyncio.get_running_loop()
+        agen = bounded(one_answer(), loop.time() + 0.05)
+        first = await agen.__anext__()
+        assert first["event"] == "message_done"
+        # The deadline passes after the final event was already delivered.
+        await asyncio.sleep(0.1)
+        try:
+            with pytest.raises(StopAsyncIteration):
+                await agen.__anext__()
+        except asyncio.TimeoutError:
+            pytest.fail(
+                "a stream that had already delivered its final event was "
+                "timed out on the pull that would have ended it"
+            )
+        finally:
+            await agen.aclose()
+
+    @pytest.mark.asyncio
+    async def test_a_late_stream_still_times_out(self):
+        """The complement: the terminal grace must not let a producer that
+        is merely slow keep streaming past its deadline."""
+        from liminallm.service.node_attempt import bounded
+
+        async def slow():
+            yield {"event": "token", "data": "a"}
+            await asyncio.sleep(0.5)
+            yield {"event": "token", "data": "late"}
+
+        loop = asyncio.get_running_loop()
+        agen = bounded(slow(), loop.time() + 0.05)
+        got = [await agen.__anext__()]
+        with pytest.raises(asyncio.TimeoutError):
+            while True:
+                got.append(await agen.__anext__())
+        assert [e["data"] for e in got] == ["a"]
+        await agen.aclose()
+
+
+class TestBothPreflightsSeeTheSameInputs:
+    """Bugbot finding on #186. Blocking inserts `user_message` when the
+    node's inputs carry no `message`, then validates; streaming validated
+    the raw resolved inputs. A tool whose `input_schema` requires `message`
+    on a node that omits it therefore passed blocking and was refused on
+    the streamed path — even though `_stream_llm_node` would have read the
+    user message anyway.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_omitted_message_validates_the_same_on_both_paths(
+        self, store
+    ):
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('pf')}@t.local", tenant_id=_u("pft"))
+        name = _u("my.chat")
+        _tool(store, name, "llm.generic", owner=u.id, visibility="private",
+              input_schema={
+                  "type": "object",
+                  "properties": {"message": {"type": "string"}},
+                  "required": ["message"],
+              })
+        wf = store.create_artifact(
+            "workflow", _u("pfwf"),
+            {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
+                # No `inputs` at all: the message is the user's turn.
+                {"id": "call", "type": "tool_call", "tool": name,
+                 "next": "fin"},
+                {"id": "fin", "type": "end"},
+            ]},
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        engine.llm.generate = lambda *a, **k: {
+            "content": "hi", "usage": {"total_tokens": 1}
+        }
+        engine.llm.generate_stream = lambda *a, **k: iter([
+            {"event": "token", "data": "hi"},
+            {"event": "message_done", "data": {"content": "hi", "usage": {}}},
+        ])
+
+        blocking = await engine.run(
+            wf.id, None, "the user's message", None,
+            user_id=u.id, tenant_id=u.tenant_id)
+        blocking_ok = not any(
+            entry.get("status") == "error"
+            for entry in blocking.get("workflow_trace", [])
+        )
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "the user's message", None,
+            user_id=u.id, tenant_id=u.tenant_id)]
+        streaming_ok = not any(e.get("event") == "error" for e in events)
+
+        assert blocking_ok, blocking.get("workflow_trace")
+        assert streaming_ok == blocking_ok, (
+            f"one node, one schema, two verdicts: blocking passed and "
+            f"streaming refused with "
+            f"{[e['data'] for e in events if e.get('event') == 'error']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_grace_is_not_an_overrun(self):
+        """The terminal grace exists to notice a finished stream, not to let
+        a hot producer keep streaming past the deadline one grace at a
+        time. An event arriving inside the grace is dropped and the
+        timeout raised."""
+        from liminallm.service.node_attempt import bounded
+
+        async def hot():
+            for _ in range(200):
+                yield {"event": "token", "data": "x"}
+
+        loop = asyncio.get_running_loop()
+        agen = bounded(hot(), loop.time() - 1.0)  # already past its deadline
+        delivered = 0
+        with pytest.raises(asyncio.TimeoutError):
+            async for _event in agen:
+                delivered += 1
+        assert delivered == 0, (
+            f"{delivered} events streamed past an already-expired deadline"
+        )
+        await agen.aclose()

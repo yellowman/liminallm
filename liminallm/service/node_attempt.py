@@ -407,6 +407,21 @@ async def bounded(
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
+                # The deadline governs waiting for events, and a stream that
+                # has already delivered its final event has nothing left to
+                # time out. This raised unconditionally, so the pull that
+                # would have ended a completed stream reported a node timeout
+                # instead — and an empty completion was then retried, a
+                # second answer after one the client had received. One short
+                # grace distinguishes finished from late: `StopAsyncIteration`
+                # ends cleanly; an event, or nothing, is late — the event is
+                # dropped, exactly as if the deadline had caught it earlier.
+                try:
+                    await asyncio.wait_for(iterator.__anext__(), 0.001)
+                except StopAsyncIteration:
+                    return
+                except asyncio.TimeoutError:
+                    pass
                 raise asyncio.TimeoutError()
             try:
                 event = await asyncio.wait_for(iterator.__anext__(), remaining)

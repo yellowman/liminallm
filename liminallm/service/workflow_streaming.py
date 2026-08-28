@@ -233,11 +233,19 @@ class WorkflowStreamingMixin:
                 # entered `_stream_llm_node` with only a node, so an ordinary
                 # user's own private spec claiming `privileged: true` was
                 # refused on one path and ran the model on the other.
+                preflight_inputs = self._resolve_inputs(
+                    node.get("inputs", {}), user_message, vars_scope
+                )
+                # The same fallback `_execute_node` applies before the
+                # blocking preflight: a node that names no `message` runs on
+                # the user's turn, and `_stream_llm_node` will read exactly
+                # that — so validation must see the inputs the node executes
+                # with, or a schema requiring `message` refuses only here.
+                if "message" not in preflight_inputs and user_message:
+                    preflight_inputs["message"] = user_message
                 refusal = self.tool_preflight(
                     descriptor,
-                    self._resolve_inputs(
-                        node.get("inputs", {}), user_message, vars_scope
-                    ),
+                    preflight_inputs,
                     user_id=user_id,
                     tool_name=tool_name,
                 )

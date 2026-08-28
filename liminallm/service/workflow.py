@@ -1102,10 +1102,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     if event.get("event") == "token":
                         emitted = True
                     yield event
-                outcome = await asyncio.wait_for(
-                    current.result(),
-                    timeout=max(deadline - asyncio.get_running_loop().time(), 0),
-                )
+                # A blocking attempt runs its body inside `result()`, so the
+                # leftover deadline is its node timeout — and its `events()`
+                # is empty, so the leftover is effectively the whole budget.
+                # A streamed attempt's outcome is already computed once its
+                # events have ended; when they consumed the entire budget
+                # (ended inside `bounded`'s terminal grace), `wait_for` with
+                # a zero timeout would refuse a coroutine that only needs to
+                # return a field, and report a completed, client-delivered
+                # answer as a node timeout.
+                result_budget = deadline - asyncio.get_running_loop().time()
+                if result_budget > 0:
+                    outcome = await asyncio.wait_for(
+                        current.result(), timeout=result_budget
+                    )
+                else:
+                    outcome = await current.result()
                 result, next_nodes = outcome.result, outcome.next_nodes
                 emitted = emitted or outcome.emitted
 
