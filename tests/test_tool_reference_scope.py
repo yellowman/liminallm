@@ -57,10 +57,10 @@ def _u(p):
     return f"{p}_{uuid.uuid4().hex[:8]}"
 
 
-def _tool(store, name, handler, *, owner, visibility):
+def _tool(store, name, handler, *, owner, visibility, **extra):
     return store.create_artifact(
         "tool", _u("t"),
-        {"kind": "tool.spec", "name": name, "handler": handler},
+        {"kind": "tool.spec", "name": name, "handler": handler, **extra},
         owner_user_id=owner, visibility=visibility,
     )
 
@@ -585,6 +585,243 @@ class TestEveryAdmissionPathAsksTheQuestion:
         assert store.get_config_patch(patch.id).status != "applied", (
             "the audit records an applied configuration that was refused"
         )
+
+
+class TestAuthorityIsCheckedOnBothPaths:
+    """A resolved spec carries authority, and streaming must not skip it.
+
+    `_invoke_tool` does real work before a body runs: input-schema validation,
+    `timeout_seconds`, and SPEC §18's rule that `privileged: true` only counts
+    when an *admin-owned artifact* stands behind it. `_stream_llm_node` takes
+    a node, never a descriptor, and does none of it.
+
+    Measured on one private workflow naming an ordinary user's own private
+    spec that claims privilege:
+
+    ==========  ==============================================
+    blocking    refused; the model never ran
+    streaming   ran `generate_stream`
+    ==========  ==============================================
+
+    Resolving the descriptor before dispatch — which the streaming path now
+    does — is not enough on its own, because the descriptor is then dropped.
+    The preflight has to be shared, and streaming may specialise token
+    production only after it passes. `_stream_llm_node` must not become a
+    second implementation of tool authorization.
+    """
+
+    @staticmethod
+    def _both_paths(store, wf, runner):
+        """Run one workflow on each path and report what executed."""
+        from liminallm.service.workflow import WorkflowEngine
+        rt = get_runtime()
+
+        async def once(streaming):
+            engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag,
+                                    cache=rt.cache)
+            ran = []
+            engine._tool_llm_generic = lambda *a, **k: (
+                ran.append("llm.generic") or {"status": "ok", "content": "x"}
+            )
+
+            def generate_stream(*a, **k):
+                ran.append("generate_stream")
+                return iter([
+                    {"event": "token", "data": "hi"},
+                    {"event": "message_done",
+                     "data": {"content": "hi", "usage": {}}},
+                ])
+
+            engine.llm.generate_stream = generate_stream
+            if streaming:
+                [e async for e in engine.run_streaming(
+                    wf.id, None, "hi", None,
+                    user_id=runner.id, tenant_id=runner.tenant_id)]
+            else:
+                await engine.run(wf.id, None, "hi", None,
+                                 user_id=runner.id, tenant_id=runner.tenant_id)
+            return ran
+
+        return once
+
+    @pytest.mark.asyncio
+    async def test_a_non_admins_privileged_spec_runs_on_neither_path(self, store):
+        """SPEC §18: `privileged: true` is a property of an admin-owned
+        artifact, not a key anyone may type into their own spec."""
+        u = store.create_user(email=f"{_u('pv')}@t.local", tenant_id=_u("pvt"))
+        _tool(store, "llm.generic", "llm.generic", owner=u.id,
+              visibility="private", privileged=True)
+        wf = store.create_artifact(
+            "workflow", _u("pvwf"), _wf("llm.generic"),
+            owner_user_id=u.id, visibility="private",
+        )
+        once = self._both_paths(store, wf, u)
+        assert await once(streaming=False) == [], "blocking ran a claimed privilege"
+        assert await once(streaming=True) == [], (
+            "streaming ran a non-admin's privileged spec; the resolved "
+            "descriptor was dropped before the body was entered"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_admin_owned_privileged_tool_refuses_a_non_admin_runner(
+        self, store
+    ):
+        """The other conjunction: real provenance, wrong caller."""
+        admin = store.create_user(email=f"{_u('ad')}@t.local",
+                                  tenant_id=_u("adt"), role="admin")
+        runner = store.create_user(email=f"{_u('rn')}@t.local",
+                                   tenant_id=admin.tenant_id)
+        # A distinct name, not a second global `llm.generic`: publishing one
+        # of those is now ambiguous against the seeded row, and this test is
+        # about the caller check rather than about resolution.
+        name = _u("admin.only")
+        _tool(store, name, "llm.generic", owner=admin.id,
+              visibility="global", privileged=True)
+        wf = store.create_artifact(
+            "workflow", _u("adwf"), _wf(name),
+            owner_user_id=admin.id, visibility="global",
+        )
+        once = self._both_paths(store, wf, runner)
+        assert await once(streaming=False) == [], "blocking served a non-admin"
+        assert await once(streaming=True) == [], "streaming served a non-admin"
+
+    @pytest.mark.asyncio
+    async def test_an_unprivileged_tool_still_runs_on_both_paths(self, store):
+        """The control. Refusing everything passes both witnesses above."""
+        u = store.create_user(email=f"{_u('ok')}@t.local", tenant_id=_u("okt"))
+        wf = store.create_artifact(
+            "workflow", _u("okwf2"), _wf("llm.generic"),
+            owner_user_id=u.id, visibility="private",
+        )
+        once = self._both_paths(store, wf, u)
+        assert await once(streaming=False) == ["llm.generic"]
+        assert await once(streaming=True) == ["generate_stream"]
+
+
+class TestTheHandlerNamesTheBody:
+    """The resolved spec's `handler` decides what runs, not the reference.
+
+    `_resolve_worker_tool` checks `tool_name in tool_worker.BODY_NAMES` first
+    and only then reads the spec's `handler`, so a reference whose *name*
+    happens to match a worker body runs that body whatever the spec says.
+    Measured on a private spec named `notes.search_v1` with handler
+    `llm.generic`:
+
+    ==========================  ================
+    descriptor.handler          llm.generic
+    body actually selected      notes.search_v1
+    ==========================  ================
+
+    Admission approves one executable handler and runtime executes another —
+    the exact divergence this tranche exists to remove.
+    """
+
+    def test_the_handler_wins_over_a_name_that_matches_a_body(self, store, engine):
+        from liminallm.service.tool_namespace import ToolResolutionScope
+
+        u = store.create_user(email=f"{_u('hb')}@t.local", tenant_id=_u("hbt"))
+        _tool(store, "notes.search_v1", "llm.generic", owner=u.id,
+              visibility="private")
+        scope = ToolResolutionScope("private", u.id, u.tenant_id)
+        d = engine._resolve_tool("notes.search_v1", scope)
+        assert d is not None and d.handler == "llm.generic", d
+        body = engine._resolve_worker_tool("notes.search_v1", d.schema)
+        assert body == "llm.generic", (
+            f"the reference name beat the resolved handler: {body!r}"
+        )
+
+    def test_a_spec_with_no_handler_still_reaches_its_own_body(self, store, engine):
+        """The compatibility case, and the control. A spec that names no
+        handler means itself, so narrowing this rule must not strand the
+        seeded tools that are their own body."""
+        from liminallm.service.tool_namespace import SYSTEM_SCOPE
+
+        d = engine._resolve_tool("notes.search_v1", SYSTEM_SCOPE)
+        assert d is not None
+        assert engine._resolve_worker_tool("notes.search_v1", d.schema) == (
+            "notes.search_v1"
+        )
+
+    def test_one_function_answers_it_for_every_path(self, store):
+        """Admission, blocking execution and streaming dispatch must ask the
+        same question, or two of them can disagree about what will run."""
+        from liminallm.service.tool_namespace import resolve_executable_handler
+
+        assert resolve_executable_handler(
+            "notes.search_v1", {"handler": "llm.generic"}
+        ) == "llm.generic"
+        assert resolve_executable_handler("notes.search_v1", None) == (
+            "notes.search_v1"
+        )
+        assert resolve_executable_handler(
+            "whatever", {"handler": "no.such.handler"}
+        ) is None
+
+
+class TestAmbiguityThatAppearsLater:
+    """Admission cannot be the only altitude that refuses two rows.
+
+    Tool names have no uniqueness constraint, and publishing a second `foo`
+    does not revisit the workflows already naming it. This passes today, so it
+    is a guard rather than a red: it stops a later change reintroducing a
+    first-match at the execution altitude, which the deletion and cache
+    witnesses would not catch — they prove runtime asks canonical state, not
+    that it handles two canonical answers.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_second_row_published_later_fails_closed(self, store):
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('al')}@t.local", tenant_id=_u("alt"))
+        name = _u("foo")
+        _tool(store, name, "llm.generic", owner=u.id, visibility="global")
+        wf = store.create_artifact(
+            "workflow", _u("alwf"), _wf(name),
+            owner_user_id=u.id, visibility="global",
+        )
+        # Published after the workflow was admitted.
+        _tool(store, name, "agent.code_v1", owner=u.id, visibility="global")
+
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        ran = []
+        engine._tool_llm_generic = lambda *a, **k: (
+            ran.append("llm.generic") or {"status": "ok", "content": "x"}
+        )
+        engine._tool_agent_code = lambda *a, **k: (
+            ran.append("agent.code_v1") or {"status": "ok", "content": "x"}
+        )
+        out = await engine.run(wf.id, None, "hi", None,
+                               user_id=u.id, tenant_id=u.tenant_id)
+        assert ran == [], f"an ambiguous reference executed a body: {ran}"
+        statuses = [e.get("status") for e in out.get("workflow_trace") or []]
+        assert "error" in statuses, statuses
+
+
+class TestARefusedCreateWritesNothing:
+    """A refusal must not leave a payload behind.
+
+    `create_artifact` persists the payload inside the transaction before the
+    row is inserted, so a reference check placed after `_persist_payload`
+    would leave a file on disk for an artifact that never existed.
+    """
+
+    def test_no_payload_directory_survives_a_refusal(self, store):
+        u = store.create_user(email=f"{_u('lk')}@t.local", tenant_id=_u("lkt"))
+        artifacts_dir = store.fs_root / "artifacts"
+        before = set(p.name for p in artifacts_dir.iterdir()) if (
+            artifacts_dir.exists()
+        ) else set()
+        with pytest.raises(Exception):
+            store.create_artifact(
+                "workflow", _u("leak"), _wf("no.such.tool.v1"),
+                owner_user_id=u.id, visibility="private",
+            )
+        after = set(p.name for p in artifacts_dir.iterdir()) if (
+            artifacts_dir.exists()
+        ) else set()
+        assert after == before, f"a refused create left {after - before}"
 
 
 class TestAFreshDatabaseStillBoots:
