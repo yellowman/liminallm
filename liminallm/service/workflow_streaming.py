@@ -568,20 +568,20 @@ class WorkflowStreamingMixin:
         )
         backoff_ms = node.get("backoff_ms", DEFAULT_BACKOFF_MS)
 
-        # SPEC §9.2 validates outputs as well as inputs. Its presence is also
-        # what decides whether this node's tokens are held back: see
-        # `StreamedNodeAttempt`. The check itself is `tool_postflight` — the
-        # blocking path's, on the same raw tool-result shape, so one schema
-        # cannot pass one transport and fail the other.
+        # The postflight is the blocking path's own, applied to the canonical
+        # completed result the streaming implementation hands over — one
+        # transformation boundary, not merely a shared predicate, so one
+        # schema cannot pass one transport and fail the other, and what
+        # proceeds downstream is the sanitized object on both. The schema's
+        # *presence* additionally decides buffering: a validated output
+        # cannot be incremental (SPEC §9.2), so a node with a schema holds
+        # its tokens until the finished answer passes.
         output_schema = (descriptor.schema or {}).get("output_schema")
-        validate_output = None
-        if output_schema:
 
-            def validate_output(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                _, refusal = self.tool_postflight(
-                    result, descriptor.schema, tool_name=tool_name
-                )
-                return refusal
+        def finalize(result: Dict[str, Any]):
+            return self.tool_postflight(
+                result, descriptor.schema, tool_name=tool_name
+            )
 
         invocation = self.invocations.open(
             uuid.uuid4().hex,
@@ -610,7 +610,8 @@ class WorkflowStreamingMixin:
                     invocation=invocation,
                     cancel_event=cancel_event,
                 ),
-                validate_output=validate_output,
+                finalize=finalize,
+                buffer=bool(output_schema),
             )
 
         try:
@@ -711,6 +712,18 @@ class WorkflowStreamingMixin:
                 # different object per transport.
                 data = dict(event.get("data") or {})
                 data.setdefault("context_snippets", list(context_snippets))
+                # The canonical completed result, as its own event — exactly
+                # the keys blocking `llm.generic` returns. The handler names
+                # its result's fields; `StreamedNodeAttempt` consumes this
+                # and refuses to reconstruct one from the client event.
+                yield {
+                    "event": "tool_result",
+                    "data": {
+                        "content": data.get("content", ""),
+                        "usage": data.get("usage") or {},
+                        "context_snippets": list(data.get("context_snippets") or []),
+                    },
+                }
                 event = {"event": "message_done", "data": data}
             yield event
 
@@ -933,16 +946,16 @@ class WorkflowStreamingMixin:
                 # Keep the partial answer rather than gluing a second one after
                 # it; the caller stores what was streamed.
                 content = "".join(content_parts)
-                yield {
-                    "event": "message_done",
-                    "data": {
-                        "content": content,
-                        "usage": usage,
-                        "context_snippets": snippets,
-                        "tool_calls": tool_trace,
-                        "injection_findings": session.get("injection_findings", []),
-                    },
+                partial_result = {
+                    "content": content,
+                    "usage": usage,
+                    "context_snippets": snippets,
+                    "tool_calls": tool_trace,
+                    "artifacts": session.get("artifacts", []),
+                    "injection_findings": session.get("injection_findings", []),
                 }
+                yield {"event": "tool_result", "data": dict(partial_result)}
+                yield {"event": "message_done", "data": partial_result}
                 return
             async for event in self._stream_llm_node(
                 node,
@@ -960,14 +973,17 @@ class WorkflowStreamingMixin:
                 yield event
             return
 
-        yield {
-            "event": "message_done",
-            "data": {
-                "content": content,
-                "usage": usage,
-                "context_snippets": snippets,
-                "tool_calls": tool_trace,
-                "artifacts": session.get("artifacts", []),
-                "injection_findings": session.get("injection_findings", []),
-            },
+        # The canonical completed result — the same six keys the worker's
+        # agent loop returns on the blocking path — as its own event for
+        # `StreamedNodeAttempt`, then the client's `message_done`. The
+        # handler names its result's fields; the attempt must not.
+        completed = {
+            "content": content,
+            "usage": usage,
+            "context_snippets": snippets,
+            "tool_calls": tool_trace,
+            "artifacts": session.get("artifacts", []),
+            "injection_findings": session.get("injection_findings", []),
         }
+        yield {"event": "tool_result", "data": dict(completed)}
+        yield {"event": "message_done", "data": completed}

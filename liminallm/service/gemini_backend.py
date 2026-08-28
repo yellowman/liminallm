@@ -21,7 +21,11 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import httpx
 
 from liminallm.logging import get_logger
-from liminallm.service.model_backend import CancellableStream, StreamAbortHandle
+from liminallm.service.model_backend import (
+    CancellableStream,
+    StreamAbortHandle,
+    _arm_or_refuse,
+)
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import estimate_token_count
 
@@ -505,15 +509,29 @@ class GeminiBackend:
             # a 400 blaming thinkingConfig, which _drop_rejected_thinking has
             # then removed from the body for good.
             for attempt in (1, 2):
+                # `Connection: close` so a pooled connection cannot skip the
+                # connect event the trace arms on; the trace hands the abort
+                # handle its socket before the request is written, so a
+                # provider that stalls pre-headers is still interruptible.
                 with self._http().stream(
-                    "POST", url, headers=self._headers(), json=body,
+                    "POST", url,
+                    headers={**self._headers(), "connection": "close"},
+                    json=body,
+                    extensions={"trace": abort_handle.trace},
                 ) as resp:
-                    abort_handle.attach_response(resp)
                     if attempt == 1 and resp.status_code == 400:
                         resp.read()
                         if self._drop_rejected_thinking(body, 400, resp.text):
                             continue
                     resp.raise_for_status()
+                    # After status handling, before any token: an error
+                    # response never streams, so the fail-closed rule guards
+                    # exactly the thing it exists for — producing tokens
+                    # through a stream whose interrupt is not in hand.
+                    refusal = _arm_or_refuse(abort_handle, resp)
+                    if refusal is not None:
+                        yield refusal
+                        return
                     for line in resp.iter_lines():
                         if not line or not line.startswith("data:"):
                             continue

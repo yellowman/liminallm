@@ -275,6 +275,10 @@ class Producer(Protocol):
     yes. Registering it here rather than beside the streaming path is the whole
     point: one revoke reaches everything an attempt started, whatever kind of
     thing it is.
+
+    A producer may additionally expose `cancellation_proven() -> bool` —
+    true when a stop can interrupt its read in flight, not only its next
+    event. Terminal teardown waits for exactly those; see `live_producers`.
     """
 
     def stop(self) -> None: ...
@@ -332,17 +336,37 @@ class ResourceRegistry:
                 )
         return stopped
 
-    def live_producers(self) -> List[str]:
-        """Producers that have not returned yet, by label."""
+    def live_producers(self, *, proven_only: bool = False) -> List[str]:
+        """Producers that have not returned yet, by label.
+
+        `proven_only` narrows to producers whose cancellation is proven —
+        an interrupt is armed, so their death after a stop is prompt. The
+        terminal teardown waits on exactly that set: a proven claim is
+        cashed rather than forgotten, and an unproven producer is not
+        allowed to hold the caller for a read nothing can end.
+        """
         with self._lock:
             producers = list(self._producers)
-        alive = [entry.label for entry in producers if entry.producer.alive()]
+        alive = [
+            entry.label
+            for entry in producers
+            if entry.producer.alive()
+            and (not proven_only or self._proven(entry.producer))
+        ]
         if not alive:
             with self._lock:
                 self._producers = [
                     entry for entry in self._producers if entry.producer.alive()
                 ]
         return alive
+
+    @staticmethod
+    def _proven(producer: "Producer") -> bool:
+        check = getattr(producer, "cancellation_proven", None)
+        try:
+            return bool(check()) if callable(check) else False
+        except Exception:  # noqa: BLE001 - an exotic producer answers "no"
+            return False
 
     def add_child(
         self,
@@ -749,13 +773,17 @@ class Invocation:
         the two share a working directory, a sandbox child, and an idea of
         whose output is whose.
 
-        `producers=False` drops in-process producers from the *wait* — never
-        from the stop, which `kill_all` has already done. The retry precondition
-        needs the answer and must pay for it; ending the execution must not,
-        because a producer blocked inside a read cannot be made to return and
-        the caller would be held for the timeout waiting on a thread that owns
-        no process and no scratch path. It is a daemon thread with its stop
-        flag set: it exits when its read does.
+        `producers=False` narrows the *wait* to producers whose cancellation
+        is proven — never the stop, which `kill_all` has already done. The
+        retry precondition needs every producer dead and must pay for it;
+        ending the execution waits only where the wait is cheap: an armed
+        stream's abort interrupts the read in flight, so its death is prompt,
+        and the workflow must not report a timeout while that provider
+        operation still runs. A producer with nothing armed cannot be made
+        to return, and holding the caller for it would hand back the very
+        stall the timeout refused — it stays a daemon thread with its stop
+        flag set, excluded from this wait, and the streamed path refuses to
+        produce tokens through such a stream in the first place.
 
         The scratch goes with the processes, and `workdir` is cleared with it.
         Keeping the directory across attempts would hand the retry a
@@ -773,8 +801,9 @@ class Invocation:
             # attempt is about to replace, and "nothing of it is left" is false
             # while it is.
             alive = self.resources.live_children()
-            if producers:
-                alive = alive + self.resources.live_producers()
+            alive = alive + self.resources.live_producers(
+                proven_only=not producers
+            )
             if not alive:
                 self.resources.cleanup_paths()
                 self.session.pop("workdir", None)

@@ -40,6 +40,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Tuple,
 )
 
 #: Put on the queue when the producer has finished, and again by `stop` so a
@@ -172,6 +173,19 @@ class StreamPump:
     def alive(self) -> bool:
         return self._thread.is_alive()
 
+    def cancellation_proven(self) -> bool:
+        """Whether this producer's death can be presumed prompt.
+
+        True once the stream's abort handle is armed — an interrupt is in
+        hand, so a stop reaches a read in flight and the thread returns in
+        moments. Terminal teardown waits for exactly these producers: a
+        proven claim is cashed, not forgotten. Unarmed producers (plain
+        in-memory doubles, streams still connecting) are excluded from that
+        wait as before, and the retry precondition still waits for
+        everything.
+        """
+        return bool(getattr(self._iterator, "armed", False))
+
     async def wait_dead(self, timeout: float) -> bool:
         """True once the producer thread has actually returned."""
         self.stop()
@@ -256,6 +270,15 @@ class StreamedNodeAttempt:
     schema streams nothing until its answer passes, and a node without one
     streams exactly as it did before.
 
+    The completed tool result arrives as its own `tool_result` event, emitted
+    by the streaming implementation and consumed here — never forwarded, and
+    never reconstructed from the client-facing `message_done`. This class
+    used to manufacture the raw result itself from the fields it knew about,
+    which was exactly `llm.generic`'s four — so `agent.files_v1`'s
+    `artifacts` and `injection_findings` vanished before validation, and a
+    schema for the real result got a different verdict per transport. The
+    handler that produced the result names its fields; a transport does not.
+
     The producer's `error` event is not forwarded. It is this attempt's
     outcome, and the driver may still have a retry to spend; emitting it would
     put a failure on the client's screen that the next attempt then contradicts.
@@ -273,12 +296,17 @@ class StreamedNodeAttempt:
         self,
         stream: AsyncIterator[Dict[str, Any]],
         *,
-        validate_output: Optional[
-            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
-        ] = None,
+        finalize: Callable[
+            [Dict[str, Any]], Tuple[Dict[str, Any], Optional[Dict[str, Any]]]
+        ],
+        buffer: bool = False,
     ) -> None:
         self._stream = stream
-        self._validate_output = validate_output
+        #: The postflight: `(sanitized, refusal)`. Always applied, exactly as
+        #: the blocking path applies it — sanitizing is not conditional on a
+        #: schema, and what proceeds downstream is the sanitized object.
+        self._finalize = finalize
+        self._buffer = buffer
         self._outcome = NodeOutcome(
             result={"status": "error", "error": "stream produced no answer"}
         )
@@ -295,10 +323,10 @@ class StreamedNodeAttempt:
             await self._stream.aclose()
 
     async def _drain(self) -> AsyncIterator[Dict[str, Any]]:
-        buffering = self._validate_output is not None
         held: List[Dict[str, Any]] = []
         emitted = False
         done: Optional[Dict[str, Any]] = None
+        raw: Optional[Dict[str, Any]] = None
 
         async for event in self._stream:
             kind = event.get("event")
@@ -312,11 +340,16 @@ class StreamedNodeAttempt:
                     emitted=emitted,
                 )
                 return
+            if kind == "tool_result":
+                # The canonical completed result. Consumed, never forwarded:
+                # the client's contract is tokens and `message_done`.
+                raw = dict(event.get("data") or {})
+                continue
             if kind == "message_done":
                 done = event
                 break
             if kind == "token":
-                if buffering:
+                if self._buffer:
                     held.append(event)
                     continue
                 emitted = True
@@ -329,39 +362,31 @@ class StreamedNodeAttempt:
             self._outcome = NodeOutcome(result=dict(self._outcome.result), emitted=emitted)
             return
 
-        data = done.get("data") or {}
-        # The tool's output, in the shape the tool produced — the same keys
-        # `llm.generic` returns on the blocking path. SPEC §9.2 validates the
-        # tool output, so this dict is what the validator sees; the node's
-        # own `status` is added after, never validated. The first version
-        # validated the wrapper, and a strict schema written for the real
-        # output failed on the `status` key streaming had invented.
-        tool_result: Dict[str, Any] = {
-            "content": data.get("content", ""),
-            "usage": data.get("usage") or {},
-        }
-        # Presence, not truthiness: the blocking result carries the key even
-        # when nothing was retrieved, and a schema requiring it must see the
-        # same object here.
-        if "context_snippets" in data:
-            tool_result["context_snippets"] = list(data["context_snippets"] or [])
-        if data.get("tool_calls"):
-            tool_result["tool_calls"] = list(data["tool_calls"])
+        if raw is None:
+            # Fail closed rather than reconstruct: inventing the result here
+            # from the client event is the defect this seam removes.
+            self._outcome = NodeOutcome(
+                result={
+                    "status": "error",
+                    "error": "stream completed without a tool result",
+                },
+                emitted=emitted,
+            )
+            return
 
-        if self._validate_output is not None:
-            refusal = self._validate_output(tool_result)
-            if refusal is not None:
-                # Nothing held is released. That is the whole reason for
-                # holding it.
-                self._outcome = NodeOutcome(result=refusal, emitted=emitted)
-                return
+        sanitized, refusal = self._finalize(raw)
+        if refusal is not None:
+            # Nothing held is released. That is the whole reason for
+            # holding it.
+            self._outcome = NodeOutcome(result=refusal, emitted=emitted)
+            return
 
         for token_event in held:
             emitted = True
             yield token_event
         yield done
         self._outcome = NodeOutcome(
-            result={"status": "ok", **tool_result}, emitted=emitted
+            result={"status": "ok", **sanitized}, emitted=emitted
         )
 
     async def result(self) -> NodeOutcome:

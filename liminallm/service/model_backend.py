@@ -9,9 +9,12 @@ import socket
 import struct
 import threading
 import time
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Protocol, Tuple
+
+import httpx
 
 from liminallm.config import (
     AdapterMode,
@@ -184,6 +187,15 @@ def active_adapters(adapters: Optional[List[dict]]) -> List[dict]:
     return result
 
 
+class StreamAborted(RuntimeError):
+    """The stream's execution was aborted; no further request may be sent.
+
+    Raised by `ArmingClient.send` rather than a transport error on purpose:
+    the OpenAI SDK retries transport errors, and retrying an abort is how one
+    killed request became a fresh one blocked in the same place.
+    """
+
+
 class StreamAbortHandle:
     """A thread-safe way to interrupt a streaming read that is blocked.
 
@@ -195,12 +207,27 @@ class StreamAbortHandle:
     `close()` drops a reference to the descriptor; `shutdown()` tears down the
     connection under the blocked `recv`, which is the thing that must end.
 
+    Arming happens at TCP connect, not at response headers. httpx forwards a
+    per-request `trace` extension to httpcore, whose `connect_tcp.complete`
+    (and `start_tls.complete`) events carry the network stream — so the
+    socket is in hand before the request is even written, and a provider that
+    accepts the connection and never sends headers is still interruptible.
+    Waiting for `attach_response` left exactly that gap: the producer blocked
+    entering the stream, with nothing armed, until the client's own timeout.
+
+    `armed` is the per-stream truth the capability flag cannot carry: the
+    backend supports cancellation in principle; only a stream whose socket is
+    actually in hand has it in fact, and a claim that cannot be proven fails
+    closed at the caller.
+
     `attach` and `abort` may run on different threads in either order: an
-    abort that arrives before the response is open marks the handle, and the
-    attach then shuts the socket down on arrival rather than handing the
-    producer a connection nobody wants. Before a socket exists there is
-    nothing to interrupt — the request-establishment phase is bounded by the
-    client's own connect/read timeouts instead.
+    abort that arrives before the connect marks the handle, and the attach
+    then shuts the socket down on arrival rather than handing the producer a
+    connection nobody wants. Each retry's connect re-attaches, so an aborted
+    handle kills replacement connections as they appear. What remains before
+    any socket exists — DNS and the TCP connect itself — is bounded by the
+    client's connect timeout, a strictly smaller residue than the read
+    timeout this closes.
     """
 
     def __init__(self) -> None:
@@ -208,19 +235,44 @@ class StreamAbortHandle:
         self._sock: Optional[Any] = None
         self._aborted = False
 
+    @property
+    def armed(self) -> bool:
+        with self._lock:
+            return self._sock is not None
+
+    @property
+    def aborted(self) -> bool:
+        with self._lock:
+            return self._aborted
+
     def attach(self, sock: Any) -> None:
+        if sock is None:
+            return
         with self._lock:
             self._sock = sock
             if self._aborted:
                 self._shutdown()
 
+    def trace(self, event_name: str, info: Dict[str, Any]) -> None:
+        """httpcore trace hook: arm as soon as a connection exists."""
+        if event_name in (
+            "connection.connect_tcp.complete",
+            "connection.start_tls.complete",
+        ):
+            stream = info.get("return_value")
+            try:
+                self.attach(stream.get_extra_info("socket"))
+            except Exception:  # noqa: BLE001 - an exotic network stream
+                pass
+
     def attach_response(self, response: Any) -> None:
-        """Attach the socket under an httpx response, if it exposes one."""
+        """Backstop for a response whose connect the trace did not see."""
         try:
             stream = response.extensions["network_stream"]
             self.attach(stream.get_extra_info("socket"))
         except Exception:  # noqa: BLE001 - a transport without a socket
-            # Nothing to interrupt through; between-events stopping remains.
+            # Nothing armed. The caller checks `armed` and fails closed;
+            # swallowing this silently was the defect.
             pass
 
     def abort(self) -> None:
@@ -235,6 +287,72 @@ class StreamAbortHandle:
             self._sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+
+
+#: The abort handle for the stream the current thread is building, read by
+#: `ArmingClient.send`. Thread-local because the SDK builds its requests
+#: internally: there is no per-call seam to pass the handle through, but the
+#: request is sent on the calling thread — the stream's pump thread.
+_STREAM_HANDLE = threading.local()
+
+
+class ArmingClient(httpx.Client):
+    """An httpx client that arms the current thread's stream handle.
+
+    Given to the OpenAI SDK as its `http_client`. For requests sent while a
+    `StreamAbortHandle` is bound to the thread, it injects the handle's trace
+    (arming at connect), forces `Connection: close` so a pooled connection
+    cannot skip the connect event and open the pre-headers gap again, and
+    refuses to send at all once the handle is aborted — the SDK retries
+    transport errors, and without the refusal the abort of one request
+    started the next.
+    """
+
+    def send(self, request: httpx.Request, **kwargs: Any) -> httpx.Response:
+        handle = getattr(_STREAM_HANDLE, "handle", None)
+        if handle is not None:
+            if handle.aborted:
+                raise StreamAborted("stream aborted; not sending a request")
+            request.extensions = dict(request.extensions)
+            request.extensions.setdefault("trace", handle.trace)
+            request.headers["connection"] = "close"
+        return super().send(request, **kwargs)
+
+
+@contextmanager
+def _stream_handle(handle: StreamAbortHandle):
+    _STREAM_HANDLE.handle = handle
+    try:
+        yield
+    finally:
+        _STREAM_HANDLE.handle = None
+
+
+def _arm_or_refuse(
+    handle: StreamAbortHandle, response: Optional[Any]
+) -> Optional[dict]:
+    """Arm the handle from a network response, or the error refusing to stream.
+
+    The rule that keeps the capability honest per stream: a *network*
+    response whose socket cannot be reached is refused before any token —
+    the backend advertised an interrupt this stream cannot deliver, and
+    streaming anyway is how a 200ms timeout ran to the provider's own. No
+    response object at all means an in-memory double or fallback, where no
+    read can block on a socket and a stop between events is complete; those
+    keep streaming, exactly like the stub.
+    """
+    if response is None:
+        return None
+    handle.attach_response(response)
+    if handle.armed:
+        return None
+    return {
+        "event": "error",
+        "data": {
+            "code": "server_error",
+            "message": "stream cancellation could not be armed",
+        },
+    }
 
 
 class CancellableStream:
@@ -262,6 +380,11 @@ class CancellableStream:
 
     def abort(self) -> None:
         self._handle.abort()
+
+    @property
+    def armed(self) -> bool:
+        """Whether the interrupt is actually in hand for this stream."""
+        return self._handle.armed
 
 
 class ModelBackend(Protocol):
@@ -1037,7 +1160,14 @@ class ApiAdapterBackend:
         # Rebuild the client if credentials changed
         if not self.client or self._active_api_key != active_key:
             self.client = _OpenAIClient(
-                api_key=active_key, base_url=self._base_url, timeout=self._client_timeout
+                api_key=active_key,
+                base_url=self._base_url,
+                timeout=self._client_timeout,
+                # The SDK builds its requests internally, so this client is
+                # the only seam through which a stream's abort handle can arm
+                # itself at connect. Inert for every request sent without a
+                # handle bound to the thread — all blocking calls.
+                http_client=ArmingClient(timeout=self._client_timeout),
             )
             self._active_api_key = active_key
 
@@ -1351,9 +1481,22 @@ class ApiAdapterBackend:
         items = responses_compat.to_input_items(messages)
         kwargs = self._responses_kwargs(model, processed["extra_body"])
         try:
-            stream = self.client.responses.create(input=items, stream=True, **kwargs)
             if abort_handle is not None:
-                abort_handle.attach_response(stream.response)
+                with _stream_handle(abort_handle):
+                    stream = self.client.responses.create(
+                        input=items, stream=True, **kwargs
+                    )
+                refusal = _arm_or_refuse(
+                    abort_handle, getattr(stream, "response", None)
+                )
+                if refusal is not None:
+                    stream.close()
+                    yield refusal
+                    return True
+            else:
+                stream = self.client.responses.create(
+                    input=items, stream=True, **kwargs
+                )
             for event in stream:
                 etype = getattr(event, "type", "") or ""
                 if etype == "response.output_text.delta":
@@ -1450,14 +1593,21 @@ class ApiAdapterBackend:
 
         if self.client:
             try:
-                stream = self.client.chat.completions.create(
-                    model=target_model,
-                    messages=augmented_messages,
-                    **self._sampling_params(target_model),
-                    extra_body=extra_body,
-                    stream=True,
+                with _stream_handle(abort_handle):
+                    stream = self.client.chat.completions.create(
+                        model=target_model,
+                        messages=augmented_messages,
+                        **self._sampling_params(target_model),
+                        extra_body=extra_body,
+                        stream=True,
+                    )
+                refusal = _arm_or_refuse(
+                    abort_handle, getattr(stream, "response", None)
                 )
-                abort_handle.attach_response(stream.response)
+                if refusal is not None:
+                    stream.close()
+                    yield refusal
+                    return
                 full_content = ""
                 prompt_tokens = 0
                 completion_tokens = 0
