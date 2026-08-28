@@ -321,7 +321,7 @@ class TestRetryBackoff:
             return {"content": "success", "status": "ok", "usage": {}}
 
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
-            mock_handlers.return_value = {"test.tool": failing_tool}
+            mock_handlers.return_value = {"llm.generic": failing_tool}
 
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
@@ -367,7 +367,7 @@ class TestRetryBackoff:
             raise Exception("permanent failure")
 
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
-            mock_handlers.return_value = {"test.tool": always_failing_tool}
+            mock_handlers.return_value = {"llm.generic": always_failing_tool}
 
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
@@ -415,7 +415,7 @@ class TestRetryBackoff:
             raise Exception("failure")
 
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
-            mock_handlers.return_value = {"test.tool": always_failing_tool}
+            mock_handlers.return_value = {"llm.generic": always_failing_tool}
 
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
@@ -467,7 +467,7 @@ class TestRetryBackoff:
             patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers,
             patch("asyncio.sleep", mock_sleep),
         ):
-            mock_handlers.return_value = {"test.tool": always_failing_tool}
+            mock_handlers.return_value = {"llm.generic": always_failing_tool}
 
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
@@ -515,7 +515,7 @@ class TestRetryBackoff:
             raise Exception("failure")
 
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
-            mock_handlers.return_value = {"test.tool": slow_failing_tool}
+            mock_handlers.return_value = {"llm.generic": slow_failing_tool}
 
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
@@ -560,7 +560,7 @@ class TestRetryBackoff:
             return {"status": "error", "error": "handled failure"}
 
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
-            mock_handlers.return_value = {"test.tool": failing_tool}
+            mock_handlers.return_value = {"llm.generic": failing_tool}
 
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
@@ -607,7 +607,7 @@ class TestRetryBackoff:
             return {"content": "ok", "status": "ok", "usage": {}}
 
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
-            mock_handlers.return_value = {"test.tool": eventual_success}
+            mock_handlers.return_value = {"llm.generic": eventual_success}
 
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
@@ -668,7 +668,7 @@ class TestRetryTimeoutIntegration:
             raise Exception("failure")
 
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
-            mock_handlers.return_value = {"test.tool": failing_tool}
+            mock_handlers.return_value = {"llm.generic": failing_tool}
 
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
@@ -740,7 +740,7 @@ class TestTheWorkflowDeadlineIsRealWallClock:
             patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers,
             patch("asyncio.wait_for", capturing_wait_for),
         ):
-            mock_handlers.return_value = {"test.tool": ok_tool}
+            mock_handlers.return_value = {"llm.generic": ok_tool}
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
                 "handler": "llm.generic",
@@ -808,7 +808,7 @@ class TestTheWorkflowDeadlineIsRealWallClock:
             patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers,
             patch("asyncio.wait_for", capturing_wait_for),
         ):
-            mock_handlers.return_value = {"test.tool": ok_tool}
+            mock_handlers.return_value = {"llm.generic": ok_tool}
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
                 "handler": "llm.generic",
@@ -863,7 +863,7 @@ class TestTheWorkflowDeadlineIsRealWallClock:
             patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers,
             patch("asyncio.sleep", mock_sleep),
         ):
-            mock_handlers.return_value = {"test.tool": slow_failing_tool}
+            mock_handlers.return_value = {"llm.generic": slow_failing_tool}
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
                 "handler": "llm.generic",
@@ -911,7 +911,7 @@ class TestTheWorkflowDeadlineIsRealWallClock:
             return {"ok": True}
 
         with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
-            mock_handlers.return_value = {"test.tool": very_slow_tool}
+            mock_handlers.return_value = {"llm.generic": very_slow_tool}
             workflow_engine.store.tool_specs["test.tool"] = {
                 "name": "test.tool",
                 "handler": "llm.generic",

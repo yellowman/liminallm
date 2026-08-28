@@ -80,6 +80,7 @@ from liminallm.service.tool_namespace import (
     ResolvedWorkflow,
     ToolDescriptor,
     ToolResolutionScope,
+    resolve_executable_handler,
 )
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
@@ -1628,6 +1629,77 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return None
         return descriptor
 
+    def tool_preflight(
+        self,
+        descriptor: Optional[ToolDescriptor],
+        inputs: Dict[str, Any],
+        *,
+        user_id: Optional[str],
+        tool_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Everything a resolved tool must pass before any body runs, or
+        ``None`` when it passes.
+
+        Shared because it was not. This lived inside `_invoke_tool`, and the
+        streaming path never called it: `_stream_llm_node` takes a node, so an
+        ordinary user's own private spec claiming `privileged: true` was
+        refused on the blocking path and streamed the model on the other.
+        Token production is what streaming may specialise; deciding whether
+        the call is allowed at all is not.
+        """
+        tool_spec = descriptor.schema if descriptor else None
+        validation_errors = self._validate_tool_payload(
+            inputs,
+            tool_spec.get("input_schema") if tool_spec else None,
+            phase="input",
+            tool_name=tool_name,
+        )
+        if validation_errors:
+            return {
+                "status": "error",
+                "content": "tool input validation failed",
+                "error": "validation_error",
+                "details": {"errors": validation_errors},
+            }
+        # SPEC §18: a privileged tool requires an admin-owned *artifact* and
+        # an admin caller. Asking only about the caller is not enough: any
+        # authenticated user can author `privileged: true` through
+        # /v1/artifacts, and an admin invoking it would be handed the
+        # privileged sandbox for someone else's definition. Ownership comes
+        # from the persisted row; a spec that names an owner quotes itself.
+        if descriptor is not None and descriptor.privileged:
+            user = self.store.get_user(user_id) if user_id else None
+            role = user.role if user else None
+            if not descriptor.admin_owned:
+                self.logger.warning(
+                    "privileged_tool_denied",
+                    tool=tool_name,
+                    user_id=user_id,
+                    reason="artifact is not admin-owned",
+                    artifact_id=descriptor.artifact_id,
+                    owner_user_id=descriptor.owner_user_id,
+                )
+                return {
+                    "status": "error",
+                    "error": "forbidden",
+                    "content": (
+                        f"privileged tool {tool_name!r} requires an admin-owned "
+                        "artifact (SPEC §18)"
+                    ),
+                }
+            try:
+                get_tool_sandbox_config(tool_spec, user_role=role)
+            except PrivilegedToolError as exc:
+                self.logger.warning(
+                    "privileged_tool_denied",
+                    tool=tool_name,
+                    user_id=user_id,
+                    role=role,
+                    reason="caller is not an admin",
+                )
+                return {"status": "error", "content": str(exc), "error": "forbidden"}
+        return None
+
     def _describe_tool(self, artifact) -> ToolDescriptor:
         """Describe one artifact the caller already chose.
 
@@ -2116,53 +2188,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # Issue 6.9: Apply hardcap per SPEC §18.3 (default 15s, hard cap 60s)
         raw_timeout = tool_spec.get("timeout_seconds", 15) if tool_spec else 15
         timeout = min(raw_timeout, MAX_NODE_TIMEOUT_SECONDS)
-        validation_errors = self._validate_tool_payload(
-            inputs, tool_spec.get("input_schema") if tool_spec else None, phase="input", tool_name=tool_name
+        refusal = self.tool_preflight(
+            descriptor, inputs, user_id=user_id, tool_name=tool_name
         )
-        if validation_errors:
-            return {
-                "status": "error",
-                "content": "tool input validation failed",
-                "error": "validation_error",
-                "details": {"errors": validation_errors},
-            }
-        # SPEC §18: a privileged tool requires an admin-owned *artifact* and
-        # an admin caller. Asking only about the caller is not enough: any
-        # authenticated user can author `privileged: true` through
-        # /v1/artifacts, and an admin invoking it would be handed the
-        # privileged sandbox for someone else's definition. Ownership comes
-        # from the persisted row; a spec that names an owner quotes itself.
-        if descriptor is not None and descriptor.privileged:
-            user = self.store.get_user(user_id) if user_id else None
-            role = user.role if user else None
-            if not descriptor.admin_owned:
-                self.logger.warning(
-                    "privileged_tool_denied",
-                    tool=tool_name,
-                    user_id=user_id,
-                    reason="artifact is not admin-owned",
-                    artifact_id=descriptor.artifact_id,
-                    owner_user_id=descriptor.owner_user_id,
-                )
-                return {
-                    "status": "error",
-                    "error": "forbidden",
-                    "content": (
-                        f"privileged tool {tool_name!r} requires an admin-owned "
-                        "artifact (SPEC §18)"
-                    ),
-                }
-            try:
-                get_tool_sandbox_config(tool_spec, user_role=role)
-            except PrivilegedToolError as exc:
-                self.logger.warning(
-                    "privileged_tool_denied",
-                    tool=tool_name,
-                    user_id=user_id,
-                    role=role,
-                    reason="caller is not an admin",
-                )
-                return {"status": "error", "content": str(exc), "error": "forbidden"}
+        if refusal is not None:
+            return refusal
 
         # One logical execution. A node's retry loop passes the same one back,
         # so the second attempt replays the first's ledger; a direct invocation
@@ -2329,18 +2359,16 @@ class WorkflowEngine(WorkflowStreamingMixin):
     ) -> str:
         """The body this tool runs, following a spec's `handler` alias.
 
-        A `tool.spec` artifact may name a builtin as its handler, and the spec
-        that matters is the authorized row's — a private tool is resolved for
-        its caller and never enters the shared registry (SPEC §18), so reading
-        the alias out of the registry alone would leave it unresolved and the
-        tool would answer "unknown".
+        The resolved row's `handler` decides, through the one function
+        admission also asks. This checked `tool_name in BODY_NAMES` first, so
+        a spec named `notes.search_v1` with handler `llm.generic` ran the
+        notes body — the reference's spelling beat the row that was resolved,
+        and admission had approved the other one.
+
+        A caller with no spec keeps the literal name, which is how a builtin
+        stays reachable when nothing is persisted behind it.
         """
-        if tool_name in tool_worker.BODY_NAMES:
-            return tool_name
-        alias = (tool_spec or self.tool_registry.get(tool_name) or {}).get("handler")
-        if alias in tool_worker.BODY_NAMES or alias in self._builtin_tool_handlers():
-            return alias
-        return tool_name
+        return resolve_executable_handler(tool_name, tool_spec) or tool_name
 
     def _worker_limits(self, tool_spec: Optional[dict]) -> Dict[str, int]:
         """SPEC §18: the rlimits this tool's worker runs under.

@@ -107,6 +107,30 @@ class ResolvedWorkflow:
     tool_scope: ToolResolutionScope
 
 
+def resolve_executable_handler(
+    tool_name: str, tool_spec: Optional[dict]
+) -> Optional[str]:
+    """The body `tool_name` runs, or ``None`` when nothing runs it.
+
+    The one answer, asked by admission, by blocking execution and by streaming
+    dispatch, because three implementations of "what will this run" is three
+    chances to approve one body and execute another.
+
+    A persisted spec's `handler` is authoritative. `_resolve_worker_tool` used
+    to check `tool_name in BODY_NAMES` *first*, so a spec named
+    `notes.search_v1` with handler `llm.generic` ran the notes body — the
+    reference's spelling beat the row that was actually resolved, and
+    admission had approved the other one.
+
+    With no spec at all the literal name is the answer, which keeps a builtin
+    reachable when nothing is persisted behind it.
+    """
+    handler = (tool_spec or {}).get("handler")
+    if isinstance(handler, str) and handler:
+        return handler if handler in EXECUTABLE_HANDLER_NAMES else None
+    return tool_name if tool_name in EXECUTABLE_HANDLER_NAMES else None
+
+
 @dataclass(frozen=True)
 class ToolDescriptor:
     """A resolved tool and where its authority comes from.
@@ -137,13 +161,12 @@ class ToolDescriptor:
 
     @property
     def handler(self) -> Optional[str]:
-        """The body this spec names, or its own name when it names none."""
-        handler = (self.schema or {}).get("handler")
-        return handler if isinstance(handler, str) and handler else self.name
+        """The body this spec runs, or ``None`` when nothing runs it."""
+        return resolve_executable_handler(self.name, self.schema)
 
     @property
     def executable(self) -> bool:
-        return self.handler in EXECUTABLE_HANDLER_NAMES
+        return self.handler is not None
 
     @property
     def streamable(self) -> bool:

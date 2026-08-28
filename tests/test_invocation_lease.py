@@ -1281,33 +1281,34 @@ class TestTheWorkerCarriesNoAuthority:
     def test_a_spec_handler_alias_reaches_its_worker_body(self, runtime):
         """A `tool.spec` naming a worker-side builtin as its handler resolves
         to it. Without this the alias falls through to `tool.host`, which looks
-        in the map the body was deliberately moved out of."""
+        in the map the body was deliberately moved out of.
+
+        The spec is passed rather than looked up: every caller resolves the
+        descriptor first, and the process registry is no longer a resolution
+        source — it once answered for artifacts that had been deleted.
+        """
         engine = runtime.workflow
-        engine.tool_registry["custom.analyse"] = {
-            "name": "custom.analyse",
-            "handler": "code.python_v1",
-        }
-        engine.tool_registry["custom.chat"] = {
-            "name": "custom.chat",
-            "handler": "llm.generic",
-        }
-        try:
-            assert engine._resolve_worker_tool("custom.analyse") == "code.python_v1"
-            assert engine._resolve_worker_tool("code.python_v1") == "code.python_v1"
-            # A host body's alias resolves too, so `tool.host` is asked for the
-            # body rather than for the name that pointed at it.
-            assert engine._resolve_worker_tool("custom.chat") == "llm.generic"
-            # And the authorized row's spec wins over the shared registry: a
-            # private tool never enters it.
-            assert (
-                engine._resolve_worker_tool(
-                    "not.registered", {"handler": "notes.search_v1"}
-                )
-                == "notes.search_v1"
+        assert engine._resolve_worker_tool(
+            "custom.analyse", {"handler": "code.python_v1"}
+        ) == "code.python_v1"
+        # A name that is itself a body still resolves with no spec at all.
+        assert engine._resolve_worker_tool("code.python_v1") == "code.python_v1"
+        # A host body's alias resolves too, so `tool.host` is asked for the
+        # body rather than for the name that pointed at it.
+        assert engine._resolve_worker_tool(
+            "custom.chat", {"handler": "llm.generic"}
+        ) == "llm.generic"
+        # The authorized row's spec decides, including when its own name
+        # happens to match a different body.
+        assert (
+            engine._resolve_worker_tool(
+                "not.registered", {"handler": "notes.search_v1"}
             )
-        finally:
-            engine.tool_registry.pop("custom.analyse", None)
-            engine.tool_registry.pop("custom.chat", None)
+            == "notes.search_v1"
+        )
+        assert engine._resolve_worker_tool(
+            "notes.search_v1", {"handler": "llm.generic"}
+        ) == "llm.generic"
 
 
 # ---------------------------------------------------------------------------

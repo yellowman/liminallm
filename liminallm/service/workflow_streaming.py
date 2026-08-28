@@ -200,7 +200,21 @@ class WorkflowStreamingMixin:
                 # streamed LLM call at all, and a graph declaring
                 # `tool -> recover` on failure ended the turn instead. Only
                 # token production below is streaming-specific.
-                tool_result = await self._circuit_open_result(
+                # Everything a resolved tool must pass before any body runs,
+                # through the same function the blocking path uses. Streaming
+                # specialises token production and nothing above it: this path
+                # entered `_stream_llm_node` with only a node, so an ordinary
+                # user's own private spec claiming `privileged: true` was
+                # refused on one path and ran the model on the other.
+                refusal = self.tool_preflight(
+                    descriptor,
+                    self._resolve_inputs(
+                        node.get("inputs", {}), user_message, vars_scope
+                    ),
+                    user_id=user_id,
+                    tool_name=tool_name,
+                )
+                tool_result = refusal or await self._circuit_open_result(
                     node, tenant_id=tenant_id
                 )
                 failure_event = None
