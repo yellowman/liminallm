@@ -1095,8 +1095,15 @@ class TestAStreamedAttemptCanBeStopped:
         stopped = threading.Event()
 
         def generate_stream(*a, **k):
+            # Effectively unbounded against the 5s assertion below, so the
+            # `finally` cannot fire because the loop ran out — that made the
+            # first version vacuous. But not literally unbounded: under a
+            # mutation that removes the deadline the driver drains this
+            # forever, and a witness that hangs measures nothing. 20s makes
+            # every mutation fail instead.
+            deadline = _time.monotonic() + 20.0
             try:
-                while True:
+                while _time.monotonic() < deadline:
                     _time.sleep(0.02)
                     yield {"event": "token", "data": "."}
             finally:
