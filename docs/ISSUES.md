@@ -15577,3 +15577,99 @@ generator. The §V rule stands: a hand-written double answers capability
 questions by not having the attribute, and every capability the engine
 learns to ask about is a question every double answers wrong until
 someone notices.
+
+## Cancellation was armed too late, and canonical stopped one handler in
+
+Fourth review round on the streaming tranche: one HIGH, one MEDIUM. Both
+were the previous round's fixes stopping one step short of their own rule.
+
+### The interrupt existed only after response headers
+
+`supports_stream_cancel = True` promised an interruptible stream, and the
+socket-shutdown interrupt delivered that — from the moment
+`attach_response` had a socket. Before headers arrived there was nothing
+armed: a provider that accepts the connection and stalls silent leaves the
+producer blocked *entering* the stream, `abort()` records a flag and
+interrupts nothing, and `close()` — which deliberately did not wait for
+producers — forgot it. Reproduced with a server that accepts TCP and never
+sends a byte: the workflow returned its 400ms timeout with the producer
+alive on both network backends. The same waiter-versus-work defect as the
+round before, moved earlier in the HTTP lifecycle.
+
+Two measurements fixed it:
+
+* httpx forwards a per-request `trace` extension to httpcore, and the
+  `connect_tcp.complete` event carries the network stream — so the socket
+  is in hand before the request is written, and `shutdown(SHUT_RDWR)`
+  wakes a headers-wait immediately. Gemini passes the trace on its stream
+  call; the OpenAI SDK builds requests internally, so its client is now an
+  `ArmingClient` that injects the current thread's handle. Streaming
+  requests force `Connection: close`, because a pooled connection skips
+  the connect event and would reopen the gap.
+* The SDK retries transport errors: killing one blocked request started a
+  fresh one blocked in the same place (measured — the first probe's
+  shutdown freed nothing because retry two was already waiting). An
+  aborted handle now refuses the next send with an exception the SDK does
+  not retry, and each retry's connect re-attaches into the aborted handle
+  and dies on arrival.
+
+What remains unarmed is DNS and the TCP connect itself, bounded by the
+client's connect timeout — a strictly smaller residue than the read
+timeout this closes, and one with no provider operation yet on the other
+end.
+
+### Proven per stream, and the claim is cashed at teardown
+
+The backend flag says cancellation is possible in principle;
+`CancellableStream.armed` says this stream actually holds the interrupt.
+A network response whose socket cannot be reached is now refused before
+any token — silently arming nothing while advertised cancellable was the
+finding. No response object at all (in-memory doubles, the no-client
+fallback) still streams: nothing there can block on a socket. The gate
+sits after Gemini's 400-degrade handling; an error response never streams
+and must stay readable for the thinking-config retry, which the first
+placement of the gate broke and a mock-wire test caught.
+
+`terminate(producers=False)` — the terminal teardown — now waits for
+producers whose cancellation is proven: their death after a stop is
+prompt, and the workflow must not report a timeout while that provider
+operation runs on. Unproven producers stay excluded from the wait exactly
+as before; they can no longer be producing tokens anyway.
+
+The Gemini mock-wire streaming tests arm their `MockTransport` responses
+with a fake network stream, because production now fails closed on an
+unarmable stream and without the fake they would test the refusal rather
+than the wire format.
+
+### The handler names its result's fields
+
+The streamed attempt rebuilt the "raw tool result" from the fields it knew
+about — which were exactly `llm.generic`'s. `agent.files_v1` streams too,
+and its blocking result carries `artifacts` and `injection_findings`; the
+reconstruction dropped both before validation, so one result and one
+strict schema got two verdicts. Reproduced with the worker's real six-key
+shape.
+
+The streaming implementations now emit the completed result as a
+`tool_result` event — the llm node with its three keys, the agent node
+with the worker loop's six, on the partial-answer path included — and
+`StreamedNodeAttempt` consumes it and fails closed if it is missing,
+rather than reconstructing. Every newly streamable handler now names its
+own fields once, where it builds them.
+
+`tool_postflight` became the transformation boundary it was named as:
+streaming applies it to every completed result — sanitizing included,
+which it previously skipped entirely when no schema was declared — and
+what proceeds downstream is the sanitized object it returns, on both
+paths.
+
+### Recorded, not fixed: the context-window probe blocks the turn
+
+Found while writing the pre-headers witness. `context_window` is resolved
+lazily by probing the provider, and the prompt-budget path triggers it on
+the event loop — against the stalled provider the *turn* blocked for the
+client's full read timeout (measured 60.15s Gemini, 5.07s OpenAI-SDK)
+before the node even started. Pre-existing, unrelated to the streaming
+seams, and its own fix: the probe belongs off the loop with a budget
+fallback while it resolves. The witnesses pin `_context_window` to keep
+it out of their measurement.
