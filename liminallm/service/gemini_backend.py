@@ -21,6 +21,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import httpx
 
 from liminallm.logging import get_logger
+from liminallm.service.model_backend import CancellableStream, StreamAbortHandle
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import estimate_token_count
 
@@ -468,6 +469,12 @@ class GeminiBackend:
             "usage": usage_dict(payload),
         }
 
+    #: The stream below attaches its response's socket to the abort handle,
+    #: so a read blocked mid-stream can be interrupted from another thread.
+    #: Declared only because that handle exists — see
+    #: `ModelBackend.generate_stream`.
+    supports_stream_cancel = True
+
     def generate_stream(
         self,
         messages: List[dict],
@@ -478,6 +485,17 @@ class GeminiBackend:
         """SSE over streamGenerateContent?alt=sse: each `data:` line is a
         chunk whose candidate parts carry text deltas; the last one carries
         usageMetadata."""
+        handle = StreamAbortHandle()
+        return CancellableStream(
+            self._generate_stream_impl(messages, adapters, handle), handle
+        )
+
+    def _generate_stream_impl(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        abort_handle: StreamAbortHandle,
+    ) -> Iterator[dict]:
         body, applied = self._request_body(messages, adapters)
         url = self._url(self.base_model, "streamGenerateContent") + "?alt=sse"
         full_content = ""
@@ -490,6 +508,7 @@ class GeminiBackend:
                 with self._http().stream(
                     "POST", url, headers=self._headers(), json=body,
                 ) as resp:
+                    abort_handle.attach_response(resp)
                     if attempt == 1 and resp.status_code == 400:
                         resp.read()
                         if self._drop_rejected_thinking(body, 400, resp.text):

@@ -45,6 +45,7 @@ handler executability.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import pytest
@@ -1209,4 +1210,523 @@ class TestAStreamedAttemptCanBeStopped:
         done = [e for e in events if e.get("event") == "message_done"]
         assert done and done[-1]["data"].get("content"), (
             f"the fallback produced no answer: {events[-2:]}"
+        )
+
+
+class TestAStreamedAttemptIsAnAttempt:
+    """SPEC §18.3 keeps two ids because they answer different questions: one
+    logical execution, and a *fresh lease per attempt*. A streamed attempt had
+    neither `begin_attempt` nor `end_attempt`, so it had no lease at all.
+
+    That is not bookkeeping. `Invocation.revoke` reads `_current is None` as
+    "nothing has started" and refuses the whole execution, deliberately, so a
+    revoke landing before the first spawn is not forgotten by the attempt that
+    follows it. `_previous_attempt_is_dead` calls `revoke("retry")` — so on a
+    streamed retry the execution is cancelled, and the next attempt then calls
+    the provider anyway because nothing on that path begins an attempt or asks
+    whether it still holds authority.
+
+    Producer liveness is not the lease. The peak-concurrency witness proves
+    attempt two does not overlap attempt one; it says nothing about whether
+    attempt two is allowed to run.
+    """
+
+    @staticmethod
+    def _aliased(store, owner, **spec_extra):
+        name = _u("my.chat")
+        _tool(store, name, "llm.generic", owner=owner.id, visibility="private",
+              **spec_extra)
+        return name
+
+    def _engine_for(self, store, node, tag, **spec_extra):
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u(tag)}@t.local", tenant_id=_u(tag))
+        name = self._aliased(store, u, **spec_extra)
+        wf = store.create_artifact(
+            "workflow", _u(f"{tag}wf"),
+            {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
+                {"id": "call", "type": "tool_call", "tool": name, **node},
+                {"id": "fin", "type": "end"},
+            ]},
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        held = {}
+        opener = engine.invocations.open
+
+        def spy(*a, **k):
+            held["invocation"] = inv = opener(*a, **k)
+            return inv
+
+        engine.invocations.open = spy
+        return engine, wf, u, held
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_retry_holds_a_fresh_lease(self, store):
+        engine, wf, u, held = self._engine_for(
+            store,
+            {"max_retries": 1, "backoff_ms": 5, "next": "fin"},
+            "lease",
+        )
+        seen = []
+
+        def generate_stream(*a, **k):
+            inv = held["invocation"]
+            seen.append({
+                "cancelled": inv.cancelled,
+                "attempts": len(inv.attempts),
+                "has_current": inv.current_attempt is not None,
+            })
+            raise RuntimeError("backend down")
+
+        engine.llm.generate_stream = generate_stream
+        [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+
+        assert len(seen) == 2, f"expected two attempts, saw {len(seen)}"
+        assert seen[0]["has_current"], (
+            "attempt one began no `Attempt`, so it holds no lease of its own"
+        )
+        assert not seen[1]["cancelled"], (
+            "attempt two called the provider under a cancelled invocation: "
+            "`revoke('retry')` saw no current attempt and refused the whole "
+            "execution, and nothing on this path noticed"
+        )
+        assert seen[1]["attempts"] == 2, (
+            f"attempt two reused attempt one's lease: "
+            f"{seen[1]['attempts']} `Attempt` records"
+        )
+        inv = held["invocation"]
+        assert inv.attempts[0].revoked or inv.attempts[0].terminated_at, (
+            "attempt one was never closed out"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_stops_the_next_provider_request(self, store):
+        """The companion, and the one that names the mechanism.
+
+        The execution is cancelled outright during attempt one — the exact
+        state `revoke("retry")` produces when it finds no current attempt, and
+        the same state `POST /chat/cancel` produces through the watcher. A
+        cancelled execution has no authority, so attempt two must not reach
+        the provider.
+
+        Cancelling here rather than setting the cancel event, because the
+        event is read in two incidental places — `_pumped` checks it per event
+        and the driver checks it inside `if sleep_ms > 0` — and each can end
+        the turn for a reason that is not the lease. `backoff_ms: 0` closes
+        the second of those, and cancelling directly closes the first.
+        """
+        engine, wf, u, held = self._engine_for(
+            store,
+            {"max_retries": 2, "backoff_ms": 0, "next": "fin"},
+            "canc",
+        )
+        calls = []
+
+        def generate_stream(*a, **k):
+            calls.append(1)
+            held["invocation"].cancel("cancelled")
+            raise RuntimeError("backend down")
+
+        engine.llm.generate_stream = generate_stream
+        [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert len(calls) == 1, (
+            f"a cancelled execution still called the provider {len(calls)} "
+            f"times; nothing on this path asks whether it holds authority"
+        )
+
+
+class TestOneCanonicalOutputOnBothPaths:
+    """SPEC §9.2 validates the tool's output, not a transport's projection of
+    it.
+
+    Blocking validates the tool result — for `llm.generic`,
+    `{content, usage, context_snippets}`. Streaming rebuilt a node-ish object
+    with a `status` key the tool never produced and validated that instead, so
+    a schema that fits the real output can pass one path and fail the other.
+    """
+
+    @staticmethod
+    def _aliased(store, owner, **spec_extra):
+        name = _u("my.chat")
+        _tool(store, name, "llm.generic", owner=owner.id, visibility="private",
+              **spec_extra)
+        return name
+
+    STRICT = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string"},
+            "usage": {"type": "object"},
+            "context_snippets": {"type": "array"},
+        },
+        "required": ["content"],
+        "additionalProperties": False,
+    }
+
+    @pytest.mark.asyncio
+    async def test_the_same_output_passes_both_paths(self, store):
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('can')}@t.local", tenant_id=_u("cant"))
+        name = self._aliased(store, u, output_schema=self.STRICT)
+        wf = store.create_artifact(
+            "workflow", _u("canwf"), _wf(name),
+            owner_user_id=u.id, visibility="private",
+        )
+        engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
+        engine.llm.generate = lambda *a, **k: {
+            "content": "hi", "usage": {"total_tokens": 1}
+        }
+        engine.llm.generate_stream = lambda *a, **k: iter([
+            {"event": "token", "data": "hi"},
+            {"event": "message_done",
+             "data": {"content": "hi", "usage": {"total_tokens": 1}}},
+        ])
+
+        blocking = await engine.run(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        streamed_errors = [
+            e["data"].get("code") for e in events if e.get("event") == "error"
+        ]
+        blocking_ok = not any(
+            entry.get("status") == "error"
+            for entry in blocking.get("workflow_trace", [])
+        )
+        assert blocking_ok, blocking.get("workflow_trace")
+        assert not streamed_errors, (
+            f"one output, one schema, two answers: blocking accepted it and "
+            f"streaming refused it with {streamed_errors}. Streaming is "
+            f"validating a reconstructed object, not the tool's output."
+        )
+
+
+class TestTheCancelCapabilityIsProven:
+    """`supports_stream_cancel` fails closed, and a declaration is backed by
+    a real interrupt.
+
+    Measured before this existed: both shipped network backends block
+    *inside* an event — the OpenAI-compatible SDK in synchronous chunk
+    iteration under a 30s client timeout, native Gemini in `iter_lines()`
+    under a 60s one — and neither `Response.close`, `Client.close`, closing
+    the network stream nor `socket.close()` woke the blocked read. Only
+    `socket.shutdown(SHUT_RDWR)` did. A default of "yes unless declared no"
+    therefore claimed an ability the shipped backends did not have, and a
+    `timeout_ms: 200` stopped the waiter while the provider request ran on.
+    Unprovable capability claims fail closed.
+    """
+
+    @staticmethod
+    def _bare_llm():
+        """A real `LLMService` over a backend that declares nothing."""
+        from liminallm.service.llm import LLMService
+
+        class Bare:
+            def generate(self, messages, adapters, *, user_id=None):
+                return {"content": "whole answer", "usage": {}}
+
+            def generate_stream(self, messages, adapters, *, user_id=None):
+                self.streamed = True
+                return iter([
+                    {"event": "token", "data": "x"},
+                    {"event": "message_done", "data": {"content": "x", "usage": {}}},
+                ])
+
+        backend = Bare()
+        return LLMService("test-model", backend=backend), backend
+
+    def test_an_undeclared_backend_is_not_cancellable(self):
+        llm, _ = self._bare_llm()
+        assert llm.stream_is_cancellable is False, (
+            "a backend that declares nothing was assumed stoppable; the "
+            "capability must fail closed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_undeclared_backend_does_not_stream(self, store):
+        """The engine half: undeclared means the fallback executor, and the
+        answer still arrives in the final `message_done`."""
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('nd')}@t.local", tenant_id=_u("ndt"))
+        wf = store.create_artifact(
+            "workflow", _u("ndwf"), _wf("llm.generic"),
+            owner_user_id=u.id, visibility="private",
+        )
+        llm, backend = self._bare_llm()
+        engine = WorkflowEngine(store, llm, rt.router, rt.rag, cache=rt.cache)
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        assert not getattr(backend, "streamed", False), (
+            "an undeclared backend was streamed anyway"
+        )
+        done = [e for e in events if e.get("event") == "message_done"]
+        assert done and done[-1]["data"].get("content") == "whole answer", (
+            f"the fallback lost the answer: {events[-2:]}"
+        )
+        assert not [e for e in events if e.get("event") == "error"], events
+
+    @pytest.mark.asyncio
+    async def test_stop_interrupts_a_read_in_flight(self):
+        """The pump half of the promise: `stop()` reaches the iterator's
+        `abort()`, and the producer thread is then confirmably dead — not
+        merely no longer waited for."""
+        import threading
+        import time as _time
+
+        from liminallm.service.node_attempt import StreamPump
+
+        release = threading.Event()
+
+        class BlockedRead:
+            """One token, then a read that returns only when aborted."""
+
+            def __init__(self):
+                self._sent = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if not self._sent:
+                    self._sent = True
+                    return {"event": "token", "data": "x"}
+                release.wait(8.0)  # the blocking read
+                raise StopIteration
+
+            def abort(self):
+                release.set()
+
+        pump = StreamPump(BlockedRead, label="blocked").start()
+        events = pump.events()
+        first = await asyncio.wait_for(events.__anext__(), 2.0)
+        assert first["event"] == "token"
+        # Give the producer a moment to enter the blocked read.
+        await asyncio.sleep(0.05)
+        start = _time.monotonic()
+        dead = await pump.wait_dead(2.0)
+        elapsed = _time.monotonic() - start
+        assert dead, "the producer did not die: stop() never reached abort()"
+        assert elapsed < 2.0, f"death took {elapsed:.2f}s against an 8s read"
+        await events.aclose()
+
+
+def _stall_server(first_payload: bytes, stall_seconds: float = 8.0):
+    """An HTTP server that streams one SSE chunk and then stalls.
+
+    The shape every witness of a blocked provider read needs: the first
+    event proves the stream is open, the stall is where an uninterruptible
+    reader would sit for the provider's own timeout.
+    """
+    import http.server
+    import socketserver
+    import threading
+    import time as _time
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            try:
+                self.wfile.write(
+                    b"%x\r\n" % len(first_payload) + first_payload + b"\r\n"
+                )
+                self.wfile.flush()
+                _time.sleep(stall_seconds)
+                self.wfile.write(b"0\r\n\r\n")
+            except Exception:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    server = Server(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
+
+
+class TestTheShippedBackendsHonourTheirDeclaration:
+    """Each backend that declares `supports_stream_cancel` is tested against
+    a provider that stalls mid-stream: first token through, then `stop()`,
+    then the producer must be confirmably dead in far less time than the
+    stall. This is the difference between declaring the capability and
+    having it — the declaration alone passed every test that does not
+    actually block.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gemini_native_interrupts_a_stalled_stream(self):
+        from liminallm.service.gemini_backend import GeminiBackend
+        from liminallm.service.node_attempt import StreamPump
+
+        payload = (
+            b'data: {"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}\n\n'
+        )
+        server, port = _stall_server(payload)
+        try:
+            backend = GeminiBackend(
+                "gemini-test", api_key="k", base_url=f"http://127.0.0.1:{port}"
+            )
+            assert backend.supports_stream_cancel is True
+            pump = StreamPump(
+                lambda: backend.generate_stream(
+                    [{"role": "user", "content": "x"}], []
+                ),
+                label="gemini",
+            ).start()
+            events = pump.events()
+            first = await asyncio.wait_for(events.__anext__(), 5.0)
+            assert first["event"] == "token", first
+            dead = await pump.wait_dead(3.0)
+            assert dead, (
+                "the Gemini stream could not be interrupted mid-stall; the "
+                "socket was never attached to the abort handle"
+            )
+            await events.aclose()
+        finally:
+            server.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_api_adapter_interrupts_a_stalled_stream(self):
+        from liminallm.service.model_backend import ApiAdapterBackend
+        from liminallm.service.node_attempt import StreamPump
+
+        payload = (
+            b'data: {"id":"1","object":"chat.completion.chunk","created":0,'
+            b'"model":"m","choices":[{"index":0,"delta":{"content":"hi"},'
+            b'"finish_reason":null}]}\n\n'
+        )
+        server, port = _stall_server(payload)
+        try:
+            backend = ApiAdapterBackend(
+                "m", api_key="t", base_url=f"http://127.0.0.1:{port}"
+            )
+            # Pin the chat path: this witness is about the chat stream's
+            # socket, and probing /responses against the stall server would
+            # measure the probe, not the interrupt.
+            backend._responses_ok = False
+            assert backend.supports_stream_cancel is True
+            pump = StreamPump(
+                lambda: backend.generate_stream(
+                    [{"role": "user", "content": "x"}], []
+                ),
+                label="openai",
+            ).start()
+            events = pump.events()
+            first = await asyncio.wait_for(events.__anext__(), 5.0)
+            assert first["event"] == "token", first
+            dead = await pump.wait_dead(3.0)
+            assert dead, (
+                "the OpenAI-compatible stream could not be interrupted "
+                "mid-stall; the socket was never attached to the abort handle"
+            )
+            await events.aclose()
+        finally:
+            server.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_holds_a_blocked_body_to_the_deadline(self, store):
+        """The other half of the fallback claim. A non-cancellable backend's
+        node runs on the ordinary executor — whose body for `llm.generic` is
+        the *parent's* `llm.generate`, not something a worker kill reaches.
+        The deadline must bind anyway: the node fails at `timeout_ms` while
+        the body runs on as authorityless work."""
+        import time as _time
+
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('fb')}@t.local", tenant_id=_u("fbt"))
+        wf = store.create_artifact(
+            "workflow", _u("fbwf"),
+            {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
+                {"id": "call", "type": "tool_call", "tool": "llm.generic",
+                 "timeout_ms": 800, "max_retries": 0, "next": "fin"},
+                {"id": "fin", "type": "end"},
+            ]},
+            owner_user_id=u.id, visibility="private",
+        )
+        llm, backend = TestTheCancelCapabilityIsProven._bare_llm()
+
+        def slow_generate(messages, adapters, *, user_id=None):
+            _time.sleep(4.0)
+            return {"content": "far too late", "usage": {}}
+
+        backend.generate = slow_generate
+        engine = WorkflowEngine(store, llm, rt.router, rt.rag, cache=rt.cache)
+        start = _time.monotonic()
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        elapsed = _time.monotonic() - start
+        assert elapsed < 3.5, (
+            f"a fallback node with `timeout_ms: 800` ran {elapsed:.2f}s; the "
+            f"deadline does not bind the blocked body"
+        )
+        errors = [e for e in events if e.get("event") == "error"]
+        assert errors, f"the timed-out node reported nothing: {events[-2:]}"
+        assert not any(
+            e.get("event") == "message_done"
+            and e["data"].get("content") == "far too late"
+            for e in events
+        ), "the late answer was delivered as if the deadline had held"
+
+
+class TestTheStreamedResultCarriesItsGrounding:
+    """The canonical output includes what the node retrieved.
+
+    Blocking `llm.generic` returns `context_snippets` beside `content` and
+    `usage`; the streamed node retrieved the same snippets, put them in the
+    prompt, and then reported none — its `message_done` came straight from
+    the backend, which never saw the retrieval. So the turn's grounding
+    vanished on the streamed transport, and an `output_schema` mentioning
+    `context_snippets` validated a different object per path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_retrieved_snippets_reach_message_done(self, store):
+        from types import SimpleNamespace
+
+        from liminallm.service.workflow import WorkflowEngine
+
+        rt = get_runtime()
+        u = store.create_user(email=f"{_u('gr')}@t.local", tenant_id=_u("grt"))
+        wf = store.create_artifact(
+            "workflow", _u("grwf"), _wf("llm.generic"),
+            owner_user_id=u.id, visibility="private",
+        )
+
+        class Grounded:
+            def retrieve(self, ctx_ids, query, **kwargs):
+                return [SimpleNamespace(content="GROUNDING-42")]
+
+        engine = WorkflowEngine(store, rt.llm, rt.router, Grounded(), cache=rt.cache)
+        engine.llm.generate_stream = lambda *a, **k: iter([
+            {"event": "token", "data": "hi"},
+            {"event": "message_done", "data": {"content": "hi", "usage": {}}},
+        ])
+        events = [e async for e in engine.run_streaming(
+            wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)]
+        done = [e for e in events if e.get("event") == "message_done"]
+        assert done, events[-2:]
+        assert "GROUNDING-42" in (done[-1]["data"].get("context_snippets") or []), (
+            f"the streamed turn dropped its grounding: "
+            f"{done[-1]['data'].get('context_snippets')}"
         )

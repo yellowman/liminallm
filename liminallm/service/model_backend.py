@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import socket
 import struct
 import threading
 import time
@@ -183,6 +184,86 @@ def active_adapters(adapters: Optional[List[dict]]) -> List[dict]:
     return result
 
 
+class StreamAbortHandle:
+    """A thread-safe way to interrupt a streaming read that is blocked.
+
+    Measured, because the obvious answers do not work: with a provider that
+    stalls mid-stream, `Response.close`, `Client.close`, closing the network
+    stream and even `socket.close()` all left the reading thread blocked for
+    the full stall — only `socket.shutdown(SHUT_RDWR)` woke it, immediately,
+    with a protocol error the stream generator reports as its error event.
+    `close()` drops a reference to the descriptor; `shutdown()` tears down the
+    connection under the blocked `recv`, which is the thing that must end.
+
+    `attach` and `abort` may run on different threads in either order: an
+    abort that arrives before the response is open marks the handle, and the
+    attach then shuts the socket down on arrival rather than handing the
+    producer a connection nobody wants. Before a socket exists there is
+    nothing to interrupt — the request-establishment phase is bounded by the
+    client's own connect/read timeouts instead.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sock: Optional[Any] = None
+        self._aborted = False
+
+    def attach(self, sock: Any) -> None:
+        with self._lock:
+            self._sock = sock
+            if self._aborted:
+                self._shutdown()
+
+    def attach_response(self, response: Any) -> None:
+        """Attach the socket under an httpx response, if it exposes one."""
+        try:
+            stream = response.extensions["network_stream"]
+            self.attach(stream.get_extra_info("socket"))
+        except Exception:  # noqa: BLE001 - a transport without a socket
+            # Nothing to interrupt through; between-events stopping remains.
+            pass
+
+    def abort(self) -> None:
+        with self._lock:
+            self._aborted = True
+            self._shutdown()
+
+    def _shutdown(self) -> None:
+        if self._sock is None:
+            return
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
+class CancellableStream:
+    """A stream-event iterator with a real interrupt.
+
+    What `supports_stream_cancel = True` promises the caller: iterating this
+    yields the backend's events, and `abort()` — from any thread — makes a
+    read that is currently blocked return instead of running to the
+    provider's own timeout. The consumer that stops between events still just
+    stops; `abort` is for the read in flight.
+    """
+
+    def __init__(self, gen: Iterator[dict], handle: StreamAbortHandle) -> None:
+        self._gen = gen
+        self._handle = handle
+
+    def __iter__(self) -> "CancellableStream":
+        return self
+
+    def __next__(self) -> dict:
+        return next(self._gen)
+
+    def close(self) -> None:
+        self._gen.close()
+
+    def abort(self) -> None:
+        self._handle.abort()
+
+
 class ModelBackend(Protocol):
     """Interface for pluggable generation backends."""
 
@@ -209,6 +290,15 @@ class ModelBackend(Protocol):
         - {"event": "token", "data": "token_text"}
         - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
         - {"event": "error", "data": {"code": "...", "message": "..."}}
+
+        A backend sets ``supports_stream_cancel = True`` only when the
+        iterator it returns can really be stopped: a stop between events is
+        honoured, and a read blocked inside the iterator can be interrupted
+        from another thread (`CancellableStream.abort`). Undeclared means
+        ``False`` — a workflow node's `timeout_ms` is a SPEC §9.2 obligation,
+        and a capability that cannot be proven is not claimed. Backends
+        without it do not stream; the node runs on the ordinary executor
+        instead.
         """
         ...
 
@@ -221,6 +311,9 @@ class StubBackend:
 
     mode = "stub"
     context_window = 8192
+    #: In-memory and yields per word: it never blocks, so a stop between
+    #: events is a complete interrupt and the promise above holds vacuously.
+    supports_stream_cancel = True
 
     STUB_RESPONSE = "This is a stub response for testing purposes."
 
@@ -1245,7 +1338,8 @@ class ApiAdapterBackend:
         }
 
     def _stream_via_responses(
-        self, messages: List[dict], model: str, processed: dict
+        self, messages: List[dict], model: str, processed: dict,
+        abort_handle: Optional[StreamAbortHandle] = None,
     ):
         """Stream via /responses. Returns True if any event was emitted (the
         caller must not fall through to chat), False to fall back — which is
@@ -1258,6 +1352,8 @@ class ApiAdapterBackend:
         kwargs = self._responses_kwargs(model, processed["extra_body"])
         try:
             stream = self.client.responses.create(input=items, stream=True, **kwargs)
+            if abort_handle is not None:
+                abort_handle.attach_response(stream.response)
             for event in stream:
                 etype = getattr(event, "type", "") or ""
                 if etype == "response.output_text.delta":
@@ -1302,6 +1398,12 @@ class ApiAdapterBackend:
         }
         return True
 
+    #: The streams below carry a real interrupt: `_abort_handle.attach_response`
+    #: exposes the in-flight response's socket, and `CancellableStream.abort`
+    #: shuts it down under a blocked read. Declared only because that handle
+    #: exists — see `ModelBackend.generate_stream`.
+    supports_stream_cancel = True
+
     def generate_stream(
         self,
         messages: List[dict],
@@ -1316,6 +1418,17 @@ class ApiAdapterBackend:
         - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
         - {"event": "error", "data": {"code": "...", "message": "..."}}
         """
+        handle = StreamAbortHandle()
+        return CancellableStream(
+            self._generate_stream_impl(messages, adapters, handle), handle
+        )
+
+    def _generate_stream_impl(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        abort_handle: StreamAbortHandle,
+    ) -> Iterator[dict]:
         self._ensure_client()
 
         adapter_list = adapters or []
@@ -1330,7 +1443,7 @@ class ApiAdapterBackend:
 
         if self.client and self._responses_available():
             emitted = yield from self._stream_via_responses(
-                augmented_messages, target_model, processed
+                augmented_messages, target_model, processed, abort_handle
             )
             if emitted:
                 return
@@ -1344,6 +1457,7 @@ class ApiAdapterBackend:
                     extra_body=extra_body,
                     stream=True,
                 )
+                abort_handle.attach_response(stream.response)
                 full_content = ""
                 prompt_tokens = 0
                 completion_tokens = 0

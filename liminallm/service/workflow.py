@@ -1072,6 +1072,28 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
             current = make_attempt()
             previous = current
+            lease = None
+            if current.needs_lease:
+                # §18.3: authority is fresh per attempt. The worker spawn
+                # opens its own lease; an in-process attempt has nobody else
+                # to open one, and without it two things were wrong at once —
+                # a retry ran with no authority of its own, and a revoke that
+                # found no current attempt cancelled the whole execution and
+                # was then ignored by the attempt that followed.
+                try:
+                    lease = invocation.begin_attempt()
+                except LeaseRevoked:
+                    # Cancelled. Not an error to retry through: the caller
+                    # said the answer is no longer wanted.
+                    yield NodeOutcome(
+                        result={
+                            "status": "error",
+                            "error": "workflow_cancelled",
+                            "cancelled": True,
+                        },
+                        emitted=emitted,
+                    )
+                    return
             try:
                 deadline = (
                     asyncio.get_running_loop().time() + node_timeout_ms / 1000.0
@@ -1138,6 +1160,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     max_retries=max_retries,
                     error=str(exc),
                 )
+
+            finally:
+                # On every way out of the attempt — success, timeout, failure.
+                # The lease closes here so `_previous_attempt_is_dead` waits
+                # on a flag somebody actually sets; producer-thread death is
+                # confirmed separately, by `terminate` counting producers.
+                if lease is not None:
+                    invocation.end_attempt(lease)
 
             # A retry is only meaningful before the first token. After it, the
             # answer is on the user's screen: a second attempt would append a
@@ -2310,21 +2340,43 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 await asyncio.to_thread(invocation.close)
         if preamble:
             result.setdefault("context_snippets", []).insert(0, preamble)
+        sanitized, refusal = self.tool_postflight(
+            result, tool_spec, tool_name=tool_name
+        )
+        return refusal or sanitized
+
+    def tool_postflight(
+        self,
+        result: Dict[str, Any],
+        tool_spec: Optional[dict],
+        *,
+        tool_name: str,
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """The tool's output sanitized and checked, and the refusal if it
+        failed. `(sanitized, None)` or `(sanitized, refusal)`.
+
+        One function on both paths, fed the result in the shape the tool
+        produced — for `llm.generic`, `{content, usage, context_snippets}`.
+        SPEC §9.2 validates the tool output, so no caller may validate a
+        wrapper of its own instead: streaming validated a reconstruction with
+        a `status` key the tool never emitted, and a strict schema written
+        for the real output passed blocking and failed streaming.
+        """
         sanitized = self._sanitize_html_untrusted(result)
         output_errors = self._validate_tool_payload(
             sanitized,
-            tool_spec.get("output_schema") if tool_spec else None,
+            (tool_spec or {}).get("output_schema"),
             phase="output",
             tool_name=tool_name,
         )
         if output_errors:
-            return {
+            return sanitized, {
                 "status": "error",
                 "content": "tool output validation failed",
                 "error": "validation_error",
                 "details": {"errors": output_errors},
             }
-        return sanitized
+        return sanitized, None
 
     def _plan_invocation(
         self,

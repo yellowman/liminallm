@@ -140,6 +140,13 @@ def test_ddg_parsed_results_survive_the_url_filter():
 class _FailsMidStreamBackend:
     """Streams a few tokens, then the provider drops the connection."""
 
+    #: Declared, because the capability is now fail-closed and an undeclared
+    #: backend does not stream at all — which would bypass the mid-stream
+    #: boundary this test exists to witness. Honest for this double: it is an
+    #: in-memory generator that never blocks, so a stop between events is a
+    #: complete interrupt.
+    supports_stream_cancel = True
+
     @property
     def supports_tools(self):
         return True

@@ -75,6 +75,10 @@ class StreamPump:
         self._loop = loop or asyncio.get_running_loop()
         self._queue: asyncio.Queue = asyncio.Queue()
         self._stop = threading.Event()
+        #: The producer's iterator, kept so `stop` can reach its `abort` — a
+        #: cancellable backend stream can interrupt a read in flight, and the
+        #: stop flag alone is only read *between* events.
+        self._iterator: Optional[Iterator[Dict[str, Any]]] = None
         self._thread = threading.Thread(
             target=self._run, name=f"pump-{label}", daemon=True
         )
@@ -100,17 +104,26 @@ class StreamPump:
             # way in is reported as a failed attempt rather than as an
             # exception on the event loop.
             iterator = self._factory()
+            self._iterator = iterator
+            # `stop` may have run between the factory and the assignment, in
+            # which case its abort found nothing: nothing has connected yet
+            # either, so refusing to start iterating is the complete stop.
+            if self._stop.is_set():
+                return
             for event in iterator:
                 if self._stop.is_set():
                     break
                 self._emit(event)
         except BaseException as exc:  # noqa: BLE001 - reported as an event
-            self._emit(
-                {
-                    "event": "error",
-                    "data": {"code": "server_error", "message": str(exc)},
-                }
-            )
+            # After a stop this is the abort surfacing — the shutdown socket
+            # raises out of the read — not a result anyone may act on.
+            if not self._stop.is_set():
+                self._emit(
+                    {
+                        "event": "error",
+                        "data": {"code": "server_error", "message": str(exc)},
+                    }
+                )
         finally:
             # Closing from this thread is the safe direction: the generator is
             # suspended at its own yield, so `GeneratorExit` lands where its
@@ -136,13 +149,24 @@ class StreamPump:
     # -- termination ------------------------------------------------------
 
     def stop(self) -> None:
-        """Ask the producer to stop, and release whoever is waiting on it.
+        """Stop the producer, and release whoever is waiting on it.
 
-        Both halves matter. The flag ends the thread at its next iteration;
-        the sentinel ends the consumer now, because the producer may be inside
-        a read that never returns and the caller must not wait for it.
+        Three parts, in this order. The flag ends the thread at its next
+        iteration. The abort — when the backend's stream carries one —
+        interrupts the read the thread is inside *right now*: the shipped
+        network backends block in a synchronous read bounded only by the
+        provider client's 30–60s timeout, and without the abort a
+        `timeout_ms: 200` stopped the waiter while the provider request ran
+        on. The sentinel ends the consumer immediately either way.
         """
         self._stop.set()
+        iterator = self._iterator
+        abort = getattr(iterator, "abort", None)
+        if callable(abort):
+            try:
+                abort()
+            except Exception:  # noqa: BLE001 - aborting is best effort
+                pass
         self._emit(_DONE)
 
     def alive(self) -> bool:
@@ -188,6 +212,12 @@ class NodeAttempt(Protocol):
     #: death, so the log names the thing that would not stop.
     unreaped_error: str
 
+    #: Whether the driver must open an `Attempt` lease for this try (SPEC
+    #: §18.3: authority is fresh per attempt). True for attempts whose work
+    #: runs in this process; False when the body spawns a worker, because the
+    #: spawn opens the lease itself and a second one here would double-count.
+    needs_lease: bool
+
     def events(self) -> AsyncIterator[Dict[str, Any]]: ...
 
     async def result(self) -> NodeOutcome: ...
@@ -201,6 +231,8 @@ class BlockingNodeAttempt:
     """
 
     unreaped_error = "tool_worker_unreaped"
+    #: The worker spawn calls `begin_attempt` itself, per §18.3.
+    needs_lease = False
 
     def __init__(self, run: Callable[[], Any]) -> None:
         self._run = run
@@ -230,6 +262,12 @@ class StreamedNodeAttempt:
     """
 
     unreaped_error = "stream_producer_unreaped"
+    #: No worker spawn on this path, so nothing else opens the lease. Without
+    #: it a streamed retry ran with no authority of its own — and worse:
+    #: `revoke("retry")` found no current attempt, read that as "nothing has
+    #: started", cancelled the whole execution, and the next attempt called
+    #: the provider anyway because nothing here asked.
+    needs_lease = True
 
     def __init__(
         self,
@@ -292,18 +330,26 @@ class StreamedNodeAttempt:
             return
 
         data = done.get("data") or {}
-        result: Dict[str, Any] = {
-            "status": "ok",
+        # The tool's output, in the shape the tool produced — the same keys
+        # `llm.generic` returns on the blocking path. SPEC §9.2 validates the
+        # tool output, so this dict is what the validator sees; the node's
+        # own `status` is added after, never validated. The first version
+        # validated the wrapper, and a strict schema written for the real
+        # output failed on the `status` key streaming had invented.
+        tool_result: Dict[str, Any] = {
             "content": data.get("content", ""),
             "usage": data.get("usage") or {},
         }
-        if data.get("context_snippets"):
-            result["context_snippets"] = list(data["context_snippets"])
+        # Presence, not truthiness: the blocking result carries the key even
+        # when nothing was retrieved, and a schema requiring it must see the
+        # same object here.
+        if "context_snippets" in data:
+            tool_result["context_snippets"] = list(data["context_snippets"] or [])
         if data.get("tool_calls"):
-            result["tool_calls"] = list(data["tool_calls"])
+            tool_result["tool_calls"] = list(data["tool_calls"])
 
         if self._validate_output is not None:
-            refusal = self._validate_output(result)
+            refusal = self._validate_output(tool_result)
             if refusal is not None:
                 # Nothing held is released. That is the whole reason for
                 # holding it.
@@ -314,7 +360,9 @@ class StreamedNodeAttempt:
             emitted = True
             yield token_event
         yield done
-        self._outcome = NodeOutcome(result=result, emitted=emitted)
+        self._outcome = NodeOutcome(
+            result={"status": "ok", **tool_result}, emitted=emitted
+        )
 
     async def result(self) -> NodeOutcome:
         return self._outcome

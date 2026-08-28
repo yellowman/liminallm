@@ -203,11 +203,17 @@ class WorkflowStreamingMixin:
             # Handle streaming for LLM-based tools. The attachment agent streams
             # too: its tool rounds emit trace events, then the answer streams.
             #
-            # A backend that cannot be held to the node's `timeout_ms` does not
-            # stream at all. The branch below runs the body in a worker process
-            # a kill really does end, and its answer reaches the client in the
-            # final `message_done` — later than a stream, but under the node
-            # contract SPEC §9.2 requires. See `LLMService.stream_is_cancellable`.
+            # A backend that has not proven it can be stopped does not stream
+            # at all — undeclared means no (see
+            # `LLMService.stream_is_cancellable`). The branch below runs the
+            # node on the ordinary executor: the driver enforces the deadline,
+            # the retry waits for the previous attempt to be confirmed dead,
+            # and the answer reaches the client in the final `message_done`.
+            # What the kill ends there is the worker; a host-tool body such as
+            # `llm.generic` runs in the parent's serve thread, so a generation
+            # past its deadline is reported failed at the deadline while the
+            # body runs on as bounded, authorityless work — the retry is then
+            # refused until it returns, not run beside it.
             if (
                 descriptor is not None
                 and descriptor.streamable
@@ -564,23 +570,18 @@ class WorkflowStreamingMixin:
 
         # SPEC §9.2 validates outputs as well as inputs. Its presence is also
         # what decides whether this node's tokens are held back: see
-        # `StreamedNodeAttempt`.
+        # `StreamedNodeAttempt`. The check itself is `tool_postflight` — the
+        # blocking path's, on the same raw tool-result shape, so one schema
+        # cannot pass one transport and fail the other.
         output_schema = (descriptor.schema or {}).get("output_schema")
         validate_output = None
         if output_schema:
 
             def validate_output(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-                errors = self._validate_tool_payload(
-                    result, output_schema, phase="output", tool_name=tool_name
+                _, refusal = self.tool_postflight(
+                    result, descriptor.schema, tool_name=tool_name
                 )
-                if not errors:
-                    return None
-                return {
-                    "status": "error",
-                    "content": "tool output validation failed",
-                    "error": "validation_error",
-                    "details": {"errors": errors},
-                }
+                return refusal
 
         invocation = self.invocations.open(
             uuid.uuid4().hex,
@@ -701,6 +702,16 @@ class WorkflowStreamingMixin:
             label=str(node.get("id") or "llm"),
             cancel_event=cancel_event,
         ):
+            if event.get("event") == "message_done":
+                # The grounding this node retrieved, on the node's answer —
+                # the same key the blocking `llm.generic` result carries. The
+                # backend cannot put it there: it never saw the retrieval.
+                # Without it the streamed turn reported no context, and an
+                # `output_schema` requiring `context_snippets` validated a
+                # different object per transport.
+                data = dict(event.get("data") or {})
+                data.setdefault("context_snippets", list(context_snippets))
+                event = {"event": "message_done", "data": data}
             yield event
 
     async def _pumped(

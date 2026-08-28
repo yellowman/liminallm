@@ -135,20 +135,23 @@ class LLMService:
     def stream_is_cancellable(self) -> bool:
         """Whether a streamed node can be held to its timeout.
 
-        The baseline contract is weak on purpose: a producer that yields
-        events can be stopped between them, which is all `StreamPump` needs to
-        return promptly once the answer is flowing. A backend declares itself
-        out when even that is false — `LocalJaxLoRABackend` runs the whole
-        forward pass before its first yield, so a node's `timeout_ms` could
-        not be honoured however the iteration were scheduled.
+        Fail closed: a backend that says nothing cannot stream. The first
+        version defaulted to True on the theory that any generator stops
+        between events — but the shipped network backends block *inside* an
+        event, in a synchronous read bounded only by the provider client's
+        own 30–60s timeout, and a stop flag is not read until that read
+        returns. A `timeout_ms: 200` was honoured for the waiter while the
+        provider request ran on. SPEC §9.2 makes the timeout part of the
+        node contract, and a capability that cannot be proven is not claimed.
 
-        SPEC §9.2 makes the timeout part of the node contract, so a backend
-        that cannot meet it does not get to stream: the caller falls back to
-        the ordinary node executor, which runs the body in a worker process
-        that a kill really does end, and sends the finished answer over SSE.
+        `supports_stream_cancel = True` therefore asserts the full contract:
+        the backend's stream carries an `abort()` that interrupts a read in
+        flight (`CancellableStream`), or it never blocks at all (the stub).
+        A backend without the declaration does not stream — the node runs on
+        the ordinary executor, whose deadline the driver enforces, and its
+        answer reaches the client in the final `message_done`.
         """
-        declared = getattr(self.backend, "supports_stream_cancel", None)
-        return True if declared is None else bool(declared)
+        return bool(getattr(self.backend, "supports_stream_cancel", False))
 
     def generate_with_tools(
         self,
@@ -300,11 +303,17 @@ class LLMService:
         - {"event": "token", "data": "token_text"}
         - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
         - {"event": "error", "data": {"code": "...", "message": "..."}}
+
+        Returns the backend's own iterator rather than `yield from`-ing it:
+        wrapping in a generator here hid the `abort()` a cancellable stream
+        carries, so the pump could not interrupt a blocked read.
         """
         messages, normalized_adapters = self._prepare_generation(
             prompt, adapters, context_snippets, history
         )
-        yield from self.backend.generate_stream(messages, normalized_adapters, user_id=user_id)
+        return self.backend.generate_stream(
+            messages, normalized_adapters, user_id=user_id
+        )
 
     def _format_user(self, prompt: str) -> str:
         return prompt
