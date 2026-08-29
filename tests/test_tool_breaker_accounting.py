@@ -1203,7 +1203,9 @@ class TestTheWindowIsARollingWindow:
 
 
 # =============================================================================
-# The failure history survives a rolling upgrade.
+# A representation change is a coordinated reset, not a rolling mixed-version
+# deploy. The version keeps the boundary crash-safe; it does not unify two
+# independent ledgers, so new code owns v2 alone and abandons the legacy key.
 # =============================================================================
 
 
@@ -1237,6 +1239,51 @@ class TestTheFailureKeyIsRolloutCompatible:
             cooldown_seconds=60, tenant_id=tenant,
         )
         assert tripped is False
+
+    @pytest.mark.asyncio
+    async def test_the_new_ledger_abandons_the_legacy_key(self):
+        """The version is a reset boundary, not a bridge. `:failures` and
+        `:failures:v2` are independent ledgers: a representation change
+        drains the old replicas and starts empty, so the legacy counter is
+        abandoned to its own TTL, never read into a decision or cleared by
+        the new code. Half-migrating them — new code summing the legacy count
+        into its window, or clearing it on success — would rebuild the very
+        "one success clears only one ledger" partition the coordinated-reset
+        contract forbids (SPEC §18.3). So new code touches v2 alone.
+
+        This pins the contract; it is not a claim that the two may run at
+        once. That they must not is the deployment contract, which a unit
+        test cannot enforce — draining old replicas before new ones serve is
+        an operational step, not a code path."""
+        rt = get_runtime()
+        cache = rt.cache
+        tenant = _u("reset")
+        ident = _u("tool")
+        legacy = f"circuit:{tenant}:{ident}:failures"
+        # Four failures a pre-upgrade replica left behind, one short of a trip.
+        await cache.client.set(legacy, "4", ex=60)
+
+        # The new ledger counts only its own entries, never the legacy four.
+        await cache.record_tool_failure(
+            ident, failure_threshold=5, window_seconds=60,
+            cooldown_seconds=60, tenant_id=tenant,
+        )
+        is_open, count = await cache.check_circuit_breaker(
+            ident, failure_threshold=5, window_seconds=60,
+            cooldown_seconds=60, tenant_id=tenant,
+        )
+        assert count == 1, (
+            f"the new ledger read the legacy counter into its window "
+            f"(count={count}); the two must stay independent"
+        )
+        # A success clears the active ledger and leaves the legacy key alone.
+        await cache.record_tool_success(ident, tenant_id=tenant)
+        assert await cache.client.get(legacy) == "4", (
+            "new breaker code cleared the legacy `:failures` counter; a "
+            "coordinated reset abandons it to its TTL, it does not "
+            "half-migrate the two ledgers"
+        )
+        assert 0 < int(await cache.client.ttl(legacy)) <= 60
 
 
 # =============================================================================

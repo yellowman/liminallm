@@ -2394,10 +2394,21 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   serving host's: the breaker spans replicas, and reading the window
   against a process-local clock would let a skewed replica keep a
   breaker tripped past the window or prune a failure early. The failure
-  history's storage is versioned so that upgrading the window's
-  representation cannot make old and new replicas read each other's
-  state as the wrong type mid-rollout. Attempt preparation is per
-  attempt and
+  history is ephemeral, per-window state, and its storage representation
+  is **not** rolling mixed-version compatible: two representations are
+  two independent ledgers, so with both live at once a success clears
+  only one and failures split across both may each stay under threshold
+  — the one-ledger rule the breaker depends on is lost. A change to the
+  representation is therefore a coordinated reset, not a rolling deploy:
+  replicas on the old representation are drained before replicas on the
+  new one serve, the previous failure history is abandoned to its
+  window-length TTL, and the breaker starts empty. Discarding at most
+  one window of failure history at that boundary is acceptable because
+  the history is ephemeral. Versioning the storage key is what keeps the
+  boundary safe rather than corrupting — a straggler on the old
+  representation cannot make the new one's reads fail on a wrong value
+  type — but it is a reset boundary, not a licence to run the two
+  representations side by side. Attempt preparation is per attempt and
   complete: resolution, the admission preflight (input schema,
   privileged conjunction) and the breaker check, in that order, all
   decided against the attempt's own resolved spec, identically on both

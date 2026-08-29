@@ -47,13 +47,20 @@ class RedisCache:
     # Issue 48.3: Default operation timeout for Redis commands
     DEFAULT_OPERATION_TIMEOUT = 5.0  # 5 seconds
 
-    # The breaker failure history is a sorted set keyed by this suffix. It
-    # carried a plain counter under `:failures` before the rolling window,
-    # and a sorted set is a different Redis type at the same key: a rolling
-    # deploy where old replicas `INCR` a string while new ones `ZADD` a set
-    # makes every cross-version command fail `WRONGTYPE`. The version suffix
-    # gives the new type its own key; the legacy counter is left to expire.
-    # The `:open` key is a plain string on both versions and stays shared.
+    # The breaker failure history is a sorted set keyed by this suffix, and
+    # the suffix is a version. The history is ephemeral, per-window state,
+    # and the representation is NOT rolling mixed-version compatible: the old
+    # plain counter at `:failures` and this sorted set are independent
+    # ledgers, so with both live a success clears only one and failures split
+    # across both may each stay under threshold. A change of representation
+    # is a coordinated reset — old replicas drained before new ones serve,
+    # the previous history abandoned to its window-length TTL — not a rolling
+    # deploy. The version is what keeps that boundary safe rather than
+    # corrupting: a straggler still `INCR`-ing the plain `:failures` string
+    # cannot make this set's `ZADD`/`ZCOUNT` fail `WRONGTYPE`. It is a reset
+    # boundary, not a licence to run the two side by side, so this code owns
+    # `:failures:v2` alone and never reads or clears the legacy key. The
+    # `:open` key is a plain string on both representations and stays shared.
     _FAILURES_SUFFIX = "failures:v2"
 
     # Lua token bucket script (Issue 77.2/77.10/77.12): atomic refill + consume

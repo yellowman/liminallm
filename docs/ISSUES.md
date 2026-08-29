@@ -9407,3 +9407,64 @@ transfer is revalidated under it; the breaker's window is read against the
 ledger's own clock, not any serving host's; and the failure history is
 versioned so a rolling upgrade cannot make two replicas read each other's
 state as the wrong type.
+
+## The versioned key stopped the crash but split one ledger into two
+
+Round seven versioned the breaker's failure key to `:failures:v2` so a
+rolling deploy could not make the new sorted-set commands fail on the old
+string's type. Review found that the fix, while it removed the crash,
+quietly broke a property the crash had been hiding: the breaker is one
+ledger, and `:failures` and `:failures:v2` are two. While both run, the
+one-ledger rule is gone.
+
+Three partitions show it. A success recorded by a new replica clears only
+`:failures:v2`; a legacy count of four survives, and the next old replica's
+failure trips a breaker the success was supposed to have cleared. The
+reverse is worse, because the old code is frozen: four failures in
+`:failures:v2`, an old replica's success clears only the legacy key, and
+the next new failure trips from a count no success can reach. And with no
+success at all, five real failures inside one minute can fall three on the
+old key and two on the new, and neither ledger ever reaches five.
+
+The old code cannot be taught otherwise. It is already deployed; it writes
+and reads `:failures` and will never know `:failures:v2` exists. So new
+code cannot retrofit a shared ledger across the two versions — a new
+replica reading the legacy count could not clear it on the old replica's
+behalf, and the old replica's failures never enter the new window. Two
+representations that run at once are two ledgers, and no amount of new-side
+code closes that while the old side is frozen.
+
+The resolution is not more code; it is an honest contract. The breaker's
+failure history is ephemeral, per-window state with a sixty-second TTL, so
+a change to its storage representation is a coordinated reset, not a
+rolling deploy: the old replicas are drained before the new ones serve, the
+previous history is abandoned to its TTL, and the breaker starts empty on
+the new representation. Losing at most one window of failure history at
+that boundary is the correct trade — Redis is already defined as ephemeral
+state, and one empty minute is cheaper than two contradictory ledgers. The
+version is still worth keeping: it makes the boundary crash-safe, so a
+straggling old replica cannot corrupt the new type. What it is not is a
+licence to run the two side by side, and round seven's SPEC wording implied
+it was. SPEC §18.3 now says the representation change is a coordinated
+reset, states why the two ledgers cannot be unified while both run, and
+records that the ephemeral loss at the boundary is acceptable.
+
+This round closes a false claim, not a code defect: the steady-state code —
+every replica on `:failures:v2` — was already correct, and the fault was in
+what the specification promised about the rollout. So there is no
+behavioural red here, and manufacturing one would mean testing the
+mixed-version coexistence the contract forbids, which would legitimise the
+very thing being ruled out. The witness instead pins the contract's code
+half: the new ledger owns `:failures:v2` alone, counts only its own
+entries, and on success clears only its own key — the legacy counter is
+never read into a decision or cleared, but abandoned to its TTL. A mutant
+that makes success clear the legacy key too — a half-migration that would
+rebuild the partition — is killed by it. The two other choices review named
+were both declined for cause: engineering live coexistence is impossible
+against frozen old code, and a staged two-release compatibility migration
+is heavy machinery for sixty seconds of throwaway counts.
+
+The mutation set is forty-six, all killed; the new mutant:
+
+    new mutation                                    outcome
+    success clears the legacy key too (half-migrate)  killed
