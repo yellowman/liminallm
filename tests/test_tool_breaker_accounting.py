@@ -74,7 +74,7 @@ async def _count(cache, tenant, *idents):
     total = 0
     for ident in idents:
         total += int(
-            await cache.client.zcard(f"circuit:{tenant}:{ident}:failures") or 0
+            await cache.client.zcard(f"circuit:{tenant}:{ident}:failures:v2") or 0
         )
     return total
 
@@ -1018,14 +1018,16 @@ class TestAuthorityTravelsByExactAttempt:
 # =============================================================================
 
 
-class TestAStaleServeAllocatesNothing:
+class TestAStaleServeLeavesNothing:
     @pytest.mark.asyncio
-    async def test_a_stale_serve_after_close_allocates_no_scratch(self):
+    async def test_a_stale_serve_after_close_leaves_no_scratch(self):
         """The invocation is closed — cancelled, terminated, cleaned. A
-        serve thread waking after that must be refused before it creates
-        anything: a scratch directory allocated ahead of the adoption check
-        outlives the teardown, because the second `close()` is an
-        idempotent no-op with nobody left to remove it."""
+        serve thread waking after that allocates its scratch outside the
+        lock, then is refused at the adoption check inside it. What it must
+        not do is leave that directory behind, because the second `close()`
+        is an idempotent no-op with nobody left to remove it — so the
+        refused spawn deletes the directory it made, itself."""
+        import os
         import uuid as uuid_mod
 
         from liminallm.service.broker import InvocationContext
@@ -1062,11 +1064,97 @@ class TestAStaleServeAllocatesNothing:
                 context, engine._worker_limits(None),
                 expected_attempt=lease, observation=obs,
             )
-        assert not created, (
-            f"a stale serve allocated filesystem state after the invocation "
-            f"closed, with nobody left to remove it: {created}"
-        )
+        for path in created:
+            assert not os.path.exists(path), (
+                f"a stale serve left filesystem state behind after the "
+                f"invocation closed, with nobody left to remove it: {path}"
+            )
         assert obs.started is False
+
+
+# =============================================================================
+# A stalled scratch allocation cannot hold off revocation.
+# =============================================================================
+
+
+class TestAStalledScratchDoesNotBlockRevocation:
+    @pytest.mark.asyncio
+    async def test_a_stalled_scratch_allocation_does_not_hold_off_the_revoke(
+        self,
+    ):
+        """A node deadline revokes through the invocation lock. If the
+        scratch allocation runs while that lock is held, a slow `mkdtemp`
+        holds the revoke off for its whole duration — and the hard
+        wall-clock deadline earlier rounds established is gone, replaced by
+        "the deadline, plus however long the filesystem took". Allocation
+        runs outside the lock now; only the revalidated ownership transfer
+        runs inside it, so the revoke lands at once."""
+        import os
+
+        from liminallm.service.broker import InvocationContext
+        from liminallm.service.node_attempt import BreakerObservation
+
+        c = _Ctx()
+        engine = c.engine
+        inv = engine.invocations.open(
+            _u("stall"), tool="llm.generic",
+            user_id=c.user.id, tenant_id=c.tenant,
+        )
+        lease = inv.begin_attempt()
+        obs = BreakerObservation(identity="x", attempt=lease)
+
+        entered = threading.Event()
+        allocated = []
+        real_scratch = engine._worker_scratch
+
+        def blocking_scratch(invocation):
+            entered.set()
+            time.sleep(2.0)
+            path = real_scratch(invocation)
+            allocated.append(path)
+            return path
+
+        engine._worker_scratch = blocking_scratch
+        context = InvocationContext(
+            user_id=c.user.id, tenant_id=c.tenant, conversation_id=None,
+            context_id=None, adapters=[], history=[], user_message="hi",
+        )
+        serve_err = {}
+
+        def serve():
+            try:
+                engine._serve_invocation(
+                    inv, "llm.generic", {"inputs": {}, "message": "hi"},
+                    context, engine._worker_limits(None),
+                    expected_attempt=lease, observation=obs,
+                )
+            except BaseException as exc:  # noqa: BLE001 - recorded for the assert
+                serve_err["e"] = exc
+
+        t = threading.Thread(target=serve, daemon=True)
+        t.start()
+        assert entered.wait(2.0), "the serve never reached scratch allocation"
+        # The node deadline fires here, mid-allocation.
+        t0 = time.monotonic()
+        await asyncio.to_thread(inv.revoke, "node_timeout")
+        revoke_elapsed = time.monotonic() - t0
+        assert revoke_elapsed < 0.5, (
+            f"revoke waited {revoke_elapsed:.2f}s for the stalled scratch "
+            "allocation: a slow mkdtemp held the node deadline hostage"
+        )
+        t.join(5)
+        assert isinstance(serve_err.get("e"), LeaseRevoked), (
+            f"the spawn revalidated stale must be refused: {serve_err}"
+        )
+        # No worker started, so the breaker records nothing.
+        assert obs.started is False
+        # And the directory it allocated after the revoke was deleted by the
+        # spawn itself: a refused spawn leaves nothing behind.
+        for path in allocated:
+            assert not os.path.exists(path), (
+                f"a refused spawn left its scratch behind: {path}"
+            )
+        await asyncio.to_thread(inv.close)
 
 
 # =============================================================================
@@ -1112,6 +1200,102 @@ class TestTheWindowIsARollingWindow:
                 cooldown_seconds=60, tenant_id=tenant,
             )
         assert tripped and await _is_open(cache, tenant, ident)
+
+
+# =============================================================================
+# The failure history survives a rolling upgrade.
+# =============================================================================
+
+
+class TestTheFailureKeyIsRolloutCompatible:
+    @pytest.mark.asyncio
+    async def test_a_legacy_string_failure_count_does_not_break_the_new_code(
+        self,
+    ):
+        """Merged main stores the breaker count as a plain string at
+        `:failures`, written with `INCR`. The rolling window makes that key a
+        sorted set, and the ZSET commands raise `WRONGTYPE` against a string
+        — which the breaker preflight does not mask, so every call for a tool
+        with 1–4 recent failures would error the moment a new replica rolls
+        out. The window uses a versioned key, so the legacy counter is left
+        untouched and neither side reads the other's type."""
+        rt = get_runtime()
+        cache = rt.cache
+        tenant = _u("legacy")
+        ident = _u("tool")
+        # Exactly what a pre-upgrade replica leaves behind.
+        await cache.client.set(f"circuit:{tenant}:{ident}:failures", "2", ex=60)
+
+        # Neither call may raise WRONGTYPE against the legacy string.
+        is_open, count = await cache.check_circuit_breaker(
+            ident, failure_threshold=5, window_seconds=60,
+            cooldown_seconds=60, tenant_id=tenant,
+        )
+        assert is_open is False and count == 0
+        tripped, _ = await cache.record_tool_failure(
+            ident, failure_threshold=5, window_seconds=60,
+            cooldown_seconds=60, tenant_id=tenant,
+        )
+        assert tripped is False
+
+
+# =============================================================================
+# The window's clock is the ledger's, not the serving host's.
+# =============================================================================
+
+
+class TestTheWindowClockIsTheLedgers:
+    @pytest.mark.asyncio
+    async def test_replica_clock_skew_does_not_drop_a_failure_from_the_window(
+        self, monkeypatch
+    ):
+        """The window is timestamped by the ledger's own clock, not the
+        serving host's. Threshold 2, window 60s: two failures moments apart
+        are inside one real minute and must trip. But if the first is
+        recorded by a replica whose clock runs 100 seconds slow, it lands
+        with a past score, and the next — normally-clocked — replica prunes
+        everything older than its own now-minus-window before counting,
+        dropping that failure early. The breaker then never sees two. Read
+        against the ledger's own clock the skew is inert, and the two
+        failures trip it.
+
+        (The mirror direction, a fast replica scoring in the future, is
+        masked by the set's own window-length TTL — the future entry is
+        evicted by real time before it can outlast the window — so the
+        early-prune direction is the one a witness can pin.)"""
+        import liminallm.storage.redis_cache as rc_mod
+
+        rt = get_runtime()
+        cache = rt.cache
+        tenant = _u("skew")
+        ident = _u("tool")
+
+        real_time = time.time
+        slow = {"on": True}
+
+        def maybe_slow():
+            return real_time() - 100.0 if slow["on"] else real_time()
+
+        # If the ledger scores against this process's clock, the skew lands
+        # in the entry; if it scores against Redis's clock, this is inert.
+        monkeypatch.setattr(rc_mod.time, "time", maybe_slow)
+
+        tripped, _ = await cache.record_tool_failure(
+            ident, failure_threshold=2, window_seconds=60,
+            cooldown_seconds=60, tenant_id=tenant,
+        )
+        assert not tripped
+        slow["on"] = False  # the normally-clocked replica records next
+        tripped, _ = await cache.record_tool_failure(
+            ident, failure_threshold=2, window_seconds=60,
+            cooldown_seconds=60, tenant_id=tenant,
+        )
+        assert tripped and await _is_open(cache, tenant, ident), (
+            "two failures inside one real minute failed to trip: a failure "
+            "scored by a clock-skewed replica was pruned early by the next "
+            "replica's window math, because the window is read against a "
+            "process-local clock, not the ledger's"
+        )
 
 
 # =============================================================================

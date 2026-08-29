@@ -47,6 +47,15 @@ class RedisCache:
     # Issue 48.3: Default operation timeout for Redis commands
     DEFAULT_OPERATION_TIMEOUT = 5.0  # 5 seconds
 
+    # The breaker failure history is a sorted set keyed by this suffix. It
+    # carried a plain counter under `:failures` before the rolling window,
+    # and a sorted set is a different Redis type at the same key: a rolling
+    # deploy where old replicas `INCR` a string while new ones `ZADD` a set
+    # makes every cross-version command fail `WRONGTYPE`. The version suffix
+    # gives the new type its own key; the legacy counter is left to expire.
+    # The `:open` key is a plain string on both versions and stays shared.
+    _FAILURES_SUFFIX = "failures:v2"
+
     # Lua token bucket script (Issue 77.2/77.10/77.12): atomic refill + consume
     _TOKEN_BUCKET_SCRIPT = """
 local key = KEYS[1]
@@ -854,22 +863,30 @@ return {1, tokens, 0}
         """
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         open_key = f"circuit:{tenant_prefix}{tool_id}:open"
-        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:{self._FAILURES_SUFFIX}"
 
-        # Check if circuit is open (tripped)
-        is_open = await self.client.exists(open_key)
-        if is_open:
-            return (True, -1)
-
-        # Failures inside the rolling window, counted from the timestamped
-        # set the recorder maintains; entries older than the window are
-        # pruned on write, so a read only has to bound the score range.
-        now = time.time()
-        failure_count = int(
-            await self.client.zcount(failures_key, now - window_seconds, "+inf")
+        # The cutoff comes from Redis's own clock, not this host's: the write
+        # side timestamps with the same clock, so a skewed replica cannot
+        # push a score into the future and outlast the window, nor have its
+        # failures pruned early (SPEC §18). Returns -1 for an open breaker,
+        # else the failures inside the window ending now.
+        lua_script = """
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+            return -1
+        end
+        local t = redis.call('TIME')
+        local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+        local window = tonumber(ARGV[1])
+        return redis.call('ZCOUNT', KEYS[2], now - window, '+inf')
+        """
+        count = int(
+            await self.client.eval(
+                lua_script, 2, open_key, failures_key, window_seconds
+            )
         )
-
-        return (False, failure_count)
+        if count < 0:
+            return (True, -1)
+        return (False, count)
 
     async def record_tool_failure(
         self,
@@ -898,7 +915,7 @@ return {1, tokens, 0}
         """
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         open_key = f"circuit:{tenant_prefix}{tool_id}:open"
-        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:{self._FAILURES_SUFFIX}"
 
         # A timestamped set, not a counter with a refreshed TTL. The TTL
         # refresh made the rule "a chain of failures with no gap over the
@@ -906,16 +923,26 @@ return {1, tokens, 0}
         # breaker whose sixty-second window never held five. Entries older
         # than the window are pruned before counting, so the count is the
         # failures actually inside one window ending now.
+        #
+        # The timestamp is Redis's own clock, read inside the script, not
+        # this host's `time.time()`: with several replicas a skewed one
+        # would otherwise score a failure in the future and keep the breaker
+        # tripped past the window, or score it in the past and be pruned
+        # early. One clock, the ledger's, so the window means the same thing
+        # to every replica (SPEC §18). The member is a caller-supplied unique
+        # id — data, not a clock — so two failures at the same instant both
+        # count.
         lua_script = """
         -- Check if circuit is already open
         if redis.call('EXISTS', KEYS[1]) == 1 then
             return {1, -1}  -- Already open
         end
 
-        local now = tonumber(ARGV[4])
+        local t = redis.call('TIME')
+        local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
         local window = tonumber(ARGV[1])
         redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now - window)
-        redis.call('ZADD', KEYS[2], now, ARGV[5])
+        redis.call('ZADD', KEYS[2], now, ARGV[4])
         redis.call('EXPIRE', KEYS[2], math.ceil(window))
         local failures = redis.call('ZCARD', KEYS[2])
 
@@ -932,7 +959,7 @@ return {1, tokens, 0}
         result = await self.client.eval(
             lua_script, 2, open_key, failures_key,
             window_seconds, failure_threshold, cooldown_seconds,
-            time.time(), uuid4().hex,
+            uuid4().hex,
         )
         return (bool(result[0]), int(result[1]))
 
@@ -948,5 +975,5 @@ return {1, tokens, 0}
         failure counter, allowing the circuit to eventually close.
         """
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:{self._FAILURES_SUFFIX}"
         await self.client.delete(failures_key)

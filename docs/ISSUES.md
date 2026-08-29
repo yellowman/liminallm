@@ -9321,3 +9321,89 @@ the SPEC bullet gained the words the code finally earned — the window
 is rolling, the scratch is allocated inside the locked step, and
 `started` is marked at registration itself, not when the spawn call
 returns.
+
+## The round-six mechanisms had a lock held too wide and a clock owned by the wrong process
+
+Round six fixed three real defects, and review then found that two of its
+fixes had each introduced a smaller one, plus a third the rolling window
+had carried in from the start. All three are distributed-systems faults —
+a lock, a key type, and a clock — and all three are a red turned green.
+
+1. Moving the scratch allocation inside `invocation.lock` let a stalled
+   `mkdtemp` hold a revoke hostage. Round six put the scratch factory
+   behind the exact-attempt gate to stop a stale serve leaving a
+   directory behind — correct — but the gate is the invocation lock, and
+   the node deadline revokes through that same lock. `_worker_scratch`
+   does real filesystem work, `mkdir` and `mkdtemp`; a slow one now ran
+   while the lock was held, so a 300-millisecond node deadline could take
+   the full allocation time to revoke. The hard wall-clock deadline
+   earlier rounds established was quietly back to "the deadline, plus
+   however long the disk took". The fix is two phases: the scratch is
+   allocated first, outside the lock, as this thread's own directory
+   owned by nobody; then under the lock the spawn revalidates the exact
+   attempt, transfers ownership of the directory, and starts and
+   registers the worker as one step. A spawn refused at the revalidation
+   deletes the directory it made, so a stale serve still leaves nothing
+   behind — the round-six property, kept, without the lock over the I/O.
+   The red blocks the allocation for two seconds under the deadline and
+   requires the revoke to return in well under one, with no worker
+   started and nothing left on disk.
+2. The rolling window changed the failure key from a string to a sorted
+   set in place, which no rolling deploy survives. Merged main stores the
+   breaker count at `circuit:<tenant>:<tool>:failures` as a plain string
+   written with `INCR`. Round six made the same key a sorted set, read
+   with `ZCOUNT` and `ZADD`. Any tool with one to four recent failures
+   has a live string at that key when the new version rolls out, and the
+   first `ZCOUNT` against it raises `WRONGTYPE` — which the breaker
+   preflight does not mask, so every call for that tool errors. Worse
+   mid-rollout: old replicas keep issuing `INCR` while new ones issue
+   `ZADD`, so whichever type exists breaks the other version. The fix
+   versions the key — the sorted set lives at `:failures:v2`, the legacy
+   counter is left to expire on its own TTL, and the shared `:open` key,
+   a plain string on both versions, stays put. The red writes the legacy
+   string and requires neither the check nor the record path to raise.
+3. The "shared" window was timestamped by each serving host, not by the
+   ledger. Both sides passed this process's `time.time()` into the
+   arithmetic: the writer scored each failure with its own wall clock,
+   and the reader cut the window at its own. Across replicas, clock skew
+   changes what the breaker counts. A replica whose clock runs slow
+   scores a failure in the past, and the next normally-clocked replica
+   prunes everything older than its own now-minus-window before counting
+   — dropping that failure early, so two failures inside one real minute
+   never trip a two-in-a-minute breaker. The fix gives the ledger its own
+   clock: the timestamp and the cutoff both come from Redis's `TIME`,
+   read inside the atomic script, so every replica reads the same window.
+   The red records one failure through a replica whose clock is set 100
+   seconds slow, then one through a normal replica moments later, and
+   requires the two to trip a threshold-two breaker; against a
+   process-local clock the first is pruned early and they never combine.
+   (The mirror direction — a fast replica scoring in the future — is
+   masked by the set's own window-length TTL, which evicts the future
+   entry by real time before it can outlast the window, so the
+   early-prune direction is the one a witness can pin.)
+
+The three reds bring the witness file to fifty-seven. The mutation set is
+forty-five, all killed; the four new mutants:
+
+    new mutation                                    outcome
+    scratch allocated inside the invocation lock    killed
+    a refused spawn's scratch is not cleaned up      killed
+    the failure key is not versioned                killed
+    the window is scored by the serving host's clock  killed
+
+One round-six mutant was retired rather than retargeted: it asserted that
+allocating the scratch before the adoption gate was a defect, and this
+round makes that ordering deliberate — allocation is before the gate now,
+with cleanup as the safety — so the mutant described correct code and was
+replaced by the two that police the new structure. The ownership-transfer
+mutant was re-anchored around the path registration the lock now encloses.
+Collateral: the round-six stale-serve witness asserted the scratch was
+never allocated; under two phases it is allocated and then deleted, so it
+now asserts the directory does not survive, which is the invariant that
+actually matters. The witness helper that reads the failure count follows
+the key to its versioned name. SPEC §18.3 gained the words the code
+earned: the scratch is allocated outside the lock and the ownership
+transfer is revalidated under it; the breaker's window is read against the
+ledger's own clock, not any serving host's; and the failure history is
+versioned so a rolling upgrade cannot make two replicas read each other's
+state as the wrong type.

@@ -2390,7 +2390,14 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   the breaker for **60s**; the window is rolling — failures are
   timestamped and only those inside one window ending now count, so
   failures spaced wider than the window never accumulate into a trip.
-  Attempt preparation is per attempt and
+  The timestamps and the cutoff are the ledger's own clock, not any
+  serving host's: the breaker spans replicas, and reading the window
+  against a process-local clock would let a skewed replica keep a
+  breaker tripped past the window or prune a failure early. The failure
+  history's storage is versioned so that upgrading the window's
+  representation cannot make old and new replicas read each other's
+  state as the wrong type mid-rollout. Attempt preparation is per
+  attempt and
   complete: resolution, the admission preflight (input schema,
   privileged conjunction) and the breaker check, in that order, all
   decided against the attempt's own resolved spec, identically on both
@@ -2411,15 +2418,20 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   begins: a deadline that expires during preparation or planning —
   anywhere before the worker spawn — revokes that attempt alone, and
   the retry policy keeps its remaining attempts; only the caller's
-  cancel ends the logical execution. The spawn joins the driver's
-  attempt by **exact identity**, never "whatever is current": validated,
-  its scratch allocated, started and registered as one step under the
-  execution's lock, so a stale serve waking after the retry began — or
-  after the execution closed — is refused before it creates anything,
-  and a revoke lands before the worker exists or after it is
-  registered, never between. Ownership transfers only once the worker
-  is registered — a spawn that fails setup leaves the attempt to its
-  opener, and the retry is not held for a serve that never ran. A
+  cancel ends the logical execution. The spawn allocates its scratch
+  directory *outside* the execution's lock — allocation is filesystem
+  work, and a stalled allocation must not be able to hold off the revoke
+  that a node deadline drives through that same lock — then joins the
+  driver's attempt by **exact identity**, never "whatever is current":
+  under the lock it revalidates the attempt, transfers ownership of the
+  scratch, and starts and registers the worker as one step, so a revoke
+  lands before the worker exists or after it is registered, never
+  between. A stale serve waking after the retry began — or after the
+  execution closed — is refused at that revalidation, and deletes the
+  scratch it had allocated, so it leaves nothing behind. Ownership
+  transfers only once the worker is registered — a spawn that fails
+  setup leaves the attempt to its opener, and the retry is not held for a
+  serve that never ran. A
   stream producer starts under the same gate. `started` means the
   worker or producer actually started, marked inside the registration
   step itself — not when the spawn call returns, so a worker killed

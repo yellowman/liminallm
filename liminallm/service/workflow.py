@@ -2830,20 +2830,24 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return tool_worker.limits_from_config(DEFAULT_SANDBOX_CONFIG)
 
     def _worker_scratch(self, invocation: Invocation) -> str:
-        """The empty directory a worker is confined to, made by the parent.
+        """Allocate the empty directory a worker is confined to.
 
         The worker has no filesystem credentials to make one with — that is the
-        point of it — and the invocation has to own the path so teardown
-        removes it whether the attempt ended or was killed. Node-local, like the
-        interpreter's, and never under `shared_fs_root`.
+        point of it. Node-local, like the interpreter's, and never under
+        `shared_fs_root`.
+
+        Allocation only: the caller (`tool_worker.spawn`) transfers the path to
+        the invocation under its lock, once the exact attempt is revalidated,
+        so teardown removes it whether the attempt ended or was killed — and a
+        refused spawn deletes the directory itself. Registering it here would
+        run the ownership transfer inside allocation's filesystem latency, and
+        that latency is what a node deadline must be able to revoke through.
         """
         root = Path(
             self.settings.interpreter_scratch_dir or tempfile.gettempdir()
         ) / "liminallm-worker"
         root.mkdir(parents=True, exist_ok=True)
-        scratch = tempfile.mkdtemp(prefix="worker-", dir=str(root))
-        invocation.resources.add_path(scratch)
-        return scratch
+        return tempfile.mkdtemp(prefix="worker-", dir=str(root))
 
     def _serve_invocation(
         self,
@@ -2882,9 +2886,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
             worker_tool,
             plan,
             limits=limits,
-            # A factory, invoked after the exact-attempt adoption inside the
-            # spawn's locked block: a stale serve is refused before it
-            # allocates filesystem state nobody is left to remove.
+            # A factory that allocates the scratch directory and returns it,
+            # unregistered. The spawn calls it before taking the invocation
+            # lock — filesystem latency here cannot hold a revoke off — then
+            # transfers ownership under the lock, or deletes it if the attempt
+            # is stale.
             scratch=partial(self._worker_scratch, invocation),
             expected_attempt=expected_attempt,
             on_started=mark_started,
