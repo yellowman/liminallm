@@ -2452,7 +2452,13 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   transfers only once the worker is registered — a spawn that fails
   setup leaves the attempt to its opener, and the retry is not held for a
   serve that never ran. A
-  stream producer starts under the same gate. `started` means the
+  stream producer starts under the same gate. The one exception is a
+  degraded fallback — the attachment agent answering in plain text after
+  its own serve failed and was revoked to take the worker down: that
+  producer starts on a revoked invocation, because the revoke was its own
+  teardown and not the caller leaving, and refuses only a cancelled one.
+  It carries no observation and records nothing; the agent's failure was
+  already recorded. `started` means the
   worker or producer actually started, marked inside the registration
   step itself — not when the spawn call returns, so a worker killed
   during its readiness handshake died started — and never at

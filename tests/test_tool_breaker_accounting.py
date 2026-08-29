@@ -1804,6 +1804,76 @@ class TestStreamedPlanningIsNotTheServe:
             "a deadline spent in streamed planning was charged to the tool"
         )
 
+    @pytest.mark.asyncio
+    async def test_a_failed_agent_degrades_to_a_plain_answer_not_a_cancel(self):
+        """The attachment agent, when its serve fails with no tokens emitted,
+        degrades to a plain LLM answer. It revokes first to take down the
+        failed worker before the fallback runs — but that revoke is a
+        degradation, not the caller walking away, so the fallback producer
+        must still start. The producer gate refuses a *cancelled* invocation,
+        not one revoked for degradation (SPEC §18.3): a caller who never
+        cancelled must get the plain answer, not a cancellation."""
+        c, backend = _stream_ctx()
+        # Tools offered and supported, so the turn enters the agent loop
+        # rather than taking the no-tools shortcut that never revokes.
+        backend.generate_with_tools = lambda *a, **k: {}
+
+        def boom_serve(*a, **k):
+            raise RuntimeError("agent loop boom")
+
+        c.engine._serve_invocation = boom_serve
+        c.engine._build_agent_context = lambda *a, **k: (
+            [], [{"name": "t"}], "", [], []
+        )
+        wf_art = c.wf("agent.files_v1", max_retries=0)
+        events = await c.run_streaming(wf_art)
+        kinds = [e.get("event") for e in events]
+        answered = any(
+            e.get("event") == "message_done" and (e.get("data") or {}).get("content")
+            for e in events
+        )
+        assert answered, (
+            f"a failed agent with no caller cancel produced no plain answer; "
+            f"the degradation revoke made the fallback read as a cancel "
+            f"(events: {kinds})"
+        )
+        assert kinds[-1] != "cancel_ack", (
+            "the degraded fallback ended the turn as a cancellation"
+        )
+        assert backend.stream_calls == 1, (
+            "the fallback provider did not run exactly once"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_agent_does_not_answer_through_the_fallback(self):
+        """The other side of the degraded gate: a caller who cancelled must
+        not be answered by the fallback. The fallback starts on a revoked
+        invocation but still refuses a cancelled one, so a cancel that ends
+        the agent serve ends the turn as a cancellation, not a plain answer
+        (SPEC §18.3)."""
+        c, backend = _stream_ctx()
+        backend.generate_with_tools = lambda *a, **k: {}
+
+        def cancel_then_revoked(inv, *a, **k):
+            # The caller walked away mid-serve: the worker's liveness check
+            # raises LeaseRevoked, and the invocation is cancelled.
+            inv.cancel("cancelled")
+            raise LeaseRevoked("cancelled")
+
+        c.engine._serve_invocation = cancel_then_revoked
+        c.engine._build_agent_context = lambda *a, **k: (
+            [], [{"name": "t"}], "", [], []
+        )
+        wf_art = c.wf("agent.files_v1", max_retries=0)
+        events = await c.run_streaming(wf_art)
+        assert not any(
+            e.get("event") == "message_done" and (e.get("data") or {}).get("content")
+            for e in events
+        ), "a cancelled agent turn was answered through the degraded fallback"
+        assert backend.stream_calls == 0, (
+            "the fallback provider ran for a cancelled caller"
+        )
+
 
 # =============================================================================
 # The direct invocation is the same ledger.

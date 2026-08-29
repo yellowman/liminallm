@@ -717,6 +717,7 @@ class WorkflowStreamingMixin:
         invocation: Invocation,
         cancel_event: Optional[asyncio.Event] = None,
         observation: Optional[BreakerObservation] = None,
+        degraded_fallback: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Stream tokens from an LLM node."""
         inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
@@ -770,6 +771,7 @@ class WorkflowStreamingMixin:
             label=str(node.get("id") or "llm"),
             cancel_event=cancel_event,
             observation=observation,
+            degraded_fallback=degraded_fallback,
         ):
             if event.get("event") == "message_done":
                 # The grounding this node retrieved, on the node's answer —
@@ -803,6 +805,7 @@ class WorkflowStreamingMixin:
         label: str,
         cancel_event: Optional[asyncio.Event],
         observation: Optional[BreakerObservation] = None,
+        degraded_fallback: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Drive a synchronous token producer off the loop.
 
@@ -822,11 +825,20 @@ class WorkflowStreamingMixin:
         starts the provider — the gate refuses and acknowledges instead —
         and a revoke that lands after the gate finds a registered producer
         its sweep can stop.
+
+        `degraded_fallback` is the one producer that starts on a revoked
+        invocation: the attachment agent's plain-answer path, which runs only
+        after the agent revoked its own failed serve to take the worker down
+        (SPEC §18.3). That revoke is a degradation, not the caller walking
+        away, so the fallback gate refuses a *cancelled* invocation — the
+        caller's own stop — rather than a revoked one. Every other producer
+        refuses a revoked attempt.
         """
         pump: Optional[StreamPump] = None
         with invocation.lock:
             expected = observation.attempt if observation is not None else None
-            live = not invocation.revoked and (
+            blocked = invocation.cancelled if degraded_fallback else invocation.revoked
+            live = not blocked and (
                 expected is None or invocation.current_attempt is expected
             )
             if live:
@@ -1085,6 +1097,11 @@ class WorkflowStreamingMixin:
                 tenant_id=tenant_id,
                 invocation=invocation,
                 cancel_event=cancel_event,
+                # The serve was just revoked to take its worker down; this
+                # degraded answer must still run for a caller who did not
+                # cancel. Breaker-invisible (no observation): the failure is
+                # already recorded above.
+                degraded_fallback=True,
             ):
                 yield event
             return

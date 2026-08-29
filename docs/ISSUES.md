@@ -9582,3 +9582,48 @@ with the round-nine purge mutants — a glob that matches every breaker key,
 a purge that counts but deletes nothing — re-run and still killed, and the
 unversioned-key mutant re-anchored onto the representation map the suffix is
 now read from.
+
+## Bugbot found the producer gate turning a degraded answer into a cancellation
+
+The PR's own review bot (Cursor Bugbot) flagged a real interaction the tranche
+introduced. The attachment agent, when its serve fails with no tokens emitted,
+degrades to a plain LLM answer. Before it does, it revokes the invocation — the
+comment says why: the failed agent's worker must come down before a second
+answer is produced, so a capability racing the teardown is refused rather than
+started. That revoke was harmless until round five added the producer gate.
+
+The gate refuses to start a producer once the invocation is `revoked`. The
+degradation revoke sets exactly that flag, so the fallback's own producer —
+started through `_stream_llm_node` a few lines later — was refused, and the
+turn ended with a `cancel_ack` instead of the plain answer. A caller who
+uploaded files, hit a failing agent, and never cancelled anything received a
+cancellation. The salvage path (an answer already part-streamed) was
+unaffected, because it yields its partial directly rather than through the
+gate; only the no-token fallback took the hit.
+
+The distinction the gate needed was already in the invocation: a caller who
+walks away calls `cancel`, which sets `cancelled`; the agent's degradation
+calls `revoke`, which marks the attempt revoked but leaves `cancelled` false.
+So the fix is one branch, not a new attempt: the degraded fallback — and only
+it — gates on `cancelled` rather than `revoked`. It starts on a revoked
+invocation, because that revoke was its own teardown, and still refuses a
+cancelled one, because that is the caller's stop. It carries no breaker
+observation, so nothing about the ledger changes; the agent's failure was
+already recorded before the revoke. Every other producer still refuses a
+revoked attempt exactly as before.
+
+Two reds pin the two sides. A failed agent with no caller cancel must produce
+a plain `message_done`, not a `cancel_ack` — red on the shipped commit, where
+the fallback yielded only `cancel_ack`. And a caller who cancels mid-serve must
+still get a cancellation, never the fallback answer — so the fix cannot become
+"the fallback always starts". The breaker mutation set is fifty-one, all
+killed; the two new mutants:
+
+    new mutation                                    outcome
+    the degraded fallback ignores its flag (revoked)  killed
+    the degraded fallback ignores a real cancel      killed
+
+with the round-five producer-gate mutant re-anchored onto the two-branch gate
+and re-run. The finding was a genuine regression the tranche shipped, caught
+by the PR's review bot and closed the same way as the rest of the campaign:
+red first, then the smallest branch that tells the two cases apart.
