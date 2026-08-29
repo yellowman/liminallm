@@ -47,6 +47,20 @@ class RedisCache:
     # Issue 48.3: Default operation timeout for Redis commands
     DEFAULT_OPERATION_TIMEOUT = 5.0  # 5 seconds
 
+    # Named representations of the breaker failure history, and the single
+    # source of truth for their key suffixes. `legacy` is the plain counter
+    # merged main wrote at `:failures`; `v2` is the rolling-window sorted set
+    # at `:failures:v2`. `purge_breaker_failure_history` takes one of these
+    # names, never a raw suffix, so the destructive purge is fail-closed: it
+    # can only ever target a named representation, and an unknown name is
+    # refused before any glob is built. A raw `*` would otherwise expand to
+    # `circuit:*:*` and delete the shared `:open` cooldown along with every
+    # tool's history.
+    FAILURE_REPRESENTATIONS = {
+        "legacy": "failures",
+        "v2": "failures:v2",
+    }
+
     # The breaker failure history is a sorted set keyed by this suffix, and
     # the suffix is a version. The history is ephemeral, per-window state,
     # and the representation is NOT rolling mixed-version compatible: the old
@@ -63,7 +77,7 @@ class RedisCache:
     # boundary, not a licence to run the two side by side, so this code owns
     # `:failures:v2` alone and never reads or clears the legacy key. The
     # `:open` key is a plain string on both representations and stays shared.
-    _FAILURES_SUFFIX = "failures:v2"
+    _FAILURES_SUFFIX = FAILURE_REPRESENTATIONS["v2"]
 
     # Lua token bucket script (Issue 77.2/77.10/77.12): atomic refill + consume
     _TOKEN_BUCKET_SCRIPT = """
@@ -988,7 +1002,7 @@ return {1, tokens, 0}
         await self.client.delete(failures_key)
 
     async def purge_breaker_failure_history(
-        self, *, suffix: str, dry_run: bool = False
+        self, representation: str, *, dry_run: bool = False
     ) -> int:
         """Delete every breaker failure-history key for one storage
         representation, tenant-wide. Returns the number of keys removed (or,
@@ -1004,13 +1018,22 @@ return {1, tokens, 0}
         Purging the superseded namespace after draining its replicas closes
         that window in both directions.
 
-        Scoped to the failure-history namespace of exactly the named
-        representation: the glob ends at the suffix, so `failures` does not
-        match `failures:v2` and neither matches the shared `:open` cooldown
-        key — an already-open breaker keeps its cooldown across the reset,
-        which is deliberate (an unhealthy tool is not made healthy by a
-        representation change). Never flushes the database.
+        Fail-closed: ``representation`` is a name from
+        `FAILURE_REPRESENTATIONS`, never a raw key suffix. An unknown name
+        raises before any glob is built, so this destructive purge can never
+        be widened into `circuit:*:*` and reach the shared `:open` cooldown
+        or another tool's history. The glob ends at the resolved suffix, so
+        `legacy` does not match `v2` and neither matches `:open` — an
+        already-open breaker keeps its cooldown across the reset, which is
+        deliberate (an unhealthy tool is not made healthy by a representation
+        change). Never flushes the database.
         """
+        suffix = self.FAILURE_REPRESENTATIONS.get(representation)
+        if suffix is None:
+            raise ValueError(
+                f"unknown breaker representation {representation!r}; expected "
+                f"one of {sorted(self.FAILURE_REPRESENTATIONS)}"
+            )
         pattern = f"circuit:*:{suffix}"
         removed = 0
         async for key in self.client.scan_iter(match=pattern, count=500):

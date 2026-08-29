@@ -1205,7 +1205,9 @@ class TestTheWindowIsARollingWindow:
 # =============================================================================
 # A representation change is a coordinated reset, not a rolling mixed-version
 # deploy. The version keeps the boundary crash-safe; it does not unify two
-# independent ledgers, so new code owns v2 alone and abandons the legacy key.
+# independent ledgers, so v2 owns its own key and never reads or clears a
+# stray legacy one. The cutover procedure itself — draining, then purging the
+# superseded namespace — is pinned separately below.
 # =============================================================================
 
 
@@ -1241,29 +1243,28 @@ class TestTheFailureKeyIsRolloutCompatible:
         assert tripped is False
 
     @pytest.mark.asyncio
-    async def test_the_new_ledger_abandons_the_legacy_key(self):
-        """The version is a reset boundary, not a bridge. `:failures` and
-        `:failures:v2` are independent ledgers: a representation change
-        drains the old replicas and starts empty, so the legacy counter is
-        abandoned to its own TTL, never read into a decision or cleared by
-        the new code. Half-migrating them — new code summing the legacy count
-        into its window, or clearing it on success — would rebuild the very
-        "one success clears only one ledger" partition the coordinated-reset
-        contract forbids (SPEC §18.3). So new code touches v2 alone.
+    async def test_v2_never_half_migrates_a_stray_legacy_key(self):
+        """Representation isolation, not the cutover procedure. `:failures`
+        and `:failures:v2` are independent ledgers, and the v2 code path must
+        never opportunistically read a stray legacy counter into its window
+        or clear one on success — half-migrating them would rebuild the "one
+        success clears only one ledger" partition the two-ledger design
+        forbids (SPEC §18.3). So the steady-state v2 code touches v2 alone.
 
-        This pins the contract; it is not a claim that the two may run at
-        once. That they must not is the deployment contract, which a unit
-        test cannot enforce — draining old replicas before new ones serve is
-        an operational step, not a code path."""
+        This is defense-in-depth on the code, independent of deployment. The
+        cutover itself does not leave a stray legacy key lying around — it
+        purges the superseded namespace, pinned by
+        `test_a_reset_purges_the_superseded_history_against_rollback`. Here
+        we only prove that if such a key is present, v2 ignores it."""
         rt = get_runtime()
         cache = rt.cache
-        tenant = _u("reset")
+        tenant = _u("iso")
         ident = _u("tool")
         legacy = f"circuit:{tenant}:{ident}:failures"
-        # Four failures a pre-upgrade replica left behind, one short of a trip.
+        # A stray legacy counter, four short of a trip.
         await cache.client.set(legacy, "4", ex=60)
 
-        # The new ledger counts only its own entries, never the legacy four.
+        # The v2 ledger counts only its own entries, never the legacy four.
         await cache.record_tool_failure(
             ident, failure_threshold=5, window_seconds=60,
             cooldown_seconds=60, tenant_id=tenant,
@@ -1273,15 +1274,14 @@ class TestTheFailureKeyIsRolloutCompatible:
             cooldown_seconds=60, tenant_id=tenant,
         )
         assert count == 1, (
-            f"the new ledger read the legacy counter into its window "
+            f"the v2 ledger read the stray legacy counter into its window "
             f"(count={count}); the two must stay independent"
         )
-        # A success clears the active ledger and leaves the legacy key alone.
+        # A v2 success clears the v2 ledger and leaves the stray key alone.
         await cache.record_tool_success(ident, tenant_id=tenant)
         assert await cache.client.get(legacy) == "4", (
-            "new breaker code cleared the legacy `:failures` counter; a "
-            "coordinated reset abandons it to its TTL, it does not "
-            "half-migrate the two ledgers"
+            "v2 code cleared a stray legacy `:failures` counter; the steady "
+            "state touches v2 alone and does not half-migrate the two ledgers"
         )
         assert 0 < int(await cache.client.ttl(legacy)) <= 60
 
@@ -1313,7 +1313,7 @@ class TestTheFailureKeyIsRolloutCompatible:
         await cache.client.zadd(other_v2, {"m": 100.0})
 
         # The coordinated reset onto v2 purges the legacy failure history.
-        removed = await cache.purge_breaker_failure_history(suffix="failures")
+        removed = await cache.purge_breaker_failure_history("legacy")
         assert removed >= 1
 
         # Rollback to the old representation, well inside the old 60s TTL. Its
@@ -1334,6 +1334,33 @@ class TestTheFailureKeyIsRolloutCompatible:
             "the reset of one representation purged another representation's "
             "history"
         )
+
+    @pytest.mark.asyncio
+    async def test_the_purge_refuses_an_unknown_representation(self):
+        """The purge is destructive, so it is fail-closed at the primitive,
+        not only at the CLI. It takes a named representation, not a raw key
+        suffix, and refuses anything else before building a glob. A raw `*`
+        would otherwise expand to `circuit:*:*` and delete legacy history, v2
+        history, and the shared `:open` cooldown together (SPEC §18.3)."""
+        rt = get_runtime()
+        cache = rt.cache
+        tenant = _u("failclosed")
+        ident = _u("tool")
+        legacy = f"circuit:{tenant}:{ident}:failures"
+        v2 = f"circuit:{tenant}:{ident}:failures:v2"
+        open_key = f"circuit:{tenant}:{ident}:open"
+        await cache.client.set(legacy, "4", ex=60)
+        await cache.client.zadd(v2, {"m": 100.0})
+        await cache.client.set(open_key, "1", ex=60)
+
+        for bad in ("*", "failures*", "open", "", "failures:v2:x", "failures:v2"):
+            with pytest.raises(ValueError):
+                await cache.purge_breaker_failure_history(bad)
+
+        # Nothing was touched by any refused call.
+        assert await cache.client.get(legacy) == "4"
+        assert await cache.client.exists(v2) == 1
+        assert await cache.client.exists(open_key) == 1
 
 
 # =============================================================================

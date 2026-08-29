@@ -9524,3 +9524,61 @@ This closes the operational gap round eight left open: the reset is now an
 actual retirement of the superseded representation, safe against a rollback,
 with the shared cooldown preserved and the whole procedure written down
 where it is deployed from.
+
+## The purge was fail-open, and a witness still spoke for the killed contract
+
+Round nine gave the representation reset a real purge. Review found two
+things left at that new boundary: the purge primitive trusted its caller,
+and one active test still asserted the very contract round nine had
+replaced. Both are closed, with a third, non-blocking cleanup on the
+operator command.
+
+The purge took a raw key suffix and dropped it straight into a glob:
+`pattern = f"circuit:*:{suffix}"`. The CLI guarded its own input with an
+`argparse` choice list, but the storage primitive did not, and a
+destructive primitive that trusts its argument is fail-open. `suffix="*"`
+expands to `circuit:*:*`, which deletes the legacy history, the v2 history,
+and the shared `:open` cooldown together — the exact key the SPEC and the
+runbook promise survives a reset. The round-nine mutant proved the normal
+glob must stay narrow; it did not prove the input could not widen it. The
+primitive now takes a named representation, not a suffix: `legacy` or `v2`,
+validated against a map `RedisCache` owns, and anything else is refused
+before a glob is built. The map is the single source of truth — the current
+representation's own suffix is read from it, and the operator command draws
+its `argparse` choices from it rather than keeping a second copy. The red
+seeds all three keys, asks the purge for a wildcard and four other invalid
+names, and requires each to raise with every key left intact.
+
+The second finding was a test telling the opposite of the specification.
+`test_the_new_ledger_abandons_the_legacy_key` still said the legacy counter
+was "abandoned to its own TTL" and required it to survive v2 traffic — the
+round-eight cutover reading, which round nine replaced with an explicit
+purge. The underlying code property is still worth pinning: the steady-state
+v2 path must never opportunistically read a stray legacy counter into its
+window or clear one on success, because half-migrating the two rebuilds the
+partition the design forbids. So the test was not deleted but reframed —
+`test_v2_never_half_migrates_a_stray_legacy_key` — as representation
+isolation, defense-in-depth on the code, explicitly not the cutover
+procedure. The cutover is pinned by the round-nine purge-and-rollback test,
+and the reframed test now points at it rather than contradicting it.
+
+The non-blocking cleanup: the operator command was booting the whole
+inference runtime and silently forcing `TEST_MODE=true` to do it. `TEST_MODE`
+is a testing-behaviour flag, and it gates exactly the Redis-absent fallback
+a purge command must never take — with it set, a command run against a
+downed Redis would find no cache and quietly do nothing instead of failing.
+The injection is gone; the command talks to the real Redis the fleet uses,
+and fails loudly if it is not there. The command still resolves that Redis
+through the runtime, because the Redis DSN is a database-managed setting; a
+narrower administration path that reads only that one setting is worth
+having later, but it is not this tranche.
+
+The mutation set is forty-nine, all killed; the new mutant:
+
+    new mutation                                    outcome
+    the purge accepts any representation as a suffix  killed
+
+with the round-nine purge mutants — a glob that matches every breaker key,
+a purge that counts but deletes nothing — re-run and still killed, and the
+unversioned-key mutant re-anchored onto the representation map the suffix is
+now read from.

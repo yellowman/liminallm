@@ -48,13 +48,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# The friendly name an operator types, mapped to the key suffix. Kept here so
-# the runbook never has to name a raw Redis glob; the suffixes themselves are
-# owned by RedisCache.
-REPRESENTATIONS = {
-    "legacy": "failures",
-    "v2": "failures:v2",
-}
+# The valid representation names come from RedisCache — one source of truth, so
+# the runbook and this script never name a raw Redis glob and cannot drift from
+# the storage layer. Importing the class loads no config.
+from liminallm.storage.redis_cache import RedisCache  # noqa: E402
 
 
 async def reset_breaker_history(representation: str, dry_run: bool) -> int:
@@ -64,11 +61,14 @@ async def reset_breaker_history(representation: str, dry_run: bool) -> int:
     runtime = get_runtime()
     cache = runtime.cache
     if cache is None:
+        # Redis is the breaker's store; a purge command has nothing to do
+        # without it, and this must fail loudly rather than no-op silently.
         print("Error: Redis is not configured; there is no breaker history to purge")
         sys.exit(1)
 
-    suffix = REPRESENTATIONS[representation]
-    removed = await cache.purge_breaker_failure_history(suffix=suffix, dry_run=dry_run)
+    # The primitive validates `representation` against RedisCache's map and
+    # refuses anything else, so a raw glob can never reach the purge.
+    removed = await cache.purge_breaker_failure_history(representation, dry_run=dry_run)
     verb = "would remove" if dry_run else "removed"
     print(f"{verb} {removed} breaker failure-history key(s) for '{representation}'")
     return removed
@@ -83,7 +83,7 @@ def main():
     parser.add_argument(
         "--representation",
         required=True,
-        choices=sorted(REPRESENTATIONS),
+        choices=sorted(RedisCache.FAILURE_REPRESENTATIONS),
         help="which representation's failure history to purge (the one being left)",
     )
     parser.add_argument(
@@ -96,9 +96,9 @@ def main():
     if not os.environ.get("DATABASE_URL"):
         print("Error: DATABASE_URL is required; the runtime provides the Redis client")
         sys.exit(1)
-    os.environ.setdefault("TEST_MODE", "true")
-    if not os.environ.get("SHARED_FS_ROOT"):
-        os.environ["SHARED_FS_ROOT"] = "/tmp/liminallm-breaker-reset"
+    # Deliberately NOT setting TEST_MODE: this talks to the real Redis the
+    # fleet uses. TEST_MODE only gates the Redis-absent fallback, and a purge
+    # command must never take it — if Redis is down, failing loudly is right.
 
     try:
         asyncio.run(reset_breaker_history(args.representation, args.dry_run))
