@@ -656,8 +656,9 @@ def spawn(
     plan: Dict[str, Any],
     *,
     limits: Optional[Dict[str, int]] = None,
-    scratch: str,
+    scratch: Callable[[], str],
     expected_attempt: Any = None,
+    on_started: Optional[Callable[[], None]] = None,
 ) -> WorkerHandle:
     """Start a worker for one attempt at one tool call.
 
@@ -681,23 +682,29 @@ def spawn(
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=True)
     budget = FrameBudget(_plan_bytes(plan))
-    process = ctx.Process(
-        target=_worker_main,
-        args=(child_conn, tool, plan, limits or {}, scratch),
-        daemon=True,
-    )
-    reap = lambda: process.join(_JOIN_TIMEOUT_SECONDS)  # noqa: E731
     # One linearization boundary (SPEC §18.3): validate the exact attempt
-    # this spawn was created for, start the child, register it, and only
-    # then transfer ownership. A revoke serializes against this block — it
-    # lands before, and the adoption refuses with no child started, or it
-    # lands after and its sweep finds the registered child. Ownership is
-    # transferred last: a start or registration that fails leaves the
-    # attempt unadopted, so the driver that opened it still ends it and the
-    # retry is not held for a serve loop that never ran.
+    # this spawn was created for, allocate its scratch, start the child,
+    # register it, and only then transfer ownership. A revoke serializes
+    # against this block — it lands before, and the adoption refuses with
+    # nothing allocated and no child started, or it lands after and its
+    # sweep finds the registered child. The scratch is a factory called
+    # *after* the adoption for exactly that reason: a stale serve waking
+    # once the invocation has closed must be refused before it creates
+    # filesystem state nobody is left to remove. Ownership is transferred
+    # last, and `on_started` — the breaker's record that the worker really
+    # started, one attribute write, no-throw — fires inside the same block:
+    # marked after `spawn` returns, a worker killed during the READY
+    # handshake below died registered but never `started`.
     try:
         with invocation.lock:
             attempt = invocation.adopt_attempt(expected_attempt)
+            scratch_path = scratch()
+            process = ctx.Process(
+                target=_worker_main,
+                args=(child_conn, tool, plan, limits or {}, scratch_path),
+                daemon=True,
+            )
+            reap = lambda: process.join(_JOIN_TIMEOUT_SECONDS)  # noqa: E731
             process.start()
             child_conn.close()
             attempt.pid = process.pid
@@ -705,6 +712,8 @@ def spawn(
                 process.pid or 0, f"worker:{tool}", group=False, reap=reap
             )
             attempt.adopted = True
+            if on_started is not None:
+                on_started()
     except BaseException:
         for conn in (parent_conn, child_conn):
             try:

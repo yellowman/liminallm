@@ -2867,19 +2867,28 @@ class WorkflowEngine(WorkflowStreamingMixin):
         authority.
         """
         broker = CapabilityBroker(self, context, on_capability=on_capability)
+
+        def mark_started() -> None:
+            # One attribute write, no-throw by construction: the spawn calls
+            # this inside its locked registration, which is the atomic start
+            # point the breaker's `started` means (SPEC §18.3) — a worker
+            # killed during the READY handshake died *started*, and a serve
+            # that never spawned never was.
+            if observation is not None:
+                observation.started = True
+
         handle = tool_worker.spawn(
             invocation,
             worker_tool,
             plan,
             limits=limits,
-            scratch=self._worker_scratch(invocation),
+            # A factory, invoked after the exact-attempt adoption inside the
+            # spawn's locked block: a stale serve is refused before it
+            # allocates filesystem state nobody is left to remove.
+            scratch=partial(self._worker_scratch, invocation),
             expected_attempt=expected_attempt,
+            on_started=mark_started,
         )
-        if observation is not None:
-            # The worker exists and is registered — the serve began. This is
-            # the atomic start point the breaker's `started` means (SPEC
-            # §18.3), not the scheduling of this function into a pool.
-            observation.started = True
         try:
             return broker.serve(
                 handle.conn,

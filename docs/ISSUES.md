@@ -9254,3 +9254,70 @@ interruption-records-failure mutant survive twice; it is now killed by a
 seam probe of the attempt's own contract, the same resolution the
 invocation backstop got a round earlier: defense-in-depth stays, and it
 stays witnessed.
+
+## The atomic start point was one call too late, and the window was not a window
+
+Round six moved the round-five boundaries the last distance. The atomic
+start point existed but the mark chased it from outside; the adoption
+gate existed but the scratch was allocated on the way in; and the
+sixty-second window the SPEC has always stated turned out to be a TTL
+that refreshed itself. Three reds, three greens.
+
+1. A worker could start, register, and be killed while the breaker still
+   said `started=False`. The spawn's locked block adopted, started and
+   registered the worker — but the mark lived in `_serve_invocation`,
+   after `spawn()` returned, and between the two sits the READY
+   handshake: up to fifteen seconds waiting for the child to prove its
+   process group. A node deadline expiring in that window killed a
+   registered, running worker and recorded nothing — exactly the
+   unhealthy-tool shape the ledger exists to count, and the same
+   "marked one seam late" class as round five's scheduling mark, one
+   seam later. `spawn()` now takes a no-throw `on_started` callback and
+   invokes it inside the locked registration block itself, so the mark
+   and the registration are the same step; the serve passes a one-line
+   `mark_started`. The red holds the READY wait open for six seconds
+   under a 2.5-second node deadline and requires the kill to record
+   exactly one failure.
+2. A stale serve waking after the invocation closed could still create
+   filesystem state. The scratch was allocated in the spawn call
+   expression — evaluated before the adoption validated anything — so
+   the refusal arrived after `mkdtemp` and `add_path`, and the close
+   that would have removed the path had already run; a second close is
+   an idempotent no-op, so the orphan survived. The scratch argument is
+   now a zero-argument factory, called after `adopt_attempt` inside the
+   locked block: a refused adoption allocates nothing. The red closes
+   the invocation, wakes the stale serve, and requires the refusal plus
+   zero scratch allocations.
+3. The breaker did not implement "5 failures in 60 seconds". The Lua
+   recorder incremented a counter and refreshed its TTL on every
+   failure, which makes the real rule "a chain of failures with no gap
+   longer than the window": one failure every fifty seconds tripped a
+   breaker whose sixty-second window never held five. The counter is
+   now a timestamped set — prune entries older than the window, add,
+   count — and the read side counts the same score range, so the count
+   is the failures inside one window ending now. The red sets threshold
+   three over a one-second window and drips failures 600 milliseconds
+   apart across 1.2 seconds: under the TTL refresh the third drip
+   tripped; now nothing does, and the burst control inside one window
+   still trips.
+
+The three reds plus the burst control bring the witness file to
+fifty-four. The mutation set is forty-two, all killed; the three new
+mutants:
+
+    new mutation                                    outcome
+    started marked only after spawn returns         killed
+    scratch allocated before the adoption gate      killed
+    window pruning dropped from the recorder        killed
+
+Two prior mutants were re-anchored rather than retired: the
+serve-boundary mark block they deleted no longer exists, so both now
+delete the `on_started` invocation inside the spawn block — the same
+semantic hole, at the seam it moved to — and the ownership-before-start
+mutant re-anchored around the scratch and process construction the lock
+now encloses. Collateral: two invocation-lease witnesses called
+`spawn()` with the old scratch-path string and now pass a factory, and
+the SPEC bullet gained the words the code finally earned — the window
+is rolling, the scratch is allocated inside the locked step, and
+`started` is marked at registration itself, not when the spawn call
+returns.

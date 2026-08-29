@@ -73,10 +73,9 @@ async def _count(cache, tenant, *idents):
     """
     total = 0
     for ident in idents:
-        raw = await cache.client.get(f"circuit:{tenant}:{ident}:failures")
-        if isinstance(raw, bytes):
-            raw = raw.decode()
-        total += int(raw) if raw else 0
+        total += int(
+            await cache.client.zcard(f"circuit:{tenant}:{ident}:failures") or 0
+        )
     return total
 
 
@@ -566,6 +565,36 @@ class TestTheStartedAttemptBoundary:
         )
 
     @pytest.mark.asyncio
+    async def test_a_deadline_during_the_ready_wait_records_the_failure(self):
+        """The other edge of `started`: the worker has started and is
+        registered — only the READY handshake is outstanding. A node
+        deadline expiring there kills a real, running worker, and that is
+        a started serve cut off: a breaker failure. Marking `started` only
+        after `spawn()` returns leaves a window as long as the handshake
+        timeout in which a killed worker was never `started`."""
+        from unittest.mock import patch
+
+        import liminallm.service.tool_worker as tool_worker_mod
+
+        c = _Ctx()
+        ready_entered = threading.Event()
+
+        def held_ready(conn, process):
+            ready_entered.set()
+            time.sleep(6)
+            return False
+
+        with patch.object(tool_worker_mod, "_await_ready", held_ready):
+            r = await c.run(c.wf("llm.generic", timeout_ms=2500, max_retries=0))
+        assert ready_entered.is_set(), "the worker never reached registration"
+        assert r.get("status") == "error"
+        assert await c.count(c.ident(), "llm.generic") == 1, (
+            "a registered worker was killed at the node deadline and the "
+            "breaker recorded nothing: started was marked after the READY "
+            "wait instead of at registration"
+        )
+
+    @pytest.mark.asyncio
     async def test_a_deadline_spent_in_planning_records_nothing(self):
         """The complement that positions the boundary: the same deadline,
         fired before the serve began, proves nothing about the tool."""
@@ -946,7 +975,7 @@ class TestAuthorityTravelsByExactAttempt:
         def spawn_it():
             try:
                 tool_worker_mod.spawn(
-                    inv, "llm.generic", {}, limits={}, scratch="/tmp"
+                    inv, "llm.generic", {}, limits={}, scratch=lambda: "/tmp"
                 )
             except Exception:
                 pass
@@ -982,6 +1011,107 @@ class TestAuthorityTravelsByExactAttempt:
             "after the window closed, the revoke must find the registered "
             "child and sweep it"
         )
+
+
+# =============================================================================
+# A stale serve allocates nothing on its way to being refused.
+# =============================================================================
+
+
+class TestAStaleServeAllocatesNothing:
+    @pytest.mark.asyncio
+    async def test_a_stale_serve_after_close_allocates_no_scratch(self):
+        """The invocation is closed — cancelled, terminated, cleaned. A
+        serve thread waking after that must be refused before it creates
+        anything: a scratch directory allocated ahead of the adoption check
+        outlives the teardown, because the second `close()` is an
+        idempotent no-op with nobody left to remove it."""
+        import uuid as uuid_mod
+
+        from liminallm.service.broker import InvocationContext
+        from liminallm.service.node_attempt import BreakerObservation
+
+        c = _Ctx()
+        engine = c.engine
+        inv = engine.invocations.open(
+            uuid_mod.uuid4().hex, tool="llm.generic",
+            user_id=c.user.id, tenant_id=c.tenant,
+        )
+        lease = inv.begin_attempt()
+        inv.end_attempt(lease)
+        await asyncio.to_thread(inv.close)
+
+        created = []
+        real_scratch = engine._worker_scratch
+
+        def recording_scratch(invocation):
+            path = real_scratch(invocation)
+            created.append(path)
+            return path
+
+        engine._worker_scratch = recording_scratch
+        obs = BreakerObservation(identity="x", attempt=lease)
+        context = InvocationContext(
+            user_id=c.user.id, tenant_id=c.tenant, conversation_id=None,
+            context_id=None, adapters=[], history=[], user_message="hi",
+        )
+        with pytest.raises(LeaseRevoked):
+            await asyncio.to_thread(
+                engine._serve_invocation,
+                inv, "llm.generic", {"inputs": {}, "message": "hi"},
+                context, engine._worker_limits(None),
+                expected_attempt=lease, observation=obs,
+            )
+        assert not created, (
+            f"a stale serve allocated filesystem state after the invocation "
+            f"closed, with nobody left to remove it: {created}"
+        )
+        assert obs.started is False
+
+
+# =============================================================================
+# The window is a rolling window.
+# =============================================================================
+
+
+class TestTheWindowIsARollingWindow:
+    @pytest.mark.asyncio
+    async def test_a_slow_drip_outside_any_window_never_trips(self):
+        """SPEC's contract is N failures inside one window. A per-failure
+        TTL refresh turns that into "a chain with no gap over the window",
+        so a slow drip — one failure every fifty seconds, forever — trips a
+        breaker whose sixty-second window never held five failures."""
+        rt = get_runtime()
+        cache = rt.cache
+        tenant = _u("win")
+        ident = _u("drip")
+        tripped = False
+        for pause in (0.0, 0.6, 0.6):
+            if pause:
+                await asyncio.sleep(pause)
+            tripped, _ = await cache.record_tool_failure(
+                ident, failure_threshold=3, window_seconds=1,
+                cooldown_seconds=60, tenant_id=tenant,
+            )
+        assert not tripped and not await _is_open(cache, tenant, ident), (
+            "three failures that no one-second window contains together "
+            "tripped the breaker: the TTL refresh makes the window a chain"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_burst_inside_the_window_trips(self):
+        """The control: the same three failures back to back must trip."""
+        rt = get_runtime()
+        cache = rt.cache
+        tenant = _u("win")
+        ident = _u("burst")
+        tripped = False
+        for _ in range(3):
+            tripped, _ = await cache.record_tool_failure(
+                ident, failure_threshold=3, window_seconds=1,
+                cooldown_seconds=60, tenant_id=tenant,
+            )
+        assert tripped and await _is_open(cache, tenant, ident)
 
 
 # =============================================================================

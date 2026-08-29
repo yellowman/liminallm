@@ -2387,7 +2387,10 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   a call refused before its serve begins (open breaker, unresolved
   reference, input validation, plan assembly) and an attempt abandoned
   by its caller (cancel, revoked lease). **5** failures in **60s** open
-  the breaker for **60s**. Attempt preparation is per attempt and
+  the breaker for **60s**; the window is rolling — failures are
+  timestamped and only those inside one window ending now count, so
+  failures spaced wider than the window never accumulate into a trip.
+  Attempt preparation is per attempt and
   complete: resolution, the admission preflight (input schema,
   privileged conjunction) and the breaker check, in that order, all
   decided against the attempt's own resolved spec, identically on both
@@ -2410,15 +2413,18 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   the retry policy keeps its remaining attempts; only the caller's
   cancel ends the logical execution. The spawn joins the driver's
   attempt by **exact identity**, never "whatever is current": validated,
-  started and registered as one step under the execution's lock, so a
-  stale serve waking after the retry began cannot join the retry's
-  attempt, and a revoke lands before the worker exists or after it is
+  its scratch allocated, started and registered as one step under the
+  execution's lock, so a stale serve waking after the retry began — or
+  after the execution closed — is refused before it creates anything,
+  and a revoke lands before the worker exists or after it is
   registered, never between. Ownership transfers only once the worker
   is registered — a spawn that fails setup leaves the attempt to its
   opener, and the retry is not held for a serve that never ran. A
   stream producer starts under the same gate. `started` means the
-  worker or producer actually started, marked at that registration and
-  never at scheduling; the recorder writes nothing for an attempt that
+  worker or producer actually started, marked inside the registration
+  step itself — not when the spawn call returns, so a worker killed
+  during its readiness handshake died started — and never at
+  scheduling; the recorder writes nothing for an attempt that
   never started, as a backstop rather than a convention. Recovery is
   not tool health: a body that salvages a partial answer after its
   serve failed still records the failure — the observation is sticky —

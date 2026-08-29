@@ -1126,7 +1126,7 @@ class TestTheGroupKillCannotReachTheServer:
                 "web.fetch_v1",
                 {"inputs": {}},
                 limits={},
-                scratch=str(scratch),
+                scratch=lambda: str(scratch),
             )
             handle.terminate()
         finally:
@@ -1542,7 +1542,7 @@ class TestReapingIsConfirmedNotAssumed:
         invocation = Invocation("join-no-reap", tool="web.fetch_v1")
         handle = tool_worker.spawn(
             invocation, "web.fetch_v1", {"inputs": {}},
-            limits={}, scratch=str(scratch),
+            limits={}, scratch=lambda: str(scratch),
         )
         real_join = handle._process.join
         try:

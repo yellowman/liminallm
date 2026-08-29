@@ -6,6 +6,7 @@ import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, Union
+from uuid import uuid4
 
 import redis.asyncio as aioredis
 
@@ -860,9 +861,13 @@ return {1, tokens, 0}
         if is_open:
             return (True, -1)
 
-        # Get current failure count
-        failures_raw = await self.client.get(failures_key)
-        failure_count = int(failures_raw) if failures_raw else 0
+        # Failures inside the rolling window, counted from the timestamped
+        # set the recorder maintains; entries older than the window are
+        # pruned on write, so a read only has to bound the score range.
+        now = time.time()
+        failure_count = int(
+            await self.client.zcount(failures_key, now - window_seconds, "+inf")
+        )
 
         return (False, failure_count)
 
@@ -895,22 +900,30 @@ return {1, tokens, 0}
         open_key = f"circuit:{tenant_prefix}{tool_id}:open"
         failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
 
-        # Lua script for atomic failure recording and circuit tripping
+        # A timestamped set, not a counter with a refreshed TTL. The TTL
+        # refresh made the rule "a chain of failures with no gap over the
+        # window": one failure every fifty seconds eventually tripped a
+        # breaker whose sixty-second window never held five. Entries older
+        # than the window are pruned before counting, so the count is the
+        # failures actually inside one window ending now.
         lua_script = """
         -- Check if circuit is already open
         if redis.call('EXISTS', KEYS[1]) == 1 then
             return {1, -1}  -- Already open
         end
 
-        -- Increment failure counter
-        local failures = redis.call('INCR', KEYS[2])
-        redis.call('EXPIRE', KEYS[2], ARGV[1])
+        local now = tonumber(ARGV[4])
+        local window = tonumber(ARGV[1])
+        redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now - window)
+        redis.call('ZADD', KEYS[2], now, ARGV[5])
+        redis.call('EXPIRE', KEYS[2], math.ceil(window))
+        local failures = redis.call('ZCARD', KEYS[2])
 
         -- Check if we should trip the circuit
         local threshold = tonumber(ARGV[2])
         if failures >= threshold then
             redis.call('SET', KEYS[1], '1', 'EX', ARGV[3])
-            redis.call('DEL', KEYS[2])  -- Clear failures counter
+            redis.call('DEL', KEYS[2])  -- Clear the window
             return {1, failures}  -- Circuit tripped
         end
 
@@ -918,7 +931,8 @@ return {1, tokens, 0}
         """
         result = await self.client.eval(
             lua_script, 2, open_key, failures_key,
-            window_seconds, failure_threshold, cooldown_seconds
+            window_seconds, failure_threshold, cooldown_seconds,
+            time.time(), uuid4().hex,
         )
         return (bool(result[0]), int(result[1]))
 
