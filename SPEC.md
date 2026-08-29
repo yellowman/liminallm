@@ -2369,6 +2369,108 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   **15s** and is independently capped by the kernel at **60s**. Schema
   sketches and engine sections describe these fields and cite this rule;
   they do not restate the numbers.
+- The tool circuit breaker is one ledger with one writer, and this
+  bullet is its normative home. Identity is the **resolved tool** — the
+  persisted artifact's id, or the builtin name when nothing is persisted
+  behind it — plus tenant, never the node's reference spelling: two
+  reachable specs sharing a spelling are different tools with different
+  breakers, and the implicit default spelling shares the explicit one's.
+  Every invocation whose serve begins records **exactly one** outcome
+  through one recorder, reached by the attempt driver on both workflow
+  transports — once per retry attempt — and by the direct invocation
+  endpoint (`POST /v1/tools/{id}/invoke`). Failure: a raw tool-level
+  error, an exception after the serve began, the tool's own
+  `timeout_seconds`, or a node deadline that cuts off a started serve.
+  Success: a raw tool-level success — it clears the failure count, and
+  stays a success when the node then fails the consumer's
+  `output_schema`, because node correctness is not tool health. Nothing:
+  a call refused before its serve begins (open breaker, unresolved
+  reference, input validation, plan assembly) and an attempt abandoned
+  by its caller (cancel, revoked lease). **5** failures in **60s** open
+  the breaker for **60s**; the window is rolling — failures are
+  timestamped and only those inside one window ending now count, so
+  failures spaced wider than the window never accumulate into a trip.
+  The timestamps and the cutoff are the ledger's own clock, not any
+  serving host's: the breaker spans replicas, and reading the window
+  against a process-local clock would let a skewed replica keep a
+  breaker tripped past the window or prune a failure early. The failure
+  history is ephemeral, per-window state, and its storage representation
+  is **not** rolling mixed-version compatible: two representations are
+  two independent ledgers, so with both live at once a success clears
+  only one and failures split across both may each stay under threshold
+  — the one-ledger rule the breaker depends on is lost. A change to the
+  representation is therefore a coordinated reset, not a rolling deploy:
+  replicas on the old representation are drained before replicas on the
+  new one serve, and the superseded representation's failure-history
+  namespace is **purged**, not left to its TTL. Abandoning it to the TTL
+  is not a reset: a rollback to the old representation inside that window
+  finds the old counter still live and resumes counting from it — no
+  mixed-version serving at any point, and the breaker opens on a count
+  the reset was meant to have cleared. The purge is a small checked-in
+  reset command, run once per transition, in both directions. The
+  failure history then starts empty; an already-open breaker stays open
+  through the shared `:open` cooldown, which is not part of the
+  representation and is deliberately not reset — a representation change
+  does not make a proven-unhealthy tool healthy. Discarding at most one
+  window of failure history at the boundary is acceptable because the
+  history is ephemeral. Versioning the storage key keeps the boundary
+  safe rather than corrupting — a straggler on the old representation
+  cannot make the new one's reads fail on a wrong value type — but it is
+  a reset boundary, not a licence to run the two representations side by
+  side. Attempt preparation is per attempt and
+  complete: resolution, the admission preflight (input schema,
+  privileged conjunction) and the breaker check, in that order, all
+  decided against the attempt's own resolved spec, identically on both
+  transports and mirrored on direct invocation. An open breaker refuses
+  the call before anything starts, a breaker tripped by one attempt
+  refuses the next, a tool retired between attempts refuses the retry
+  rather than running from a captured descriptor — and a retry that
+  resolves a *different* spec passes that spec's preflight or is
+  refused, because carrying the first attempt's verdict onto a
+  privileged same-name spec is an authority bypass. Preparation spends
+  the attempt's deadline: the absolute deadline is fixed before
+  preparation begins, and a stalled resolution or breaker check times
+  the attempt out rather than granting the body a fresh clock; a
+  preparation cut off this way never started and records nothing. The
+  transport decision — streamed tokens or the blocking body — reads the
+  same per-attempt resolution, so no lookup runs outside the deadline.
+  Preparation runs under attempt-scoped authority established before it
+  begins: a deadline that expires during preparation or planning —
+  anywhere before the worker spawn — revokes that attempt alone, and
+  the retry policy keeps its remaining attempts; only the caller's
+  cancel ends the logical execution. The spawn allocates its scratch
+  directory *outside* the execution's lock — allocation is filesystem
+  work, and a stalled allocation must not be able to hold off the revoke
+  that a node deadline drives through that same lock — then joins the
+  driver's attempt by **exact identity**, never "whatever is current":
+  under the lock it revalidates the attempt, transfers ownership of the
+  scratch, and starts and registers the worker as one step, so a revoke
+  lands before the worker exists or after it is registered, never
+  between. A stale serve waking after the retry began — or after the
+  execution closed — is refused at that revalidation, and deletes the
+  scratch it had allocated, so it leaves nothing behind. Ownership
+  transfers only once the worker is registered — a spawn that fails
+  setup leaves the attempt to its opener, and the retry is not held for a
+  serve that never ran. A
+  stream producer starts under the same gate. The one exception is a
+  degraded fallback — the attachment agent answering in plain text after
+  its own serve failed and was revoked to take the worker down: that
+  producer starts on a revoked invocation, because the revoke was its own
+  teardown and not the caller leaving, and refuses only a cancelled one.
+  It carries no observation and records nothing; the agent's failure was
+  already recorded. `started` means the
+  worker or producer actually started, marked inside the registration
+  step itself — not when the spawn call returns, so a worker killed
+  during its readiness handshake died started — and never at
+  scheduling; the recorder writes nothing for an attempt that
+  never started, as a backstop rather than a convention. Recovery is
+  not tool health: a body that salvages a partial answer after its
+  serve failed still records the failure — the observation is sticky —
+  while caller abandonment (cancel, revoked lease) still records
+  nothing. A stream cut short by a stop is an interrupted stream, never
+  a natural end that completes a partial answer; a stream that ends on
+  its own without a completed result is a started serve with no answer,
+  and records the failure.
 - The worker holds nothing; the parent serves every effect. The child
   gets a plan — inputs, messages, offered schemas, budgets — and no store
   handle, model client, settings object, filesystem credential, or

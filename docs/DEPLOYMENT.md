@@ -62,6 +62,21 @@ scale out by running the same image behind a load balancer. postgres and `shared
 - **background work**: periodic clustering and adapter-prune proposals take a postgres advisory lock, so they run once per interval cluster-wide rather than once per replica. training jobs need no lock — claiming a job is an atomic conditional update, so exactly one replica wins each one.
 - **workers per node**: with `model_backend` on `local_gpu_lora` keep `--workers 1` per gpu and scale by adding nodes; api backends scale fine with several workers per node.
 
+## upgrades: rolling by default, one exception
+ordinary upgrades roll: replace replicas one at a time behind the balancer, and old and new images serve side by side while the fleet turns over. nothing in the app requires a flag day for a normal deploy.
+
+the one exception is a change to the **circuit-breaker failure-history representation** (SPEC §18.3). the breaker's failure history is ephemeral, per-window redis state, and it has two on-disk shapes: the legacy plain counter at `circuit:*:failures` and the rolling-window sorted set at `circuit:*:failures:v2`. they are **independent ledgers** — a key is one shape or the other, never both — so if old and new replicas serve at once, a success on one shape does not clear the other, and five real failures can split across the two and trip neither. a representation change must therefore be a coordinated reset, not a rolling deploy:
+
+1. stop admitting traffic to the replicas on the old representation (drain them from the balancer);
+2. wait for their in-flight requests to finish;
+3. purge the **superseded** representation's failure history: `python scripts/reset_breaker_history.py --representation legacy` when cutting over to the rolling window (`--representation v2` when rolling back). add `--dry-run` first to see the count. this retires the old keys rather than trusting their ≤60s ttl — a rollback inside that window would otherwise find the old counter still live and resume counting from it, opening a breaker the reset was meant to have cleared;
+4. start the replicas on the new representation;
+5. do **not** overlap the two representations at any point;
+6. the shared `circuit:*:open` cooldown keys are intentionally left alone — an already-open breaker stays open across the reset, because a representation change does not make a proven-unhealthy tool healthy;
+7. a rollback is the same procedure in reverse: drain the new replicas, purge `--representation v2`, start the old ones.
+
+losing at most one 60s window of failure history at the boundary is acceptable — redis breaker state is ephemeral by definition, and one empty minute is cheaper than two contradictory ledgers.
+
 ## configuration management expectations
 - principle: most runtime knobs live in the database and are editable via the admin ui (`/admin`) instead of env vars.
 - database-managed settings include session rotation, concurrency caps, rate limits, pagination defaults, token ttls, feature flags (mfa/signup), training worker toggles, smtp/oauth and url settings, voice defaults, model backend/path, rag mode, embedding model id, and tenant/jwt claims.

@@ -76,6 +76,11 @@ class StreamPump:
         self._loop = loop or asyncio.get_running_loop()
         self._queue: asyncio.Queue = asyncio.Queue()
         self._stop = threading.Event()
+        #: Set when the producer ran to its natural end. `_DONE` alone cannot
+        #: say why the stream ended — `stop()` injects the same sentinel — and
+        #: a consumer that reads an interrupted stream as a finished one turns
+        #: a cancellation into a completed answer.
+        self._completed = False
         #: The producer's iterator, kept so `stop` can reach its `abort` — a
         #: cancellable backend stream can interrupt a read in flight, and the
         #: stop flag alone is only read *between* events.
@@ -115,6 +120,11 @@ class StreamPump:
                 if self._stop.is_set():
                     break
                 self._emit(event)
+            else:
+                # The producer returned on its own; only this path is a
+                # natural end of stream. A break on the stop flag, an
+                # exception, and a refusal to start all leave it unset.
+                self._completed = True
         except BaseException as exc:  # noqa: BLE001 - reported as an event
             # After a stop this is the abort surfacing — the shutdown socket
             # raises out of the read — not a result anyone may act on.
@@ -173,6 +183,11 @@ class StreamPump:
     def alive(self) -> bool:
         return self._thread.is_alive()
 
+    @property
+    def interrupted(self) -> bool:
+        """Whether a stop cut this stream short of its natural end."""
+        return self._stop.is_set() and not self._completed
+
     def cancellation_proven(self) -> bool:
         """Whether this producer's death can be presumed prompt.
 
@@ -193,6 +208,39 @@ class StreamPump:
             return True
         await asyncio.to_thread(self._thread.join, timeout)
         return not self._thread.is_alive()
+
+
+@dataclass
+class BreakerObservation:
+    """What one attempt learned about the tool's health (SPEC §18).
+
+    Deliberately not derived from the attempt's node-level result: a node can
+    fail for reasons that say nothing about the tool — the consumer's
+    `output_schema`, an input refused before anything ran — and the ledger
+    must record what the *tool* did. `outcome` is set at the raw tool
+    boundary; `started` marks that the tool's own work began, which is what
+    lets a deadline that fired mid-serve count as a failure while one that
+    fired during planning records nothing.
+    """
+
+    #: The resolved breaker identity this attempt runs under — the persisted
+    #: artifact's id, or the builtin name when nothing is persisted behind
+    #: it. On the observation rather than beside it, because resolution is
+    #: per attempt: two attempts of one node can resolve different rows, and
+    #: each outcome belongs to the row that produced it.
+    identity: Optional[str] = None
+    #: The driver's `Attempt` this observation belongs to — the exact token
+    #: a worker spawn or producer start must present to run under this
+    #: attempt's authority. Typed loosely to keep this module free of the
+    #: invocation machinery; ``None`` for driverless direct invocations.
+    attempt: Optional[Any] = None
+    #: The tool's own work began: the worker's serve started, or the stream's
+    #: producer ran. Resolution, admission, validation and planning all
+    #: precede it.
+    started: bool = False
+    #: "success" | "failure", or None when the attempt proved nothing about
+    #: the tool — refused before it started, or abandoned by its caller.
+    outcome: Optional[str] = None
 
 
 @dataclass
@@ -234,11 +282,9 @@ class NodeAttempt(Protocol):
     #: never start un-begun work there.
     result_ready_after_events: bool
 
-    #: Whether the driver must open an `Attempt` lease for this try (SPEC
-    #: §18.3: authority is fresh per attempt). True for attempts whose work
-    #: runs in this process; False when the body spawns a worker, because the
-    #: spawn opens the lease itself and a second one here would double-count.
-    needs_lease: bool
+    #: This attempt's breaker observation. The attempt fills it in; the
+    #: driver writes the ledger from it, exactly once per attempt.
+    breaker: BreakerObservation
 
     def events(self) -> AsyncIterator[Dict[str, Any]]: ...
 
@@ -253,13 +299,19 @@ class BlockingNodeAttempt:
     """
 
     unreaped_error = "tool_worker_unreaped"
-    #: The worker spawn calls `begin_attempt` itself, per §18.3.
-    needs_lease = False
     #: The body runs inside `result()`; nothing exists before it is awaited.
     result_ready_after_events = False
 
-    def __init__(self, run: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        run: Callable[[], Any],
+        *,
+        breaker: Optional[BreakerObservation] = None,
+    ) -> None:
         self._run = run
+        #: Shared with the body: the engine's tool invocation sets it at the
+        #: raw tool boundary, inside `run`, and the driver reads it here.
+        self.breaker = breaker or BreakerObservation()
 
     async def events(self) -> AsyncIterator[Dict[str, Any]]:
         return
@@ -295,12 +347,6 @@ class StreamedNodeAttempt:
     """
 
     unreaped_error = "stream_producer_unreaped"
-    #: No worker spawn on this path, so nothing else opens the lease. Without
-    #: it a streamed retry ran with no authority of its own — and worse:
-    #: `revoke("retry")` found no current attempt, read that as "nothing has
-    #: started", cancelled the whole execution, and the next attempt called
-    #: the provider anyway because nothing here asked.
-    needs_lease = True
     #: `_drain` stores the outcome before it finishes; `result()` reads it.
     result_ready_after_events = True
 
@@ -312,6 +358,7 @@ class StreamedNodeAttempt:
             [Dict[str, Any]], Tuple[Dict[str, Any], Optional[Dict[str, Any]]]
         ],
         buffer: bool = False,
+        breaker: Optional[BreakerObservation] = None,
     ) -> None:
         self._stream = stream
         #: The postflight: `(sanitized, refusal)`. Always applied, exactly as
@@ -319,6 +366,12 @@ class StreamedNodeAttempt:
         #: schema, and what proceeds downstream is the sanitized object.
         self._finalize = finalize
         self._buffer = buffer
+        #: Shared with the streaming body, which marks `started` at its own
+        #: serve boundary — the worker spawn or the provider pump, not this
+        #: class's first pull: the body plans (retrieval, grounding, context
+        #: assembly) before any tool work runs, and a deadline spent there
+        #: must record nothing.
+        self.breaker = breaker or BreakerObservation()
         self._outcome = NodeOutcome(
             result={"status": "error", "error": "stream produced no answer"}
         )
@@ -339,10 +392,17 @@ class StreamedNodeAttempt:
         emitted = False
         done: Optional[Dict[str, Any]] = None
         raw: Optional[Dict[str, Any]] = None
+        interrupted = False
 
         async for event in self._stream:
             kind = event.get("event")
+            if kind == "cancel_ack":
+                # The pump was cut short of its natural end — the caller's
+                # stop, not the stream finishing. Remembered so the no-answer
+                # tail below stays out of the ledger for it.
+                interrupted = True
             if kind == "error":
+                self.breaker.outcome = "failure"
                 self._outcome = NodeOutcome(
                     result={
                         "status": "error",
@@ -356,6 +416,17 @@ class StreamedNodeAttempt:
                 # The canonical completed result. Consumed, never forwarded:
                 # the client's contract is tokens and `message_done`.
                 raw = dict(event.get("data") or {})
+                # The breaker records what the *tool* did, so the observation
+                # is taken here — before the postflight, whose refusal is the
+                # consumer's schema speaking, not the tool (SPEC §18). A
+                # failure already observed is sticky: a body that salvages a
+                # partial answer after its provider died still emits a
+                # well-formed `tool_result`, and user-facing recovery must
+                # not rewrite tool health.
+                if self.breaker.outcome != "failure":
+                    self.breaker.outcome = (
+                        "failure" if raw.get("status") == "error" else "success"
+                    )
                 continue
             if kind == "message_done":
                 done = event
@@ -368,9 +439,16 @@ class StreamedNodeAttempt:
             yield event
 
         if done is None:
-            # The producer stopped without an answer: a cancel, or a stream
-            # that ended mid-sentence. Either way there is no result to
-            # validate and nothing to record as success.
+            # The producer stopped without an answer. A cancel is the
+            # caller's own stop and records nothing; a stream that ended on
+            # its own mid-sentence — a clean provider EOF — is a serve that
+            # started and produced no completed result, which is a tool
+            # failure: a backend that always dies mid-answer must still be
+            # able to open the breaker (SPEC §18.3). The recorder's own
+            # `started` gate keeps an attempt that never served out of the
+            # ledger either way.
+            if not interrupted and self.breaker.outcome != "failure":
+                self.breaker.outcome = "failure"
             self._outcome = NodeOutcome(result=dict(self._outcome.result), emitted=emitted)
             return
 

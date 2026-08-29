@@ -554,6 +554,10 @@ class Attempt:
     started_at: float = field(default_factory=time.monotonic)
     terminated_at: Optional[float] = None
     revoked: bool = False
+    #: Set when the worker spawn joined this attempt. From that moment the
+    #: parent-side serve loop owns `finished`; before it, whoever began the
+    #: attempt ends it.
+    adopted: bool = False
     #: Set when the parent-side serve loop for this attempt has returned. The
     #: next attempt waits on it, so no two attempts ever have a capability in
     #: flight at the same time.
@@ -692,6 +696,40 @@ class Invocation:
         with self._lock:
             attempt.terminated_at = time.monotonic()
         attempt.finished.set()
+
+    def adopt_attempt(self, expected: Optional[Attempt]) -> Attempt:
+        """The exact attempt this spawn was created for, validated.
+
+        Exact identity, never "whatever is current": an abandoned serve
+        thread waking after a timeout must not join the retry's fresh
+        attempt and run its stale plan under new authority — authority by
+        arrival time is the ambient-authority class this codebase forbids.
+        The spawn that lost the race to a revoke finds its own attempt
+        revoked, or displaced as current, and is refused. With `expected`
+        None — a direct invocation, which has no driver — the spawn begins
+        an attempt of its own.
+
+        Validation only: the caller marks `adopted` after the worker is
+        started *and* registered, under this invocation's lock, so a spawn
+        that fails setup leaves the attempt for its opener to end rather
+        than stranding a lease whose `finished` nobody will set.
+        """
+        with self._lock:
+            if self._cancelled:
+                raise LeaseRevoked(
+                    f"invocation {self.invocation_id} was cancelled "
+                    f"({self._revoke_reason}); no further attempt may start"
+                )
+            if expected is None:
+                return self.begin_attempt()
+            if self._current is not expected or expected.revoked:
+                raise LeaseRevoked(
+                    f"invocation {self.invocation_id} attempt "
+                    f"{expected.index} is no longer the live current "
+                    f"attempt ({self._revoke_reason or 'displaced'}); a "
+                    "stale spawn may not join its successor"
+                )
+            return expected
 
     def await_attempt(self, timeout: float) -> bool:
         """Wait for the current attempt's parent-side work to return.

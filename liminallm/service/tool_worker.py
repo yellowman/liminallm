@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import shutil
 import signal
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
@@ -656,7 +657,9 @@ def spawn(
     plan: Dict[str, Any],
     *,
     limits: Optional[Dict[str, int]] = None,
-    scratch: str,
+    scratch: Callable[[], str],
+    expected_attempt: Any = None,
+    on_started: Optional[Callable[[], None]] = None,
 ) -> WorkerHandle:
     """Start a worker for one attempt at one tool call.
 
@@ -675,25 +678,66 @@ def spawn(
     from liminallm.logging import get_logger  # parent-side: see module docstring
 
     logger = get_logger(__name__)
-    attempt = invocation.begin_attempt()
     # spawn, not fork: forking a threaded API process risks deadlocks, and a
     # fresh interpreter holding none of the parent's handles is the boundary.
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=True)
     budget = FrameBudget(_plan_bytes(plan))
-    process = ctx.Process(
-        target=_worker_main,
-        args=(child_conn, tool, plan, limits or {}, scratch),
-        daemon=True,
-    )
-    process.start()
-    child_conn.close()
-    attempt.pid = process.pid
+    # Two phases, and the split is the whole point. The scratch is allocated
+    # first, *outside* the invocation lock, as this thread's own temporary
+    # directory owned by nobody yet — because allocation is real filesystem
+    # I/O, and the node deadline revokes through this same lock: a `mkdtemp`
+    # that stalls must not be able to hold a revoke off (SPEC §18.3), which
+    # is exactly what happened when it ran inside the lock.
+    #
+    # Then one linearization boundary under the lock: revalidate the exact
+    # attempt this spawn was created for, transfer ownership of the scratch,
+    # start and register the child, and transfer ownership last. A revoke
+    # serializes against this block — it lands before, and the adoption
+    # refuses with no child started, or it lands after and its sweep finds
+    # the registered child. `on_started` — the breaker's record that the
+    # worker really started, one attribute write, no-throw — fires inside the
+    # same block: marked after `spawn` returns, a worker killed during the
+    # READY handshake below died registered but never `started`.
+    #
+    # If the adoption refuses (stale attempt, closed execution), the scratch
+    # was never handed to the invocation, so this thread deletes the
+    # directory it made — a stale serve leaves nothing behind. Once the path
+    # is registered, teardown owns it and a direct delete would race the
+    # opener, so cleanup stops there.
+    registered = False
+    scratch_path: Optional[str] = None
+    try:
+        scratch_path = scratch()
+        with invocation.lock:
+            attempt = invocation.adopt_attempt(expected_attempt)
+            invocation.resources.add_path(scratch_path)
+            registered = True
+            process = ctx.Process(
+                target=_worker_main,
+                args=(child_conn, tool, plan, limits or {}, scratch_path),
+                daemon=True,
+            )
+            reap = lambda: process.join(_JOIN_TIMEOUT_SECONDS)  # noqa: E731
+            process.start()
+            child_conn.close()
+            attempt.pid = process.pid
+            invocation.resources.add_child(
+                process.pid or 0, f"worker:{tool}", group=False, reap=reap
+            )
+            attempt.adopted = True
+            if on_started is not None:
+                on_started()
+    except BaseException:
+        if scratch_path is not None and not registered:
+            shutil.rmtree(scratch_path, ignore_errors=True)
+        for conn in (parent_conn, child_conn):
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - already failing
+                pass
+        raise
     handle = WorkerHandle(process, parent_conn, attempt, budget)
-    reap = lambda: process.join(_JOIN_TIMEOUT_SECONDS)  # noqa: E731
-    invocation.resources.add_child(
-        process.pid or 0, f"worker:{tool}", group=False, reap=reap
-    )
     leads_group = _await_ready(parent_conn, process)
     if leads_group:
         invocation.resources.add_child(

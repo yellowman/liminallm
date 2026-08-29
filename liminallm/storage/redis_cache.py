@@ -6,6 +6,7 @@ import json
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, Union
+from uuid import uuid4
 
 import redis.asyncio as aioredis
 
@@ -45,6 +46,38 @@ class RedisCache:
 
     # Issue 48.3: Default operation timeout for Redis commands
     DEFAULT_OPERATION_TIMEOUT = 5.0  # 5 seconds
+
+    # Named representations of the breaker failure history, and the single
+    # source of truth for their key suffixes. `legacy` is the plain counter
+    # merged main wrote at `:failures`; `v2` is the rolling-window sorted set
+    # at `:failures:v2`. `purge_breaker_failure_history` takes one of these
+    # names, never a raw suffix, so the destructive purge is fail-closed: it
+    # can only ever target a named representation, and an unknown name is
+    # refused before any glob is built. A raw `*` would otherwise expand to
+    # `circuit:*:*` and delete the shared `:open` cooldown along with every
+    # tool's history.
+    FAILURE_REPRESENTATIONS = {
+        "legacy": "failures",
+        "v2": "failures:v2",
+    }
+
+    # The breaker failure history is a sorted set keyed by this suffix, and
+    # the suffix is a version. The history is ephemeral, per-window state,
+    # and the representation is NOT rolling mixed-version compatible: the old
+    # plain counter at `:failures` and this sorted set are independent
+    # ledgers, so with both live a success clears only one and failures split
+    # across both may each stay under threshold. A change of representation
+    # is a coordinated reset — old replicas drained before new ones serve,
+    # the previous history purged by `purge_breaker_failure_history` (not
+    # merely left to expire: a rollback inside the TTL would otherwise find
+    # it live again) — not a rolling deploy. The version is what keeps that
+    # boundary safe rather than
+    # corrupting: a straggler still `INCR`-ing the plain `:failures` string
+    # cannot make this set's `ZADD`/`ZCOUNT` fail `WRONGTYPE`. It is a reset
+    # boundary, not a licence to run the two side by side, so this code owns
+    # `:failures:v2` alone and never reads or clears the legacy key. The
+    # `:open` key is a plain string on both representations and stays shared.
+    _FAILURES_SUFFIX = FAILURE_REPRESENTATIONS["v2"]
 
     # Lua token bucket script (Issue 77.2/77.10/77.12): atomic refill + consume
     _TOKEN_BUCKET_SCRIPT = """
@@ -853,18 +886,30 @@ return {1, tokens, 0}
         """
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         open_key = f"circuit:{tenant_prefix}{tool_id}:open"
-        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:{self._FAILURES_SUFFIX}"
 
-        # Check if circuit is open (tripped)
-        is_open = await self.client.exists(open_key)
-        if is_open:
+        # The cutoff comes from Redis's own clock, not this host's: the write
+        # side timestamps with the same clock, so a skewed replica cannot
+        # push a score into the future and outlast the window, nor have its
+        # failures pruned early (SPEC §18). Returns -1 for an open breaker,
+        # else the failures inside the window ending now.
+        lua_script = """
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+            return -1
+        end
+        local t = redis.call('TIME')
+        local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+        local window = tonumber(ARGV[1])
+        return redis.call('ZCOUNT', KEYS[2], now - window, '+inf')
+        """
+        count = int(
+            await self.client.eval(
+                lua_script, 2, open_key, failures_key, window_seconds
+            )
+        )
+        if count < 0:
             return (True, -1)
-
-        # Get current failure count
-        failures_raw = await self.client.get(failures_key)
-        failure_count = int(failures_raw) if failures_raw else 0
-
-        return (False, failure_count)
+        return (False, count)
 
     async def record_tool_failure(
         self,
@@ -893,24 +938,42 @@ return {1, tokens, 0}
         """
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         open_key = f"circuit:{tenant_prefix}{tool_id}:open"
-        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:{self._FAILURES_SUFFIX}"
 
-        # Lua script for atomic failure recording and circuit tripping
+        # A timestamped set, not a counter with a refreshed TTL. The TTL
+        # refresh made the rule "a chain of failures with no gap over the
+        # window": one failure every fifty seconds eventually tripped a
+        # breaker whose sixty-second window never held five. Entries older
+        # than the window are pruned before counting, so the count is the
+        # failures actually inside one window ending now.
+        #
+        # The timestamp is Redis's own clock, read inside the script, not
+        # this host's `time.time()`: with several replicas a skewed one
+        # would otherwise score a failure in the future and keep the breaker
+        # tripped past the window, or score it in the past and be pruned
+        # early. One clock, the ledger's, so the window means the same thing
+        # to every replica (SPEC §18). The member is a caller-supplied unique
+        # id — data, not a clock — so two failures at the same instant both
+        # count.
         lua_script = """
         -- Check if circuit is already open
         if redis.call('EXISTS', KEYS[1]) == 1 then
             return {1, -1}  -- Already open
         end
 
-        -- Increment failure counter
-        local failures = redis.call('INCR', KEYS[2])
-        redis.call('EXPIRE', KEYS[2], ARGV[1])
+        local t = redis.call('TIME')
+        local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
+        local window = tonumber(ARGV[1])
+        redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now - window)
+        redis.call('ZADD', KEYS[2], now, ARGV[4])
+        redis.call('EXPIRE', KEYS[2], math.ceil(window))
+        local failures = redis.call('ZCARD', KEYS[2])
 
         -- Check if we should trip the circuit
         local threshold = tonumber(ARGV[2])
         if failures >= threshold then
             redis.call('SET', KEYS[1], '1', 'EX', ARGV[3])
-            redis.call('DEL', KEYS[2])  -- Clear failures counter
+            redis.call('DEL', KEYS[2])  -- Clear the window
             return {1, failures}  -- Circuit tripped
         end
 
@@ -918,7 +981,8 @@ return {1, tokens, 0}
         """
         result = await self.client.eval(
             lua_script, 2, open_key, failures_key,
-            window_seconds, failure_threshold, cooldown_seconds
+            window_seconds, failure_threshold, cooldown_seconds,
+            uuid4().hex,
         )
         return (bool(result[0]), int(result[1]))
 
@@ -934,5 +998,47 @@ return {1, tokens, 0}
         failure counter, allowing the circuit to eventually close.
         """
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:{self._FAILURES_SUFFIX}"
         await self.client.delete(failures_key)
+
+    async def purge_breaker_failure_history(
+        self, representation: str, *, dry_run: bool = False
+    ) -> int:
+        """Delete every breaker failure-history key for one storage
+        representation, tenant-wide. Returns the number of keys removed (or,
+        with ``dry_run``, the number that would be removed).
+
+        A change of failure-history representation (see `_FAILURES_SUFFIX`)
+        is a coordinated reset, and a reset has to *retire* the superseded
+        representation, not merely let it expire (SPEC §18.3). Abandoning it
+        to its window-length TTL leaves a resurrection window: a rollback to
+        the old representation inside that TTL finds the old counter still
+        live and resumes counting from it, opening a breaker the reset was
+        meant to have cleared — with no mixed-version serving at any point.
+        Purging the superseded namespace after draining its replicas closes
+        that window in both directions.
+
+        Fail-closed: ``representation`` is a name from
+        `FAILURE_REPRESENTATIONS`, never a raw key suffix. An unknown name
+        raises before any glob is built, so this destructive purge can never
+        be widened into `circuit:*:*` and reach the shared `:open` cooldown
+        or another tool's history. The glob ends at the resolved suffix, so
+        `legacy` does not match `v2` and neither matches `:open` — an
+        already-open breaker keeps its cooldown across the reset, which is
+        deliberate (an unhealthy tool is not made healthy by a representation
+        change). Never flushes the database.
+        """
+        suffix = self.FAILURE_REPRESENTATIONS.get(representation)
+        if suffix is None:
+            raise ValueError(
+                f"unknown breaker representation {representation!r}; expected "
+                f"one of {sorted(self.FAILURE_REPRESENTATIONS)}"
+            )
+        pattern = f"circuit:*:{suffix}"
+        removed = 0
+        async for key in self.client.scan_iter(match=pattern, count=500):
+            if dry_run:
+                removed += 1
+            else:
+                removed += int(await self.client.delete(key))
+        return removed

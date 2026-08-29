@@ -8819,3 +8819,811 @@ tests, an interaction between the outer run's own lease state and the
 lease machinery those tests exercise in-process. The file's docstring
 already warns about the externally-supplied-service shape; the tests
 predate an outer run that leases.
+
+## The breaker ledger had two transports, five phantom writers, and a spelling for a key
+
+The tranche's rule, sharpened by review before any code moved:
+
+    Every tool invocation that actually starts records exactly one breaker
+    outcome against the resolved tool and tenant. Tool-level failure
+    increments; tool-level success clears. Transport and retry path do not
+    change the ledger. A call refused before invocation records nothing.
+
+Characterized by execution first — real engine, real Postgres, real Redis,
+one attempt per row unless stated:
+
+    scenario                         recorded      the rule says
+    blocking raw error               1 failure     1 failure
+    blocking success (seeded 3)      cleared       cleared
+    blocking exception x3 attempts   3             3
+    tool-spec timeout                1 failure     1 failure
+    node-deadline timeout            nothing       1 failure (ruling below)
+    output_schema refusal            1 failure     success — tool answered
+    input-validation refusal         1 failure     nothing — never started
+    unresolved reference             1 failure     nothing
+    plan-phase crash                 1 failure     nothing
+    caller revocation                1 failure     nothing (ruling below)
+    circuit-open refusal             nothing       nothing
+    streamed failure                 nothing       1 failure
+    streamed success (seeded 3)      stayed 3      cleared
+    direct invoke (either outcome)   nothing       recorded, not this tranche
+
+And the key was the node's reference spelling plus tenant on every path, so
+Alice's failing private `foo` opened the breaker for Bob's healthy private
+`foo`, while the implicit default-LLM spelling (`tool` absent) was never
+checked or recorded at all.
+
+The consolidation gives the ledger one writer. Attempts carry a
+`BreakerObservation` — `started` and `outcome`, explicitly not derived from
+the node result — filled at the raw tool boundary: `_invoke_tool` sets it
+for blocking (before the postflight), `StreamedNodeAttempt._drain` sets it
+for streaming (at the `tool_result` event, before `finalize`). The shared
+attempt driver writes the ledger exactly once per attempt in its
+per-attempt `finally`, keyed by the resolved identity — the persisted
+artifact's id, or the builtin name when nothing is persisted behind it —
+which the seeded default tools make an artifact id even for `llm.generic`.
+The breaker *check* moved before the invocation opens
+(`_execute_node_with_retry`, mirroring the streaming preflight), so a
+refusal is now truly pre-invocation: it opens nothing, records nothing, and
+no longer burns the node's retries and backoff on calls the breaker was
+always going to refuse — with `on_error` it takes that edge immediately,
+without one the turn fails immediately.
+
+Two boundary rulings, stated in SPEC §18.3 rather than slipped in:
+
+* An attempt that starts and is then cut off at the node's own deadline
+  records a failure. Without it a backend hung past every node budget never
+  records an outcome — the breaker could not open for exactly the hang it
+  exists to stop. `started` marks the serve, so the same deadline spent in
+  plan assembly still records nothing.
+* An attempt abandoned by its caller — cancel, revoked lease — records
+  nothing. Charging revocations meant a user's cancel habit could open
+  their tenant's breaker with the tool never once at fault.
+
+Witnesses: `tests/test_tool_breaker_accounting.py`, nineteen tests — twelve
+were red on the previous code, each failing on its own assertion; the
+seven controls pin what already held. Exact-count witnesses sum the
+identity key and the spelling key, so a write regressed to the spelling is
+a miscount, not a miss.
+
+Mutations, seventeen across the reviewer's six families plus the boundary
+placements, each run against the witness file with sources restored and
+verified byte-for-byte between runs:
+
+    mutation                                        outcome
+    drop streamed failure accounting                killed
+    blocking raw failures recorded as success       killed
+    success no longer resets the count              killed
+    circuit-open refusal records a failure          equivalent (below)
+    unresolved reference records a failure          killed
+    input-validation refusal records a failure      killed
+    blocking outcome derived from final node status killed
+    streamed outcome derived from final node status killed
+    blocking identity collapsed to the spelling     killed
+    streamed check keyed by the spelling            killed
+    streamed record keyed by the spelling           killed
+    node-deadline completion dropped                killed
+    started marked at entry instead of at serve     killed
+    caller revocation counted as failure            killed
+    the driver writes twice                         killed
+    streamed raw observation dropped                killed
+    the driver write removed entirely               killed
+
+The survivor is an equivalent mutant, not a coverage hole. A circuit-open
+refusal exists only while the open key exists, and `record_tool_failure`'s
+atomic script begins by returning `already open` without incrementing when
+it does — so a failure recorded at that refusal site writes nothing the
+ledger can show. The property is enforced twice, engine and cache; the
+mutant disables the engine half and the cache half holds. It stops being
+equivalent only in the window where the open key expires between the check
+and the write, which no test can stage deterministically.
+
+Recorded, not fixed — two residuals for the reviewer:
+
+* The direct-invocation path (`invoke_tool`, serving
+  `POST /v1/tools/{id}/invoke`) neither consults nor writes the breaker,
+  measured before and unchanged here: it has no driver, and giving it one
+  is its own change. Under the invariant those invocations do start, so
+  they should record; scoped out rather than half-done.
+* A streamed producer that ends cleanly with no `message_done` and no
+  error event records nothing. The only in-tree way to end that way is the
+  pump's deliberate stop (caller-side, correctly nothing); a provider
+  stream that truncates without erroring would evade the ledger, and
+  distinguishing the two needs a signal the attempt does not have today.
+* One full-lane run during this tranche failed
+  `test_a_stream_request_never_reuses_a_warmed_connection` (a tranche-2
+  witness over untouched code): its arming poll allows 2 seconds under a
+  saturated 4-vCPU lane. Green five times serially and green in the
+  confirming full lane; recorded as a load-sensitivity observation, not
+  repaired here.
+
+## Review found the breaker bound to the node, not the attempt
+
+Four findings on the first breaker commit, three of them merge blockers,
+none visible to its own nineteen witnesses — each is now a red turned
+green:
+
+1. A breaker tripped by attempt one did not stop attempt two. The check
+   ran once before the logical invocation opened, so a node with retries
+   walked its remaining attempts straight past the trip its own first
+   attempt caused: seeded to four failures, a failing tool with
+   `max_retries: 2` ran three times where the rule allows one. Both
+   transports.
+2. The same hoist froze the descriptor at node entry, and every retry ran
+   the captured spec. That regressed tranche 2's frozen rule — current
+   canonical state is consulted at execution, and a process-local capture
+   cannot create authority: a tool retired by its own first attempt was
+   executed again by the second.
+3. The streamed `started` mark sat at the drain's first pull — before the
+   streaming bodies plan. Retrieval and budget assembly (plain LLM) and
+   grounding plus agent-context assembly (`agent.files_v1`) all ran after
+   the mark, so a node deadline spent in streamed planning was recorded
+   as a tool failure while the same deadline on the blocking path
+   correctly recorded nothing.
+4. The commit knowingly shipped SPEC broader than the code: "every
+   invocation whose serve begins records exactly one outcome" beside an
+   ISSUES residual admitting the direct endpoint records nothing. The
+   review declined the pairing — a normative rule the implementation
+   contradicts on purpose is a false rule.
+
+One correction resolves the first two: attempts are prepared immediately
+before they start, inside the driver's loop. `_resolve_attempt_authority`
+resolves the descriptor fresh, derives the breaker identity, and checks
+the breaker — per attempt, one helper for both transports — and a refusal
+comes back as the attempt itself: terminal, routed through the same
+refused-result chooser, retrying nothing. The identity moved onto the
+observation, because with per-attempt resolution two attempts of one node
+can legitimately run under two different rows. For the third, the
+observation now travels into the streaming bodies and `started` is marked
+at the real serve boundaries — the provider pump for the plain LLM node,
+the worker serve for the agent — with two new hang witnesses pinning that
+a provider or serve that starts and stalls past the node deadline records
+the failure the mark exists to catch. For the fourth, the direct endpoint
+now checks the breaker before starting and records through the same
+recorder, and SPEC names the endpoint in the writer sentence instead of
+excusing it.
+
+The review also rejected the "equivalent mutant" claim from the first
+round, correctly: Redis masking a wrong engine call is not the engine
+being right. The circuit-open witnesses now hold a delegating spy over
+the real cache and assert the refusal made no recording call at all,
+which kills that mutant deterministically instead of excusing it.
+
+The mutation set was rebuilt for the new structure and grew to
+twenty-five, all killed — the round-one survivor included:
+
+    mutation                                        outcome
+    drop streamed failure accounting                killed
+    blocking raw failures recorded as success       killed
+    success no longer resets the count              killed
+    streamed raw observation dropped                killed
+    breaker refusal records a failure (shared)      killed (was: survived)
+    unresolved reference records a failure          killed
+    input-validation refusal records a failure      killed
+    direct refusal records a failure                killed
+    blocking outcome derived from final node status killed
+    streamed outcome derived from final node status killed
+    shared identity collapsed to the spelling       killed
+    streamed observation identity to the spelling   killed
+    direct identity collapsed to the spelling       killed
+    blocking observation identity to the spelling   killed
+    started-and-cut-off completion dropped          killed
+    started marked at entry instead of at serve     killed
+    caller revocation counted as failure            killed
+    streamed started re-marked at drain entry       killed
+    llm-body serve mark dropped                     killed
+    agent-body serve mark dropped                   killed
+    the driver writes twice                         killed
+    the driver write removed entirely               killed
+    direct breaker check dropped                    killed
+    direct recording dropped                        killed
+    resolution cached across attempts               killed
+
+The witnesses for findings one and two need no synthetic mutants: they
+were written red against the exact structure under indictment — the
+committed hoist — and turned green only when the preparation moved into
+the attempt loop, which is the direct sensitivity proof a string mutation
+would only imitate.
+
+## The preparation seam re-resolved authority and forgot to re-adjudicate it
+
+Review of the second breaker commit found three more merge blockers, all
+exposed by the per-attempt preparation the previous round introduced. Each
+is a red turned green.
+
+1. Fresh streaming authority was not freshly preflighted. The streaming
+   branch ran `tool_preflight` once, against the descriptor that chose the
+   transport; every retry then re-resolved a fresh descriptor and inherited
+   that first verdict. An ordinary user's non-privileged private spec could
+   fail, be retired, and the retry fall through to an admin-owned
+   *privileged* spec of the same name — and run it, because the clean
+   preflight travelled while the spec did not. An authority bypass, not
+   staleness. Preparation is now complete: resolution, the admission
+   preflight against the attempt's own inputs, then the breaker check, one
+   helper for both transports, and the outer streaming preflight is gone.
+   The witness runs exactly the bypass; its complement proves a
+   substituted spec's `input_schema` refuses the retry. `tool_preflight`
+   still also runs inside `_invoke_tool` — the authority witnesses pin the
+   invocation boundary as its own backstop, and one function called twice
+   is not two copies.
+2. Preparation could spend the deadline and the tool started anyway. The
+   driver computed the node budget, awaited preparation unbounded, and
+   only then started the clock — so a breaker check that stalled half a
+   second handed the body a fresh budget past the node's own deadline, the
+   same class as tranche 2's blocking-work-after-budget, one seam earlier.
+   The absolute deadline is now fixed before preparation, preparation is
+   awaited under it, and the resolver and preflight run off-loop so the
+   bound is a hard wall clock rather than one noticed after a stalled
+   query returns. A preparation cut off this way never `started` and
+   records nothing.
+3. The agent could turn a real post-start failure into breaker success.
+   `agent.files_v1` deliberately salvages: a final stream that dies after
+   a token keeps the partial answer and emits a well-formed `tool_result`,
+   which the attempt read as a raw success — five provider deaths became a
+   clean bill of health because the UI kept the fragments. The agent's
+   catch now marks the observation failed (revoked leases excluded: caller
+   abandonment still records nothing) and the observation is sticky — a
+   later partial or fallback `tool_result` cannot rewrite a failure. The
+   witness seeds four failures, salvages a partial, asserts the partial
+   still reaches the client *and* the breaker is open.
+
+SPEC §18.3 now states all three normatively: preparation per attempt and
+complete, in resolve → preflight → breaker order on both transports;
+preparation spends the attempt's deadline; recovery is not tool health.
+One ordering note made deliberately rather than silently: the workflow
+transports refuse invalid input before consulting the breaker, while the
+direct endpoint checks the breaker first and preflights inside the
+invocation — the transports now agree with each other, which is what the
+review asked; aligning the direct endpoint's order is a one-line follow-up
+if wanted.
+
+Five witnesses were added — the bypass, its validation complement, the
+deadline, the salvage, and a direct input refusal — bringing the file to
+thirty-four, and the mutation set grew to twenty-nine, all killed:
+
+    new mutation                                    outcome
+    preflight dropped from attempt preparation      killed
+    deadline established after preparation          killed
+    agent caught failure left unmarked              killed
+    observation stickiness dropped                  killed
+
+The preflight-drop mutant is killed by the retry-shaped witnesses alone —
+the single-attempt validation witness survives it through the
+`_invoke_tool` backstop, which is exactly the layering: the backstop
+guards the invocation, the preparation guards the attempt, and only the
+attempt-level half can see a spec that changed between retries.
+
+## A timeout with nowhere to land cancelled the execution, and two more seams review found beside it
+
+Round four on the breaker tranche: three runtime blockers and the direct
+ordering the previous round had left as a follow-up. Each is a red turned
+green.
+
+1. A timeout before the worker opened its `Attempt` cancelled the whole
+   logical execution. `Invocation.revoke` with no current attempt fails
+   closed by cancelling everything — right for a revoke racing the first
+   spawn, wrong for a node timeout whose retry policy still owes the node
+   its retry. A stalled breaker check on attempt one, or blocking plan
+   assembly running past the deadline, both revoked pre-spawn: the retry
+   then died on `begin_attempt` (streamed) or was refused at its own spawn
+   (blocking). The driver now establishes attempt-scoped authority before
+   any cancelable work — `begin_attempt` precedes preparation for every
+   attempt — so its timeout always revokes the attempt, never the
+   execution. The worker spawn *adopts* the driver's attempt instead of
+   beginning its own (`Invocation.adopt_attempt`), refusing one the
+   timeout already revoked, which keeps the pre-spawn revoke fence; a
+   driverless caller — direct invocation — still begins its own. Once
+   adopted, the parent-side serve loop keeps sole ownership of `finished`,
+   so a retry still waits for the abandoned serve to actually return; the
+   driver ends only attempts nothing adopted. Three witnesses: a stalled
+   breaker check, its streamed sibling, and stalled plan assembly — each
+   with a fast second attempt that must succeed.
+2. Streaming still had one free, synchronous resolver: the dispatch call
+   that chose streamed-versus-blocking ran before any node deadline
+   existed, so a stalled lookup granted the provider a fresh clock — the
+   class the previous round closed, surviving in the one lookup that round
+   did not move. The dispatch resolver is gone: every `tool_call` node
+   enters the shared attempt driver, and the *preparation* decides the
+   transport from the same per-attempt resolution the admission uses — a
+   non-streamable spec, or a backend that cannot be stopped, gets a
+   blocking attempt under the same driver, deadline and ledger, and the
+   streaming loop applies the blocking bookkeeping to outcomes that
+   carried no client events. The `tool_changed` refusal died with the
+   frozen dispatch: a spec that stops streaming between attempts now
+   simply runs blocking.
+3. Caller cancellation could still clear the agent's breaker. The pump's
+   stop injects the same `_DONE` sentinel a finished producer emits, so a
+   cancel landing while the provider was blocked mid-read ended
+   `_pumped()` as if the stream had completed: the agent fell out of its
+   loop, emitted a well-formed partial `tool_result`, and the caller's own
+   cancel recorded a breaker success over four seeded failures. The pump
+   now knows why it ended — `interrupted` is a stop that cut the producer
+   short of its natural end — and `_pumped` emits `cancel_ack` for an
+   interrupted stream, which the agent's existing cancel branch turns into
+   an unrecorded, unanswered exit. The witness cancels mid-read and holds
+   the count at four, with a spy proving no success was ever recorded.
+4. The direct endpoint's admission order now matches the transports
+   instead of being recorded as a follow-up: `_admit_descriptor` — the
+   preflight, then the breaker — is the second half of attempt preparation
+   and the whole of direct admission, which skips only the resolution it
+   does not need. With both grounds to refuse, every seam answers
+   validation, not circuit-open; the witness holds an open breaker against
+   an impossible input schema and requires `validation_error`.
+
+Six new witnesses (the three timeout-retry shapes, the dispatch clock,
+the cancel-mid-read, the direct order) plus a seam probe of the
+invocation backstop, bringing the file to forty-seven. The mutation set
+is thirty-three, all killed. The five new mutants:
+
+    new mutation                                    outcome
+    driver timeout cancels the execution            killed
+    attempt begun after preparation                 killed
+    dispatch resolver reintroduced pre-driver       killed
+    pump interruption read as natural end           killed
+    pump `interrupted` never true                   killed
+
+One prior mutant needed a new witness rather than a shrug: with admission
+now refusing at every seam, the `_invoke_tool` backstop's refusal branch
+became unreachable from the workflow and direct paths, and the mutant
+that makes it record survived as dead code. The backstop exists precisely
+for a caller that skips admission, so it earned a seam-level probe — the
+refusal returns, the observation stays empty, and the recorder writes
+nothing — which kills that mutant deterministically.
+
+One load-sensitivity observation, same class as the pool-arming witness
+recorded earlier: one loaded full-lane run failed
+`test_a_replacement_cannot_be_undone_by_a_write_already_in_flight` — a
+file-replacement race witness over code this tranche never touched, last
+changed before this branch existed. Green five times serially (a 31-second
+concurrency witness each run) and green on the confirming full lane;
+recorded, not repaired here.
+
+## Authority travelled by arrival time, and three smaller doors beside it
+
+Round five on the breaker tranche found the deepest defect of the
+campaign in the round-four adoption seam, plus a producer-start race, a
+`started` mark that still meant "scheduled", and the truncation gap the
+first round had recorded as a residual. Every one is a red turned green.
+
+1. `adopt_attempt()` adopted whatever attempt happened to be current.
+   Attempt A's serve, queued in a thread pool, could wake after the node
+   timed out, A was revoked and ended, and retry B had begun — and join
+   B: A's stale plan executing under B's fresh authority, potentially
+   beside B's own worker. Ambient authority by arrival time, the exact
+   class tranche 2 removed from resolution. Adoption is now by exact
+   attempt identity: the driver stamps its lease onto the per-attempt
+   observation, the serve hands that token to the spawn, and
+   `adopt_attempt(expected)` refuses anything that is not the live
+   current attempt — the staged race runs the tool body once, not twice.
+   Two smaller doors in the same seam closed with it. Adoption, worker
+   start and child registration are now one step under the execution's
+   lock, so a revoke lands before the worker exists (the adoption
+   refuses) or after it is registered (the sweep finds it), never in
+   between — witnessed with a held fake process proving a revoke cannot
+   complete inside the spawn window. And ownership transfers only after
+   registration: a `process.start()` that raises leaves the attempt
+   unadopted for the driver to end, so a one-line OSError is an ordinary
+   retryable failure — measured at thirty seconds of `tool_worker_unreaped`
+   before, under two seconds after.
+2. A cancel landing during streamed preparation still started the
+   provider: preparation returned normally onto a revoked attempt, and
+   the pump was built and running before anything consulted the cancel.
+   The producer now starts the way a worker does — under the invocation
+   lock, exact attempt verified live, started and registered atomically,
+   `cancel_ack` when the gate refuses. The witness blocks preparation in
+   the breaker check, cancels, and requires zero provider calls and an
+   empty ledger.
+3. `started` still meant "the serve was scheduled": blocking marked it
+   before `to_thread` ever ran the serve, so a saturated pool — or the
+   adoption refusal above — charged the tool for a worker that never
+   existed. The mark moved to the atomic start point on every path: after
+   the spawn registers the worker, inside the producer gate for streams.
+   And `_record_breaker_outcome` now refuses to write for an unstarted
+   attempt outright — the normative boundary as a backstop rather than a
+   convention every caller must remember.
+4. A stream that ended cleanly without a completed result still recorded
+   nothing — the first round's residual, now cheap to close because the
+   pump distinguishes interruption from natural completion: the caller's
+   stop stays silent, and a clean provider EOF with no answer is a
+   started serve that failed. Five clean truncations open the breaker.
+
+Seven reds staged the races the forty-seven prior witnesses never
+staged — the late adoption, the exact-token contract, the spawn-failure
+strand, the revoke window, the cancel during preparation, the pre-spawn
+deadline, the clean truncation — plus a cancel discovered between events
+and a drain-seam probe, bringing the file to fifty. The mutation set is
+thirty-nine, all killed; the six new mutants:
+
+    new mutation                                    outcome
+    adoption falls back to whatever is current      killed
+    ownership transferred before process start      killed
+    producer gate dropped                           killed
+    recorder writes for an unstarted attempt        killed
+    truncation not recorded as failure              killed
+    interruption recorded as failure                killed
+
+Two witnesses had gone insensitive under this round's own layering and
+were sharpened rather than excused. The revocation witness's serve double
+never marked `started`, so the new recorder gate masked the very write it
+polices — it now marks `started` the way the real serve does, standing
+for a worker that spawned and was then revoked. And the interruption
+carve-out in the drain turned out to be unreachable end-to-end — every
+running path stops iterating at the forwarded `cancel_ack`, so the
+no-answer tail never runs post-acknowledgment — which made the
+interruption-records-failure mutant survive twice; it is now killed by a
+seam probe of the attempt's own contract, the same resolution the
+invocation backstop got a round earlier: defense-in-depth stays, and it
+stays witnessed.
+
+## The atomic start point was one call too late, and the window was not a window
+
+Round six moved the round-five boundaries the last distance. The atomic
+start point existed but the mark chased it from outside; the adoption
+gate existed but the scratch was allocated on the way in; and the
+sixty-second window the SPEC has always stated turned out to be a TTL
+that refreshed itself. Three reds, three greens.
+
+1. A worker could start, register, and be killed while the breaker still
+   said `started=False`. The spawn's locked block adopted, started and
+   registered the worker — but the mark lived in `_serve_invocation`,
+   after `spawn()` returned, and between the two sits the READY
+   handshake: up to fifteen seconds waiting for the child to prove its
+   process group. A node deadline expiring in that window killed a
+   registered, running worker and recorded nothing — exactly the
+   unhealthy-tool shape the ledger exists to count, and the same
+   "marked one seam late" class as round five's scheduling mark, one
+   seam later. `spawn()` now takes a no-throw `on_started` callback and
+   invokes it inside the locked registration block itself, so the mark
+   and the registration are the same step; the serve passes a one-line
+   `mark_started`. The red holds the READY wait open for six seconds
+   under a 2.5-second node deadline and requires the kill to record
+   exactly one failure.
+2. A stale serve waking after the invocation closed could still create
+   filesystem state. The scratch was allocated in the spawn call
+   expression — evaluated before the adoption validated anything — so
+   the refusal arrived after `mkdtemp` and `add_path`, and the close
+   that would have removed the path had already run; a second close is
+   an idempotent no-op, so the orphan survived. The scratch argument is
+   now a zero-argument factory, called after `adopt_attempt` inside the
+   locked block: a refused adoption allocates nothing. The red closes
+   the invocation, wakes the stale serve, and requires the refusal plus
+   zero scratch allocations.
+3. The breaker did not implement "5 failures in 60 seconds". The Lua
+   recorder incremented a counter and refreshed its TTL on every
+   failure, which makes the real rule "a chain of failures with no gap
+   longer than the window": one failure every fifty seconds tripped a
+   breaker whose sixty-second window never held five. The counter is
+   now a timestamped set — prune entries older than the window, add,
+   count — and the read side counts the same score range, so the count
+   is the failures inside one window ending now. The red sets threshold
+   three over a one-second window and drips failures 600 milliseconds
+   apart across 1.2 seconds: under the TTL refresh the third drip
+   tripped; now nothing does, and the burst control inside one window
+   still trips.
+
+The three reds plus the burst control bring the witness file to
+fifty-four. The mutation set is forty-two, all killed; the three new
+mutants:
+
+    new mutation                                    outcome
+    started marked only after spawn returns         killed
+    scratch allocated before the adoption gate      killed
+    window pruning dropped from the recorder        killed
+
+Two prior mutants were re-anchored rather than retired: the
+serve-boundary mark block they deleted no longer exists, so both now
+delete the `on_started` invocation inside the spawn block — the same
+semantic hole, at the seam it moved to — and the ownership-before-start
+mutant re-anchored around the scratch and process construction the lock
+now encloses. Collateral: two invocation-lease witnesses called
+`spawn()` with the old scratch-path string and now pass a factory, and
+the SPEC bullet gained the words the code finally earned — the window
+is rolling, the scratch is allocated inside the locked step, and
+`started` is marked at registration itself, not when the spawn call
+returns.
+
+## The round-six mechanisms had a lock held too wide and a clock owned by the wrong process
+
+Round six fixed three real defects, and review then found that two of its
+fixes had each introduced a smaller one, plus a third the rolling window
+had carried in from the start. All three are distributed-systems faults —
+a lock, a key type, and a clock — and all three are a red turned green.
+
+1. Moving the scratch allocation inside `invocation.lock` let a stalled
+   `mkdtemp` hold a revoke hostage. Round six put the scratch factory
+   behind the exact-attempt gate to stop a stale serve leaving a
+   directory behind — correct — but the gate is the invocation lock, and
+   the node deadline revokes through that same lock. `_worker_scratch`
+   does real filesystem work, `mkdir` and `mkdtemp`; a slow one now ran
+   while the lock was held, so a 300-millisecond node deadline could take
+   the full allocation time to revoke. The hard wall-clock deadline
+   earlier rounds established was quietly back to "the deadline, plus
+   however long the disk took". The fix is two phases: the scratch is
+   allocated first, outside the lock, as this thread's own directory
+   owned by nobody; then under the lock the spawn revalidates the exact
+   attempt, transfers ownership of the directory, and starts and
+   registers the worker as one step. A spawn refused at the revalidation
+   deletes the directory it made, so a stale serve still leaves nothing
+   behind — the round-six property, kept, without the lock over the I/O.
+   The red blocks the allocation for two seconds under the deadline and
+   requires the revoke to return in well under one, with no worker
+   started and nothing left on disk.
+2. The rolling window changed the failure key from a string to a sorted
+   set in place, which no rolling deploy survives. Merged main stores the
+   breaker count at `circuit:<tenant>:<tool>:failures` as a plain string
+   written with `INCR`. Round six made the same key a sorted set, read
+   with `ZCOUNT` and `ZADD`. Any tool with one to four recent failures
+   has a live string at that key when the new version rolls out, and the
+   first `ZCOUNT` against it raises `WRONGTYPE` — which the breaker
+   preflight does not mask, so every call for that tool errors. Worse
+   mid-rollout: old replicas keep issuing `INCR` while new ones issue
+   `ZADD`, so whichever type exists breaks the other version. The fix
+   versions the key — the sorted set lives at `:failures:v2`, the legacy
+   counter is left to expire on its own TTL, and the shared `:open` key,
+   a plain string on both versions, stays put. The red writes the legacy
+   string and requires neither the check nor the record path to raise.
+3. The "shared" window was timestamped by each serving host, not by the
+   ledger. Both sides passed this process's `time.time()` into the
+   arithmetic: the writer scored each failure with its own wall clock,
+   and the reader cut the window at its own. Across replicas, clock skew
+   changes what the breaker counts. A replica whose clock runs slow
+   scores a failure in the past, and the next normally-clocked replica
+   prunes everything older than its own now-minus-window before counting
+   — dropping that failure early, so two failures inside one real minute
+   never trip a two-in-a-minute breaker. The fix gives the ledger its own
+   clock: the timestamp and the cutoff both come from Redis's `TIME`,
+   read inside the atomic script, so every replica reads the same window.
+   The red records one failure through a replica whose clock is set 100
+   seconds slow, then one through a normal replica moments later, and
+   requires the two to trip a threshold-two breaker; against a
+   process-local clock the first is pruned early and they never combine.
+   (The mirror direction — a fast replica scoring in the future — is
+   masked by the set's own window-length TTL, which evicts the future
+   entry by real time before it can outlast the window, so the
+   early-prune direction is the one a witness can pin.)
+
+The three reds bring the witness file to fifty-seven. The mutation set is
+forty-five, all killed; the four new mutants:
+
+    new mutation                                    outcome
+    scratch allocated inside the invocation lock    killed
+    a refused spawn's scratch is not cleaned up      killed
+    the failure key is not versioned                killed
+    the window is scored by the serving host's clock  killed
+
+One round-six mutant was retired rather than retargeted: it asserted that
+allocating the scratch before the adoption gate was a defect, and this
+round makes that ordering deliberate — allocation is before the gate now,
+with cleanup as the safety — so the mutant described correct code and was
+replaced by the two that police the new structure. The ownership-transfer
+mutant was re-anchored around the path registration the lock now encloses.
+Collateral: the round-six stale-serve witness asserted the scratch was
+never allocated; under two phases it is allocated and then deleted, so it
+now asserts the directory does not survive, which is the invariant that
+actually matters. The witness helper that reads the failure count follows
+the key to its versioned name. SPEC §18.3 gained the words the code
+earned: the scratch is allocated outside the lock and the ownership
+transfer is revalidated under it; the breaker's window is read against the
+ledger's own clock, not any serving host's; and the failure history is
+versioned so a rolling upgrade cannot make two replicas read each other's
+state as the wrong type.
+
+## The versioned key stopped the crash but split one ledger into two
+
+Round seven versioned the breaker's failure key to `:failures:v2` so a
+rolling deploy could not make the new sorted-set commands fail on the old
+string's type. Review found that the fix, while it removed the crash,
+quietly broke a property the crash had been hiding: the breaker is one
+ledger, and `:failures` and `:failures:v2` are two. While both run, the
+one-ledger rule is gone.
+
+Three partitions show it. A success recorded by a new replica clears only
+`:failures:v2`; a legacy count of four survives, and the next old replica's
+failure trips a breaker the success was supposed to have cleared. The
+reverse is worse, because the old code is frozen: four failures in
+`:failures:v2`, an old replica's success clears only the legacy key, and
+the next new failure trips from a count no success can reach. And with no
+success at all, five real failures inside one minute can fall three on the
+old key and two on the new, and neither ledger ever reaches five.
+
+The old code cannot be taught otherwise. It is already deployed; it writes
+and reads `:failures` and will never know `:failures:v2` exists. So new
+code cannot retrofit a shared ledger across the two versions — a new
+replica reading the legacy count could not clear it on the old replica's
+behalf, and the old replica's failures never enter the new window. Two
+representations that run at once are two ledgers, and no amount of new-side
+code closes that while the old side is frozen.
+
+The resolution is not more code; it is an honest contract. The breaker's
+failure history is ephemeral, per-window state with a sixty-second TTL, so
+a change to its storage representation is a coordinated reset, not a
+rolling deploy: the old replicas are drained before the new ones serve, the
+previous history is abandoned to its TTL, and the breaker starts empty on
+the new representation. Losing at most one window of failure history at
+that boundary is the correct trade — Redis is already defined as ephemeral
+state, and one empty minute is cheaper than two contradictory ledgers. The
+version is still worth keeping: it makes the boundary crash-safe, so a
+straggling old replica cannot corrupt the new type. What it is not is a
+licence to run the two side by side, and round seven's SPEC wording implied
+it was. SPEC §18.3 now says the representation change is a coordinated
+reset, states why the two ledgers cannot be unified while both run, and
+records that the ephemeral loss at the boundary is acceptable.
+
+This round closes a false claim, not a code defect: the steady-state code —
+every replica on `:failures:v2` — was already correct, and the fault was in
+what the specification promised about the rollout. So there is no
+behavioural red here, and manufacturing one would mean testing the
+mixed-version coexistence the contract forbids, which would legitimise the
+very thing being ruled out. The witness instead pins the contract's code
+half: the new ledger owns `:failures:v2` alone, counts only its own
+entries, and on success clears only its own key — the legacy counter is
+never read into a decision or cleared, but abandoned to its TTL. A mutant
+that makes success clear the legacy key too — a half-migration that would
+rebuild the partition — is killed by it. The two other choices review named
+were both declined for cause: engineering live coexistence is impossible
+against frozen old code, and a staged two-release compatibility migration
+is heavy machinery for sixty seconds of throwaway counts.
+
+The mutation set is forty-six, all killed; the new mutant:
+
+    new mutation                                    outcome
+    success clears the legacy key too (half-migrate)  killed
+
+## A reset that trusts a TTL is not a reset once you allow rollback
+
+Round eight made the breaker representation change a coordinated reset:
+drain the old replicas, let the superseded failure history expire on its
+sixty-second TTL, start the new representation empty. Review found that
+"expire on its TTL" is not a reset the moment a rollback is on the table.
+
+The sequence needs no mixed-version serving at all. Old replicas write four
+failures to the legacy `:failures` counter, each refreshing its sixty-second
+TTL. The fleet drains and cuts over to `:failures:v2`, which starts empty. A
+tool succeeds; the new code clears `:failures:v2` and, by the round-eight
+contract, deliberately never touches the legacy key. Ten seconds later the
+deploy is rolled back — drain v2, start the old image again — well inside
+the legacy key's TTL. The old code reads its still-live `:failures` = 4, the
+next failure makes five, and the breaker opens on a count a success was
+supposed to have cleared. The coordinated contract was followed to the
+letter; the discarded ledger simply became authoritative again when its
+representation returned.
+
+So the reset has to retire the superseded history, not trust its TTL. The
+transition now purges the old representation's failure-history namespace
+outright — a small checked-in command, `scripts/reset_breaker_history.py`,
+run once per transition in whichever direction it goes. It deletes only
+`circuit:*:<representation>` keys: the glob ends at the representation's
+suffix, so purging `failures` cannot touch `failures:v2` and neither can
+touch the shared `:open` cooldown. That last point is deliberate and was the
+round's second, smaller finding: round eight said the breaker "starts
+empty", which read as contradicting the `:open` key the code keeps shared
+across representations. It does not — an already-open breaker keeps its
+cooldown across a representation change, because a change of storage shape
+does not make a proven-unhealthy tool healthy. The failure *history* starts
+empty; the open *cooldown* survives. SPEC §18.3 now says both, and the
+operational procedure — drain, purge the superseded namespace, start, never
+overlap, `:open` survives, rollback in reverse — lives in
+`docs/DEPLOYMENT.md`, where an operator will find it, rather than only in the
+specification and this journal.
+
+The red is behavioural, and it fails for its own reason on the round-eight
+code: seed the legacy counter to four, run the reset, simulate a rollback
+with an old-style increment, and require the result to be one, not five.
+Under "abandon to TTL" the increment resurrects the count to five; under the
+purge it starts fresh at one. The witness also pins the two boundaries the
+purge must respect — the shared `:open` cooldown and any other
+representation's history both survive it. The mutation set is forty-eight,
+all killed; the three new mutants:
+
+    new mutation                                    outcome
+    success clears the legacy key too (half-migrate)  killed
+    the purge glob matches every breaker key         killed
+    the purge counts keys but deletes none           killed
+
+This closes the operational gap round eight left open: the reset is now an
+actual retirement of the superseded representation, safe against a rollback,
+with the shared cooldown preserved and the whole procedure written down
+where it is deployed from.
+
+## The purge was fail-open, and a witness still spoke for the killed contract
+
+Round nine gave the representation reset a real purge. Review found two
+things left at that new boundary: the purge primitive trusted its caller,
+and one active test still asserted the very contract round nine had
+replaced. Both are closed, with a third, non-blocking cleanup on the
+operator command.
+
+The purge took a raw key suffix and dropped it straight into a glob:
+`pattern = f"circuit:*:{suffix}"`. The CLI guarded its own input with an
+`argparse` choice list, but the storage primitive did not, and a
+destructive primitive that trusts its argument is fail-open. `suffix="*"`
+expands to `circuit:*:*`, which deletes the legacy history, the v2 history,
+and the shared `:open` cooldown together — the exact key the SPEC and the
+runbook promise survives a reset. The round-nine mutant proved the normal
+glob must stay narrow; it did not prove the input could not widen it. The
+primitive now takes a named representation, not a suffix: `legacy` or `v2`,
+validated against a map `RedisCache` owns, and anything else is refused
+before a glob is built. The map is the single source of truth — the current
+representation's own suffix is read from it, and the operator command draws
+its `argparse` choices from it rather than keeping a second copy. The red
+seeds all three keys, asks the purge for a wildcard and four other invalid
+names, and requires each to raise with every key left intact.
+
+The second finding was a test telling the opposite of the specification.
+`test_the_new_ledger_abandons_the_legacy_key` still said the legacy counter
+was "abandoned to its own TTL" and required it to survive v2 traffic — the
+round-eight cutover reading, which round nine replaced with an explicit
+purge. The underlying code property is still worth pinning: the steady-state
+v2 path must never opportunistically read a stray legacy counter into its
+window or clear one on success, because half-migrating the two rebuilds the
+partition the design forbids. So the test was not deleted but reframed —
+`test_v2_never_half_migrates_a_stray_legacy_key` — as representation
+isolation, defense-in-depth on the code, explicitly not the cutover
+procedure. The cutover is pinned by the round-nine purge-and-rollback test,
+and the reframed test now points at it rather than contradicting it.
+
+The non-blocking cleanup: the operator command was booting the whole
+inference runtime and silently forcing `TEST_MODE=true` to do it. `TEST_MODE`
+is a testing-behaviour flag, and it gates exactly the Redis-absent fallback
+a purge command must never take — with it set, a command run against a
+downed Redis would find no cache and quietly do nothing instead of failing.
+The injection is gone; the command talks to the real Redis the fleet uses,
+and fails loudly if it is not there. The command still resolves that Redis
+through the runtime, because the Redis DSN is a database-managed setting; a
+narrower administration path that reads only that one setting is worth
+having later, but it is not this tranche.
+
+The mutation set is forty-nine, all killed; the new mutant:
+
+    new mutation                                    outcome
+    the purge accepts any representation as a suffix  killed
+
+with the round-nine purge mutants — a glob that matches every breaker key,
+a purge that counts but deletes nothing — re-run and still killed, and the
+unversioned-key mutant re-anchored onto the representation map the suffix is
+now read from.
+
+## Bugbot found the producer gate turning a degraded answer into a cancellation
+
+The PR's own review bot (Cursor Bugbot) flagged a real interaction the tranche
+introduced. The attachment agent, when its serve fails with no tokens emitted,
+degrades to a plain LLM answer. Before it does, it revokes the invocation — the
+comment says why: the failed agent's worker must come down before a second
+answer is produced, so a capability racing the teardown is refused rather than
+started. That revoke was harmless until round five added the producer gate.
+
+The gate refuses to start a producer once the invocation is `revoked`. The
+degradation revoke sets exactly that flag, so the fallback's own producer —
+started through `_stream_llm_node` a few lines later — was refused, and the
+turn ended with a `cancel_ack` instead of the plain answer. A caller who
+uploaded files, hit a failing agent, and never cancelled anything received a
+cancellation. The salvage path (an answer already part-streamed) was
+unaffected, because it yields its partial directly rather than through the
+gate; only the no-token fallback took the hit.
+
+The distinction the gate needed was already in the invocation: a caller who
+walks away calls `cancel`, which sets `cancelled`; the agent's degradation
+calls `revoke`, which marks the attempt revoked but leaves `cancelled` false.
+So the fix is one branch, not a new attempt: the degraded fallback — and only
+it — gates on `cancelled` rather than `revoked`. It starts on a revoked
+invocation, because that revoke was its own teardown, and still refuses a
+cancelled one, because that is the caller's stop. It carries no breaker
+observation, so nothing about the ledger changes; the agent's failure was
+already recorded before the revoke. Every other producer still refuses a
+revoked attempt exactly as before.
+
+Two reds pin the two sides. A failed agent with no caller cancel must produce
+a plain `message_done`, not a `cancel_ack` — red on the shipped commit, where
+the fallback yielded only `cancel_ack`. And a caller who cancels mid-serve must
+still get a cancellation, never the fallback answer — so the fix cannot become
+"the fallback always starts". The breaker mutation set is fifty-one, all
+killed; the two new mutants:
+
+    new mutation                                    outcome
+    the degraded fallback ignores its flag (revoked)  killed
+    the degraded fallback ignores a real cancel      killed
+
+with the round-five producer-gate mutant re-anchored onto the two-branch gate
+and re-run. The finding was a genuine regression the tranche shipped, caught
+by the PR's review bot and closed the same way as the rest of the campaign:
+red first, then the smallest branch that tells the two cases apart.

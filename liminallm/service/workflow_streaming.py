@@ -27,8 +27,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from liminallm.logging import log_routing_trace, log_workflow_trace
 from liminallm.service.broker import InvocationContext
-from liminallm.service.invocation import Invocation
+from liminallm.service.invocation import Invocation, LeaseRevoked
 from liminallm.service.node_attempt import (
+    BreakerObservation,
     NodeOutcome,
     StreamedNodeAttempt,
     StreamPump,
@@ -36,7 +37,11 @@ from liminallm.service.node_attempt import (
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
-from liminallm.service.tool_namespace import SYSTEM_SCOPE, ResolvedWorkflow
+from liminallm.service.tool_namespace import (
+    SYSTEM_SCOPE,
+    ResolvedWorkflow,
+    ToolResolutionScope,
+)
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
@@ -186,73 +191,38 @@ class WorkflowStreamingMixin:
             node_type = node.get("type", "tool_call")
             tool_name = node.get("tool", "")
 
-            # Resolve before choosing a capability. This compared the
-            # reference *spelling* against a fixed list, so a tenant-shared
-            # spec overriding the name `llm.generic` streamed the model while
-            # the blocking path ran the override's real body: the `stream`
-            # flag decided which capability a published workflow executed.
-            # Deciding on the resolved handler also lets an aliased name whose
-            # handler *is* the LLM stream, which a spelling comparison could
-            # not express.
-            descriptor = (
-                self._resolve_tool(tool_name, tool_scope)
-                if node_type == "tool_call" and tool_name
-                else None
-            )
-
-            # Handle streaming for LLM-based tools. The attachment agent streams
-            # too: its tool rounds emit trace events, then the answer streams.
-            #
-            # A backend that has not proven it can be stopped does not stream
-            # at all — undeclared means no (see
-            # `LLMService.stream_is_cancellable`). The branch below runs the
-            # node on the ordinary executor: the driver enforces the deadline,
-            # the retry waits for the previous attempt to be confirmed dead,
-            # and the answer reaches the client in the final `message_done`.
-            # What the kill ends there is the worker; a host-tool body such as
-            # `llm.generic` runs in the parent's serve thread, so a generation
-            # past its deadline is reported failed at the deadline while the
-            # body runs on as bounded, authorityless work — the retry is then
-            # refused until it returns, not run beside it.
-            if (
-                descriptor is not None
-                and descriptor.streamable
-                and self.llm.stream_is_cancellable
-            ):
-                # The control plane around the call is the blocking path's,
-                # shared rather than copied: an open breaker refuses the call
-                # (SPEC §18), and a call that fails takes `on_error` (SPEC §9).
-                # Both used to live only inside `_execute_node`, which this
-                # branch does not call — so an open breaker did not stop a
-                # streamed LLM call at all, and a graph declaring
-                # `tool -> recover` on failure ended the turn instead. Only
-                # token production below is streaming-specific.
-                # Everything a resolved tool must pass before any body runs,
-                # through the same function the blocking path uses. Streaming
-                # specialises token production and nothing above it: this path
-                # entered `_stream_llm_node` with only a node, so an ordinary
-                # user's own private spec claiming `privileged: true` was
-                # refused on one path and ran the model on the other.
-                preflight_inputs = self._resolve_inputs(
-                    node.get("inputs", {}), user_message, vars_scope
-                )
-                # The same fallback `_execute_node` applies before the
-                # blocking preflight: a node that names no `message` runs on
-                # the user's turn, and `_stream_llm_node` will read exactly
-                # that — so validation must see the inputs the node executes
-                # with, or a schema requiring `message` refuses only here.
-                if "message" not in preflight_inputs and user_message:
-                    preflight_inputs["message"] = user_message
-                refusal = self.tool_preflight(
-                    descriptor,
-                    preflight_inputs,
-                    user_id=user_id,
-                    tool_name=tool_name,
-                )
-                tool_result = refusal or await self._circuit_open_result(
-                    node, tenant_id=tenant_id
-                )
+            # Every tool_call node goes through the attempt driver; whether
+            # it streams is the *preparation's* decision, made per attempt
+            # from the same resolution the admission uses. A resolver out
+            # here decided the transport before any node deadline existed —
+            # a stalled lookup ran on free wall clock, on the event loop,
+            # and then handed the body a fresh budget — and its answer froze
+            # across retries. A non-streamable spec, or a backend that has
+            # not proven it can be stopped (undeclared means no — see
+            # `LLMService.stream_is_cancellable`), runs the blocking body
+            # under the same driver: the deadline is enforced, the retry
+            # waits for the previous attempt to be confirmed dead, and the
+            # answer reaches the client in the turn's final `message_done`.
+            # What the kill ends there is the worker; a host-tool body such
+            # as `llm.generic` runs in the parent's serve thread, so a
+            # generation past its deadline is reported failed at the
+            # deadline while the body runs on as bounded, authorityless
+            # work — the retry is then refused until it returns, not run
+            # beside it.
+            if node_type == "tool_call":
+                # No admission decision is made here. Resolution, the
+                # preflight and the breaker check all run in the attempt
+                # driver's per-attempt preparation, exactly as the blocking
+                # path runs them — against the spec each attempt actually
+                # resolves. This branch used to preflight once, out here,
+                # against the dispatch descriptor: every retry then
+                # re-resolved but inherited that first verdict, so a retry
+                # that fell through to a privileged spec of the same name
+                # ran it on the retired spec's clean preflight (SPEC §18.3).
+                tool_result = None
                 failure_event = None
+                node_outcome = None
+                saw_done = False
                 # Once a token has reached the client it is on their screen,
                 # so recovery would append a second answer to the same bubble
                 # rather than replace the first. `_stream_agent_files_node`
@@ -262,75 +232,76 @@ class WorkflowStreamingMixin:
                 emitted_tokens = False
                 cancelled = False
 
-                if tool_result is None:
-                    async with aclosing(
-                        self._stream_node_with_retry(
-                            node,
-                            descriptor=descriptor,
-                            tool_name=tool_name,
-                            user_message=user_message,
-                            context_id=context_id,
-                            conversation_id=conversation_id,
-                            adapters=adapters,
-                            history=history,
-                            vars_scope=vars_scope,
-                            user_id=user_id,
-                            tenant_id=tenant_id,
-                            workflow_start_time=workflow_start_time,
-                            workflow_timeout_ms=workflow_timeout_ms,
-                            cancel_event=cancel_event,
-                        )
-                    ) as driver:
-                        async for event in driver:
-                            if isinstance(event, NodeOutcome):
-                                emitted_tokens = event.emitted
-                                failure_event = event.failure_event
-                                if event.result.get("status") == "error":
-                                    tool_result = event.result
-                                continue
-                            if event["event"] == "token":
-                                yield event
-                            elif event["event"] == "trace":
-                                # Tool-activity notices from the attachment
-                                # agent pass straight through for the UI.
-                                yield event
-                            elif event["event"] == "message_done":
-                                # Update state from completed message
-                                data = event.get("data", {})
-                                content = data.get("content", "")
-                                node_usage = data.get("usage", {})
-                                usage = self._merge_usage(usage, node_usage)
-                                for snippet in data.get("context_snippets") or []:
-                                    if (
-                                        snippet not in context_seen
-                                        and len(context_snippets) < MAX_CONTEXT_SNIPPETS
-                                    ):
-                                        context_seen.add(snippet)
-                                        context_snippets.append(snippet)
-                                trace_entry: Dict[str, Any] = {
-                                    "node": node_id,
-                                    "status": "ok",
-                                    "content": content,
-                                    "usage": node_usage,
-                                }
-                                if data.get("tool_calls"):
-                                    trace_entry["tool_calls"] = data["tool_calls"]
-                                if data.get("injection_findings"):
-                                    trace_entry["injection_findings"] = data[
-                                        "injection_findings"
-                                    ]
-                                self._append_trace(workflow_trace, trace_entry)
-                                # Emit trace event
-                                yield {
-                                    "event": "trace",
-                                    "data": {"workflow_trace": workflow_trace[-1]},
-                                }
-                            elif event["event"] == "cancel_ack":
-                                yield event
-                                cancelled = True
-                                break
-                    if cancelled:
-                        return
+                async with aclosing(
+                    self._stream_node_with_retry(
+                        node,
+                        tool_scope=tool_scope,
+                        tool_name=tool_name,
+                        user_message=user_message,
+                        context_id=context_id,
+                        conversation_id=conversation_id,
+                        adapters=adapters,
+                        history=history,
+                        vars_scope=vars_scope,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        workflow_start_time=workflow_start_time,
+                        workflow_timeout_ms=workflow_timeout_ms,
+                        cancel_event=cancel_event,
+                    )
+                ) as driver:
+                    async for event in driver:
+                        if isinstance(event, NodeOutcome):
+                            node_outcome = event
+                            emitted_tokens = event.emitted
+                            failure_event = event.failure_event
+                            if event.result.get("status") == "error":
+                                tool_result = event.result
+                            continue
+                        if event["event"] == "token":
+                            yield event
+                        elif event["event"] == "trace":
+                            # Tool-activity notices from the attachment
+                            # agent pass straight through for the UI.
+                            yield event
+                        elif event["event"] == "message_done":
+                            # Update state from completed message
+                            saw_done = True
+                            data = event.get("data", {})
+                            content = data.get("content", "")
+                            node_usage = data.get("usage", {})
+                            usage = self._merge_usage(usage, node_usage)
+                            for snippet in data.get("context_snippets") or []:
+                                if (
+                                    snippet not in context_seen
+                                    and len(context_snippets) < MAX_CONTEXT_SNIPPETS
+                                ):
+                                    context_seen.add(snippet)
+                                    context_snippets.append(snippet)
+                            trace_entry: Dict[str, Any] = {
+                                "node": node_id,
+                                "status": "ok",
+                                "content": content,
+                                "usage": node_usage,
+                            }
+                            if data.get("tool_calls"):
+                                trace_entry["tool_calls"] = data["tool_calls"]
+                            if data.get("injection_findings"):
+                                trace_entry["injection_findings"] = data[
+                                    "injection_findings"
+                                ]
+                            self._append_trace(workflow_trace, trace_entry)
+                            # Emit trace event
+                            yield {
+                                "event": "trace",
+                                "data": {"workflow_trace": workflow_trace[-1]},
+                            }
+                        elif event["event"] == "cancel_ack":
+                            yield event
+                            cancelled = True
+                            break
+                if cancelled:
+                    return
 
                 if tool_result is not None:
                     self._append_trace(
@@ -354,6 +325,33 @@ class WorkflowStreamingMixin:
                         {"node_id": node_id, "tool": tool_name},
                     )
                     return
+
+                if node_outcome is not None and not saw_done:
+                    # A blocking-bodied attempt: no client events carried its
+                    # data, so the outcome does — the same bookkeeping the
+                    # non-tool branch below applies to its results.
+                    result = node_outcome.result
+                    self._append_trace(
+                        workflow_trace, {"node": node_id, **result}
+                    )
+                    yield {
+                        "event": "trace",
+                        "data": {"workflow_trace": workflow_trace[-1]},
+                    }
+                    if result.get("outputs"):
+                        vars_scope.update(result["outputs"])
+                    for snippet in result.get("context_snippets") or []:
+                        if snippet in context_seen:
+                            continue
+                        if len(context_snippets) >= MAX_CONTEXT_SNIPPETS:
+                            break
+                        context_seen.add(snippet)
+                        context_snippets.append(snippet)
+                    if result.get("content"):
+                        content = result["content"]
+                    usage = self._merge_usage(usage, result.get("usage") or {})
+                    pending.extend(node_outcome.next_nodes)
+                    continue
 
                 pending.extend(self._successors(node, {"status": "ok"}))
 
@@ -543,7 +541,7 @@ class WorkflowStreamingMixin:
         self,
         node: Dict[str, Any],
         *,
-        descriptor,
+        tool_scope: ToolResolutionScope,
         tool_name: str,
         user_message: str,
         context_id: Optional[str],
@@ -576,21 +574,6 @@ class WorkflowStreamingMixin:
         )
         backoff_ms = node.get("backoff_ms", DEFAULT_BACKOFF_MS)
 
-        # The postflight is the blocking path's own, applied to the canonical
-        # completed result the streaming implementation hands over — one
-        # transformation boundary, not merely a shared predicate, so one
-        # schema cannot pass one transport and fail the other, and what
-        # proceeds downstream is the sanitized object on both. The schema's
-        # *presence* additionally decides buffering: a validated output
-        # cannot be incremental (SPEC §9.2), so a node with a schema holds
-        # its tokens until the finished answer passes.
-        output_schema = (descriptor.schema or {}).get("output_schema")
-
-        def finalize(result: Dict[str, Any]):
-            return self.tool_postflight(
-                result, descriptor.schema, tool_name=tool_name
-            )
-
         invocation = self.invocations.open(
             uuid.uuid4().hex,
             tool=str(node.get("tool") or ""),
@@ -598,10 +581,80 @@ class WorkflowStreamingMixin:
             tenant_id=tenant_id,
         )
 
-        def make_attempt():
+        lookup = str(tool_name or "") or "llm.generic"
+
+        async def make_attempt():
+            """One attempt's authority, body and *transport*, prepared now —
+            the same per-attempt rule as the blocking path (SPEC §18.3):
+            resolution, the admission preflight and the breaker check run
+            fresh for every attempt, through the same helper, so a tool
+            retired between attempts refuses the retry, a spec this turn's
+            inputs or caller may not pass refuses it too, and a breaker
+            tripped by attempt one refuses attempt two. The transport
+            decision reads this same resolution: deciding it out in the
+            dispatch took a resolver call before the attempt's deadline
+            existed — free wall clock, on the event loop — and froze the
+            answer across retries.
+            """
+            # The inputs the preflight judges, computed as `_execute_node`
+            # computes them: a node that names no `message` runs on the
+            # user's turn, and the streaming bodies read exactly that.
+            attempt_inputs = self._resolve_inputs(
+                node.get("inputs", {}), user_message, vars_scope
+            )
+            if "message" not in attempt_inputs and user_message:
+                attempt_inputs["message"] = user_message
+            fresh, identity, refusal = await self._resolve_attempt_authority(
+                lookup,
+                tool_scope,
+                inputs=attempt_inputs,
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
+            if refusal is not None:
+                return refusal
+            observation = BreakerObservation(identity=identity)
+            if not (fresh.streamable and self.llm.stream_is_cancellable):
+                # A spec that does not stream, or a backend that has not
+                # proven it can be stopped, runs the blocking body under
+                # this same driver, deadline and ledger; the answer reaches
+                # the client in the turn's final `message_done`.
+                return self._blocking_attempt(
+                    node,
+                    descriptor=fresh,
+                    observation=observation,
+                    inputs=attempt_inputs,
+                    user_message=user_message,
+                    context_id=context_id,
+                    conversation_id=conversation_id,
+                    adapters=adapters,
+                    history=history,
+                    vars_scope=vars_scope,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    tool_scope=tool_scope,
+                    invocation=invocation,
+                )
+
+            # The postflight is the blocking path's own, applied to the
+            # canonical completed result the streaming implementation hands
+            # over — one transformation boundary, not merely a shared
+            # predicate, so one schema cannot pass one transport and fail
+            # the other, and what proceeds downstream is the sanitized
+            # object on both. The schema's *presence* additionally decides
+            # buffering: a validated output cannot be incremental (SPEC
+            # §9.2), so a node with a schema holds its tokens until the
+            # finished answer passes.
+            output_schema = (fresh.schema or {}).get("output_schema")
+
+            def finalize(result: Dict[str, Any]):
+                return self.tool_postflight(
+                    result, fresh.schema, tool_name=tool_name
+                )
+
             body = (
                 self._stream_agent_files_node
-                if descriptor.handler == "agent.files_v1"
+                if fresh.handler == "agent.files_v1"
                 else self._stream_llm_node
             )
             return StreamedNodeAttempt(
@@ -617,9 +670,11 @@ class WorkflowStreamingMixin:
                     tenant_id=tenant_id,
                     invocation=invocation,
                     cancel_event=cancel_event,
+                    observation=observation,
                 ),
                 finalize=finalize,
                 buffer=bool(output_schema),
+                breaker=observation,
             )
 
         try:
@@ -635,6 +690,7 @@ class WorkflowStreamingMixin:
                         workflow_start_time=workflow_start_time,
                         workflow_timeout_ms=workflow_timeout_ms,
                         cancel_event=cancel_event,
+                        tenant_id=tenant_id,
                     )
                 ) as driver:
                     async for item in driver:
@@ -660,6 +716,8 @@ class WorkflowStreamingMixin:
         tenant_id: Optional[str],
         invocation: Invocation,
         cancel_event: Optional[asyncio.Event] = None,
+        observation: Optional[BreakerObservation] = None,
+        degraded_fallback: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Stream tokens from an LLM node."""
         inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
@@ -697,7 +755,9 @@ class WorkflowStreamingMixin:
         # serving waited on this one's tokens, and a node past its `timeout_ms`
         # could not be stopped because nothing was watching the clock. The pump
         # owns the iterator on a thread of its own and is registered on the
-        # execution, so one revoke reaches it — see `StreamPump`.
+        # execution, so one revoke reaches it — see `StreamPump`. The breaker
+        # `started` mark lives inside the pump gate: the provider call is the
+        # tool's work beginning, and everything above is planning.
         async for event in self._pumped(
             invocation,
             partial(
@@ -710,6 +770,8 @@ class WorkflowStreamingMixin:
             ),
             label=str(node.get("id") or "llm"),
             cancel_event=cancel_event,
+            observation=observation,
+            degraded_fallback=degraded_fallback,
         ):
             if event.get("event") == "message_done":
                 # The grounding this node retrieved, on the node's answer —
@@ -742,6 +804,8 @@ class WorkflowStreamingMixin:
         *,
         label: str,
         cancel_event: Optional[asyncio.Event],
+        observation: Optional[BreakerObservation] = None,
+        degraded_fallback: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Drive a synchronous token producer off the loop.
 
@@ -753,14 +817,50 @@ class WorkflowStreamingMixin:
         found it: with two, removing either changed nothing that any test
         could see. One authority for what an attempt started, which is the
         `Invocation`.
+
+        The start is gated the way a worker spawn is (SPEC §18.3): under the
+        invocation's lock, the exact attempt must still be live, and only
+        then does the producer start, get registered, and mark the breaker's
+        `started`. A cancel that landed during preparation therefore never
+        starts the provider — the gate refuses and acknowledges instead —
+        and a revoke that lands after the gate finds a registered producer
+        its sweep can stop.
+
+        `degraded_fallback` is the one producer that starts on a revoked
+        invocation: the attachment agent's plain-answer path, which runs only
+        after the agent revoked its own failed serve to take the worker down
+        (SPEC §18.3). That revoke is a degradation, not the caller walking
+        away, so the fallback gate refuses a *cancelled* invocation — the
+        caller's own stop — rather than a revoked one. Every other producer
+        refuses a revoked attempt.
         """
-        pump = StreamPump(factory, label=label).start()
-        invocation.resources.add_producer(pump, f"stream:{label}")
+        pump: Optional[StreamPump] = None
+        with invocation.lock:
+            expected = observation.attempt if observation is not None else None
+            blocked = invocation.cancelled if degraded_fallback else invocation.revoked
+            live = not blocked and (
+                expected is None or invocation.current_attempt is expected
+            )
+            if live:
+                pump = StreamPump(factory, label=label).start()
+                invocation.resources.add_producer(pump, f"stream:{label}")
+                if observation is not None:
+                    observation.started = True
+        if pump is None:
+            yield {"event": "cancel_ack", "data": {}}
+            return
         async for event in pump.events():
             if cancel_event and cancel_event.is_set():
                 yield {"event": "cancel_ack", "data": {}}
                 return
             yield event
+        if pump.interrupted:
+            # The stop landed while the producer was blocked mid-read, so the
+            # sentinel arrived with no event to check the flag against — and
+            # a stream cut short must not read as a natural end: the agent
+            # body would complete its partial as a normal answer, and the
+            # caller's own cancel would record a breaker success (SPEC §18.3).
+            yield {"event": "cancel_ack", "data": {}}
 
     async def _stream_agent_files_node(
         self,
@@ -776,6 +876,7 @@ class WorkflowStreamingMixin:
         tenant_id: Optional[str],
         invocation: Invocation,
         cancel_event: Optional[asyncio.Event] = None,
+        observation: Optional[BreakerObservation] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Attachment agent with a streamed final answer.
 
@@ -828,6 +929,7 @@ class WorkflowStreamingMixin:
                 tenant_id=tenant_id,
                 invocation=invocation,
                 cancel_event=cancel_event,
+                observation=observation,
             ):
                 yield event
             return
@@ -841,6 +943,10 @@ class WorkflowStreamingMixin:
         # would append a second answer to the same bubble.
         emitted_tokens = False
 
+        # Everything above is planning — attachments, grounding, agent
+        # context — and a deadline spent there proves nothing about the
+        # tool. `started` is marked inside `_serve_invocation`, once the
+        # worker is actually spawned and registered (SPEC §18.3).
         try:
             # The tool rounds run in the worker, exactly as they do on the
             # batch path — a second copy of the agent loop here is a second
@@ -883,6 +989,10 @@ class WorkflowStreamingMixin:
                     ),
                     self._worker_limits(self.tool_registry.get("agent.files_v1")),
                     on_capability=traces.append,
+                    expected_attempt=(
+                        observation.attempt if observation is not None else None
+                    ),
+                    observation=observation,
                 ),
                 timeout=self.AGENT_DEADLINE_SECONDS,
             )
@@ -912,6 +1022,7 @@ class WorkflowStreamingMixin:
                 ),
                 label="agent.files_v1",
                 cancel_event=cancel_event,
+                observation=observation,
             ):
                 kind = event.get("event")
                 if kind == "token":
@@ -940,6 +1051,15 @@ class WorkflowStreamingMixin:
                     return
             content = "".join(content_parts)
         except Exception as exc:  # noqa: BLE001 - degrade to a plain answer
+            # Tool health before salvage: the serve began and then failed,
+            # which is a breaker failure whatever the client-facing recovery
+            # below keeps (SPEC §18.3). Sticky in the observation, so the
+            # partial or fallback `tool_result` further down cannot rewrite
+            # five provider deaths into a clean bill of health. A revoked
+            # lease stays unrecorded — that is the caller abandoning the
+            # attempt, not the tool failing.
+            if observation is not None and not isinstance(exc, LeaseRevoked):
+                observation.outcome = "failure"
             # Revoke before degrading, not after: the fallback below runs
             # inside this handler, so a worker left alive would be answering
             # capability requests while a second answer is being produced.
@@ -977,6 +1097,11 @@ class WorkflowStreamingMixin:
                 tenant_id=tenant_id,
                 invocation=invocation,
                 cancel_event=cancel_event,
+                # The serve was just revoked to take its worker down; this
+                # degraded answer must still run for a caller who did not
+                # cancel. Breaker-invisible (no observation): the failure is
+                # already recorded above.
+                degraded_fallback=True,
             ):
                 yield event
             return
