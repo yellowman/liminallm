@@ -29,6 +29,7 @@ from liminallm.logging import log_routing_trace, log_workflow_trace
 from liminallm.service.broker import InvocationContext
 from liminallm.service.invocation import Invocation
 from liminallm.service.node_attempt import (
+    BreakerObservation,
     NodeOutcome,
     StreamedNodeAttempt,
     StreamPump,
@@ -36,7 +37,11 @@ from liminallm.service.node_attempt import (
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
-from liminallm.service.tool_namespace import SYSTEM_SCOPE, ResolvedWorkflow
+from liminallm.service.tool_namespace import (
+    SYSTEM_SCOPE,
+    ResolvedWorkflow,
+    ToolResolutionScope,
+)
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
@@ -243,18 +248,16 @@ class WorkflowStreamingMixin:
                 # with, or a schema requiring `message` refuses only here.
                 if "message" not in preflight_inputs and user_message:
                     preflight_inputs["message"] = user_message
-                refusal = self.tool_preflight(
+                # The breaker check is not here: it runs in the attempt
+                # driver's per-attempt preparation, exactly as the blocking
+                # path runs it — keyed by the resolved identity, and fresh
+                # per attempt so a breaker tripped by attempt one refuses
+                # attempt two (SPEC §18.3).
+                tool_result = self.tool_preflight(
                     descriptor,
                     preflight_inputs,
                     user_id=user_id,
                     tool_name=tool_name,
-                )
-                # Keyed by the resolved identity, exactly as the blocking
-                # path keys it: the reference's spelling names a different
-                # tool per scope, and the artifact behind it is the thing
-                # whose health the ledger tracks (SPEC §18).
-                tool_result = refusal or await self._circuit_open_result(
-                    descriptor.artifact_id or descriptor.name, tenant_id=tenant_id
                 )
                 failure_event = None
                 # Once a token has reached the client it is on their screen,
@@ -270,7 +273,7 @@ class WorkflowStreamingMixin:
                     async with aclosing(
                         self._stream_node_with_retry(
                             node,
-                            descriptor=descriptor,
+                            tool_scope=tool_scope,
                             tool_name=tool_name,
                             user_message=user_message,
                             context_id=context_id,
@@ -547,7 +550,7 @@ class WorkflowStreamingMixin:
         self,
         node: Dict[str, Any],
         *,
-        descriptor,
+        tool_scope: ToolResolutionScope,
         tool_name: str,
         user_message: str,
         context_id: Optional[str],
@@ -580,21 +583,6 @@ class WorkflowStreamingMixin:
         )
         backoff_ms = node.get("backoff_ms", DEFAULT_BACKOFF_MS)
 
-        # The postflight is the blocking path's own, applied to the canonical
-        # completed result the streaming implementation hands over — one
-        # transformation boundary, not merely a shared predicate, so one
-        # schema cannot pass one transport and fail the other, and what
-        # proceeds downstream is the sanitized object on both. The schema's
-        # *presence* additionally decides buffering: a validated output
-        # cannot be incremental (SPEC §9.2), so a node with a schema holds
-        # its tokens until the finished answer passes.
-        output_schema = (descriptor.schema or {}).get("output_schema")
-
-        def finalize(result: Dict[str, Any]):
-            return self.tool_postflight(
-                result, descriptor.schema, tool_name=tool_name
-            )
-
         invocation = self.invocations.open(
             uuid.uuid4().hex,
             tool=str(node.get("tool") or ""),
@@ -602,10 +590,48 @@ class WorkflowStreamingMixin:
             tenant_id=tenant_id,
         )
 
-        def make_attempt():
+        async def make_attempt():
+            """One attempt's authority and body, prepared *now* — the same
+            per-attempt rule as the blocking path (SPEC §18.3): resolution
+            and the breaker check run fresh for every attempt, through the
+            same helper, so a tool retired between attempts refuses the
+            retry and a breaker tripped by attempt one refuses attempt two.
+            The dispatch out in the caller decided this node streams; the
+            spec's word on *that* is re-checked here too, because the row
+            may have changed since.
+            """
+            fresh, identity, refusal = await self._resolve_attempt_authority(
+                tool_name, tool_scope, tenant_id=tenant_id
+            )
+            if refusal is not None:
+                return refusal
+            if not fresh.streamable:
+                return {
+                    "status": "error",
+                    "content": f"tool {tool_name} no longer streams",
+                    "error": "tool_changed",
+                }
+            observation = BreakerObservation(identity=identity)
+
+            # The postflight is the blocking path's own, applied to the
+            # canonical completed result the streaming implementation hands
+            # over — one transformation boundary, not merely a shared
+            # predicate, so one schema cannot pass one transport and fail
+            # the other, and what proceeds downstream is the sanitized
+            # object on both. The schema's *presence* additionally decides
+            # buffering: a validated output cannot be incremental (SPEC
+            # §9.2), so a node with a schema holds its tokens until the
+            # finished answer passes.
+            output_schema = (fresh.schema or {}).get("output_schema")
+
+            def finalize(result: Dict[str, Any]):
+                return self.tool_postflight(
+                    result, fresh.schema, tool_name=tool_name
+                )
+
             body = (
                 self._stream_agent_files_node
-                if descriptor.handler == "agent.files_v1"
+                if fresh.handler == "agent.files_v1"
                 else self._stream_llm_node
             )
             return StreamedNodeAttempt(
@@ -621,9 +647,11 @@ class WorkflowStreamingMixin:
                     tenant_id=tenant_id,
                     invocation=invocation,
                     cancel_event=cancel_event,
+                    observation=observation,
                 ),
                 finalize=finalize,
                 buffer=bool(output_schema),
+                breaker=observation,
             )
 
         try:
@@ -639,7 +667,6 @@ class WorkflowStreamingMixin:
                         workflow_start_time=workflow_start_time,
                         workflow_timeout_ms=workflow_timeout_ms,
                         cancel_event=cancel_event,
-                        breaker_identity=descriptor.artifact_id or descriptor.name,
                         tenant_id=tenant_id,
                     )
                 ) as driver:
@@ -666,6 +693,7 @@ class WorkflowStreamingMixin:
         tenant_id: Optional[str],
         invocation: Invocation,
         cancel_event: Optional[asyncio.Event] = None,
+        observation: Optional[BreakerObservation] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Stream tokens from an LLM node."""
         inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
@@ -698,6 +726,12 @@ class WorkflowStreamingMixin:
             message or "", context_snippets, history
         )
 
+        # Everything above is planning — retrieval, digest, budget — and a
+        # deadline spent there proves nothing about the tool. The tool's own
+        # work starts with the provider call the pump is about to make, so
+        # the breaker observation marks `started` here (SPEC §18.3).
+        if observation is not None:
+            observation.started = True
         # `generate_stream` is a synchronous iterator, and iterating it here
         # ran the model on the event loop: every other request the worker was
         # serving waited on this one's tokens, and a node past its `timeout_ms`
@@ -782,6 +816,7 @@ class WorkflowStreamingMixin:
         tenant_id: Optional[str],
         invocation: Invocation,
         cancel_event: Optional[asyncio.Event] = None,
+        observation: Optional[BreakerObservation] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Attachment agent with a streamed final answer.
 
@@ -834,6 +869,7 @@ class WorkflowStreamingMixin:
                 tenant_id=tenant_id,
                 invocation=invocation,
                 cancel_event=cancel_event,
+                observation=observation,
             ):
                 yield event
             return
@@ -847,6 +883,12 @@ class WorkflowStreamingMixin:
         # would append a second answer to the same bubble.
         emitted_tokens = False
 
+        # Everything above is planning — attachments, grounding, agent
+        # context — and a deadline spent there proves nothing about the
+        # tool. The tool's own work starts with the worker serve below, so
+        # the breaker observation marks `started` here (SPEC §18.3).
+        if observation is not None:
+            observation.started = True
         try:
             # The tool rounds run in the worker, exactly as they do on the
             # batch path — a second copy of the agent loop here is a second

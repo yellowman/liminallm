@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
+import inspect
 import json
 import math
 import os
@@ -279,10 +280,37 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "status": refusal.get("status", "error"),
             "outputs": {},
         }
-        for k in ("content", "usage", "context_snippets"):
+        for k in ("content", "usage", "context_snippets", "error"):
             if k in refusal:
                 payload[k] = refusal[k]
         return payload, next_nodes
+
+    async def _resolve_attempt_authority(
+        self,
+        lookup: str,
+        tool_scope: ToolResolutionScope,
+        *,
+        tenant_id: Optional[str],
+    ) -> Tuple[Optional[ToolDescriptor], Optional[str], Optional[Dict[str, Any]]]:
+        """What one attempt runs under: `(descriptor, breaker identity,
+        refusal)` — the refusal ``None`` when the attempt may proceed.
+
+        Called per attempt, never once per node: current canonical state is
+        consulted at execution, so a tool retired between attempts refuses
+        the retry rather than running from a captured descriptor — and a
+        breaker tripped by attempt N refuses attempt N+1 (SPEC §18.3), which
+        a check at node entry walks straight past.
+        """
+        descriptor = self._resolve_tool(lookup, tool_scope)
+        if descriptor is None:
+            return None, None, {
+                "status": "error",
+                "content": f"unknown tool {lookup}",
+                "error": "tool_reference_unresolved",
+            }
+        identity = descriptor.artifact_id or descriptor.name
+        refusal = await self._circuit_open_result(identity, tenant_id=tenant_id)
+        return descriptor, identity, refusal
 
     def _error_event(
         self, code: str, message: str, details: dict | None = None
@@ -947,33 +975,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         backoff_ms = node.get("backoff_ms", DEFAULT_BACKOFF_MS)
 
-        # Resolve the tool before anything is opened, for the two refusals
-        # that must happen — and record nothing — before invocation (SPEC
-        # §18): a reference that names nothing, and an open breaker. Both are
-        # keyed by what the reference *resolves to*: a node that spells no
-        # tool runs the default LLM tool, and the streaming path resolves
-        # before its own preflight the same way. A refusal here retries
-        # nothing: the previous shape returned an error result into the
-        # retry loop, so an open breaker burned every retry and its backoff
-        # on calls it was always going to refuse.
-        descriptor = None
-        breaker_identity = None
-        if node.get("type", "tool_call") == "tool_call":
-            lookup = str(node.get("tool") or "") or "llm.generic"
-            descriptor = self._resolve_tool(lookup, tool_scope)
-            if descriptor is None:
-                refusal = {
-                    "status": "error",
-                    "content": f"unknown tool {lookup}",
-                    "error": "tool_reference_unresolved",
-                }
-                return self._refused_node_result(node, refusal)
-            breaker_identity = descriptor.artifact_id or descriptor.name
-            refusal = await self._circuit_open_result(
-                breaker_identity, tenant_id=tenant_id
-            )
-            if refusal is not None:
-                return self._refused_node_result(node, refusal)
+        node_type = node.get("type", "tool_call")
+        lookup = str(node.get("tool") or "") or "llm.generic"
 
         # One id for this node execution, stable across its attempts. Each
         # attempt gets its own worker — attempt two must not inherit attempt
@@ -986,8 +989,27 @@ class WorkflowEngine(WorkflowStreamingMixin):
             tenant_id=tenant_id,
         )
 
-        def make_attempt() -> BlockingNodeAttempt:
+        async def make_attempt():
+            """One attempt's authority and body, prepared *now* (SPEC §18.3).
+
+            Resolution and the breaker check run per attempt, in the driver's
+            loop: a node that spells no tool runs the default LLM tool; a
+            reference that resolves to nothing, and an open breaker — one
+            opened by this node's own previous attempt included — refuse the
+            attempt before anything is spawned, and the refusal retries
+            nothing.
+            """
+            descriptor = None
             observation = BreakerObservation()
+            if node_type == "tool_call":
+                descriptor, identity, refusal = (
+                    await self._resolve_attempt_authority(
+                        lookup, tool_scope, tenant_id=tenant_id
+                    )
+                )
+                if refusal is not None:
+                    return refusal
+                observation.identity = identity
             return BlockingNodeAttempt(
                 partial(
                     self._execute_node,
@@ -1019,7 +1041,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
                     cancel_event=cancel_event,
-                    breaker_identity=breaker_identity,
                     tenant_id=tenant_id,
                 )
                 return outcome.result, outcome.next_nodes
@@ -1076,40 +1097,43 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
     async def _record_breaker_outcome(
         self,
-        attempt: NodeAttempt,
-        identity: Optional[str],
+        observation: Optional[BreakerObservation],
         *,
         tenant_id: Optional[str],
-        timed_out: bool,
+        timed_out: bool = False,
+        raised: bool = False,
     ) -> None:
         """Write one attempt's breaker observation to the ledger (SPEC §18).
 
-        Tool-level failure increments; tool-level success clears; an attempt
-        that proved nothing — refused before it started, or abandoned by its
-        caller — writes nothing. One deliberate completion here: an attempt
-        that *started* and was then cut off at the node's own deadline is a
-        failure, because a backend hung past every node budget would
-        otherwise never record an outcome, and the breaker could not open
-        for exactly the hang it exists to stop.
+        The one recorder: the attempt driver calls it for both workflow
+        transports, and the direct invocation seam calls it for
+        `POST /v1/tools/{id}/invoke`. Tool-level failure increments;
+        tool-level success clears; an attempt that proved nothing — refused
+        before it started, or abandoned by its caller — writes nothing. One
+        deliberate completion here: an attempt that *started* and then ended
+        in a deadline or an escaped exception without a recorded outcome is
+        a failure — a backend hung past every node budget, or a serve that
+        died without reporting, would otherwise never record an outcome, and
+        the breaker could not open for exactly the failure it exists to
+        stop. Cancellation takes neither flag, so it still records nothing.
         """
-        if not (self.cache and identity):
-            return
-        observation = getattr(attempt, "breaker", None)
-        if observation is None:
+        if observation is None or not (self.cache and observation.identity):
             return
         outcome = observation.outcome
-        if outcome is None and timed_out and observation.started:
+        if outcome is None and observation.started and (timed_out or raised):
             outcome = "failure"
         if outcome == "success":
-            await self.cache.record_tool_success(identity, tenant_id=tenant_id)
+            await self.cache.record_tool_success(
+                observation.identity, tenant_id=tenant_id
+            )
         elif outcome == "failure":
             tripped, failures = await self.cache.record_tool_failure(
-                identity, tenant_id=tenant_id
+                observation.identity, tenant_id=tenant_id
             )
             if tripped:
                 self.logger.warning(
                     "tool_circuit_tripped",
-                    tool=identity,
+                    tool=observation.identity,
                     failures=failures,
                     tenant_id=tenant_id,
                 )
@@ -1122,11 +1146,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
         node_id: str,
         max_retries: int,
         backoff_ms: float,
-        make_attempt: Callable[[], NodeAttempt],
+        make_attempt: Callable[[], Any],
         workflow_start_time: float,
         workflow_timeout_ms: float,
         cancel_event: Optional[asyncio.Event] = None,
-        breaker_identity: Optional[str] = None,
         tenant_id: Optional[str] = None,
     ) -> AsyncIterator[Any]:
         """The attempt loop of one logical execution, whatever produced it.
@@ -1188,32 +1211,54 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 MAX_NODE_TIMEOUT_SECONDS * 1000,
                 remaining_ms,
             )
-            current = make_attempt()
-            previous = current
+            current: Optional[NodeAttempt] = None
             lease = None
             attempt_timed_out = False
-            if current.needs_lease:
-                # §18.3: authority is fresh per attempt. The worker spawn
-                # opens its own lease; an in-process attempt has nobody else
-                # to open one, and without it two things were wrong at once —
-                # a retry ran with no authority of its own, and a revoke that
-                # found no current attempt cancelled the whole execution and
-                # was then ignored by the attempt that followed.
-                try:
-                    lease = invocation.begin_attempt()
-                except LeaseRevoked:
-                    # Cancelled. Not an error to retry through: the caller
-                    # said the answer is no longer wanted.
+            attempt_raised = False
+            try:
+                # Prepared here, inside the loop, so each attempt runs under
+                # authority resolved *now* (SPEC §18.3): a breaker tripped by
+                # the previous attempt refuses this one, and a tool retired
+                # between attempts is a refusal, not a captured descriptor. A
+                # factory may also be plain and synchronous — the direct
+                # attempt shapes in tests are — and a refusal comes back as
+                # the refusal result itself, terminal: retrying a refusal is
+                # just waiting.
+                prepared = make_attempt()
+                if inspect.isawaitable(prepared):
+                    prepared = await prepared
+                if isinstance(prepared, dict):
+                    payload, refusal_next = self._refused_node_result(
+                        node, prepared
+                    )
                     yield NodeOutcome(
-                        result={
-                            "status": "error",
-                            "error": "workflow_cancelled",
-                            "cancelled": True,
-                        },
-                        emitted=emitted,
+                        result=payload, next_nodes=refusal_next, emitted=emitted
                     )
                     return
-            try:
+                current = prepared
+                previous = current
+                if current.needs_lease:
+                    # §18.3: authority is fresh per attempt. The worker spawn
+                    # opens its own lease; an in-process attempt has nobody
+                    # else to open one, and without it two things were wrong
+                    # at once — a retry ran with no authority of its own, and
+                    # a revoke that found no current attempt cancelled the
+                    # whole execution and was then ignored by the attempt
+                    # that followed.
+                    try:
+                        lease = invocation.begin_attempt()
+                    except LeaseRevoked:
+                        # Cancelled. Not an error to retry through: the caller
+                        # said the answer is no longer wanted.
+                        yield NodeOutcome(
+                            result={
+                                "status": "error",
+                                "error": "workflow_cancelled",
+                                "cancelled": True,
+                            },
+                            emitted=emitted,
+                        )
+                        return
                 deadline = (
                     asyncio.get_running_loop().time() + node_timeout_ms / 1000.0
                 )
@@ -1295,6 +1340,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 next_nodes = []
 
             except Exception as exc:
+                attempt_raised = True
                 last_error = exc
                 self.logger.warning(
                     "workflow_node_retry",
@@ -1314,12 +1360,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # SPEC §18: exactly one breaker outcome per started attempt,
                 # on every way out — including the caller closing this
                 # generator, where an unset observation records nothing.
-                await self._record_breaker_outcome(
-                    current,
-                    breaker_identity,
-                    tenant_id=tenant_id,
-                    timed_out=attempt_timed_out,
-                )
+                if current is not None:
+                    await self._record_breaker_outcome(
+                        getattr(current, "breaker", None),
+                        tenant_id=tenant_id,
+                        timed_out=attempt_timed_out,
+                        raised=attempt_raised,
+                    )
 
             # A retry is only meaningful before the first token. After it, the
             # answer is on the user's screen: a second attempt would append a
@@ -2051,6 +2098,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tool_name = descriptor.name
         if not tool_name:
             return {"status": "error", "content": "tool spec missing name"}
+        # The same ledger as every workflow attempt (SPEC §18.3): an open
+        # breaker refuses the direct invocation before anything starts and
+        # records nothing, and a started one records exactly one outcome
+        # through the same recorder — without this, the direct endpoint was
+        # an unmetered way to keep hammering a tool the breaker had already
+        # cut off for every workflow of the tenant.
+        identity = descriptor.artifact_id or descriptor.name
+        refusal = await self._circuit_open_result(identity, tenant_id=tenant_id)
+        if refusal is not None:
+            return refusal
+        observation = BreakerObservation(identity=identity)
         history: List[Any] = []
         if conversation_id:
             if self._validate_conversation_scope(
@@ -2066,18 +2124,25 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         error=str(exc),
                     )
                     history = []
-        return await self._invoke_tool(
-            tool_name,
-            inputs,
-            adapters=[],
-            history=history,
-            context_id=context_id,
-            conversation_id=conversation_id,
-            user_message=user_message or inputs.get("message") or "",
-            user_id=user_id,
-            tenant_id=tenant_id,
-            descriptor=descriptor,
-        )
+        try:
+            return await self._invoke_tool(
+                tool_name,
+                inputs,
+                adapters=[],
+                history=history,
+                context_id=context_id,
+                conversation_id=conversation_id,
+                user_message=user_message or inputs.get("message") or "",
+                user_id=user_id,
+                tenant_id=tenant_id,
+                descriptor=descriptor,
+                observation=observation,
+            )
+        finally:
+            # On every way out, exceptions included: `_invoke_tool` has
+            # already marked the serve failure by then, and an observation
+            # never started writes nothing.
+            await self._record_breaker_outcome(observation, tenant_id=tenant_id)
 
     def _turn_needs_tools(
         self, conversation_id: Optional[str], user_id: Optional[str]

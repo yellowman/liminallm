@@ -47,13 +47,15 @@ def _u(p):
     return f"{p}_{uuid.uuid4().hex[:8]}"
 
 
-def _wf(tool_name, *, max_retries=0, timeout_ms=None):
+def _wf(tool_name, *, max_retries=0, timeout_ms=None, backoff_ms=None):
     node = {"id": "call", "type": "tool_call", "next": "fin",
             "max_retries": max_retries}
     if tool_name is not None:
         node["tool"] = tool_name
     if timeout_ms is not None:
         node["timeout_ms"] = timeout_ms
+    if backoff_ms is not None:
+        node["backoff_ms"] = backoff_ms
     return {"kind": "workflow.chat", "entrypoint": "call", "nodes": [
         node, {"id": "fin", "type": "end"},
     ]}
@@ -163,30 +165,64 @@ def _raise(*a, **k):
 
 class _StreamBackend:
     """A cancellable streaming backend: one token, then the answer — or a
-    failure before any token when told to fail."""
+    failure before any token when told to fail. `on_stream` runs at the top
+    of each provider call, for witnesses that change the world mid-retry."""
 
     supports_stream_cancel = True
 
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, stall=False):
         self.fail = fail
+        self.stall = stall
         self.stream_calls = 0
+        self.on_stream = None
 
     def generate(self, messages, adapters, *, user_id=None):
         return {"content": "whole answer", "usage": {}}
 
     def generate_stream(self, messages, adapters, *, user_id=None):
         self.stream_calls += 1
+        if self.on_stream is not None:
+            self.on_stream()
 
         def gen():
             if self.fail:
                 raise RuntimeError("stream boom")
             yield {"event": "token", "data": "x"}
+            if self.stall:
+                time.sleep(2)
             yield {"event": "message_done", "data": {"content": "x", "usage": {}}}
         return gen()
 
 
-def _stream_ctx(fail=False):
-    backend = _StreamBackend(fail=fail)
+class _SpyCache:
+    """The real cache, with the ledger writes on the record.
+
+    Delegation rather than a hand-made stand-in: every read and the Lua
+    arithmetic stay the real object's, and the spy only observes. Needed
+    because the real ledger masks one class of defect — recording a failure
+    while the breaker is open is a no-op in the atomic script — so "the
+    counter did not move" cannot distinguish a refusal that records nothing
+    from a refusal whose recording was silently swallowed.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.recorded = []
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def record_tool_failure(self, *a, **k):
+        self.recorded.append(("failure", a, k))
+        return await self._inner.record_tool_failure(*a, **k)
+
+    async def record_tool_success(self, *a, **k):
+        self.recorded.append(("success", a, k))
+        return await self._inner.record_tool_success(*a, **k)
+
+
+def _stream_ctx(fail=False, stall=False):
+    backend = _StreamBackend(fail=fail, stall=stall)
     return _Ctx(llm=LLMService("test-model", backend=backend)), backend
 
 
@@ -341,15 +377,22 @@ class TestARefusalBeforeInvocationRecordsNothing:
     @pytest.mark.asyncio
     async def test_a_circuit_open_refusal_records_nothing(self):
         """The control that already held: the breaker's own refusal must not
-        feed the breaker."""
+        feed the breaker. The spy is what makes it airtight — the real
+        ledger no-ops a failure recorded while open, so the counter alone
+        cannot see an engine that wrongly records on refusal."""
         c = _Ctx()
         await c.seed_failures(c.ident(), 5)
         assert await c.is_open(c.ident())
+        spy = _SpyCache(c.cache)
+        c.engine.cache = spy
         ran = []
         c.engine._tool_llm_generic = lambda *a, **k: (ran.append(1), _ok())[1]
         r = await c.run(c.wf("llm.generic"))
         assert r.get("status") == "error" and not ran
         assert await c.count(c.ident(), "llm.generic") == 0
+        assert not spy.recorded, (
+            f"an open-breaker refusal wrote to the ledger: {spy.recorded}"
+        )
 
     @pytest.mark.asyncio
     async def test_an_input_validation_refusal_records_nothing(self):
@@ -439,6 +482,214 @@ class TestTheStartedAttemptBoundary:
         r = await c.run(c.wf("llm.generic"))
         assert r.get("status") == "error"
         assert await c.count(c.ident(), "llm.generic") == 0
+
+
+# =============================================================================
+# The breaker binds each attempt, not the logical node.
+# =============================================================================
+
+
+class TestTheBreakerBindsEachAttempt:
+    @pytest.mark.asyncio
+    async def test_a_breaker_tripped_mid_execution_stops_the_next_attempt(self):
+        """The fifth failure arrives on attempt one of a retrying node. The
+        retry is a new invocation, and an open breaker refuses it before it
+        starts — checking once at node entry lets retries walk past the trip
+        their own first attempt caused."""
+        c = _Ctx()
+        await c.seed_failures(c.ident(), 4)
+        calls = []
+        c.engine._tool_llm_generic = lambda *a, **k: (calls.append(1), _err())[1]
+        r = await c.run(c.wf("llm.generic", max_retries=2, backoff_ms=1))
+        assert r.get("status") == "error"
+        assert await c.is_open(c.ident())
+        assert len(calls) == 1, (
+            f"the first attempt tripped the breaker and the retries ran the "
+            f"tool anyway: {len(calls)} calls"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_trip_mid_execution_stops_the_next_attempt(self):
+        c, backend = _stream_ctx(fail=True)
+        await c.seed_failures(c.ident(), 4)
+        await c.run_streaming(c.wf("llm.generic", max_retries=2, backoff_ms=1))
+        assert await c.is_open(c.ident())
+        assert backend.stream_calls == 1, (
+            f"the first streamed attempt tripped the breaker and the retries "
+            f"called the provider anyway: {backend.stream_calls} calls"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_retry_resolves_current_canonical_state(self):
+        """Tranche 2's frozen rule, per attempt: current canonical state is
+        consulted at execution, and a captured descriptor is a process-local
+        cache manufacturing authority. Attempt one retires the tool; attempt
+        two must ask Postgres and refuse, not rerun the deleted spec."""
+        c = _Ctx()
+        name = _u("mut")
+        art = c.tool(name)
+        wf_art = c.wf(name, max_retries=1, backoff_ms=1)
+        calls = []
+
+        def delete_and_fail(*a, **k):
+            calls.append(1)
+            with c.store._connect() as conn:
+                conn.execute("DELETE FROM artifact WHERE id = %s", (art.id,))
+            return _err()
+
+        c.engine._tool_llm_generic = delete_and_fail
+        r = await c.run(wf_art)
+        assert r.get("status") == "error"
+        assert len(calls) == 1, (
+            f"a retry ran a spec the store no longer holds: {len(calls)} calls"
+        )
+        assert await c.count(name, art.id) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_retry_resolves_current_canonical_state(self):
+        c, backend = _stream_ctx(fail=True)
+        name = _u("smut")
+        art = c.tool(name)
+        wf_art = c.wf(name, max_retries=1, backoff_ms=1)
+
+        def delete_art():
+            with c.store._connect() as conn:
+                conn.execute("DELETE FROM artifact WHERE id = %s", (art.id,))
+
+        backend.on_stream = delete_art
+        await c.run_streaming(wf_art)
+        assert backend.stream_calls == 1, (
+            f"a streamed retry ran a spec the store no longer holds: "
+            f"{backend.stream_calls} calls"
+        )
+        assert await c.count(name, art.id) == 1
+
+
+# =============================================================================
+# Streamed planning is not the serve.
+# =============================================================================
+
+
+class TestStreamedPlanningIsNotTheServe:
+    @pytest.mark.asyncio
+    async def test_a_streamed_provider_hang_records_a_failure(self):
+        """The other side of the boundary: the provider was called and then
+        hung past the node deadline. That is the hang the breaker exists to
+        stop, and it must count exactly as the blocking sibling counts."""
+        c, backend = _stream_ctx(stall=True)
+        r = await c.run_streaming(c.wf("llm.generic", timeout_ms=300))
+        assert any(e.get("event") == "error" for e in r)
+        assert backend.stream_calls == 1
+        assert await c.count(c.ident(), "llm.generic") == 1
+
+    @pytest.mark.asyncio
+    async def test_an_agent_serve_hang_records_a_failure(self):
+        """The agent body reaches its worker serve — the backend declares
+        tool support and the context assembly offers a tool, else the body
+        delegates to the plain LLM node before any serve exists."""
+        c, backend = _stream_ctx()
+        # `LLMService.supports_tools` asks for a callable, not a flag; the
+        # spy serve below means it is never actually called.
+        backend.generate_with_tools = lambda *a, **k: {}
+        wf_art = c.wf("agent.files_v1", timeout_ms=300, max_retries=0)
+
+        def hung_serve(*a, **k):
+            time.sleep(2)
+            return {}
+
+        c.engine._serve_invocation = hung_serve
+        c.engine._build_agent_context = lambda *a, **k: (
+            [], [{"name": "t"}], "", [], []
+        )
+        events = await c.run_streaming(wf_art)
+        assert any(e.get("event") == "error" for e in events)
+        assert await c.count(c.ident("agent.files_v1"), "agent.files_v1") == 1
+
+    @pytest.mark.asyncio
+    async def test_a_deadline_spent_in_streamed_planning_records_nothing(self):
+        """The streamed complement of the blocking witness above: the agent
+        body assembles grounding and context before any worker or provider
+        runs, and a node deadline spent there proves nothing about the
+        tool. `started` must mark the serve, not the body's first line."""
+        c, backend = _stream_ctx()
+        wf_art = c.wf("agent.files_v1", timeout_ms=300, max_retries=0)
+        serve_calls = []
+
+        def spy_serve(*a, **k):
+            serve_calls.append(1)
+            return {}
+
+        def slow_grounding(*a, **k):
+            time.sleep(2)
+            return ([], "")
+
+        c.engine._serve_invocation = spy_serve
+        c.engine._explicit_context_grounding = slow_grounding
+        events = await c.run_streaming(wf_art)
+        assert any(e.get("event") == "error" for e in events)
+        assert not serve_calls, "the worker serve ran despite the stalled plan"
+        assert backend.stream_calls == 0, "the provider ran despite the stalled plan"
+        assert await c.count(c.ident("agent.files_v1"), "agent.files_v1") == 0, (
+            "a deadline spent in streamed planning was charged to the tool"
+        )
+
+
+# =============================================================================
+# The direct invocation is the same ledger.
+# =============================================================================
+
+
+class TestTheDirectInvocationIsTheSameLedger:
+    """`POST /v1/tools/{id}/invoke` starts tool invocations like any node
+    attempt, so it checks the same breaker and records through the same
+    writer — otherwise the direct API is an unmetered way to hammer a tool
+    the breaker has already cut off for every workflow."""
+
+    def _descriptor(self, c):
+        from liminallm.service.tool_namespace import ToolResolutionScope
+
+        return c.engine._resolve_tool(
+            "llm.generic", ToolResolutionScope("private", c.user.id, c.tenant)
+        )
+
+    async def _invoke(self, c):
+        return await c.engine.invoke_tool(
+            self._descriptor(c), {"message": "hi"},
+            user_id=c.user.id, tenant_id=c.tenant,
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_direct_raw_error_records_one_failure(self):
+        c = _Ctx()
+        c.engine._tool_llm_generic = _err
+        r = await self._invoke(c)
+        assert r.get("status") == "error"
+        assert await c.count(c.ident(), "llm.generic") == 1
+
+    @pytest.mark.asyncio
+    async def test_a_direct_success_clears_the_failure_count(self):
+        c = _Ctx()
+        await c.seed_failures(c.ident(), 3)
+        c.engine._tool_llm_generic = _ok
+        r = await self._invoke(c)
+        assert r.get("status") != "error"
+        assert await c.count(c.ident(), "llm.generic") == 0
+
+    @pytest.mark.asyncio
+    async def test_an_open_breaker_refuses_the_direct_invocation(self):
+        c = _Ctx()
+        await c.seed_failures(c.ident(), 5)
+        assert await c.is_open(c.ident())
+        spy = _SpyCache(c.cache)
+        c.engine.cache = spy
+        ran = []
+        c.engine._tool_llm_generic = lambda *a, **k: (ran.append(1), _ok())[1]
+        r = await self._invoke(c)
+        assert r.get("error") == "circuit_breaker_open", r
+        assert not ran, "an open breaker did not stop the direct invocation"
+        assert not spy.recorded, (
+            f"a refused direct invocation wrote to the ledger: {spy.recorded}"
+        )
 
 
 # =============================================================================

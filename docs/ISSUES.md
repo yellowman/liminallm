@@ -8936,3 +8936,91 @@ Recorded, not fixed — two residuals for the reviewer:
   saturated 4-vCPU lane. Green five times serially and green in the
   confirming full lane; recorded as a load-sensitivity observation, not
   repaired here.
+
+## Review found the breaker bound to the node, not the attempt
+
+Four findings on the first breaker commit, three of them merge blockers,
+none visible to its own nineteen witnesses — each is now a red turned
+green:
+
+1. A breaker tripped by attempt one did not stop attempt two. The check
+   ran once before the logical invocation opened, so a node with retries
+   walked its remaining attempts straight past the trip its own first
+   attempt caused: seeded to four failures, a failing tool with
+   `max_retries: 2` ran three times where the rule allows one. Both
+   transports.
+2. The same hoist froze the descriptor at node entry, and every retry ran
+   the captured spec. That regressed tranche 2's frozen rule — current
+   canonical state is consulted at execution, and a process-local capture
+   cannot create authority: a tool retired by its own first attempt was
+   executed again by the second.
+3. The streamed `started` mark sat at the drain's first pull — before the
+   streaming bodies plan. Retrieval and budget assembly (plain LLM) and
+   grounding plus agent-context assembly (`agent.files_v1`) all ran after
+   the mark, so a node deadline spent in streamed planning was recorded
+   as a tool failure while the same deadline on the blocking path
+   correctly recorded nothing.
+4. The commit knowingly shipped SPEC broader than the code: "every
+   invocation whose serve begins records exactly one outcome" beside an
+   ISSUES residual admitting the direct endpoint records nothing. The
+   review declined the pairing — a normative rule the implementation
+   contradicts on purpose is a false rule.
+
+One correction resolves the first two: attempts are prepared immediately
+before they start, inside the driver's loop. `_resolve_attempt_authority`
+resolves the descriptor fresh, derives the breaker identity, and checks
+the breaker — per attempt, one helper for both transports — and a refusal
+comes back as the attempt itself: terminal, routed through the same
+refused-result chooser, retrying nothing. The identity moved onto the
+observation, because with per-attempt resolution two attempts of one node
+can legitimately run under two different rows. For the third, the
+observation now travels into the streaming bodies and `started` is marked
+at the real serve boundaries — the provider pump for the plain LLM node,
+the worker serve for the agent — with two new hang witnesses pinning that
+a provider or serve that starts and stalls past the node deadline records
+the failure the mark exists to catch. For the fourth, the direct endpoint
+now checks the breaker before starting and records through the same
+recorder, and SPEC names the endpoint in the writer sentence instead of
+excusing it.
+
+The review also rejected the "equivalent mutant" claim from the first
+round, correctly: Redis masking a wrong engine call is not the engine
+being right. The circuit-open witnesses now hold a delegating spy over
+the real cache and assert the refusal made no recording call at all,
+which kills that mutant deterministically instead of excusing it.
+
+The mutation set was rebuilt for the new structure and grew to
+twenty-five, all killed — the round-one survivor included:
+
+    mutation                                        outcome
+    drop streamed failure accounting                killed
+    blocking raw failures recorded as success       killed
+    success no longer resets the count              killed
+    streamed raw observation dropped                killed
+    breaker refusal records a failure (shared)      killed (was: survived)
+    unresolved reference records a failure          killed
+    input-validation refusal records a failure      killed
+    direct refusal records a failure                killed
+    blocking outcome derived from final node status killed
+    streamed outcome derived from final node status killed
+    shared identity collapsed to the spelling       killed
+    streamed observation identity to the spelling   killed
+    direct identity collapsed to the spelling       killed
+    blocking observation identity to the spelling   killed
+    started-and-cut-off completion dropped          killed
+    started marked at entry instead of at serve     killed
+    caller revocation counted as failure            killed
+    streamed started re-marked at drain entry       killed
+    llm-body serve mark dropped                     killed
+    agent-body serve mark dropped                   killed
+    the driver writes twice                         killed
+    the driver write removed entirely               killed
+    direct breaker check dropped                    killed
+    direct recording dropped                        killed
+    resolution cached across attempts               killed
+
+The witnesses for findings one and two need no synthetic mutants: they
+were written red against the exact structure under indictment — the
+committed hoist — and turned green only when the preparation moved into
+the attempt loop, which is the direct sensitivity proof a string mutation
+would only imitate.

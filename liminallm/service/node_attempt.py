@@ -208,6 +208,12 @@ class BreakerObservation:
     fired during planning records nothing.
     """
 
+    #: The resolved breaker identity this attempt runs under — the persisted
+    #: artifact's id, or the builtin name when nothing is persisted behind
+    #: it. On the observation rather than beside it, because resolution is
+    #: per attempt: two attempts of one node can resolve different rows, and
+    #: each outcome belongs to the row that produced it.
+    identity: Optional[str] = None
     #: The tool's own work began: the worker's serve started, or the stream's
     #: producer ran. Resolution, admission, validation and planning all
     #: precede it.
@@ -346,6 +352,7 @@ class StreamedNodeAttempt:
             [Dict[str, Any]], Tuple[Dict[str, Any], Optional[Dict[str, Any]]]
         ],
         buffer: bool = False,
+        breaker: Optional[BreakerObservation] = None,
     ) -> None:
         self._stream = stream
         #: The postflight: `(sanitized, refusal)`. Always applied, exactly as
@@ -353,7 +360,12 @@ class StreamedNodeAttempt:
         #: schema, and what proceeds downstream is the sanitized object.
         self._finalize = finalize
         self._buffer = buffer
-        self.breaker = BreakerObservation()
+        #: Shared with the streaming body, which marks `started` at its own
+        #: serve boundary — the worker spawn or the provider pump, not this
+        #: class's first pull: the body plans (retrieval, grounding, context
+        #: assembly) before any tool work runs, and a deadline spent there
+        #: must record nothing.
+        self.breaker = breaker or BreakerObservation()
         self._outcome = NodeOutcome(
             result={"status": "error", "error": "stream produced no answer"}
         )
@@ -374,8 +386,6 @@ class StreamedNodeAttempt:
         emitted = False
         done: Optional[Dict[str, Any]] = None
         raw: Optional[Dict[str, Any]] = None
-        # Iterating is what runs the producer, so the tool's work starts here.
-        self.breaker.started = True
 
         async for event in self._stream:
             kind = event.get("event")

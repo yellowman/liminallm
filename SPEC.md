@@ -2375,18 +2375,24 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   behind it — plus tenant, never the node's reference spelling: two
   reachable specs sharing a spelling are different tools with different
   breakers, and the implicit default spelling shares the explicit one's.
-  Every invocation whose serve begins records **exactly one** outcome,
-  written by the attempt driver identically on both transports and once
-  per retry attempt. Failure: a raw tool-level error, an exception after
-  the serve began, the tool's own `timeout_seconds`, or a node deadline
-  that cuts off a started serve. Success: a raw tool-level success — it
-  clears the failure count, and stays a success when the node then fails
-  the consumer's `output_schema`, because node correctness is not tool
-  health. Nothing: a call refused before its serve begins (open breaker,
-  unresolved reference, input validation, plan assembly) and an attempt
-  abandoned by its caller (cancel, revoked lease). **5** failures in
-  **60s** open the breaker for **60s**; an open breaker refuses the
-  invocation before anything starts, on both transports.
+  Every invocation whose serve begins records **exactly one** outcome
+  through one recorder, reached by the attempt driver on both workflow
+  transports — once per retry attempt — and by the direct invocation
+  endpoint (`POST /v1/tools/{id}/invoke`). Failure: a raw tool-level
+  error, an exception after the serve began, the tool's own
+  `timeout_seconds`, or a node deadline that cuts off a started serve.
+  Success: a raw tool-level success — it clears the failure count, and
+  stays a success when the node then fails the consumer's
+  `output_schema`, because node correctness is not tool health. Nothing:
+  a call refused before its serve begins (open breaker, unresolved
+  reference, input validation, plan assembly) and an attempt abandoned
+  by its caller (cancel, revoked lease). **5** failures in **60s** open
+  the breaker for **60s**. The check runs per attempt, against identity
+  resolved at that attempt, on both transports and on direct invocation:
+  an open breaker refuses the call before anything starts, a breaker
+  tripped by one attempt refuses the next, and a tool retired between
+  attempts refuses the retry rather than running from a captured
+  descriptor.
 - The worker holds nothing; the parent serves every effect. The child
   gets a plan — inputs, messages, offered schemas, budgets — and no store
   handle, model client, settings object, filesystem credential, or
