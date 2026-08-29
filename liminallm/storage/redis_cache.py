@@ -54,8 +54,10 @@ class RedisCache:
     # ledgers, so with both live a success clears only one and failures split
     # across both may each stay under threshold. A change of representation
     # is a coordinated reset — old replicas drained before new ones serve,
-    # the previous history abandoned to its window-length TTL — not a rolling
-    # deploy. The version is what keeps that boundary safe rather than
+    # the previous history purged by `purge_breaker_failure_history` (not
+    # merely left to expire: a rollback inside the TTL would otherwise find
+    # it live again) — not a rolling deploy. The version is what keeps that
+    # boundary safe rather than
     # corrupting: a straggler still `INCR`-ing the plain `:failures` string
     # cannot make this set's `ZADD`/`ZCOUNT` fail `WRONGTYPE`. It is a reset
     # boundary, not a licence to run the two side by side, so this code owns
@@ -984,3 +986,36 @@ return {1, tokens, 0}
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         failures_key = f"circuit:{tenant_prefix}{tool_id}:{self._FAILURES_SUFFIX}"
         await self.client.delete(failures_key)
+
+    async def purge_breaker_failure_history(
+        self, *, suffix: str, dry_run: bool = False
+    ) -> int:
+        """Delete every breaker failure-history key for one storage
+        representation, tenant-wide. Returns the number of keys removed (or,
+        with ``dry_run``, the number that would be removed).
+
+        A change of failure-history representation (see `_FAILURES_SUFFIX`)
+        is a coordinated reset, and a reset has to *retire* the superseded
+        representation, not merely let it expire (SPEC §18.3). Abandoning it
+        to its window-length TTL leaves a resurrection window: a rollback to
+        the old representation inside that TTL finds the old counter still
+        live and resumes counting from it, opening a breaker the reset was
+        meant to have cleared — with no mixed-version serving at any point.
+        Purging the superseded namespace after draining its replicas closes
+        that window in both directions.
+
+        Scoped to the failure-history namespace of exactly the named
+        representation: the glob ends at the suffix, so `failures` does not
+        match `failures:v2` and neither matches the shared `:open` cooldown
+        key — an already-open breaker keeps its cooldown across the reset,
+        which is deliberate (an unhealthy tool is not made healthy by a
+        representation change). Never flushes the database.
+        """
+        pattern = f"circuit:*:{suffix}"
+        removed = 0
+        async for key in self.client.scan_iter(match=pattern, count=500):
+            if dry_run:
+                removed += 1
+            else:
+                removed += int(await self.client.delete(key))
+        return removed

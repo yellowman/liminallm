@@ -2401,14 +2401,23 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   — the one-ledger rule the breaker depends on is lost. A change to the
   representation is therefore a coordinated reset, not a rolling deploy:
   replicas on the old representation are drained before replicas on the
-  new one serve, the previous failure history is abandoned to its
-  window-length TTL, and the breaker starts empty. Discarding at most
-  one window of failure history at that boundary is acceptable because
-  the history is ephemeral. Versioning the storage key is what keeps the
-  boundary safe rather than corrupting — a straggler on the old
-  representation cannot make the new one's reads fail on a wrong value
-  type — but it is a reset boundary, not a licence to run the two
-  representations side by side. Attempt preparation is per attempt and
+  new one serve, and the superseded representation's failure-history
+  namespace is **purged**, not left to its TTL. Abandoning it to the TTL
+  is not a reset: a rollback to the old representation inside that window
+  finds the old counter still live and resumes counting from it — no
+  mixed-version serving at any point, and the breaker opens on a count
+  the reset was meant to have cleared. The purge is a small checked-in
+  reset command, run once per transition, in both directions. The
+  failure history then starts empty; an already-open breaker stays open
+  through the shared `:open` cooldown, which is not part of the
+  representation and is deliberately not reset — a representation change
+  does not make a proven-unhealthy tool healthy. Discarding at most one
+  window of failure history at the boundary is acceptable because the
+  history is ephemeral. Versioning the storage key keeps the boundary
+  safe rather than corrupting — a straggler on the old representation
+  cannot make the new one's reads fail on a wrong value type — but it is
+  a reset boundary, not a licence to run the two representations side by
+  side. Attempt preparation is per attempt and
   complete: resolution, the admission preflight (input schema,
   privileged conjunction) and the breaker check, in that order, all
   decided against the attempt's own resolved spec, identically on both

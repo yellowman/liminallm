@@ -1285,6 +1285,56 @@ class TestTheFailureKeyIsRolloutCompatible:
         )
         assert 0 < int(await cache.client.ttl(legacy)) <= 60
 
+    @pytest.mark.asyncio
+    async def test_a_reset_purges_the_superseded_history_against_rollback(self):
+        """Abandoning the old counter to its TTL is not a reset if the old
+        representation can come back inside that window. There is no
+        mixed-version serving in this sequence — the deployment contract is
+        followed perfectly — and the reset still fails: a rollback re-reads a
+        still-live legacy `:failures` and resumes counting from it, opening a
+        breaker the reset was supposed to have cleared. So the reset purges
+        the superseded representation's failure history rather than trusting
+        its TTL. The shared `:open` cooldown and other representations are
+        left alone (SPEC §18.3)."""
+        rt = get_runtime()
+        cache = rt.cache
+        tenant = _u("rollback")
+        ident = _u("tool")
+        legacy = f"circuit:{tenant}:{ident}:failures"
+        open_key = f"circuit:{tenant}:{ident}:open"
+        # A different tool already on the new representation, which the purge
+        # of the *old* one must not touch.
+        other = _u("other")
+        other_v2 = f"circuit:{tenant}:{other}:failures:v2"
+
+        # The old representation left four failures and an open cooldown.
+        await cache.client.set(legacy, "4", ex=60)
+        await cache.client.set(open_key, "1", ex=60)
+        await cache.client.zadd(other_v2, {"m": 100.0})
+
+        # The coordinated reset onto v2 purges the legacy failure history.
+        removed = await cache.purge_breaker_failure_history(suffix="failures")
+        assert removed >= 1
+
+        # Rollback to the old representation, well inside the old 60s TTL. Its
+        # counter must be gone, so an old-style INCR starts fresh at one.
+        resumed = await cache.client.incr(legacy)
+        assert resumed == 1, (
+            f"the legacy counter survived the reset and resurrected on "
+            f"rollback (resumed at {resumed}, not 1): the reset abandoned it "
+            f"to its TTL instead of purging it"
+        )
+        # The shared cooldown survives — an unhealthy tool stays open.
+        assert await cache.client.exists(open_key) == 1, (
+            "the reset purged the shared `:open` cooldown; it must survive a "
+            "representation change"
+        )
+        # And another representation's history is untouched.
+        assert await cache.client.exists(other_v2) == 1, (
+            "the reset of one representation purged another representation's "
+            "history"
+        )
+
 
 # =============================================================================
 # The window's clock is the ledger's, not the serving host's.

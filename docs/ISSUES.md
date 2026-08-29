@@ -9468,3 +9468,59 @@ The mutation set is forty-six, all killed; the new mutant:
 
     new mutation                                    outcome
     success clears the legacy key too (half-migrate)  killed
+
+## A reset that trusts a TTL is not a reset once you allow rollback
+
+Round eight made the breaker representation change a coordinated reset:
+drain the old replicas, let the superseded failure history expire on its
+sixty-second TTL, start the new representation empty. Review found that
+"expire on its TTL" is not a reset the moment a rollback is on the table.
+
+The sequence needs no mixed-version serving at all. Old replicas write four
+failures to the legacy `:failures` counter, each refreshing its sixty-second
+TTL. The fleet drains and cuts over to `:failures:v2`, which starts empty. A
+tool succeeds; the new code clears `:failures:v2` and, by the round-eight
+contract, deliberately never touches the legacy key. Ten seconds later the
+deploy is rolled back — drain v2, start the old image again — well inside
+the legacy key's TTL. The old code reads its still-live `:failures` = 4, the
+next failure makes five, and the breaker opens on a count a success was
+supposed to have cleared. The coordinated contract was followed to the
+letter; the discarded ledger simply became authoritative again when its
+representation returned.
+
+So the reset has to retire the superseded history, not trust its TTL. The
+transition now purges the old representation's failure-history namespace
+outright — a small checked-in command, `scripts/reset_breaker_history.py`,
+run once per transition in whichever direction it goes. It deletes only
+`circuit:*:<representation>` keys: the glob ends at the representation's
+suffix, so purging `failures` cannot touch `failures:v2` and neither can
+touch the shared `:open` cooldown. That last point is deliberate and was the
+round's second, smaller finding: round eight said the breaker "starts
+empty", which read as contradicting the `:open` key the code keeps shared
+across representations. It does not — an already-open breaker keeps its
+cooldown across a representation change, because a change of storage shape
+does not make a proven-unhealthy tool healthy. The failure *history* starts
+empty; the open *cooldown* survives. SPEC §18.3 now says both, and the
+operational procedure — drain, purge the superseded namespace, start, never
+overlap, `:open` survives, rollback in reverse — lives in
+`docs/DEPLOYMENT.md`, where an operator will find it, rather than only in the
+specification and this journal.
+
+The red is behavioural, and it fails for its own reason on the round-eight
+code: seed the legacy counter to four, run the reset, simulate a rollback
+with an old-style increment, and require the result to be one, not five.
+Under "abandon to TTL" the increment resurrects the count to five; under the
+purge it starts fresh at one. The witness also pins the two boundaries the
+purge must respect — the shared `:open` cooldown and any other
+representation's history both survive it. The mutation set is forty-eight,
+all killed; the three new mutants:
+
+    new mutation                                    outcome
+    success clears the legacy key too (half-migrate)  killed
+    the purge glob matches every breaker key         killed
+    the purge counts keys but deletes none           killed
+
+This closes the operational gap round eight left open: the reset is now an
+actual retirement of the superseded representation, safe against a rollback,
+with the shared cooldown preserved and the whole procedure written down
+where it is deployed from.
