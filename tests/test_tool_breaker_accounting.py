@@ -33,6 +33,7 @@ share a spelling shared a breaker across scopes.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import uuid
 
@@ -177,6 +178,9 @@ class _StreamBackend:
         self.fail_after_token = fail_after_token
         self.stream_calls = 0
         self.on_stream = None
+        #: When set, the stream blocks on this event after its first token —
+        #: the shape of a provider mid-read when a cancel lands.
+        self.block_after_token = None
 
     def generate(self, messages, adapters, *, user_id=None):
         return {"content": "whole answer", "usage": {}}
@@ -192,6 +196,8 @@ class _StreamBackend:
             yield {"event": "token", "data": "x"}
             if self.fail_after_token:
                 raise RuntimeError("post-token boom")
+            if self.block_after_token is not None:
+                self.block_after_token.wait(8.0)
             if self.stall:
                 time.sleep(2)
             yield {"event": "message_done", "data": {"content": "x", "usage": {}}}
@@ -234,17 +240,23 @@ def _stream_ctx(fail=False, stall=False, fail_after_token=False):
 
 class _SlowCheckCache:
     """The real cache with a stalled breaker check, for the witness that
-    preparation time comes out of the attempt's budget, not on top of it."""
+    preparation time comes out of the attempt's budget, not on top of it.
+    With `once=True` only the first check stalls — the shape of a transient
+    stall whose retry must then get its retry."""
 
-    def __init__(self, inner, delay):
+    def __init__(self, inner, delay, once=False):
         self._inner = inner
         self._delay = delay
+        self._once = once
+        self._checks = 0
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
     async def check_circuit_breaker(self, *a, **k):
-        await asyncio.sleep(self._delay)
+        self._checks += 1
+        if not self._once or self._checks == 1:
+            await asyncio.sleep(self._delay)
         return await self._inner.check_circuit_breaker(*a, **k)
 
 
@@ -445,6 +457,34 @@ class TestARefusalBeforeInvocationRecordsNothing:
         )
 
     @pytest.mark.asyncio
+    async def test_the_invocation_backstop_refusal_records_nothing(self):
+        """`_invoke_tool` keeps its own preflight as the last line of defense
+        for a caller that skipped admission — the seams refuse first, so
+        only a direct probe reaches it. Its refusal must be as silent in
+        the ledger as the seams' are."""
+        c = _Ctx()
+        art = c.tool(
+            name := _u("backstop"),
+            input_schema={"type": "object", "required": ["impossible_key"]},
+        )
+        from liminallm.service.node_attempt import BreakerObservation
+        from liminallm.service.tool_namespace import ToolResolutionScope
+
+        d = c.engine._resolve_tool(
+            name, ToolResolutionScope("private", c.user.id, c.tenant)
+        )
+        observation = BreakerObservation(identity=art.id)
+        r = await c.engine._invoke_tool(
+            name, {"message": "hi"}, [], [], None, None, None,
+            user_id=c.user.id, tenant_id=c.tenant,
+            descriptor=d, observation=observation,
+        )
+        assert r.get("error") == "validation_error", r
+        assert observation.outcome is None and not observation.started
+        await c.engine._record_breaker_outcome(observation, tenant_id=c.tenant)
+        assert await c.count(name, art.id) == 0
+
+    @pytest.mark.asyncio
     async def test_a_plan_phase_failure_records_nothing(self):
         """Plan assembly is engine work — attachments, context, budgets. A
         crash there proves nothing about the tool, whose body never ran."""
@@ -606,6 +646,107 @@ class TestTheBreakerBindsEachAttempt:
 
 
 # =============================================================================
+# A timed-out attempt is one attempt, not the whole execution.
+# =============================================================================
+
+
+class TestATimedOutAttemptIsNotTheExecution:
+    """The driver's timeout revoke must scope to the attempt that timed out.
+    A revoke that finds no current `Attempt` cancels the logical execution —
+    fail-closed and right for a revoke racing the first spawn, wrong for a
+    node timeout whose retry policy still owes the node a retry."""
+
+    @pytest.mark.asyncio
+    async def test_a_preparation_timeout_leaves_the_retry_its_retry(self):
+        """Attempt one's breaker check stalls past the node deadline; attempt
+        two is instant and its body succeeds. The node must succeed."""
+        c = _Ctx()
+        c.engine.cache = _SlowCheckCache(c.cache, 0.5, once=True)
+        ran = []
+        c.engine._tool_llm_generic = lambda *a, **k: (ran.append(1), _ok())[1]
+        r = await c.run(
+            c.wf("llm.generic", timeout_ms=300, max_retries=1, backoff_ms=1)
+        )
+        assert r.get("status") != "error", (
+            f"a preparation timeout cancelled the logical execution and the "
+            f"retry never ran: {r.get('error')}"
+        )
+        assert len(ran) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_preparation_timeout_leaves_the_retry_its_retry(self):
+        c, backend = _stream_ctx()
+        c.engine.cache = _SlowCheckCache(c.cache, 0.5, once=True)
+        events = await c.run_streaming(
+            c.wf("llm.generic", timeout_ms=300, max_retries=1, backoff_ms=1)
+        )
+        done = [e for e in events if e.get("event") == "message_done"]
+        assert done and done[-1]["data"].get("content") == "x", (
+            "a streamed preparation timeout cancelled the logical execution "
+            "and the retry never streamed"
+        )
+        assert backend.stream_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_a_planning_timeout_leaves_the_retry_its_retry(self):
+        """The same hole one stage later: blocking plan assembly times out
+        before the worker spawn ever opened an `Attempt`."""
+        c = _Ctx()
+        real_plan = c.engine._plan_invocation
+        calls = []
+
+        def slow_once_plan(*a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                time.sleep(0.6)
+            return real_plan(*a, **k)
+
+        c.engine._plan_invocation = slow_once_plan
+        ran = []
+        c.engine._tool_llm_generic = lambda *a, **k: (ran.append(1), _ok())[1]
+        r = await c.run(
+            c.wf("llm.generic", timeout_ms=300, max_retries=1, backoff_ms=1)
+        )
+        assert r.get("status") != "error", (
+            f"a planning timeout cancelled the logical execution and the "
+            f"retry never ran: {r.get('error')}"
+        )
+        assert len(ran) == 1
+
+
+# =============================================================================
+# The dispatch resolver is not free clock.
+# =============================================================================
+
+
+class TestDispatchIsNotFreeClock:
+    @pytest.mark.asyncio
+    async def test_the_transport_decision_spends_the_node_deadline(self):
+        """The streamed turn's only resolver runs inside the attempt's
+        deadline. A resolver that stalls longer than the node budget must
+        time the attempt out — not run on free clock and then hand the
+        provider a fresh one."""
+        c, backend = _stream_ctx()
+        real_resolve = c.engine._resolve_tool
+        calls = []
+
+        def slow_once_resolve(name, scope):
+            calls.append(1)
+            if len(calls) == 1:
+                time.sleep(0.6)
+            return real_resolve(name, scope)
+
+        c.engine._resolve_tool = slow_once_resolve
+        events = await c.run_streaming(c.wf("llm.generic", timeout_ms=300))
+        assert backend.stream_calls == 0, (
+            "the dispatch resolver ran on free clock and the provider "
+            "started after the node deadline was spent"
+        )
+        assert any(e.get("event") == "error" for e in events)
+        assert await c.count(c.ident(), "llm.generic") == 0
+
+
+# =============================================================================
 # Fresh authority is freshly adjudicated.
 # =============================================================================
 
@@ -702,6 +843,48 @@ class TestFreshAuthorityIsFreshlyAdjudicated:
 
 
 class TestRecoveryIsNotToolHealth:
+    @pytest.mark.asyncio
+    async def test_a_cancel_mid_read_does_not_complete_the_answer(self):
+        """Cancellation stops the pump, and the pump's terminal sentinel must
+        not read as a natural end of stream: with the provider blocked
+        mid-read, the agent otherwise falls out of its loop, completes the
+        partial as a normal answer, and the caller's own cancel clears the
+        breaker as a success. Caller abandonment records nothing."""
+        c, backend = _stream_ctx()
+        backend.generate_with_tools = lambda *a, **k: {}
+        backend.block_after_token = threading.Event()
+        agent_ident = c.ident("agent.files_v1")
+        await c.seed_failures(agent_ident, 4)
+        spy = _SpyCache(c.cache)
+        c.engine.cache = spy
+        wf_art = c.wf("agent.files_v1", max_retries=0)
+        c.engine._serve_invocation = lambda *a, **k: {
+            "messages": [], "usage": {}, "context_snippets": [],
+            "tool_calls": [], "artifacts": [], "injection_findings": [],
+        }
+        c.engine._build_agent_context = lambda *a, **k: (
+            [], [{"name": "t"}], "", [], []
+        )
+        cancel_event = asyncio.Event()
+        events = []
+        async for e in c.engine.run_streaming(
+            wf_art.id, None, "hi", None,
+            user_id=c.user.id, tenant_id=c.tenant, cancel_event=cancel_event,
+        ):
+            events.append(e)
+            if e.get("event") == "token":
+                cancel_event.set()
+        assert not any(
+            e.get("event") == "message_done" and (e.get("data") or {}).get("content")
+            for e in events
+        ), "a cancelled turn was completed as a normal answer"
+        assert await c.count(agent_ident) == 4, (
+            "the caller's own cancel cleared the tool's failure count"
+        )
+        assert not [r for r in spy.recorded if r[0] == "success"], (
+            "a cancelled attempt recorded a breaker success"
+        )
+
     @pytest.mark.asyncio
     async def test_a_salvaged_partial_answer_still_records_the_failure(self):
         """The agent keeps a partial answer when its final stream dies after
@@ -862,6 +1045,31 @@ class TestTheDirectInvocationIsTheSameLedger:
         assert r.get("error") == "validation_error", r
         assert not ran
         assert await c.count(name, art.id) == 0
+
+    @pytest.mark.asyncio
+    async def test_direct_admission_order_matches_the_transports(self):
+        """One admission order everywhere: preflight, then breaker. With both
+        grounds to refuse, the direct endpoint gives the same answer a
+        workflow attempt gives — validation, not circuit-open."""
+        c = _Ctx()
+        art = c.tool(
+            name := _u("ordfoo"),
+            input_schema={"type": "object", "required": ["impossible_key"]},
+        )
+        await c.seed_failures(art.id, 5)
+        assert await c.is_open(art.id)
+        from liminallm.service.tool_namespace import ToolResolutionScope
+
+        d = c.engine._resolve_tool(
+            name, ToolResolutionScope("private", c.user.id, c.tenant)
+        )
+        r = await c.engine.invoke_tool(
+            d, {"message": "hi"}, user_id=c.user.id, tenant_id=c.tenant
+        )
+        assert r.get("error") == "validation_error", (
+            f"the direct endpoint consulted the breaker before validation: "
+            f"{r.get('error')}"
+        )
 
     @pytest.mark.asyncio
     async def test_an_open_breaker_refuses_the_direct_invocation(self):

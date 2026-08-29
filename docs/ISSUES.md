@@ -9092,3 +9092,88 @@ the single-attempt validation witness survives it through the
 `_invoke_tool` backstop, which is exactly the layering: the backstop
 guards the invocation, the preparation guards the attempt, and only the
 attempt-level half can see a spec that changed between retries.
+
+## A timeout with nowhere to land cancelled the execution, and two more seams review found beside it
+
+Round four on the breaker tranche: three runtime blockers and the direct
+ordering the previous round had left as a follow-up. Each is a red turned
+green.
+
+1. A timeout before the worker opened its `Attempt` cancelled the whole
+   logical execution. `Invocation.revoke` with no current attempt fails
+   closed by cancelling everything — right for a revoke racing the first
+   spawn, wrong for a node timeout whose retry policy still owes the node
+   its retry. A stalled breaker check on attempt one, or blocking plan
+   assembly running past the deadline, both revoked pre-spawn: the retry
+   then died on `begin_attempt` (streamed) or was refused at its own spawn
+   (blocking). The driver now establishes attempt-scoped authority before
+   any cancelable work — `begin_attempt` precedes preparation for every
+   attempt — so its timeout always revokes the attempt, never the
+   execution. The worker spawn *adopts* the driver's attempt instead of
+   beginning its own (`Invocation.adopt_attempt`), refusing one the
+   timeout already revoked, which keeps the pre-spawn revoke fence; a
+   driverless caller — direct invocation — still begins its own. Once
+   adopted, the parent-side serve loop keeps sole ownership of `finished`,
+   so a retry still waits for the abandoned serve to actually return; the
+   driver ends only attempts nothing adopted. Three witnesses: a stalled
+   breaker check, its streamed sibling, and stalled plan assembly — each
+   with a fast second attempt that must succeed.
+2. Streaming still had one free, synchronous resolver: the dispatch call
+   that chose streamed-versus-blocking ran before any node deadline
+   existed, so a stalled lookup granted the provider a fresh clock — the
+   class the previous round closed, surviving in the one lookup that round
+   did not move. The dispatch resolver is gone: every `tool_call` node
+   enters the shared attempt driver, and the *preparation* decides the
+   transport from the same per-attempt resolution the admission uses — a
+   non-streamable spec, or a backend that cannot be stopped, gets a
+   blocking attempt under the same driver, deadline and ledger, and the
+   streaming loop applies the blocking bookkeeping to outcomes that
+   carried no client events. The `tool_changed` refusal died with the
+   frozen dispatch: a spec that stops streaming between attempts now
+   simply runs blocking.
+3. Caller cancellation could still clear the agent's breaker. The pump's
+   stop injects the same `_DONE` sentinel a finished producer emits, so a
+   cancel landing while the provider was blocked mid-read ended
+   `_pumped()` as if the stream had completed: the agent fell out of its
+   loop, emitted a well-formed partial `tool_result`, and the caller's own
+   cancel recorded a breaker success over four seeded failures. The pump
+   now knows why it ended — `interrupted` is a stop that cut the producer
+   short of its natural end — and `_pumped` emits `cancel_ack` for an
+   interrupted stream, which the agent's existing cancel branch turns into
+   an unrecorded, unanswered exit. The witness cancels mid-read and holds
+   the count at four, with a spy proving no success was ever recorded.
+4. The direct endpoint's admission order now matches the transports
+   instead of being recorded as a follow-up: `_admit_descriptor` — the
+   preflight, then the breaker — is the second half of attempt preparation
+   and the whole of direct admission, which skips only the resolution it
+   does not need. With both grounds to refuse, every seam answers
+   validation, not circuit-open; the witness holds an open breaker against
+   an impossible input schema and requires `validation_error`.
+
+Six new witnesses (the three timeout-retry shapes, the dispatch clock,
+the cancel-mid-read, the direct order) plus a seam probe of the
+invocation backstop, bringing the file to forty-seven. The mutation set
+is thirty-three, all killed. The five new mutants:
+
+    new mutation                                    outcome
+    driver timeout cancels the execution            killed
+    attempt begun after preparation                 killed
+    dispatch resolver reintroduced pre-driver       killed
+    pump interruption read as natural end           killed
+    pump `interrupted` never true                   killed
+
+One prior mutant needed a new witness rather than a shrug: with admission
+now refusing at every seam, the `_invoke_tool` backstop's refusal branch
+became unreachable from the workflow and direct paths, and the mutant
+that makes it record survived as dead code. The backstop exists precisely
+for a caller that skips admission, so it earned a seam-level probe — the
+refusal returns, the observation stays empty, and the recorder writes
+nothing — which kills that mutant deterministically.
+
+One load-sensitivity observation, same class as the pool-arming witness
+recorded earlier: one loaded full-lane run failed
+`test_a_replacement_cannot_be_undone_by_a_write_already_in_flight` — a
+file-replacement race witness over code this tranche never touched, last
+changed before this branch existed. Green five times serially (a 31-second
+concurrency witness each run) and green on the confirming full lane;
+recorded, not repaired here.

@@ -2401,11 +2401,21 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   the attempt's deadline: the absolute deadline is fixed before
   preparation begins, and a stalled resolution or breaker check times
   the attempt out rather than granting the body a fresh clock; a
-  preparation cut off this way never started and records nothing.
-  Recovery is not tool health: a body that salvages a partial answer
-  after its serve failed still records the failure — the observation is
-  sticky — while caller abandonment (cancel, revoked lease) still
-  records nothing.
+  preparation cut off this way never started and records nothing. The
+  transport decision — streamed tokens or the blocking body — reads the
+  same per-attempt resolution, so no lookup runs outside the deadline.
+  Preparation runs under attempt-scoped authority established before it
+  begins: a deadline that expires during preparation or planning —
+  anywhere before the worker spawn — revokes that attempt alone, the
+  spawn joins the driver's attempt rather than opening its own (a spawn
+  that lost the race to the timeout is refused), and the retry policy
+  keeps its remaining attempts; only the caller's cancel ends the
+  logical execution. Recovery is not tool health: a body that salvages
+  a partial answer after its serve failed still records the failure —
+  the observation is sticky — while caller abandonment (cancel, revoked
+  lease) still records nothing, and a stream cut short by a stop is an
+  interrupted stream, never a natural end that completes a partial
+  answer.
 - The worker holds nothing; the parent serves every effect. The child
   gets a plan — inputs, messages, offered schemas, budgets — and no store
   handle, model client, settings object, filesystem credential, or

@@ -191,39 +191,25 @@ class WorkflowStreamingMixin:
             node_type = node.get("type", "tool_call")
             tool_name = node.get("tool", "")
 
-            # Resolve before choosing a capability. This compared the
-            # reference *spelling* against a fixed list, so a tenant-shared
-            # spec overriding the name `llm.generic` streamed the model while
-            # the blocking path ran the override's real body: the `stream`
-            # flag decided which capability a published workflow executed.
-            # Deciding on the resolved handler also lets an aliased name whose
-            # handler *is* the LLM stream, which a spelling comparison could
-            # not express.
-            descriptor = (
-                self._resolve_tool(tool_name, tool_scope)
-                if node_type == "tool_call" and tool_name
-                else None
-            )
-
-            # Handle streaming for LLM-based tools. The attachment agent streams
-            # too: its tool rounds emit trace events, then the answer streams.
-            #
-            # A backend that has not proven it can be stopped does not stream
-            # at all — undeclared means no (see
-            # `LLMService.stream_is_cancellable`). The branch below runs the
-            # node on the ordinary executor: the driver enforces the deadline,
-            # the retry waits for the previous attempt to be confirmed dead,
-            # and the answer reaches the client in the final `message_done`.
-            # What the kill ends there is the worker; a host-tool body such as
-            # `llm.generic` runs in the parent's serve thread, so a generation
-            # past its deadline is reported failed at the deadline while the
-            # body runs on as bounded, authorityless work — the retry is then
-            # refused until it returns, not run beside it.
-            if (
-                descriptor is not None
-                and descriptor.streamable
-                and self.llm.stream_is_cancellable
-            ):
+            # Every tool_call node goes through the attempt driver; whether
+            # it streams is the *preparation's* decision, made per attempt
+            # from the same resolution the admission uses. A resolver out
+            # here decided the transport before any node deadline existed —
+            # a stalled lookup ran on free wall clock, on the event loop,
+            # and then handed the body a fresh budget — and its answer froze
+            # across retries. A non-streamable spec, or a backend that has
+            # not proven it can be stopped (undeclared means no — see
+            # `LLMService.stream_is_cancellable`), runs the blocking body
+            # under the same driver: the deadline is enforced, the retry
+            # waits for the previous attempt to be confirmed dead, and the
+            # answer reaches the client in the turn's final `message_done`.
+            # What the kill ends there is the worker; a host-tool body such
+            # as `llm.generic` runs in the parent's serve thread, so a
+            # generation past its deadline is reported failed at the
+            # deadline while the body runs on as bounded, authorityless
+            # work — the retry is then refused until it returns, not run
+            # beside it.
+            if node_type == "tool_call":
                 # No admission decision is made here. Resolution, the
                 # preflight and the breaker check all run in the attempt
                 # driver's per-attempt preparation, exactly as the blocking
@@ -233,9 +219,10 @@ class WorkflowStreamingMixin:
                 # re-resolved but inherited that first verdict, so a retry
                 # that fell through to a privileged spec of the same name
                 # ran it on the retired spec's clean preflight (SPEC §18.3).
-                # `descriptor` above decides only the transport.
                 tool_result = None
                 failure_event = None
+                node_outcome = None
+                saw_done = False
                 # Once a token has reached the client it is on their screen,
                 # so recovery would append a second answer to the same bubble
                 # rather than replace the first. `_stream_agent_files_node`
@@ -265,6 +252,7 @@ class WorkflowStreamingMixin:
                 ) as driver:
                     async for event in driver:
                         if isinstance(event, NodeOutcome):
+                            node_outcome = event
                             emitted_tokens = event.emitted
                             failure_event = event.failure_event
                             if event.result.get("status") == "error":
@@ -278,6 +266,7 @@ class WorkflowStreamingMixin:
                             yield event
                         elif event["event"] == "message_done":
                             # Update state from completed message
+                            saw_done = True
                             data = event.get("data", {})
                             content = data.get("content", "")
                             node_usage = data.get("usage", {})
@@ -336,6 +325,33 @@ class WorkflowStreamingMixin:
                         {"node_id": node_id, "tool": tool_name},
                     )
                     return
+
+                if node_outcome is not None and not saw_done:
+                    # A blocking-bodied attempt: no client events carried its
+                    # data, so the outcome does — the same bookkeeping the
+                    # non-tool branch below applies to its results.
+                    result = node_outcome.result
+                    self._append_trace(
+                        workflow_trace, {"node": node_id, **result}
+                    )
+                    yield {
+                        "event": "trace",
+                        "data": {"workflow_trace": workflow_trace[-1]},
+                    }
+                    if result.get("outputs"):
+                        vars_scope.update(result["outputs"])
+                    for snippet in result.get("context_snippets") or []:
+                        if snippet in context_seen:
+                            continue
+                        if len(context_snippets) >= MAX_CONTEXT_SNIPPETS:
+                            break
+                        context_seen.add(snippet)
+                        context_snippets.append(snippet)
+                    if result.get("content"):
+                        content = result["content"]
+                    usage = self._merge_usage(usage, result.get("usage") or {})
+                    pending.extend(node_outcome.next_nodes)
+                    continue
 
                 pending.extend(self._successors(node, {"status": "ok"}))
 
@@ -565,16 +581,20 @@ class WorkflowStreamingMixin:
             tenant_id=tenant_id,
         )
 
+        lookup = str(tool_name or "") or "llm.generic"
+
         async def make_attempt():
-            """One attempt's authority and body, prepared *now* — the same
-            per-attempt rule as the blocking path (SPEC §18.3): resolution,
-            the admission preflight and the breaker check run fresh for
-            every attempt, through the same helper, so a tool retired
-            between attempts refuses the retry, a spec this turn's inputs
-            or caller may not pass refuses it too, and a breaker tripped by
-            attempt one refuses attempt two. The dispatch out in the caller
-            decided this node streams; the spec's word on *that* is
-            re-checked here as well, because the row may have changed since.
+            """One attempt's authority, body and *transport*, prepared now —
+            the same per-attempt rule as the blocking path (SPEC §18.3):
+            resolution, the admission preflight and the breaker check run
+            fresh for every attempt, through the same helper, so a tool
+            retired between attempts refuses the retry, a spec this turn's
+            inputs or caller may not pass refuses it too, and a breaker
+            tripped by attempt one refuses attempt two. The transport
+            decision reads this same resolution: deciding it out in the
+            dispatch took a resolver call before the attempt's deadline
+            existed — free wall clock, on the event loop — and froze the
+            answer across retries.
             """
             # The inputs the preflight judges, computed as `_execute_node`
             # computes them: a node that names no `message` runs on the
@@ -585,7 +605,7 @@ class WorkflowStreamingMixin:
             if "message" not in attempt_inputs and user_message:
                 attempt_inputs["message"] = user_message
             fresh, identity, refusal = await self._resolve_attempt_authority(
-                tool_name,
+                lookup,
                 tool_scope,
                 inputs=attempt_inputs,
                 user_id=user_id,
@@ -593,13 +613,28 @@ class WorkflowStreamingMixin:
             )
             if refusal is not None:
                 return refusal
-            if not fresh.streamable:
-                return {
-                    "status": "error",
-                    "content": f"tool {tool_name} no longer streams",
-                    "error": "tool_changed",
-                }
             observation = BreakerObservation(identity=identity)
+            if not (fresh.streamable and self.llm.stream_is_cancellable):
+                # A spec that does not stream, or a backend that has not
+                # proven it can be stopped, runs the blocking body under
+                # this same driver, deadline and ledger; the answer reaches
+                # the client in the turn's final `message_done`.
+                return self._blocking_attempt(
+                    node,
+                    descriptor=fresh,
+                    observation=observation,
+                    inputs=attempt_inputs,
+                    user_message=user_message,
+                    context_id=context_id,
+                    conversation_id=conversation_id,
+                    adapters=adapters,
+                    history=history,
+                    vars_scope=vars_scope,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    tool_scope=tool_scope,
+                    invocation=invocation,
+                )
 
             # The postflight is the blocking path's own, applied to the
             # canonical completed result the streaming implementation hands
@@ -789,6 +824,13 @@ class WorkflowStreamingMixin:
                 yield {"event": "cancel_ack", "data": {}}
                 return
             yield event
+        if pump.interrupted:
+            # The stop landed while the producer was blocked mid-read, so the
+            # sentinel arrived with no event to check the flag against — and
+            # a stream cut short must not read as a natural end: the agent
+            # body would complete its partial as a normal answer, and the
+            # caller's own cancel would record a breaker success (SPEC §18.3).
+            yield {"event": "cancel_ack", "data": {}}
 
     async def _stream_agent_files_node(
         self,

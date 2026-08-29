@@ -324,18 +324,41 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 "content": f"unknown tool {lookup}",
                 "error": "tool_reference_unresolved",
             }
+        identity, refusal = await self._admit_descriptor(
+            descriptor, inputs, tool_name=lookup, user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        return descriptor, identity, refusal
+
+    async def _admit_descriptor(
+        self,
+        descriptor: ToolDescriptor,
+        inputs: Dict[str, Any],
+        *,
+        tool_name: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Admission for one exact descriptor: `(breaker identity, refusal)`.
+
+        The second half of attempt preparation, and the whole of it for the
+        direct endpoint, which is bound to an authorized row and has no name
+        to resolve. One admission order everywhere — the preflight first,
+        then the breaker — so an invalid input is reported as validation on
+        every seam rather than as circuit-open on one of them (SPEC §18.3).
+        """
         refusal = await asyncio.to_thread(
             self.tool_preflight,
             descriptor,
             inputs,
             user_id=user_id,
-            tool_name=lookup,
+            tool_name=tool_name,
         )
         if refusal is not None:
-            return descriptor, None, refusal
+            return None, refusal
         identity = descriptor.artifact_id or descriptor.name
         refusal = await self._circuit_open_result(identity, tenant_id=tenant_id)
-        return descriptor, identity, refusal
+        return identity, refusal
 
     def _error_event(
         self, code: str, message: str, details: dict | None = None
@@ -1048,25 +1071,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 if refusal is not None:
                     return refusal
                 observation.identity = identity
-            return BlockingNodeAttempt(
-                partial(
-                    self._execute_node,
-                    node,
-                    user_message=user_message,
-                    context_id=context_id,
-                    conversation_id=conversation_id,
-                    adapters=adapters,
-                    history=history,
-                    vars_scope=vars_scope,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                    tool_scope=tool_scope,
-                    invocation=invocation,
-                    descriptor=descriptor,
-                    observation=observation,
-                    inputs=attempt_inputs,
-                ),
-                breaker=observation,
+            return self._blocking_attempt(
+                node,
+                descriptor=descriptor,
+                observation=observation,
+                inputs=attempt_inputs,
+                user_message=user_message,
+                context_id=context_id,
+                conversation_id=conversation_id,
+                adapters=adapters,
+                history=history,
+                vars_scope=vars_scope,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                tool_scope=tool_scope,
+                invocation=invocation,
             )
         try:
             async with self._cancel_revokes(invocation, cancel_event):
@@ -1133,6 +1152,49 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     outcome = item
         # Every path out of the driver yields an outcome before it returns.
         return outcome
+
+    def _blocking_attempt(
+        self,
+        node: Dict[str, Any],
+        *,
+        descriptor: Optional[ToolDescriptor],
+        observation: BreakerObservation,
+        inputs: Optional[Dict[str, Any]],
+        user_message: str,
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        adapters: List[dict],
+        history: List[Any],
+        vars_scope: Dict[str, Any],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        tool_scope: ToolResolutionScope,
+        invocation: Invocation,
+    ) -> BlockingNodeAttempt:
+        """One blocking attempt over `_execute_node`, for either transport's
+        preparation: a streamed turn whose spec does not stream — or whose
+        backend has not proven it can be stopped — runs exactly the body the
+        blocking transport runs, under the same driver and ledger."""
+        return BlockingNodeAttempt(
+            partial(
+                self._execute_node,
+                node,
+                user_message=user_message,
+                context_id=context_id,
+                conversation_id=conversation_id,
+                adapters=adapters,
+                history=history,
+                vars_scope=vars_scope,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                tool_scope=tool_scope,
+                invocation=invocation,
+                descriptor=descriptor,
+                observation=observation,
+                inputs=inputs,
+            ),
+            breaker=observation,
+        )
 
     async def _record_breaker_outcome(
         self,
@@ -1265,6 +1327,30 @@ class WorkflowEngine(WorkflowStreamingMixin):
             attempt_timed_out = False
             attempt_raised = False
             try:
+                # §18.3: authority is fresh per attempt, and it exists
+                # *before* the cancelable work. A timeout during preparation
+                # or planning then revokes this attempt, not the execution:
+                # `Invocation.revoke` with no current attempt fails closed by
+                # cancelling everything, which is right for a revoke racing
+                # the first spawn and wrong for a node timeout whose retry
+                # policy still owes the node its retry. The worker spawn
+                # *adopts* this attempt rather than beginning its own, and a
+                # spawn that lost the race to the timeout finds it revoked
+                # and refuses.
+                try:
+                    lease = invocation.begin_attempt()
+                except LeaseRevoked:
+                    # Cancelled. Not an error to retry through: the caller
+                    # said the answer is no longer wanted.
+                    yield NodeOutcome(
+                        result={
+                            "status": "error",
+                            "error": "workflow_cancelled",
+                            "cancelled": True,
+                        },
+                        emitted=emitted,
+                    )
+                    return
                 # Prepared here, inside the loop, so each attempt runs under
                 # authority resolved *now* (SPEC §18.3): a breaker tripped by
                 # the previous attempt refuses this one, and a tool retired
@@ -1291,28 +1377,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     return
                 current = prepared
                 previous = current
-                if current.needs_lease:
-                    # §18.3: authority is fresh per attempt. The worker spawn
-                    # opens its own lease; an in-process attempt has nobody
-                    # else to open one, and without it two things were wrong
-                    # at once — a retry ran with no authority of its own, and
-                    # a revoke that found no current attempt cancelled the
-                    # whole execution and was then ignored by the attempt
-                    # that followed.
-                    try:
-                        lease = invocation.begin_attempt()
-                    except LeaseRevoked:
-                        # Cancelled. Not an error to retry through: the caller
-                        # said the answer is no longer wanted.
-                        yield NodeOutcome(
-                            result={
-                                "status": "error",
-                                "error": "workflow_cancelled",
-                                "cancelled": True,
-                            },
-                            emitted=emitted,
-                        )
-                        return
                 async for event in bounded(current.events(), deadline):
                     if event.get("event") == "token":
                         emitted = True
@@ -1406,7 +1470,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # The lease closes here so `_previous_attempt_is_dead` waits
                 # on a flag somebody actually sets; producer-thread death is
                 # confirmed separately, by `terminate` counting producers.
-                if lease is not None:
+                # Once the worker spawn has adopted this attempt, though, the
+                # parent-side serve loop owns `finished`: ending it here on a
+                # timeout would release the next attempt while the abandoned
+                # serve still runs beside it.
+                if lease is not None and not lease.adopted:
                     invocation.end_attempt(lease)
                 # SPEC §18: exactly one breaker outcome per started attempt,
                 # on every way out — including the caller closing this
@@ -2149,14 +2217,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tool_name = descriptor.name
         if not tool_name:
             return {"status": "error", "content": "tool spec missing name"}
-        # The same ledger as every workflow attempt (SPEC §18.3): an open
-        # breaker refuses the direct invocation before anything starts and
-        # records nothing, and a started one records exactly one outcome
-        # through the same recorder — without this, the direct endpoint was
-        # an unmetered way to keep hammering a tool the breaker had already
-        # cut off for every workflow of the tenant.
-        identity = descriptor.artifact_id or descriptor.name
-        refusal = await self._circuit_open_result(identity, tenant_id=tenant_id)
+        # The same admission and the same ledger as every workflow attempt
+        # (SPEC §18.3): preflight then breaker, through the shared admission
+        # — the endpoint is bound to one authorized row, so resolution is
+        # the one step it skips — and a started invocation records exactly
+        # one outcome through the same recorder. Without the check, the
+        # direct endpoint was an unmetered way to keep hammering a tool the
+        # breaker had already cut off for every workflow of the tenant.
+        identity, refusal = await self._admit_descriptor(
+            descriptor, inputs, tool_name=tool_name, user_id=user_id,
+            tenant_id=tenant_id,
+        )
         if refusal is not None:
             return refusal
         observation = BreakerObservation(identity=identity)

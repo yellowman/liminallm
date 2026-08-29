@@ -675,7 +675,10 @@ def spawn(
     from liminallm.logging import get_logger  # parent-side: see module docstring
 
     logger = get_logger(__name__)
-    attempt = invocation.begin_attempt()
+    # Joins the attempt the retry driver already opened — refusing one the
+    # timeout has revoked — and begins its own only for driverless callers
+    # (direct invocation). See `Invocation.adopt_attempt`.
+    attempt = invocation.adopt_attempt()
     # spawn, not fork: forking a threaded API process risks deadlocks, and a
     # fresh interpreter holding none of the parent's handles is the boundary.
     ctx = multiprocessing.get_context("spawn")

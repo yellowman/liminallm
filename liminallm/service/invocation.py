@@ -554,6 +554,10 @@ class Attempt:
     started_at: float = field(default_factory=time.monotonic)
     terminated_at: Optional[float] = None
     revoked: bool = False
+    #: Set when the worker spawn joined this attempt. From that moment the
+    #: parent-side serve loop owns `finished`; before it, whoever began the
+    #: attempt ends it.
+    adopted: bool = False
     #: Set when the parent-side serve loop for this attempt has returned. The
     #: next attempt waits on it, so no two attempts ever have a capability in
     #: flight at the same time.
@@ -692,6 +696,38 @@ class Invocation:
         with self._lock:
             attempt.terminated_at = time.monotonic()
         attempt.finished.set()
+
+    def adopt_attempt(self) -> Attempt:
+        """The attempt the retry driver already opened, joined by the spawn.
+
+        The driver establishes attempt-scoped authority before any
+        cancelable work, so a node timeout always has an attempt to revoke
+        instead of cancelling the whole execution — and this is the other
+        half of that contract: a spawn that lost the race to the timeout
+        finds the attempt revoked and refuses, rather than beginning a
+        fresh attempt after the revoke and running unsupervised. With no
+        current attempt — a direct invocation, which has no driver — the
+        spawn begins its own, exactly as before.
+        """
+        with self._lock:
+            if self._cancelled:
+                raise LeaseRevoked(
+                    f"invocation {self.invocation_id} was cancelled "
+                    f"({self._revoke_reason}); no further attempt may start"
+                )
+            attempt = self._current
+            if attempt is None:
+                attempt = Attempt(index=len(self.attempts))
+                self.attempts.append(attempt)
+                self._current = attempt
+            elif attempt.revoked:
+                raise LeaseRevoked(
+                    f"invocation {self.invocation_id} attempt "
+                    f"{attempt.index} was revoked ({self._revoke_reason}) "
+                    "before its worker spawned"
+                )
+            attempt.adopted = True
+            return attempt
 
     def await_attempt(self, timeout: float) -> bool:
         """Wait for the current attempt's parent-side work to return.
