@@ -8819,3 +8819,120 @@ tests, an interaction between the outer run's own lease state and the
 lease machinery those tests exercise in-process. The file's docstring
 already warns about the externally-supplied-service shape; the tests
 predate an outer run that leases.
+
+## The breaker ledger had two transports, five phantom writers, and a spelling for a key
+
+The tranche's rule, sharpened by review before any code moved:
+
+    Every tool invocation that actually starts records exactly one breaker
+    outcome against the resolved tool and tenant. Tool-level failure
+    increments; tool-level success clears. Transport and retry path do not
+    change the ledger. A call refused before invocation records nothing.
+
+Characterized by execution first — real engine, real Postgres, real Redis,
+one attempt per row unless stated:
+
+    scenario                         recorded      the rule says
+    blocking raw error               1 failure     1 failure
+    blocking success (seeded 3)      cleared       cleared
+    blocking exception x3 attempts   3             3
+    tool-spec timeout                1 failure     1 failure
+    node-deadline timeout            nothing       1 failure (ruling below)
+    output_schema refusal            1 failure     success — tool answered
+    input-validation refusal         1 failure     nothing — never started
+    unresolved reference             1 failure     nothing
+    plan-phase crash                 1 failure     nothing
+    caller revocation                1 failure     nothing (ruling below)
+    circuit-open refusal             nothing       nothing
+    streamed failure                 nothing       1 failure
+    streamed success (seeded 3)      stayed 3      cleared
+    direct invoke (either outcome)   nothing       recorded, not this tranche
+
+And the key was the node's reference spelling plus tenant on every path, so
+Alice's failing private `foo` opened the breaker for Bob's healthy private
+`foo`, while the implicit default-LLM spelling (`tool` absent) was never
+checked or recorded at all.
+
+The consolidation gives the ledger one writer. Attempts carry a
+`BreakerObservation` — `started` and `outcome`, explicitly not derived from
+the node result — filled at the raw tool boundary: `_invoke_tool` sets it
+for blocking (before the postflight), `StreamedNodeAttempt._drain` sets it
+for streaming (at the `tool_result` event, before `finalize`). The shared
+attempt driver writes the ledger exactly once per attempt in its
+per-attempt `finally`, keyed by the resolved identity — the persisted
+artifact's id, or the builtin name when nothing is persisted behind it —
+which the seeded default tools make an artifact id even for `llm.generic`.
+The breaker *check* moved before the invocation opens
+(`_execute_node_with_retry`, mirroring the streaming preflight), so a
+refusal is now truly pre-invocation: it opens nothing, records nothing, and
+no longer burns the node's retries and backoff on calls the breaker was
+always going to refuse — with `on_error` it takes that edge immediately,
+without one the turn fails immediately.
+
+Two boundary rulings, stated in SPEC §18.3 rather than slipped in:
+
+* An attempt that starts and is then cut off at the node's own deadline
+  records a failure. Without it a backend hung past every node budget never
+  records an outcome — the breaker could not open for exactly the hang it
+  exists to stop. `started` marks the serve, so the same deadline spent in
+  plan assembly still records nothing.
+* An attempt abandoned by its caller — cancel, revoked lease — records
+  nothing. Charging revocations meant a user's cancel habit could open
+  their tenant's breaker with the tool never once at fault.
+
+Witnesses: `tests/test_tool_breaker_accounting.py`, nineteen tests — twelve
+were red on the previous code, each failing on its own assertion; the
+seven controls pin what already held. Exact-count witnesses sum the
+identity key and the spelling key, so a write regressed to the spelling is
+a miscount, not a miss.
+
+Mutations, seventeen across the reviewer's six families plus the boundary
+placements, each run against the witness file with sources restored and
+verified byte-for-byte between runs:
+
+    mutation                                        outcome
+    drop streamed failure accounting                killed
+    blocking raw failures recorded as success       killed
+    success no longer resets the count              killed
+    circuit-open refusal records a failure          equivalent (below)
+    unresolved reference records a failure          killed
+    input-validation refusal records a failure      killed
+    blocking outcome derived from final node status killed
+    streamed outcome derived from final node status killed
+    blocking identity collapsed to the spelling     killed
+    streamed check keyed by the spelling            killed
+    streamed record keyed by the spelling           killed
+    node-deadline completion dropped                killed
+    started marked at entry instead of at serve     killed
+    caller revocation counted as failure            killed
+    the driver writes twice                         killed
+    streamed raw observation dropped                killed
+    the driver write removed entirely               killed
+
+The survivor is an equivalent mutant, not a coverage hole. A circuit-open
+refusal exists only while the open key exists, and `record_tool_failure`'s
+atomic script begins by returning `already open` without incrementing when
+it does — so a failure recorded at that refusal site writes nothing the
+ledger can show. The property is enforced twice, engine and cache; the
+mutant disables the engine half and the cache half holds. It stops being
+equivalent only in the window where the open key expires between the check
+and the write, which no test can stage deterministically.
+
+Recorded, not fixed — two residuals for the reviewer:
+
+* The direct-invocation path (`invoke_tool`, serving
+  `POST /v1/tools/{id}/invoke`) neither consults nor writes the breaker,
+  measured before and unchanged here: it has no driver, and giving it one
+  is its own change. Under the invariant those invocations do start, so
+  they should record; scoped out rather than half-done.
+* A streamed producer that ends cleanly with no `message_done` and no
+  error event records nothing. The only in-tree way to end that way is the
+  pump's deliberate stop (caller-side, correctly nothing); a provider
+  stream that truncates without erroring would evade the ledger, and
+  distinguishing the two needs a signal the attempt does not have today.
+* One full-lane run during this tranche failed
+  `test_a_stream_request_never_reuses_a_warmed_connection` (a tranche-2
+  witness over untouched code): its arming poll allows 2 seconds under a
+  saturated 4-vCPU lane. Green five times serially and green in the
+  confirming full lane; recorded as a load-sensitivity observation, not
+  repaired here.

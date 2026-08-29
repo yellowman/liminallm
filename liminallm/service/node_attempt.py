@@ -196,6 +196,28 @@ class StreamPump:
 
 
 @dataclass
+class BreakerObservation:
+    """What one attempt learned about the tool's health (SPEC §18).
+
+    Deliberately not derived from the attempt's node-level result: a node can
+    fail for reasons that say nothing about the tool — the consumer's
+    `output_schema`, an input refused before anything ran — and the ledger
+    must record what the *tool* did. `outcome` is set at the raw tool
+    boundary; `started` marks that the tool's own work began, which is what
+    lets a deadline that fired mid-serve count as a failure while one that
+    fired during planning records nothing.
+    """
+
+    #: The tool's own work began: the worker's serve started, or the stream's
+    #: producer ran. Resolution, admission, validation and planning all
+    #: precede it.
+    started: bool = False
+    #: "success" | "failure", or None when the attempt proved nothing about
+    #: the tool — refused before it started, or abandoned by its caller.
+    outcome: Optional[str] = None
+
+
+@dataclass
 class NodeOutcome:
     """What one node execution produced, however it was transported.
 
@@ -240,6 +262,10 @@ class NodeAttempt(Protocol):
     #: spawn opens the lease itself and a second one here would double-count.
     needs_lease: bool
 
+    #: This attempt's breaker observation. The attempt fills it in; the
+    #: driver writes the ledger from it, exactly once per attempt.
+    breaker: BreakerObservation
+
     def events(self) -> AsyncIterator[Dict[str, Any]]: ...
 
     async def result(self) -> NodeOutcome: ...
@@ -258,8 +284,16 @@ class BlockingNodeAttempt:
     #: The body runs inside `result()`; nothing exists before it is awaited.
     result_ready_after_events = False
 
-    def __init__(self, run: Callable[[], Any]) -> None:
+    def __init__(
+        self,
+        run: Callable[[], Any],
+        *,
+        breaker: Optional[BreakerObservation] = None,
+    ) -> None:
         self._run = run
+        #: Shared with the body: the engine's tool invocation sets it at the
+        #: raw tool boundary, inside `run`, and the driver reads it here.
+        self.breaker = breaker or BreakerObservation()
 
     async def events(self) -> AsyncIterator[Dict[str, Any]]:
         return
@@ -319,6 +353,7 @@ class StreamedNodeAttempt:
         #: schema, and what proceeds downstream is the sanitized object.
         self._finalize = finalize
         self._buffer = buffer
+        self.breaker = BreakerObservation()
         self._outcome = NodeOutcome(
             result={"status": "error", "error": "stream produced no answer"}
         )
@@ -339,10 +374,13 @@ class StreamedNodeAttempt:
         emitted = False
         done: Optional[Dict[str, Any]] = None
         raw: Optional[Dict[str, Any]] = None
+        # Iterating is what runs the producer, so the tool's work starts here.
+        self.breaker.started = True
 
         async for event in self._stream:
             kind = event.get("event")
             if kind == "error":
+                self.breaker.outcome = "failure"
                 self._outcome = NodeOutcome(
                     result={
                         "status": "error",
@@ -356,6 +394,12 @@ class StreamedNodeAttempt:
                 # The canonical completed result. Consumed, never forwarded:
                 # the client's contract is tokens and `message_done`.
                 raw = dict(event.get("data") or {})
+                # The breaker records what the *tool* did, so the observation
+                # is taken here — before the postflight, whose refusal is the
+                # consumer's schema speaking, not the tool (SPEC §18).
+                self.breaker.outcome = (
+                    "failure" if raw.get("status") == "error" else "success"
+                )
                 continue
             if kind == "message_done":
                 done = event

@@ -63,6 +63,7 @@ from liminallm.service.llm import LLMService
 from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW, active_adapters
 from liminallm.service.node_attempt import (
     BlockingNodeAttempt,
+    BreakerObservation,
     NodeAttempt,
     NodeOutcome,
     bounded,
@@ -226,30 +227,62 @@ class WorkflowEngine(WorkflowStreamingMixin):
         return []
 
     async def _circuit_open_result(
-        self, node: Dict[str, Any], *, tenant_id: Optional[str]
+        self, identity: Optional[str], *, tenant_id: Optional[str]
     ) -> Optional[Dict[str, Any]]:
-        """The error result an open breaker owes this node, or ``None`` when
+        """The error result an open breaker owes this call, or ``None`` when
         the call may proceed.
 
         Its own method because the preflight used to live inside
         `_execute_node`, and the streaming path enters `_stream_llm_node`
         directly: an open breaker did not stop a streamed LLM call at all,
         for the three tools every ordinary chat turn uses (SPEC §18).
+
+        `identity` is the *resolved* breaker identity — the artifact id, or
+        the builtin name when nothing is persisted behind it — never the
+        node's reference spelling. Two reachable specs that happen to share
+        a spelling are different tools, and one failing must not cut the
+        other off; conversely the implicit default spelling and the explicit
+        one are the same tool and share one breaker.
         """
-        tool_name = node.get("tool", "")
-        if not (self.cache and tool_name):
+        if not (self.cache and identity):
             return None
         is_open, _ = await self.cache.check_circuit_breaker(
-            tool_name, tenant_id=tenant_id
+            identity, tenant_id=tenant_id
         )
         if not is_open:
             return None
-        self.logger.warning("tool_circuit_open", tool=tool_name, tenant_id=tenant_id)
+        self.logger.warning("tool_circuit_open", tool=identity, tenant_id=tenant_id)
         return {
             "status": "error",
             "content": "tool temporarily unavailable (circuit breaker open)",
             "error": "circuit_breaker_open",
         }
+
+    def _refused_node_result(
+        self, node: Dict[str, Any], refusal: Dict[str, Any]
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """A pre-invocation refusal as a node result.
+
+        With `on_error` declared, the refusal takes that edge — through the
+        same chooser as every other tool failure, because an earlier shape
+        read `next` directly and an open breaker took the success edge into
+        nodes that assume outputs the failed node never produced. Without
+        one there is no edge to take: an error may never continue down the
+        success path, so the successor list is empty and the turn fails.
+        The retry loop used to produce that same end state by retrying the
+        refusal to exhaustion first, a backoff spent on calls the breaker
+        was always going to refuse.
+        """
+        next_nodes = self._successors(node, refusal) if node.get("on_error") else []
+        payload: Dict[str, Any] = {
+            "node_id": node.get("id", "unknown"),
+            "status": refusal.get("status", "error"),
+            "outputs": {},
+        }
+        for k in ("content", "usage", "context_snippets"):
+            if k in refusal:
+                payload[k] = refusal[k]
+        return payload, next_nodes
 
     def _error_event(
         self, code: str, message: str, details: dict | None = None
@@ -914,6 +947,34 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         backoff_ms = node.get("backoff_ms", DEFAULT_BACKOFF_MS)
 
+        # Resolve the tool before anything is opened, for the two refusals
+        # that must happen — and record nothing — before invocation (SPEC
+        # §18): a reference that names nothing, and an open breaker. Both are
+        # keyed by what the reference *resolves to*: a node that spells no
+        # tool runs the default LLM tool, and the streaming path resolves
+        # before its own preflight the same way. A refusal here retries
+        # nothing: the previous shape returned an error result into the
+        # retry loop, so an open breaker burned every retry and its backoff
+        # on calls it was always going to refuse.
+        descriptor = None
+        breaker_identity = None
+        if node.get("type", "tool_call") == "tool_call":
+            lookup = str(node.get("tool") or "") or "llm.generic"
+            descriptor = self._resolve_tool(lookup, tool_scope)
+            if descriptor is None:
+                refusal = {
+                    "status": "error",
+                    "content": f"unknown tool {lookup}",
+                    "error": "tool_reference_unresolved",
+                }
+                return self._refused_node_result(node, refusal)
+            breaker_identity = descriptor.artifact_id or descriptor.name
+            refusal = await self._circuit_open_result(
+                breaker_identity, tenant_id=tenant_id
+            )
+            if refusal is not None:
+                return self._refused_node_result(node, refusal)
+
         # One id for this node execution, stable across its attempts. Each
         # attempt gets its own worker — attempt two must not inherit attempt
         # one's process — but the ledger is keyed by this, because killing
@@ -924,6 +985,28 @@ class WorkflowEngine(WorkflowStreamingMixin):
             user_id=user_id,
             tenant_id=tenant_id,
         )
+
+        def make_attempt() -> BlockingNodeAttempt:
+            observation = BreakerObservation()
+            return BlockingNodeAttempt(
+                partial(
+                    self._execute_node,
+                    node,
+                    user_message=user_message,
+                    context_id=context_id,
+                    conversation_id=conversation_id,
+                    adapters=adapters,
+                    history=history,
+                    vars_scope=vars_scope,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    tool_scope=tool_scope,
+                    invocation=invocation,
+                    descriptor=descriptor,
+                    observation=observation,
+                ),
+                breaker=observation,
+            )
         try:
             async with self._cancel_revokes(invocation, cancel_event):
                 outcome = await self._run_node_attempts(
@@ -932,25 +1015,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     node_id=node_id,
                     max_retries=max_retries,
                     backoff_ms=backoff_ms,
-                    make_attempt=lambda: BlockingNodeAttempt(
-                        partial(
-                            self._execute_node,
-                            node,
-                            user_message=user_message,
-                            context_id=context_id,
-                            conversation_id=conversation_id,
-                            adapters=adapters,
-                            history=history,
-                            vars_scope=vars_scope,
-                            user_id=user_id,
-                            tenant_id=tenant_id,
-                            tool_scope=tool_scope,
-                            invocation=invocation,
-                        )
-                    ),
+                    make_attempt=make_attempt,
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
                     cancel_event=cancel_event,
+                    breaker_identity=breaker_identity,
+                    tenant_id=tenant_id,
                 )
                 return outcome.result, outcome.next_nodes
         finally:
@@ -1004,6 +1074,46 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # Every path out of the driver yields an outcome before it returns.
         return outcome
 
+    async def _record_breaker_outcome(
+        self,
+        attempt: NodeAttempt,
+        identity: Optional[str],
+        *,
+        tenant_id: Optional[str],
+        timed_out: bool,
+    ) -> None:
+        """Write one attempt's breaker observation to the ledger (SPEC §18).
+
+        Tool-level failure increments; tool-level success clears; an attempt
+        that proved nothing — refused before it started, or abandoned by its
+        caller — writes nothing. One deliberate completion here: an attempt
+        that *started* and was then cut off at the node's own deadline is a
+        failure, because a backend hung past every node budget would
+        otherwise never record an outcome, and the breaker could not open
+        for exactly the hang it exists to stop.
+        """
+        if not (self.cache and identity):
+            return
+        observation = getattr(attempt, "breaker", None)
+        if observation is None:
+            return
+        outcome = observation.outcome
+        if outcome is None and timed_out and observation.started:
+            outcome = "failure"
+        if outcome == "success":
+            await self.cache.record_tool_success(identity, tenant_id=tenant_id)
+        elif outcome == "failure":
+            tripped, failures = await self.cache.record_tool_failure(
+                identity, tenant_id=tenant_id
+            )
+            if tripped:
+                self.logger.warning(
+                    "tool_circuit_tripped",
+                    tool=identity,
+                    failures=failures,
+                    tenant_id=tenant_id,
+                )
+
     async def _drive_node_attempts(
         self,
         node: Dict[str, Any],
@@ -1016,6 +1126,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         workflow_start_time: float,
         workflow_timeout_ms: float,
         cancel_event: Optional[asyncio.Event] = None,
+        breaker_identity: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> AsyncIterator[Any]:
         """The attempt loop of one logical execution, whatever produced it.
 
@@ -1025,6 +1137,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         point: the retry cap, the backoff, the three-way node deadline and the
         workflow deadline are SPEC §9.2 properties of the node, and a second
         copy of them beside the streaming path is a second chance to disagree.
+
+        The breaker ledger is written here, once per attempt, from the
+        observation the attempt carries (SPEC §18). Here and not in the
+        attempt bodies, because the driver is the one place both transports
+        share and the one place that knows the attempt is over — however it
+        ended.
         """
         last_error: Optional[Exception] = None
         attempt = 0
@@ -1073,6 +1191,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             current = make_attempt()
             previous = current
             lease = None
+            attempt_timed_out = False
             if current.needs_lease:
                 # §18.3: authority is fresh per attempt. The worker spawn
                 # opens its own lease; an in-process attempt has nobody else
@@ -1152,6 +1271,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 )
 
             except asyncio.TimeoutError:
+                attempt_timed_out = True
                 timeout_latency = (time.monotonic() * 1000) - start_ms
                 last_error = asyncio.TimeoutError("node_timeout")
                 # `wait_for` cancelled the coroutine; it did not stop the work.
@@ -1191,6 +1311,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # confirmed separately, by `terminate` counting producers.
                 if lease is not None:
                     invocation.end_attempt(lease)
+                # SPEC §18: exactly one breaker outcome per started attempt,
+                # on every way out — including the caller closing this
+                # generator, where an unset observation records nothing.
+                await self._record_breaker_outcome(
+                    current,
+                    breaker_identity,
+                    tenant_id=tenant_id,
+                    timed_out=attempt_timed_out,
+                )
 
             # A retry is only meaningful before the first token. After it, the
             # answer is on the user's screen: a second attempt would append a
@@ -2125,6 +2254,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         invocation: Optional[Invocation] = None,
+        descriptor: Optional[ToolDescriptor] = None,
+        observation: Optional[BreakerObservation] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         node_type = node.get("type", "tool_call")
         if node_type == "switch":
@@ -2156,24 +2287,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         if "message" not in inputs and user_message:
             inputs["message"] = user_message
 
-        # SPEC §18: Check circuit breaker before invoking tool
-        tool_result = await self._circuit_open_result(node, tenant_id=tenant_id)
-        if tool_result is not None:
-            # Through the same chooser as every other tool failure. This
-            # used to read `next` directly and return, so an open breaker
-            # took the success edge into nodes that assume outputs the
-            # failed node never produced.
-            next_nodes_list = self._successors(node, tool_result)
-            result_payload = {
-                "node_id": node.get("id", "unknown"),
-                "status": tool_result.get("status", "done"),
-                "outputs": {},
-            }
-            for k in ("content", "usage", "context_snippets"):
-                if k in tool_result:
-                    result_payload[k] = tool_result[k]
-            return result_payload, next_nodes_list
-
+        # No breaker traffic here. The check happens before the invocation is
+        # opened, in `_execute_node_with_retry`; the recording happens in the
+        # attempt driver, from the observation `_invoke_tool` fills in at the
+        # raw tool boundary. This body deciding both is how a consumer's
+        # `output_schema` refusal and an input refused before anything ran
+        # were charged to the tool's breaker (SPEC §18).
         try:
             tool_result = await self._invoke_tool(
                 tool_name,
@@ -2186,50 +2305,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 user_id=user_id,
                 tenant_id=tenant_id,
                 tool_scope=tool_scope,
+                descriptor=descriptor,
                 invocation=invocation,
+                observation=observation,
             )
-            # SPEC §18: Record success to reset failure counter
-            if self.cache and tool_name:
-                if isinstance(tool_result, dict) and tool_result.get("status") != "error":
-                    await self.cache.record_tool_success(tool_name, tenant_id=tenant_id)
         except Exception as exc:
             self.logger.error("tool_invoke_failed", tool=tool_name, error=str(exc))
-            # SPEC §18: Record failure for circuit breaker (only here for exceptions)
-            if self.cache and tool_name:
-                tripped, failures = await self.cache.record_tool_failure(
-                    tool_name, tenant_id=tenant_id
-                )
-                if tripped:
-                    self.logger.warning(
-                        "tool_circuit_tripped",
-                        tool=tool_name,
-                        failures=failures,
-                        tenant_id=tenant_id,
-                    )
             tool_result = {
                 "status": "error",
                 "content": "tool execution failed",
                 "error": str(exc),
-                "_failure_recorded": True,  # Flag to prevent double-counting
             }
-        # Record failure for error results from _invoke_tool (but not if already recorded)
-        if (
-            self.cache
-            and tool_name
-            and isinstance(tool_result, dict)
-            and tool_result.get("status") == "error"
-            and not tool_result.get("_failure_recorded")
-        ):
-            tripped, failures = await self.cache.record_tool_failure(
-                tool_name, tenant_id=tenant_id
-            )
-            if tripped:
-                self.logger.warning(
-                    "tool_circuit_tripped",
-                    tool=tool_name,
-                    failures=failures,
-                    tenant_id=tenant_id,
-                )
         outputs = {}
         for key in node.get("outputs", []) or []:
             if isinstance(tool_result, dict) and key in tool_result:
@@ -2238,7 +2324,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             outputs = {
                 k: v
                 for k, v in tool_result.items()
-                if k not in {"usage", "context_snippets", "_failure_recorded"}
+                if k not in {"usage", "context_snippets"}
             }
         next_nodes_list = self._successors(node, tool_result)
         result_payload: Dict[str, Any] = {
@@ -2270,6 +2356,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
         descriptor: Optional[ToolDescriptor] = None,
         invocation: Optional[Invocation] = None,
+        observation: Optional[BreakerObservation] = None,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         if descriptor is None:
@@ -2324,6 +2411,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
             tool_spec=tool_spec,
         )
         limits = self._worker_limits(tool_spec)
+        # From here the tool's own work runs: everything above — resolution,
+        # preflight, planning — refuses without touching the breaker ledger,
+        # and everything below is an outcome of the started attempt (SPEC
+        # §18). The driver writes the ledger from this observation, once.
+        if observation is not None:
+            observation.started = True
         try:
             # to_thread carries the broker's serve loop, not the tool's work.
             # That distinction is the whole change: when this await is
@@ -2342,6 +2435,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
         except asyncio.TimeoutError:
             self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
+            # The tool's own declared budget, exceeded: tool health.
+            if observation is not None:
+                observation.outcome = "failure"
             # Revoke before returning, and in that order: a timeout that leaves
             # the worker running is the defect, not the report of one. Off the
             # event loop, because killing and reaping block.
@@ -2353,14 +2449,31 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 tool=tool_name,
                 invocation_id=invocation.invocation_id,
             )
+            # The caller walked away; the tool was not proven unhealthy. No
+            # observation, so nothing is recorded — a cancel habit must not
+            # open the tenant's breaker.
             return {
                 "status": "error",
                 "content": "tool invocation was revoked",
                 "error": "revoked",
             }
+        except Exception:
+            # The serve itself broke after the tool's work began.
+            if observation is not None:
+                observation.outcome = "failure"
+            raise
         finally:
             if owned:
                 await asyncio.to_thread(invocation.close)
+        if observation is not None:
+            # The raw result, before the postflight: what the *tool* did.
+            # A consumer's `output_schema` refusing the node below does not
+            # change this — a healthy tool records a success (SPEC §18).
+            observation.outcome = (
+                "failure"
+                if isinstance(result, dict) and result.get("status") == "error"
+                else "success"
+            )
         if preamble:
             result.setdefault("context_snippets", []).insert(0, preamble)
         sanitized, refusal = self.tool_postflight(

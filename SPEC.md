@@ -2369,6 +2369,24 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   **15s** and is independently capped by the kernel at **60s**. Schema
   sketches and engine sections describe these fields and cite this rule;
   they do not restate the numbers.
+- The tool circuit breaker is one ledger with one writer, and this
+  bullet is its normative home. Identity is the **resolved tool** — the
+  persisted artifact's id, or the builtin name when nothing is persisted
+  behind it — plus tenant, never the node's reference spelling: two
+  reachable specs sharing a spelling are different tools with different
+  breakers, and the implicit default spelling shares the explicit one's.
+  Every invocation whose serve begins records **exactly one** outcome,
+  written by the attempt driver identically on both transports and once
+  per retry attempt. Failure: a raw tool-level error, an exception after
+  the serve began, the tool's own `timeout_seconds`, or a node deadline
+  that cuts off a started serve. Success: a raw tool-level success — it
+  clears the failure count, and stays a success when the node then fails
+  the consumer's `output_schema`, because node correctness is not tool
+  health. Nothing: a call refused before its serve begins (open breaker,
+  unresolved reference, input validation, plan assembly) and an attempt
+  abandoned by its caller (cancel, revoked lease). **5** failures in
+  **60s** open the breaker for **60s**; an open breaker refuses the
+  invocation before anything starts, on both transports.
 - The worker holds nothing; the parent serves every effect. The child
   gets a plan — inputs, messages, offered schemas, budgets — and no store
   handle, model client, settings object, filesystem credential, or

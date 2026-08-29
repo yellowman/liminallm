@@ -249,8 +249,12 @@ class WorkflowStreamingMixin:
                     user_id=user_id,
                     tool_name=tool_name,
                 )
+                # Keyed by the resolved identity, exactly as the blocking
+                # path keys it: the reference's spelling names a different
+                # tool per scope, and the artifact behind it is the thing
+                # whose health the ledger tracks (SPEC §18).
                 tool_result = refusal or await self._circuit_open_result(
-                    node, tenant_id=tenant_id
+                    descriptor.artifact_id or descriptor.name, tenant_id=tenant_id
                 )
                 failure_event = None
                 # Once a token has reached the client it is on their screen,
@@ -635,6 +639,8 @@ class WorkflowStreamingMixin:
                         workflow_start_time=workflow_start_time,
                         workflow_timeout_ms=workflow_timeout_ms,
                         cancel_event=cancel_event,
+                        breaker_identity=descriptor.artifact_id or descriptor.name,
+                        tenant_id=tenant_id,
                     )
                 ) as driver:
                     async for item in driver:
