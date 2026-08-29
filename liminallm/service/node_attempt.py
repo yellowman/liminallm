@@ -406,10 +406,15 @@ class StreamedNodeAttempt:
                 raw = dict(event.get("data") or {})
                 # The breaker records what the *tool* did, so the observation
                 # is taken here — before the postflight, whose refusal is the
-                # consumer's schema speaking, not the tool (SPEC §18).
-                self.breaker.outcome = (
-                    "failure" if raw.get("status") == "error" else "success"
-                )
+                # consumer's schema speaking, not the tool (SPEC §18). A
+                # failure already observed is sticky: a body that salvages a
+                # partial answer after its provider died still emits a
+                # well-formed `tool_result`, and user-facing recovery must
+                # not rewrite tool health.
+                if self.breaker.outcome != "failure":
+                    self.breaker.outcome = (
+                        "failure" if raw.get("status") == "error" else "success"
+                    )
                 continue
             if kind == "message_done":
                 done = event

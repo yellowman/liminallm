@@ -2387,12 +2387,25 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   a call refused before its serve begins (open breaker, unresolved
   reference, input validation, plan assembly) and an attempt abandoned
   by its caller (cancel, revoked lease). **5** failures in **60s** open
-  the breaker for **60s**. The check runs per attempt, against identity
-  resolved at that attempt, on both transports and on direct invocation:
-  an open breaker refuses the call before anything starts, a breaker
-  tripped by one attempt refuses the next, and a tool retired between
-  attempts refuses the retry rather than running from a captured
-  descriptor.
+  the breaker for **60s**. Attempt preparation is per attempt and
+  complete: resolution, the admission preflight (input schema,
+  privileged conjunction) and the breaker check, in that order, all
+  decided against the attempt's own resolved spec, identically on both
+  transports and mirrored on direct invocation. An open breaker refuses
+  the call before anything starts, a breaker tripped by one attempt
+  refuses the next, a tool retired between attempts refuses the retry
+  rather than running from a captured descriptor — and a retry that
+  resolves a *different* spec passes that spec's preflight or is
+  refused, because carrying the first attempt's verdict onto a
+  privileged same-name spec is an authority bypass. Preparation spends
+  the attempt's deadline: the absolute deadline is fixed before
+  preparation begins, and a stalled resolution or breaker check times
+  the attempt out rather than granting the body a fresh clock; a
+  preparation cut off this way never started and records nothing.
+  Recovery is not tool health: a body that salvages a partial answer
+  after its serve failed still records the failure — the observation is
+  sticky — while caller abandonment (cancel, revoked lease) still
+  records nothing.
 - The worker holds nothing; the parent serves every effect. The child
   gets a plan — inputs, messages, offered schemas, budgets — and no store
   handle, model client, settings object, filesystem credential, or

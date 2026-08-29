@@ -9024,3 +9024,71 @@ were written red against the exact structure under indictment — the
 committed hoist — and turned green only when the preparation moved into
 the attempt loop, which is the direct sensitivity proof a string mutation
 would only imitate.
+
+## The preparation seam re-resolved authority and forgot to re-adjudicate it
+
+Review of the second breaker commit found three more merge blockers, all
+exposed by the per-attempt preparation the previous round introduced. Each
+is a red turned green.
+
+1. Fresh streaming authority was not freshly preflighted. The streaming
+   branch ran `tool_preflight` once, against the descriptor that chose the
+   transport; every retry then re-resolved a fresh descriptor and inherited
+   that first verdict. An ordinary user's non-privileged private spec could
+   fail, be retired, and the retry fall through to an admin-owned
+   *privileged* spec of the same name — and run it, because the clean
+   preflight travelled while the spec did not. An authority bypass, not
+   staleness. Preparation is now complete: resolution, the admission
+   preflight against the attempt's own inputs, then the breaker check, one
+   helper for both transports, and the outer streaming preflight is gone.
+   The witness runs exactly the bypass; its complement proves a
+   substituted spec's `input_schema` refuses the retry. `tool_preflight`
+   still also runs inside `_invoke_tool` — the authority witnesses pin the
+   invocation boundary as its own backstop, and one function called twice
+   is not two copies.
+2. Preparation could spend the deadline and the tool started anyway. The
+   driver computed the node budget, awaited preparation unbounded, and
+   only then started the clock — so a breaker check that stalled half a
+   second handed the body a fresh budget past the node's own deadline, the
+   same class as tranche 2's blocking-work-after-budget, one seam earlier.
+   The absolute deadline is now fixed before preparation, preparation is
+   awaited under it, and the resolver and preflight run off-loop so the
+   bound is a hard wall clock rather than one noticed after a stalled
+   query returns. A preparation cut off this way never `started` and
+   records nothing.
+3. The agent could turn a real post-start failure into breaker success.
+   `agent.files_v1` deliberately salvages: a final stream that dies after
+   a token keeps the partial answer and emits a well-formed `tool_result`,
+   which the attempt read as a raw success — five provider deaths became a
+   clean bill of health because the UI kept the fragments. The agent's
+   catch now marks the observation failed (revoked leases excluded: caller
+   abandonment still records nothing) and the observation is sticky — a
+   later partial or fallback `tool_result` cannot rewrite a failure. The
+   witness seeds four failures, salvages a partial, asserts the partial
+   still reaches the client *and* the breaker is open.
+
+SPEC §18.3 now states all three normatively: preparation per attempt and
+complete, in resolve → preflight → breaker order on both transports;
+preparation spends the attempt's deadline; recovery is not tool health.
+One ordering note made deliberately rather than silently: the workflow
+transports refuse invalid input before consulting the breaker, while the
+direct endpoint checks the breaker first and preflights inside the
+invocation — the transports now agree with each other, which is what the
+review asked; aligning the direct endpoint's order is a one-line follow-up
+if wanted.
+
+Five witnesses were added — the bypass, its validation complement, the
+deadline, the salvage, and a direct input refusal — bringing the file to
+thirty-four, and the mutation set grew to twenty-nine, all killed:
+
+    new mutation                                    outcome
+    preflight dropped from attempt preparation      killed
+    deadline established after preparation          killed
+    agent caught failure left unmarked              killed
+    observation stickiness dropped                  killed
+
+The preflight-drop mutant is killed by the retry-shaped witnesses alone —
+the single-attempt validation witness survives it through the
+`_invoke_tool` backstop, which is exactly the layering: the backstop
+guards the invocation, the preparation guards the attempt, and only the
+attempt-level half can see a spec that changed between retries.

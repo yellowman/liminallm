@@ -290,24 +290,49 @@ class WorkflowEngine(WorkflowStreamingMixin):
         lookup: str,
         tool_scope: ToolResolutionScope,
         *,
+        inputs: Dict[str, Any],
+        user_id: Optional[str],
         tenant_id: Optional[str],
     ) -> Tuple[Optional[ToolDescriptor], Optional[str], Optional[Dict[str, Any]]]:
         """What one attempt runs under: `(descriptor, breaker identity,
         refusal)` — the refusal ``None`` when the attempt may proceed.
 
-        Called per attempt, never once per node: current canonical state is
-        consulted at execution, so a tool retired between attempts refuses
-        the retry rather than running from a captured descriptor — and a
-        breaker tripped by attempt N refuses attempt N+1 (SPEC §18.3), which
-        a check at node entry walks straight past.
+        Called per attempt, never once per node, and complete: resolution,
+        the admission preflight, then the breaker check, in that order on
+        both transports. Current canonical state is consulted at execution,
+        so a tool retired between attempts refuses the retry rather than
+        running from a captured descriptor — and *everything* the resolved
+        spec must pass is decided against the attempt's own resolution:
+        re-resolving without re-preflighting let a retry fall through to a
+        privileged spec of the same name and run it on the retired spec's
+        clean preflight, which is an authority bypass, not staleness. The
+        breaker tripped by attempt N refuses attempt N+1 (SPEC §18.3).
+        `tool_preflight` also runs inside `_invoke_tool` as the invocation
+        boundary's own backstop — the authority witnesses pin that; this
+        call is what makes the decision per-attempt and pre-breaker.
+
+        The store work runs off-loop so the driver's deadline around
+        preparation is a hard wall clock, not one noticed after a stalled
+        query returns.
         """
-        descriptor = self._resolve_tool(lookup, tool_scope)
+        descriptor = await asyncio.to_thread(
+            self._resolve_tool, lookup, tool_scope
+        )
         if descriptor is None:
             return None, None, {
                 "status": "error",
                 "content": f"unknown tool {lookup}",
                 "error": "tool_reference_unresolved",
             }
+        refusal = await asyncio.to_thread(
+            self.tool_preflight,
+            descriptor,
+            inputs,
+            user_id=user_id,
+            tool_name=lookup,
+        )
+        if refusal is not None:
+            return descriptor, None, refusal
         identity = descriptor.artifact_id or descriptor.name
         refusal = await self._circuit_open_result(identity, tenant_id=tenant_id)
         return descriptor, identity, refusal
@@ -992,19 +1017,32 @@ class WorkflowEngine(WorkflowStreamingMixin):
         async def make_attempt():
             """One attempt's authority and body, prepared *now* (SPEC §18.3).
 
-            Resolution and the breaker check run per attempt, in the driver's
-            loop: a node that spells no tool runs the default LLM tool; a
-            reference that resolves to nothing, and an open breaker — one
-            opened by this node's own previous attempt included — refuse the
-            attempt before anything is spawned, and the refusal retries
-            nothing.
+            Resolution, the admission preflight and the breaker check run per
+            attempt, in the driver's loop: a node that spells no tool runs
+            the default LLM tool; a reference that resolves to nothing, a
+            spec this turn's inputs or caller may not pass, and an open
+            breaker — one opened by this node's own previous attempt
+            included — refuse the attempt before anything is spawned, and
+            the refusal retries nothing. The inputs are computed here and
+            handed to the body, so the preflight judges exactly what the
+            attempt executes with.
             """
             descriptor = None
+            attempt_inputs = None
             observation = BreakerObservation()
             if node_type == "tool_call":
+                attempt_inputs = self._resolve_inputs(
+                    node.get("inputs", {}), user_message, vars_scope
+                )
+                if "message" not in attempt_inputs and user_message:
+                    attempt_inputs["message"] = user_message
                 descriptor, identity, refusal = (
                     await self._resolve_attempt_authority(
-                        lookup, tool_scope, tenant_id=tenant_id
+                        lookup,
+                        tool_scope,
+                        inputs=attempt_inputs,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
                     )
                 )
                 if refusal is not None:
@@ -1026,6 +1064,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     invocation=invocation,
                     descriptor=descriptor,
                     observation=observation,
+                    inputs=attempt_inputs,
                 ),
                 breaker=observation,
             )
@@ -1211,6 +1250,16 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 MAX_NODE_TIMEOUT_SECONDS * 1000,
                 remaining_ms,
             )
+            # The absolute deadline, fixed before preparation: preparation
+            # is part of the attempt and spends its budget. Established
+            # after it, a stalled resolution or breaker check handed the
+            # body a fresh clock past the node's own deadline — the same
+            # class as blocking work starting after its budget was gone
+            # (§18.3), one seam earlier. A preparation cut off here never
+            # `started`, so it records nothing.
+            deadline = (
+                asyncio.get_running_loop().time() + node_timeout_ms / 1000.0
+            )
             current: Optional[NodeAttempt] = None
             lease = None
             attempt_timed_out = False
@@ -1226,7 +1275,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # just waiting.
                 prepared = make_attempt()
                 if inspect.isawaitable(prepared):
-                    prepared = await prepared
+                    prepared = await asyncio.wait_for(
+                        prepared,
+                        timeout=max(
+                            deadline - asyncio.get_running_loop().time(), 0.0
+                        ),
+                    )
                 if isinstance(prepared, dict):
                     payload, refusal_next = self._refused_node_result(
                         node, prepared
@@ -1259,9 +1313,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
                             emitted=emitted,
                         )
                         return
-                deadline = (
-                    asyncio.get_running_loop().time() + node_timeout_ms / 1000.0
-                )
                 async for event in bounded(current.events(), deadline):
                     if event.get("event") == "token":
                         emitted = True
@@ -2321,6 +2372,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         invocation: Optional[Invocation] = None,
         descriptor: Optional[ToolDescriptor] = None,
         observation: Optional[BreakerObservation] = None,
+        inputs: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         node_type = node.get("type", "tool_call")
         if node_type == "switch":
@@ -2348,9 +2400,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return {"status": "end"}, []
 
         tool_name = node.get("tool", "")
-        inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
-        if "message" not in inputs and user_message:
-            inputs["message"] = user_message
+        if inputs is None:
+            # The retry driver's preparation computes the inputs and hands
+            # them in, so the preflight judged exactly this object; the
+            # fallback keeps this body callable on its own.
+            inputs = self._resolve_inputs(
+                node.get("inputs", {}), user_message, vars_scope
+            )
+            if "message" not in inputs and user_message:
+                inputs["message"] = user_message
 
         # No breaker traffic here. The check happens before the invocation is
         # opened, in `_execute_node_with_retry`; the recording happens in the

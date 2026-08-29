@@ -32,6 +32,7 @@ share a spelling shared a breaker across scopes.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 
@@ -170,9 +171,10 @@ class _StreamBackend:
 
     supports_stream_cancel = True
 
-    def __init__(self, fail=False, stall=False):
+    def __init__(self, fail=False, stall=False, fail_after_token=False):
         self.fail = fail
         self.stall = stall
+        self.fail_after_token = fail_after_token
         self.stream_calls = 0
         self.on_stream = None
 
@@ -188,6 +190,8 @@ class _StreamBackend:
             if self.fail:
                 raise RuntimeError("stream boom")
             yield {"event": "token", "data": "x"}
+            if self.fail_after_token:
+                raise RuntimeError("post-token boom")
             if self.stall:
                 time.sleep(2)
             yield {"event": "message_done", "data": {"content": "x", "usage": {}}}
@@ -221,9 +225,27 @@ class _SpyCache:
         return await self._inner.record_tool_success(*a, **k)
 
 
-def _stream_ctx(fail=False, stall=False):
-    backend = _StreamBackend(fail=fail, stall=stall)
+def _stream_ctx(fail=False, stall=False, fail_after_token=False):
+    backend = _StreamBackend(
+        fail=fail, stall=stall, fail_after_token=fail_after_token
+    )
     return _Ctx(llm=LLMService("test-model", backend=backend)), backend
+
+
+class _SlowCheckCache:
+    """The real cache with a stalled breaker check, for the witness that
+    preparation time comes out of the attempt's budget, not on top of it."""
+
+    def __init__(self, inner, delay):
+        self._inner = inner
+        self._delay = delay
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    async def check_circuit_breaker(self, *a, **k):
+        await asyncio.sleep(self._delay)
+        return await self._inner.check_circuit_breaker(*a, **k)
 
 
 # =============================================================================
@@ -470,6 +492,24 @@ class TestTheStartedAttemptBoundary:
         assert await c.count(c.ident(), "llm.generic") == 0
 
     @pytest.mark.asyncio
+    async def test_preparation_cannot_extend_the_node_deadline(self):
+        """The deadline is absolute and preparation spends it. A breaker
+        check that stalls past the node budget must not hand the body a
+        fresh clock afterwards: the attempt times out, the tool never
+        starts, and nothing is recorded — preparation never `started`."""
+        c = _Ctx()
+        c.engine.cache = _SlowCheckCache(c.cache, 0.5)
+        ran = []
+        c.engine._tool_llm_generic = lambda *a, **k: (ran.append(1), _ok())[1]
+        r = await c.run(c.wf("llm.generic", timeout_ms=300))
+        assert r.get("status") == "error"
+        assert not ran, (
+            "preparation overran the node deadline and the body started on "
+            "a fresh clock anyway"
+        )
+        assert await c.count(c.ident(), "llm.generic") == 0
+
+    @pytest.mark.asyncio
     async def test_a_caller_revocation_records_nothing(self):
         """The caller walked away mid-serve. The tool was not proven
         unhealthy, and a cancel habit must not open the tenant's breaker."""
@@ -563,6 +603,133 @@ class TestTheBreakerBindsEachAttempt:
             f"{backend.stream_calls} calls"
         )
         assert await c.count(name, art.id) == 1
+
+
+# =============================================================================
+# Fresh authority is freshly adjudicated.
+# =============================================================================
+
+
+class TestFreshAuthorityIsFreshlyAdjudicated:
+    """Re-resolving per attempt is only half of tranche 2's rule. The other
+    half is that everything a resolved tool must pass before any body runs —
+    the privileged conjunction, the input schema — is decided against the
+    spec the attempt actually resolved, not the one the first attempt saw."""
+
+    @pytest.mark.asyncio
+    async def test_a_retry_cannot_inherit_preflight_from_a_retired_spec(self):
+        """Attempt one runs the caller's own non-privileged spec and fails;
+        the spec is retired; attempt two falls through to an admin-owned
+        *privileged* spec of the same name. An ordinary caller must be
+        refused `forbidden` before that body starts — a preflight carried
+        over from the retired spec is an authority bypass, not staleness."""
+        rt = get_runtime()
+        store = rt.store
+        tenant = _u("auth")
+        user = store.create_user(email=f"{_u('or')}@t.local", tenant_id=tenant)
+        admin = store.create_user(
+            email=f"{_u('ad')}@t.local", tenant_id=tenant, role="admin"
+        )
+        name = _u("authfoo")
+        private_art = store.create_artifact(
+            "tool", _u("t"),
+            {"kind": "tool.spec", "name": name, "handler": "llm.generic"},
+            owner_user_id=user.id, visibility="private",
+        )
+        store.create_artifact(
+            "tool", _u("t"),
+            {"kind": "tool.spec", "name": name, "handler": "llm.generic",
+             "privileged": True},
+            owner_user_id=admin.id, visibility="global",
+        )
+        c, backend = _stream_ctx(fail=True)
+        c.tenant, c.user = tenant, user
+        wf_art = c.wf(name, max_retries=1, backoff_ms=1)
+
+        def retire_private():
+            with store._connect() as conn:
+                conn.execute(
+                    "DELETE FROM artifact WHERE id = %s", (private_art.id,)
+                )
+
+        backend.on_stream = retire_private
+        events = await c.run_streaming(wf_art)
+        assert backend.stream_calls == 1, (
+            f"an ordinary caller ran a privileged spec because the retry "
+            f"kept the retired spec's preflight: {backend.stream_calls} calls"
+        )
+        errs = [e for e in events if e.get("event") == "error"]
+        assert errs and errs[-1]["data"].get("code") == "forbidden", errs[-2:]
+
+    @pytest.mark.asyncio
+    async def test_a_retry_revalidates_inputs_against_the_current_spec(self):
+        """The same shape without the authority load: the spec standing
+        behind the retired one requires an input the turn does not carry,
+        and the retry must refuse it rather than execute it."""
+        rt = get_runtime()
+        store = rt.store
+        c, backend = _stream_ctx(fail=True)
+        name = _u("valfoo")
+        plain = c.tool(name)
+        store.create_artifact(
+            "tool", _u("t"),
+            {"kind": "tool.spec", "name": name, "handler": "llm.generic",
+             "input_schema": {"type": "object",
+                              "required": ["impossible_key"]}},
+            owner_user_id=c.user.id, visibility="global",
+        )
+        wf_art = c.wf(name, max_retries=1, backoff_ms=1)
+
+        def retire_plain():
+            with store._connect() as conn:
+                conn.execute("DELETE FROM artifact WHERE id = %s", (plain.id,))
+
+        backend.on_stream = retire_plain
+        events = await c.run_streaming(wf_art)
+        assert backend.stream_calls == 1, (
+            f"a retry executed a spec whose input schema refuses this turn: "
+            f"{backend.stream_calls} calls"
+        )
+        errs = [e for e in events if e.get("event") == "error"]
+        assert errs and errs[-1]["data"].get("code") == "validation_error", (
+            errs[-2:]
+        )
+
+
+# =============================================================================
+# Recovery is not tool health.
+# =============================================================================
+
+
+class TestRecoveryIsNotToolHealth:
+    @pytest.mark.asyncio
+    async def test_a_salvaged_partial_answer_still_records_the_failure(self):
+        """The agent keeps a partial answer when its final stream dies after
+        a token — the user keeps what was on their screen. The breaker must
+        still see the provider failure: the salvage is user-facing recovery,
+        and a partial `tool_result` that overwrites the observation with
+        success turns five provider deaths into a clean bill of health."""
+        c, backend = _stream_ctx(fail_after_token=True)
+        backend.generate_with_tools = lambda *a, **k: {}
+        await c.seed_failures(c.ident("agent.files_v1"), 4)
+        wf_art = c.wf("agent.files_v1", max_retries=0)
+        c.engine._serve_invocation = lambda *a, **k: {
+            "messages": [], "usage": {}, "context_snippets": [],
+            "tool_calls": [], "artifacts": [], "injection_findings": [],
+        }
+        c.engine._build_agent_context = lambda *a, **k: (
+            [], [{"name": "t"}], "", [], []
+        )
+        events = await c.run_streaming(wf_art)
+        done = [e for e in events if e.get("event") == "message_done"]
+        assert done and done[-1]["data"].get("content") == "x", (
+            "the salvage itself must keep working: the partial answer "
+            "reaches the client"
+        )
+        assert await c.is_open(c.ident("agent.files_v1")), (
+            "a salvaged partial answer recorded the provider failure as a "
+            "breaker success"
+        )
 
 
 # =============================================================================
@@ -674,6 +841,27 @@ class TestTheDirectInvocationIsTheSameLedger:
         r = await self._invoke(c)
         assert r.get("status") != "error"
         assert await c.count(c.ident(), "llm.generic") == 0
+
+    @pytest.mark.asyncio
+    async def test_a_direct_input_refusal_records_nothing(self):
+        c = _Ctx()
+        art = c.tool(
+            name := _u("directin"),
+            input_schema={"type": "object", "required": ["impossible_key"]},
+        )
+        ran = []
+        c.engine._tool_llm_generic = lambda *a, **k: (ran.append(1), _ok())[1]
+        from liminallm.service.tool_namespace import ToolResolutionScope
+
+        d = c.engine._resolve_tool(
+            name, ToolResolutionScope("private", c.user.id, c.tenant)
+        )
+        r = await c.engine.invoke_tool(
+            d, {"message": "hi"}, user_id=c.user.id, tenant_id=c.tenant
+        )
+        assert r.get("error") == "validation_error", r
+        assert not ran
+        assert await c.count(name, art.id) == 0
 
     @pytest.mark.asyncio
     async def test_an_open_breaker_refuses_the_direct_invocation(self):
