@@ -8784,3 +8784,38 @@ adds the field, and the assertion now demands the specific `node_timeout`
 error, so a crash on a missing protocol field can never again read as the
 intended refusal. ND1 re-run: killed by both witnesses, now on the path
 they claim.
+
+## Parallel CI exposed a shared Redis, and the fix was already built
+
+The first parallel CI run on the speedup PR failed one test on 3.10:
+the identity-tokens erasure witness scans its whole Redis database for
+`reset:*` and asserts empty, and it saw a neighbouring worker's token.
+Not a flake and not the witness's fault: CI never set `TEST_REDIS_URL`,
+so the per-worker Redis leasing the 2I.1 work built never engaged there —
+every worker fell back to the settings default, which is the same host
+and database 0 as the service container. Serially that sharing was
+invisible; under `-n 4` it is four workers in one database.
+
+Diagnosed by execution, not the server log: the Postgres container dump
+that ends the job log is full of duplicate-key and FK errors that are
+deliberate test behaviour (the migration-guard witnesses run
+`migrate.sh` against corrupted rows on purpose), and reading it as
+cross-worker bleed was wrong twice before the pytest summary — one line,
+2,100 lines deep — named the actual test. Local reproductions of the CI
+shape (shared server, prepared clones, xdist, both Pythons, confinement
+required) were green because this machine has `redis-server`, so every
+worker got a scratch instance CI cannot start.
+
+The fix is one line: `TEST_REDIS_URL: redis://localhost:6379/0` in the
+test job's environment, engaging the leasing against the service Redis.
+Verified in the binary-less CI shape that the harness's own isolation
+tests skip (they stand up scratch services CI has no binaries for), and
+that the erasure witness passes under leasing.
+
+Recorded, not fixed — a harness-tranche residual: running the suite with
+`TEST_REDIS_URL` set on a machine that also has the service binaries
+(neither lane's configuration) fails eight `test_worker_isolation.py`
+tests, an interaction between the outer run's own lease state and the
+lease machinery those tests exercise in-process. The file's docstring
+already warns about the externally-supplied-service shape; the tests
+predate an outer run that leases.
