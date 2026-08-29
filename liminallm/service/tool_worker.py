@@ -657,6 +657,7 @@ def spawn(
     *,
     limits: Optional[Dict[str, int]] = None,
     scratch: str,
+    expected_attempt: Any = None,
 ) -> WorkerHandle:
     """Start a worker for one attempt at one tool call.
 
@@ -675,10 +676,6 @@ def spawn(
     from liminallm.logging import get_logger  # parent-side: see module docstring
 
     logger = get_logger(__name__)
-    # Joins the attempt the retry driver already opened — refusing one the
-    # timeout has revoked — and begins its own only for driverless callers
-    # (direct invocation). See `Invocation.adopt_attempt`.
-    attempt = invocation.adopt_attempt()
     # spawn, not fork: forking a threaded API process risks deadlocks, and a
     # fresh interpreter holding none of the parent's handles is the boundary.
     ctx = multiprocessing.get_context("spawn")
@@ -689,14 +686,33 @@ def spawn(
         args=(child_conn, tool, plan, limits or {}, scratch),
         daemon=True,
     )
-    process.start()
-    child_conn.close()
-    attempt.pid = process.pid
-    handle = WorkerHandle(process, parent_conn, attempt, budget)
     reap = lambda: process.join(_JOIN_TIMEOUT_SECONDS)  # noqa: E731
-    invocation.resources.add_child(
-        process.pid or 0, f"worker:{tool}", group=False, reap=reap
-    )
+    # One linearization boundary (SPEC §18.3): validate the exact attempt
+    # this spawn was created for, start the child, register it, and only
+    # then transfer ownership. A revoke serializes against this block — it
+    # lands before, and the adoption refuses with no child started, or it
+    # lands after and its sweep finds the registered child. Ownership is
+    # transferred last: a start or registration that fails leaves the
+    # attempt unadopted, so the driver that opened it still ends it and the
+    # retry is not held for a serve loop that never ran.
+    try:
+        with invocation.lock:
+            attempt = invocation.adopt_attempt(expected_attempt)
+            process.start()
+            child_conn.close()
+            attempt.pid = process.pid
+            invocation.resources.add_child(
+                process.pid or 0, f"worker:{tool}", group=False, reap=reap
+            )
+            attempt.adopted = True
+    except BaseException:
+        for conn in (parent_conn, child_conn):
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001 - already failing
+                pass
+        raise
+    handle = WorkerHandle(process, parent_conn, attempt, budget)
     leads_group = _await_ready(parent_conn, process)
     if leads_group:
         invocation.resources.add_child(

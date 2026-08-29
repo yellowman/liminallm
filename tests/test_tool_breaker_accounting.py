@@ -172,15 +172,22 @@ class _StreamBackend:
 
     supports_stream_cancel = True
 
-    def __init__(self, fail=False, stall=False, fail_after_token=False):
+    def __init__(self, fail=False, stall=False, fail_after_token=False,
+                 truncate=False):
         self.fail = fail
         self.stall = stall
         self.fail_after_token = fail_after_token
+        #: A clean TCP-style EOF: one token, then the iterator returns with
+        #: no `message_done` and no error.
+        self.truncate = truncate
         self.stream_calls = 0
         self.on_stream = None
         #: When set, the stream blocks on this event after its first token —
         #: the shape of a provider mid-read when a cancel lands.
         self.block_after_token = None
+        #: A pause between two tokens, so a cancel set on the first is
+        #: discovered when the second arrives rather than by the stop path.
+        self.gap = False
 
     def generate(self, messages, adapters, *, user_id=None):
         return {"content": "whole answer", "usage": {}}
@@ -194,10 +201,15 @@ class _StreamBackend:
             if self.fail:
                 raise RuntimeError("stream boom")
             yield {"event": "token", "data": "x"}
+            if self.truncate:
+                return
             if self.fail_after_token:
                 raise RuntimeError("post-token boom")
             if self.block_after_token is not None:
                 self.block_after_token.wait(8.0)
+            if self.gap:
+                time.sleep(0.4)
+                yield {"event": "token", "data": "y"}
             if self.stall:
                 time.sleep(2)
             yield {"event": "message_done", "data": {"content": "x", "usage": {}}}
@@ -231,9 +243,10 @@ class _SpyCache:
         return await self._inner.record_tool_success(*a, **k)
 
 
-def _stream_ctx(fail=False, stall=False, fail_after_token=False):
+def _stream_ctx(fail=False, stall=False, fail_after_token=False, truncate=False):
     backend = _StreamBackend(
-        fail=fail, stall=stall, fail_after_token=fail_after_token
+        fail=fail, stall=stall, fail_after_token=fail_after_token,
+        truncate=truncate,
     )
     return _Ctx(llm=LLMService("test-model", backend=backend)), backend
 
@@ -344,6 +357,22 @@ class TestTheTransportDoesNotChangeTheLedger:
         r = await blocking.run(blocking.wf("llm.generic"))
         assert r.get("status") == "error" and not ran, (
             "an open breaker did not refuse the blocking invocation"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_clean_truncation_is_a_failure(self):
+        """A provider that returns mid-answer without an error event — a
+        clean TCP EOF — started its serve and produced no completed result.
+        That is a tool failure, distinguishable now from an interruption:
+        the pump knows a stop cut the stream short, and only the stop stays
+        silent. Five clean EOFs must open the breaker."""
+        c, backend = _stream_ctx(truncate=True)
+        await c.seed_failures(c.ident(), 4)
+        events = await c.run_streaming(c.wf("llm.generic", max_retries=0))
+        assert any(e.get("event") == "error" for e in events)
+        assert await c.is_open(c.ident()), (
+            "a provider stream that truncated cleanly recorded nothing; "
+            "a backend that always dies mid-answer can never open the breaker"
         )
 
     @pytest.mark.asyncio
@@ -517,6 +546,26 @@ class TestTheStartedAttemptBoundary:
         assert await c.count(c.ident(), "llm.generic") == 1
 
     @pytest.mark.asyncio
+    async def test_a_deadline_before_the_worker_spawns_records_nothing(self):
+        """`started` means the worker actually started — not that the serve
+        was scheduled into a thread pool. A deadline that expires while the
+        serve is queued or stalled short of its spawn proves nothing about
+        the tool."""
+        c = _Ctx()
+
+        def never_spawns(*a, **k):
+            time.sleep(2)
+            return _ok()
+
+        c.engine._serve_invocation = never_spawns
+        r = await c.run(c.wf("llm.generic", timeout_ms=300, max_retries=0))
+        assert r.get("status") == "error"
+        assert await c.count(c.ident(), "llm.generic") == 0, (
+            "a deadline that expired before any worker spawned was charged "
+            "to the tool"
+        )
+
+    @pytest.mark.asyncio
     async def test_a_deadline_spent_in_planning_records_nothing(self):
         """The complement that positions the boundary: the same deadline,
         fired before the serve began, proves nothing about the tool."""
@@ -556,6 +605,12 @@ class TestTheStartedAttemptBoundary:
         c = _Ctx()
 
         def revoked(*a, **k):
+            # Stands for a worker that spawned and whose lease was then
+            # revoked mid-serve: the real serve marks `started` at the
+            # spawn, so this double does too — otherwise the recorder's
+            # started gate masks the very write this witness polices.
+            if k.get("observation") is not None:
+                k["observation"].started = True
             raise LeaseRevoked("caller cancelled")
 
         c.engine._serve_invocation = revoked
@@ -712,6 +767,261 @@ class TestATimedOutAttemptIsNotTheExecution:
             f"retry never ran: {r.get('error')}"
         )
         assert len(ran) == 1
+
+
+# =============================================================================
+# Authority travels by exact attempt identity.
+# =============================================================================
+
+
+class TestAuthorityTravelsByExactAttempt:
+    """A worker spawn joins the attempt it was created for — never whatever
+    attempt happens to be current when an abandoned thread finally wakes up.
+    Ambient authority by arrival time is the class tranche 2 removed."""
+
+    @pytest.mark.asyncio
+    async def test_a_late_serve_cannot_adopt_the_retry_attempt(self):
+        """Attempt one's serve is still queued when the node times out and
+        the retry begins. When that stale thread finally spawns, it must be
+        refused — not adopt the retry's fresh attempt and run the old plan
+        beside the retry's own worker."""
+        c = _Ctx()
+        real_serve = c.engine._serve_invocation
+        b_started = threading.Event()
+        a_done = threading.Event()
+        serve_calls = []
+        body_calls = []
+
+        def gated_serve(*a, **k):
+            n = len(serve_calls)
+            serve_calls.append(1)
+            if n == 0:
+                try:
+                    b_started.wait(8.0)
+                    return real_serve(*a, **k)
+                finally:
+                    a_done.set()
+            b_started.set()
+            return real_serve(*a, **k)
+
+        c.engine._serve_invocation = gated_serve
+        c.engine._tool_llm_generic = (
+            lambda *a, **k: (body_calls.append(1), time.sleep(0.5), _ok())[2]
+        )
+        r = await c.run(
+            c.wf("llm.generic", timeout_ms=1500, max_retries=1, backoff_ms=1)
+        )
+        assert r.get("status") != "error", r
+        assert a_done.wait(8.0), "attempt one's serve thread never finished"
+        await asyncio.sleep(0.2)
+        assert len(body_calls) == 1, (
+            f"attempt one's abandoned serve adopted the retry's attempt and "
+            f"ran the old plan under its authority: {len(body_calls)} runs"
+        )
+
+    def test_adoption_requires_the_exact_live_attempt(self):
+        """The `Invocation` contract itself: adoption names the attempt the
+        spawn belongs to, and anything else — a revoked attempt, a
+        different current attempt, a cancelled execution — is refused."""
+        from liminallm.service.invocation import Invocation, LeaseRevoked
+
+        inv = Invocation(_u("inv"), tool="t")
+        a = inv.begin_attempt()
+        inv.revoke("node_timeout")
+        inv.end_attempt(a)
+        b = inv.begin_attempt()
+
+        with pytest.raises(LeaseRevoked):
+            inv.adopt_attempt(a)
+        assert not b.adopted, (
+            "a stale spawn's adoption attached to the retry's attempt"
+        )
+        assert inv.adopt_attempt(b) is b
+
+        fresh = Invocation(_u("inv"), tool="t")
+        own = fresh.adopt_attempt(None)
+        assert own is fresh.current_attempt, (
+            "a driverless spawn must still begin its own attempt"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_spawn_failure_leaves_the_retry_prompt(self):
+        """`process.start()` raising is an ordinary retryable failure. It
+        must not strand a half-adopted attempt whose `finished` nobody will
+        ever set — that turns a one-line OSError into the thirty-second
+        unreaped path."""
+        import liminallm.service.tool_worker as tool_worker_mod
+
+        real_get_context = tool_worker_mod.multiprocessing.get_context
+        state = {"n": 0}
+
+        class FlakyContext:
+            def __init__(self, real):
+                self._real = real
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def Process(self, *a, **k):
+                p = self._real.Process(*a, **k)
+                state["n"] += 1
+                if state["n"] == 1:
+                    def boom():
+                        raise OSError("spawn refused")
+                    p.start = boom
+                return p
+
+        c = _Ctx()
+        ran = []
+        c.engine._tool_llm_generic = lambda *a, **k: (ran.append(1), _ok())[1]
+        t0 = time.monotonic()
+        from unittest.mock import patch
+
+        with patch.object(
+            tool_worker_mod.multiprocessing, "get_context",
+            lambda kind: FlakyContext(real_get_context(kind)),
+        ):
+            r = await c.run(
+                c.wf("llm.generic", max_retries=1, backoff_ms=1)
+            )
+        elapsed = time.monotonic() - t0
+        assert r.get("status") != "error", r
+        assert len(ran) == 1
+        assert elapsed < 10, (
+            f"a spawn failure stranded its attempt and the retry waited "
+            f"{elapsed:.0f}s for a serve loop that never ran"
+        )
+        assert await c.count(c.ident(), "llm.generic") == 0, (
+            "a worker that never started was charged to the tool"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_revoke_cannot_land_inside_the_spawn_window(self):
+        """Adoption, worker start and child registration are one
+        linearization boundary: a revoke either refuses the spawn before it
+        starts anything, or finds the started child registered and kills
+        it. On the unlocked shape, a revoke slips between adoption and
+        `process.start()`, its kill sweep finds nothing, and the child
+        starts after revocation with nobody holding it."""
+        import liminallm.service.tool_worker as tool_worker_mod
+        from liminallm.service.invocation import Invocation
+
+        in_window = threading.Event()
+        release = threading.Event()
+        registered = []
+        kills = []
+
+        class HeldProcess:
+            pid = 4242
+
+            def start(self):
+                in_window.set()
+                release.wait(8.0)
+
+            def is_alive(self):
+                return False
+
+            def join(self, *a, **k):
+                return None
+
+        class HeldContext:
+            def __init__(self, real):
+                self._real = real
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+            def Process(self, *a, **k):
+                return HeldProcess()
+
+        inv = Invocation(_u("inv"), tool="t")
+        inv.resources.add_child = (
+            lambda *a, **k: registered.append(1)
+        )
+        inv.resources.kill_all = lambda: (kills.append(1), [])[1]
+
+        real_get_context = tool_worker_mod.multiprocessing.get_context
+        revoke_done_in_window = []
+
+        def spawn_it():
+            try:
+                tool_worker_mod.spawn(
+                    inv, "llm.generic", {}, limits={}, scratch="/tmp"
+                )
+            except Exception:
+                pass
+
+        from unittest.mock import patch
+
+        with patch.object(
+            tool_worker_mod.multiprocessing, "get_context",
+            lambda kind: HeldContext(real_get_context(kind)),
+        ), patch.object(tool_worker_mod, "_READY_TIMEOUT_SECONDS", 0.2):
+            t1 = threading.Thread(target=spawn_it, daemon=True)
+            t1.start()
+            assert in_window.wait(8.0), "the spawn never reached start()"
+
+            def revoke_it():
+                inv.revoke("node_timeout")
+
+            t2 = threading.Thread(target=revoke_it, daemon=True)
+            t2.start()
+            t2.join(0.4)
+            if not t2.is_alive():
+                revoke_done_in_window.append(1)
+            release.set()
+            t1.join(8.0)
+            t2.join(8.0)
+
+        assert not revoke_done_in_window, (
+            "a revoke completed between adoption and process.start(): its "
+            "kill sweep ran before the child existed, and the child then "
+            "started after revocation"
+        )
+        assert registered and kills, (
+            "after the window closed, the revoke must find the registered "
+            "child and sweep it"
+        )
+
+
+# =============================================================================
+# Cancellation during preparation stops the provider before it starts.
+# =============================================================================
+
+
+class TestCancelDuringPreparationStopsTheProvider:
+    @pytest.mark.asyncio
+    async def test_a_cancel_set_during_preparation_never_starts_the_provider(self):
+        """The cancel lands while preparation is blocked in the breaker
+        check. Preparation then returns normally — and the provider must
+        not start on a revoked attempt: the producer gate checks the exact
+        attempt's liveness under the invocation lock before anything runs."""
+        c, backend = _stream_ctx()
+        spy = _SpyCache(_SlowCheckCache(c.cache, 0.5, once=True))
+        c.engine.cache = spy
+        wf_art = c.wf("llm.generic", max_retries=0)
+        cancel_event = asyncio.Event()
+
+        async def trip():
+            await asyncio.sleep(0.15)
+            cancel_event.set()
+
+        task = asyncio.create_task(trip())
+        events = []
+        async for e in c.engine.run_streaming(
+            wf_art.id, None, "hi", None,
+            user_id=c.user.id, tenant_id=c.tenant, cancel_event=cancel_event,
+        ):
+            events.append(e)
+        await task
+        assert backend.stream_calls == 0, (
+            "the provider started on an attempt the cancel had already "
+            "revoked during preparation"
+        )
+        assert any(e.get("event") == "cancel_ack" for e in events), events[-2:]
+        assert not spy.recorded, (
+            f"a cancelled preparation wrote to the ledger: {spy.recorded}"
+        )
 
 
 # =============================================================================
@@ -886,6 +1196,74 @@ class TestRecoveryIsNotToolHealth:
         )
 
     @pytest.mark.asyncio
+    async def test_a_cancel_between_events_does_not_record(self):
+        """The other cancel arrival: the pump has started — `started` is
+        marked — and the cancel is discovered when the next event lands,
+        not by the stop cutting a blocked read. The drain then runs its
+        no-answer tail with the acknowledgment in hand, and the caller's
+        cancel must still leave the ledger untouched."""
+        c, backend = _stream_ctx()
+        backend.gap = True
+        ident = c.ident()
+        await c.seed_failures(ident, 4)
+        spy = _SpyCache(c.cache)
+        c.engine.cache = spy
+        wf_art = c.wf("llm.generic", max_retries=0)
+        cancel_event = asyncio.Event()
+        events = []
+        async for e in c.engine.run_streaming(
+            wf_art.id, None, "hi", None,
+            user_id=c.user.id, tenant_id=c.tenant, cancel_event=cancel_event,
+        ):
+            events.append(e)
+            if e.get("event") == "token":
+                cancel_event.set()
+        assert any(e.get("event") == "cancel_ack" for e in events), events[-2:]
+        assert await c.count(ident) == 4, (
+            "a cancel discovered between events changed the ledger"
+        )
+        assert not spy.recorded, spy.recorded
+
+    @pytest.mark.asyncio
+    async def test_the_drain_distinguishes_interruption_from_truncation(self):
+        """The attempt's own contract, probed at the seam: the running paths
+        stop iterating at a forwarded `cancel_ack`, so the drain's tail
+        only ever runs post-acknowledgment for a consumer that drains to
+        the end — and for that consumer the distinction must hold: an
+        acknowledged interruption records nothing, a truncation records
+        the failure."""
+        from liminallm.service.node_attempt import StreamedNodeAttempt
+
+        async def stream(events):
+            for e in events:
+                yield e
+
+        acked = StreamedNodeAttempt(
+            stream([
+                {"event": "token", "data": "x"},
+                {"event": "cancel_ack", "data": {}},
+            ]),
+            finalize=lambda r: (r, None),
+        )
+        acked.breaker.started = True
+        _ = [e async for e in acked.events()]
+        assert acked.breaker.outcome is None, (
+            "an acknowledged interruption was recorded as a truncation "
+            "failure"
+        )
+
+        truncated = StreamedNodeAttempt(
+            stream([{"event": "token", "data": "x"}]),
+            finalize=lambda r: (r, None),
+        )
+        truncated.breaker.started = True
+        _ = [e async for e in truncated.events()]
+        assert truncated.breaker.outcome == "failure", (
+            "a stream that ended with no answer and no acknowledgment "
+            "recorded nothing"
+        )
+
+    @pytest.mark.asyncio
     async def test_a_salvaged_partial_answer_still_records_the_failure(self):
         """The agent keeps a partial answer when its final stream dies after
         a token — the user keeps what was on their screen. The breaker must
@@ -944,6 +1322,11 @@ class TestStreamedPlanningIsNotTheServe:
         wf_art = c.wf("agent.files_v1", timeout_ms=300, max_retries=0)
 
         def hung_serve(*a, **k):
+            # Stands for a worker that spawned and then hung: the real serve
+            # marks `started` once the spawn has registered the child, so
+            # this double does the same before it stalls.
+            if k.get("observation") is not None:
+                k["observation"].started = True
             time.sleep(2)
             return {}
 

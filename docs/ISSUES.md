@@ -9177,3 +9177,80 @@ file-replacement race witness over code this tranche never touched, last
 changed before this branch existed. Green five times serially (a 31-second
 concurrency witness each run) and green on the confirming full lane;
 recorded, not repaired here.
+
+## Authority travelled by arrival time, and three smaller doors beside it
+
+Round five on the breaker tranche found the deepest defect of the
+campaign in the round-four adoption seam, plus a producer-start race, a
+`started` mark that still meant "scheduled", and the truncation gap the
+first round had recorded as a residual. Every one is a red turned green.
+
+1. `adopt_attempt()` adopted whatever attempt happened to be current.
+   Attempt A's serve, queued in a thread pool, could wake after the node
+   timed out, A was revoked and ended, and retry B had begun — and join
+   B: A's stale plan executing under B's fresh authority, potentially
+   beside B's own worker. Ambient authority by arrival time, the exact
+   class tranche 2 removed from resolution. Adoption is now by exact
+   attempt identity: the driver stamps its lease onto the per-attempt
+   observation, the serve hands that token to the spawn, and
+   `adopt_attempt(expected)` refuses anything that is not the live
+   current attempt — the staged race runs the tool body once, not twice.
+   Two smaller doors in the same seam closed with it. Adoption, worker
+   start and child registration are now one step under the execution's
+   lock, so a revoke lands before the worker exists (the adoption
+   refuses) or after it is registered (the sweep finds it), never in
+   between — witnessed with a held fake process proving a revoke cannot
+   complete inside the spawn window. And ownership transfers only after
+   registration: a `process.start()` that raises leaves the attempt
+   unadopted for the driver to end, so a one-line OSError is an ordinary
+   retryable failure — measured at thirty seconds of `tool_worker_unreaped`
+   before, under two seconds after.
+2. A cancel landing during streamed preparation still started the
+   provider: preparation returned normally onto a revoked attempt, and
+   the pump was built and running before anything consulted the cancel.
+   The producer now starts the way a worker does — under the invocation
+   lock, exact attempt verified live, started and registered atomically,
+   `cancel_ack` when the gate refuses. The witness blocks preparation in
+   the breaker check, cancels, and requires zero provider calls and an
+   empty ledger.
+3. `started` still meant "the serve was scheduled": blocking marked it
+   before `to_thread` ever ran the serve, so a saturated pool — or the
+   adoption refusal above — charged the tool for a worker that never
+   existed. The mark moved to the atomic start point on every path: after
+   the spawn registers the worker, inside the producer gate for streams.
+   And `_record_breaker_outcome` now refuses to write for an unstarted
+   attempt outright — the normative boundary as a backstop rather than a
+   convention every caller must remember.
+4. A stream that ended cleanly without a completed result still recorded
+   nothing — the first round's residual, now cheap to close because the
+   pump distinguishes interruption from natural completion: the caller's
+   stop stays silent, and a clean provider EOF with no answer is a
+   started serve that failed. Five clean truncations open the breaker.
+
+Seven reds staged the races the forty-seven prior witnesses never
+staged — the late adoption, the exact-token contract, the spawn-failure
+strand, the revoke window, the cancel during preparation, the pre-spawn
+deadline, the clean truncation — plus a cancel discovered between events
+and a drain-seam probe, bringing the file to fifty. The mutation set is
+thirty-nine, all killed; the six new mutants:
+
+    new mutation                                    outcome
+    adoption falls back to whatever is current      killed
+    ownership transferred before process start      killed
+    producer gate dropped                           killed
+    recorder writes for an unstarted attempt        killed
+    truncation not recorded as failure              killed
+    interruption recorded as failure                killed
+
+Two witnesses had gone insensitive under this round's own layering and
+were sharpened rather than excused. The revocation witness's serve double
+never marked `started`, so the new recorder gate masked the very write it
+polices — it now marks `started` the way the real serve does, standing
+for a worker that spawned and was then revoked. And the interruption
+carve-out in the drain turned out to be unreachable end-to-end — every
+running path stops iterating at the forwarded `cancel_ack`, so the
+no-answer tail never runs post-acknowledgment — which made the
+interruption-records-failure mutant survive twice; it is now killed by a
+seam probe of the attempt's own contract, the same resolution the
+invocation backstop got a round earlier: defense-in-depth stays, and it
+stays witnessed.

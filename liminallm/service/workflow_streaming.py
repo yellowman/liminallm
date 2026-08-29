@@ -749,18 +749,14 @@ class WorkflowStreamingMixin:
             message or "", context_snippets, history
         )
 
-        # Everything above is planning — retrieval, digest, budget — and a
-        # deadline spent there proves nothing about the tool. The tool's own
-        # work starts with the provider call the pump is about to make, so
-        # the breaker observation marks `started` here (SPEC §18.3).
-        if observation is not None:
-            observation.started = True
         # `generate_stream` is a synchronous iterator, and iterating it here
         # ran the model on the event loop: every other request the worker was
         # serving waited on this one's tokens, and a node past its `timeout_ms`
         # could not be stopped because nothing was watching the clock. The pump
         # owns the iterator on a thread of its own and is registered on the
-        # execution, so one revoke reaches it — see `StreamPump`.
+        # execution, so one revoke reaches it — see `StreamPump`. The breaker
+        # `started` mark lives inside the pump gate: the provider call is the
+        # tool's work beginning, and everything above is planning.
         async for event in self._pumped(
             invocation,
             partial(
@@ -773,6 +769,7 @@ class WorkflowStreamingMixin:
             ),
             label=str(node.get("id") or "llm"),
             cancel_event=cancel_event,
+            observation=observation,
         ):
             if event.get("event") == "message_done":
                 # The grounding this node retrieved, on the node's answer —
@@ -805,6 +802,7 @@ class WorkflowStreamingMixin:
         *,
         label: str,
         cancel_event: Optional[asyncio.Event],
+        observation: Optional[BreakerObservation] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Drive a synchronous token producer off the loop.
 
@@ -816,9 +814,29 @@ class WorkflowStreamingMixin:
         found it: with two, removing either changed nothing that any test
         could see. One authority for what an attempt started, which is the
         `Invocation`.
+
+        The start is gated the way a worker spawn is (SPEC §18.3): under the
+        invocation's lock, the exact attempt must still be live, and only
+        then does the producer start, get registered, and mark the breaker's
+        `started`. A cancel that landed during preparation therefore never
+        starts the provider — the gate refuses and acknowledges instead —
+        and a revoke that lands after the gate finds a registered producer
+        its sweep can stop.
         """
-        pump = StreamPump(factory, label=label).start()
-        invocation.resources.add_producer(pump, f"stream:{label}")
+        pump: Optional[StreamPump] = None
+        with invocation.lock:
+            expected = observation.attempt if observation is not None else None
+            live = not invocation.revoked and (
+                expected is None or invocation.current_attempt is expected
+            )
+            if live:
+                pump = StreamPump(factory, label=label).start()
+                invocation.resources.add_producer(pump, f"stream:{label}")
+                if observation is not None:
+                    observation.started = True
+        if pump is None:
+            yield {"event": "cancel_ack", "data": {}}
+            return
         async for event in pump.events():
             if cancel_event and cancel_event.is_set():
                 yield {"event": "cancel_ack", "data": {}}
@@ -915,10 +933,8 @@ class WorkflowStreamingMixin:
 
         # Everything above is planning — attachments, grounding, agent
         # context — and a deadline spent there proves nothing about the
-        # tool. The tool's own work starts with the worker serve below, so
-        # the breaker observation marks `started` here (SPEC §18.3).
-        if observation is not None:
-            observation.started = True
+        # tool. `started` is marked inside `_serve_invocation`, once the
+        # worker is actually spawned and registered (SPEC §18.3).
         try:
             # The tool rounds run in the worker, exactly as they do on the
             # batch path — a second copy of the agent loop here is a second
@@ -961,6 +977,10 @@ class WorkflowStreamingMixin:
                     ),
                     self._worker_limits(self.tool_registry.get("agent.files_v1")),
                     on_capability=traces.append,
+                    expected_attempt=(
+                        observation.attempt if observation is not None else None
+                    ),
+                    observation=observation,
                 ),
                 timeout=self.AGENT_DEADLINE_SECONDS,
             )
@@ -990,6 +1010,7 @@ class WorkflowStreamingMixin:
                 ),
                 label="agent.files_v1",
                 cancel_event=cancel_event,
+                observation=observation,
             ):
                 kind = event.get("event")
                 if kind == "token":

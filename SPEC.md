@@ -2406,16 +2406,27 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   same per-attempt resolution, so no lookup runs outside the deadline.
   Preparation runs under attempt-scoped authority established before it
   begins: a deadline that expires during preparation or planning —
-  anywhere before the worker spawn — revokes that attempt alone, the
-  spawn joins the driver's attempt rather than opening its own (a spawn
-  that lost the race to the timeout is refused), and the retry policy
-  keeps its remaining attempts; only the caller's cancel ends the
-  logical execution. Recovery is not tool health: a body that salvages
-  a partial answer after its serve failed still records the failure —
-  the observation is sticky — while caller abandonment (cancel, revoked
-  lease) still records nothing, and a stream cut short by a stop is an
-  interrupted stream, never a natural end that completes a partial
-  answer.
+  anywhere before the worker spawn — revokes that attempt alone, and
+  the retry policy keeps its remaining attempts; only the caller's
+  cancel ends the logical execution. The spawn joins the driver's
+  attempt by **exact identity**, never "whatever is current": validated,
+  started and registered as one step under the execution's lock, so a
+  stale serve waking after the retry began cannot join the retry's
+  attempt, and a revoke lands before the worker exists or after it is
+  registered, never between. Ownership transfers only once the worker
+  is registered — a spawn that fails setup leaves the attempt to its
+  opener, and the retry is not held for a serve that never ran. A
+  stream producer starts under the same gate. `started` means the
+  worker or producer actually started, marked at that registration and
+  never at scheduling; the recorder writes nothing for an attempt that
+  never started, as a backstop rather than a convention. Recovery is
+  not tool health: a body that salvages a partial answer after its
+  serve failed still records the failure — the observation is sticky —
+  while caller abandonment (cancel, revoked lease) still records
+  nothing. A stream cut short by a stop is an interrupted stream, never
+  a natural end that completes a partial answer; a stream that ends on
+  its own without a completed result is a started serve with no answer,
+  and records the failure.
 - The worker holds nothing; the parent serves every effect. The child
   gets a plan — inputs, messages, offered schemas, budgets — and no store
   handle, model client, settings object, filesystem credential, or

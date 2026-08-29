@@ -697,17 +697,22 @@ class Invocation:
             attempt.terminated_at = time.monotonic()
         attempt.finished.set()
 
-    def adopt_attempt(self) -> Attempt:
-        """The attempt the retry driver already opened, joined by the spawn.
+    def adopt_attempt(self, expected: Optional[Attempt]) -> Attempt:
+        """The exact attempt this spawn was created for, validated.
 
-        The driver establishes attempt-scoped authority before any
-        cancelable work, so a node timeout always has an attempt to revoke
-        instead of cancelling the whole execution — and this is the other
-        half of that contract: a spawn that lost the race to the timeout
-        finds the attempt revoked and refuses, rather than beginning a
-        fresh attempt after the revoke and running unsupervised. With no
-        current attempt — a direct invocation, which has no driver — the
-        spawn begins its own, exactly as before.
+        Exact identity, never "whatever is current": an abandoned serve
+        thread waking after a timeout must not join the retry's fresh
+        attempt and run its stale plan under new authority — authority by
+        arrival time is the ambient-authority class this codebase forbids.
+        The spawn that lost the race to a revoke finds its own attempt
+        revoked, or displaced as current, and is refused. With `expected`
+        None — a direct invocation, which has no driver — the spawn begins
+        an attempt of its own.
+
+        Validation only: the caller marks `adopted` after the worker is
+        started *and* registered, under this invocation's lock, so a spawn
+        that fails setup leaves the attempt for its opener to end rather
+        than stranding a lease whose `finished` nobody will set.
         """
         with self._lock:
             if self._cancelled:
@@ -715,19 +720,16 @@ class Invocation:
                     f"invocation {self.invocation_id} was cancelled "
                     f"({self._revoke_reason}); no further attempt may start"
                 )
-            attempt = self._current
-            if attempt is None:
-                attempt = Attempt(index=len(self.attempts))
-                self.attempts.append(attempt)
-                self._current = attempt
-            elif attempt.revoked:
+            if expected is None:
+                return self.begin_attempt()
+            if self._current is not expected or expected.revoked:
                 raise LeaseRevoked(
                     f"invocation {self.invocation_id} attempt "
-                    f"{attempt.index} was revoked ({self._revoke_reason}) "
-                    "before its worker spawned"
+                    f"{expected.index} is no longer the live current "
+                    f"attempt ({self._revoke_reason or 'displaced'}); a "
+                    "stale spawn may not join its successor"
                 )
-            attempt.adopted = True
-            return attempt
+            return expected
 
     def await_attempt(self, timeout: float) -> bool:
         """Wait for the current attempt's parent-side work to return.

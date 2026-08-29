@@ -1220,8 +1220,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
         """
         if observation is None or not (self.cache and observation.identity):
             return
+        if not observation.started:
+            # The normative boundary as a backstop, not a convention every
+            # caller must remember: an attempt whose serve never started
+            # writes nothing, whatever an upstream path scribbled into the
+            # outcome (SPEC §18.3).
+            return
         outcome = observation.outcome
-        if outcome is None and observation.started and (timed_out or raised):
+        if outcome is None and (timed_out or raised):
             outcome = "failure"
         if outcome == "success":
             await self.cache.record_tool_success(
@@ -1377,6 +1383,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     return
                 current = prepared
                 previous = current
+                attempt_observation = getattr(current, "breaker", None)
+                if attempt_observation is not None:
+                    # The exact-authority token: whatever this attempt starts
+                    # — a worker spawn, a stream producer — must present this
+                    # lease, so a stale thread waking after the retry began
+                    # cannot join the retry's attempt (SPEC §18.3).
+                    attempt_observation.attempt = lease
                 async for event in bounded(current.events(), deadline):
                     if event.get("event") == "token":
                         emitted = True
@@ -2605,12 +2618,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
             tool_spec=tool_spec,
         )
         limits = self._worker_limits(tool_spec)
-        # From here the tool's own work runs: everything above — resolution,
-        # preflight, planning — refuses without touching the breaker ledger,
-        # and everything below is an outcome of the started attempt (SPEC
-        # §18). The driver writes the ledger from this observation, once.
-        if observation is not None:
-            observation.started = True
+        # The breaker observation is not marked here: `started` means the
+        # worker actually started, and it is set inside `_serve_invocation`
+        # once the spawn has registered the child — not when this coroutine
+        # schedules the serve into a thread pool it may never leave (SPEC
+        # §18.3). The driver writes the ledger from the observation, once.
         try:
             # to_thread carries the broker's serve loop, not the tool's work.
             # That distinction is the whole change: when this await is
@@ -2624,6 +2636,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     plan,
                     context,
                     limits,
+                    expected_attempt=(
+                        observation.attempt if observation is not None else None
+                    ),
+                    observation=observation,
                 ),
                 timeout=timeout,
             )
@@ -2838,11 +2854,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
         limits: Dict[str, int],
         *,
         on_capability: Optional[Callable[[dict], None]] = None,
+        expected_attempt: Optional[Any] = None,
+        observation: Optional[BreakerObservation] = None,
     ) -> Dict[str, Any]:
         """Spawn one worker, answer it until it finishes, then confirm it is gone.
 
         The terminate in the `finally` is not tidying: it is what lets the
         caller state that nothing of this attempt is still running.
+        `expected_attempt` is the exact attempt this serve was created for:
+        the spawn presents it and is refused if it is stale, so an abandoned
+        serve thread waking late cannot run its plan under the retry's
+        authority.
         """
         broker = CapabilityBroker(self, context, on_capability=on_capability)
         handle = tool_worker.spawn(
@@ -2851,7 +2873,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             plan,
             limits=limits,
             scratch=self._worker_scratch(invocation),
+            expected_attempt=expected_attempt,
         )
+        if observation is not None:
+            # The worker exists and is registered — the serve began. This is
+            # the atomic start point the breaker's `started` means (SPEC
+            # §18.3), not the scheduling of this function into a pool.
+            observation.started = True
         try:
             return broker.serve(
                 handle.conn,
