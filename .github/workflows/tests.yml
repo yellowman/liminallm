@@ -72,7 +72,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install .[dev] || pip install .
-          pip install pytest pytest-cov jax jaxlib
+          # pytest-xdist is in the dev extra, but this line is what runs when
+          # the `|| pip install .` fallback fired — and a missing plugin turns
+          # `-n 4` into an unrecognized-argument crash, not a serial run.
+          pip install pytest pytest-cov pytest-xdist jax jaxlib
 
       - name: Compile Python files
         run: python -m compileall liminallm
@@ -124,9 +127,21 @@ jobs:
         # own job below. ALLOW_REDIS_FALLBACK_DEV is not set here because it
         # reaches nothing — the setting is admin-managed with no environment
         # variable, and TEST_MODE above is what actually permits the fallback.
+        #
+        # `-n 4 --dist loadfile`, mirroring `make test-xdist`: the per-worker
+        # Postgres database, Redis database and filesystem root that make the
+        # suite safe in parallel are the suite's own, so CI gets the same
+        # parallelism the local lanes run — this selection took 16–33 minutes
+        # serially on these 4-vCPU runners against ~4–5 minutes locally at
+        # `-n 4`. Coverage runs on 3.11 only, the one version that uploads
+        # it; instrumenting the other two bought nothing and cost 20–40%.
         run: |
-          pytest -m 'not browser' \
-            --cov=liminallm --cov-report=xml --cov-report=term-missing -v
+          if [ "${{ matrix.python-version }}" = "3.11" ]; then
+            pytest -m 'not browser' -n 4 --dist loadfile -q --tb=short \
+              --cov=liminallm --cov-report=xml --cov-report=term-missing
+          else
+            pytest -m 'not browser' -n 4 --dist loadfile -q --tb=short
+          fi
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.11'
