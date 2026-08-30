@@ -1071,7 +1071,7 @@ class PostgresStore:
     ) -> TrainingJob:
         job_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
-        pref_ids = preference_event_ids or []
+        pref_ids = preference_event_ids
         num_events = len(pref_ids) if pref_ids else None
         columns = (
             "id, adapter_id, user_id, created_at, updated_at, status, num_events, loss, "
@@ -1097,11 +1097,74 @@ class PostgresStore:
                     now,
                     num_events,
                     dataset_path,
-                    pref_ids if pref_ids else None,
+                    pref_ids,
                     self._json_param(meta),
                 ),
             ).fetchone()
         return self._row_to_training_job(row)
+
+    #: Serializes the "does this adapter already have a job" decision.
+    _TRAINING_ENQUEUE_LOCK = 0x746A6F62  # "tjob"
+
+    def create_training_job_if_absent(
+        self,
+        user_id: str,
+        adapter_id: str,
+        preference_event_ids: list[str] | None = None,
+    ) -> TrainingJob | None:
+        """Queue one job for this adapter, or none if it already has one.
+
+        §22 runs several replicas against one Postgres, so this needs an
+        arbiter they share. `WHERE NOT EXISTS` is not one: at READ
+        COMMITTED the subquery takes no lock, so two transactions both
+        evaluate it against a snapshot without the other's row and both
+        insert. Measured, not assumed - the concurrency witness for this
+        method failed with exactly that shape.
+
+        A unique index on `adapter_id` would be the other answer, but it
+        would be wrong: an adapter legitimately trains more than once over
+        its life. So the lock is explicit and transaction-scoped, taken
+        before the check in the same transaction as the insert.
+
+        Returns the job it created, or None when another caller had already
+        queued one.
+        """
+        job_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        pref_ids = preference_event_ids
+        columns = (
+            "id, adapter_id, user_id, created_at, updated_at, status, num_events, "
+            "loss, dataset_path, new_version, preference_event_ids, meta"
+        )
+        placeholders = "%s, %s, %s, %s, %s, 'queued', %s, NULL, NULL, NULL, %s, NULL"
+        insert = (
+            f"INSERT INTO training_job ({columns}) "  # nosec B608 - fragments are source literals; values are always bound via %s
+            f"VALUES ({placeholders}) RETURNING *"
+        )
+        with self._connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                (self._TRAINING_ENQUEUE_LOCK, str(adapter_id)),
+            )
+            existing = conn.execute(
+                "SELECT 1 FROM training_job WHERE adapter_id = %s LIMIT 1",
+                (adapter_id,),
+            ).fetchone()
+            if existing:
+                return None
+            row = conn.execute(
+                insert,
+                (
+                    job_id,
+                    adapter_id,
+                    user_id,
+                    now,
+                    now,
+                    len(pref_ids) if pref_ids else None,
+                    pref_ids,
+                ),
+            ).fetchone()
+        return self._row_to_training_job(row) if row else None
 
     def update_training_job(
         self,
@@ -3019,8 +3082,31 @@ class PostgresStore:
             ).fetchone()
         return self._artifact_from_row(row) if row else None
 
+    #: Serializes one cluster's promotion decision. §22 puts several
+    #: replicas on one Postgres, so "check then create" is not a decision
+    #: any single process can make alone.
+    _CLUSTER_BINDING_LOCK = 0x636C7362  # "clsb"
+
+    @contextlib.contextmanager
+    def hold_cluster_binding(self, cluster_id: str):
+        """Hold the right to decide this cluster's adapter.
+
+        Session-scoped rather than transaction-scoped, because the check
+        and the write it guards run on different pooled connections and a
+        transaction-scoped lock would be released between them. Unlocked
+        explicitly: a pooled connection keeps its session state when it
+        goes back.
+        """
+        key = (self._CLUSTER_BINDING_LOCK, str(cluster_id))
+        with self._connect() as conn:
+            conn.execute("SELECT pg_advisory_lock(%s, hashtext(%s))", key)
+            try:
+                yield
+            finally:
+                conn.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))", key)
+
     def adapter_for_cluster(self, cluster_id: str) -> Optional[Artifact]:
-        """The adapter already bound to a semantic cluster, if any.
+        """The adapter bound to a semantic cluster, if exactly one is.
 
         Deliberately unscoped by visibility. This answers the clusterer's
         own bookkeeping question - "does this cluster already have an
@@ -3029,16 +3115,26 @@ class PostgresStore:
         has no identity to scope them by, so using it here meant a personal
         skill adapter was invisible to the pass that created it and every
         later pass minted another one for the same cluster.
+
+        More than one is refused rather than resolved. Those rows exist -
+        the bug above really did create them - and they are all live and
+        routable, so picking the oldest would turn historical ambiguity
+        into authority and leave the rest quietly serving.
         """
         if not cluster_id:
             return None
         with self._connect() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 "SELECT * FROM artifact WHERE type = 'adapter' "
-                "AND schema->>'cluster_id' = %s ORDER BY created_at LIMIT 1",
+                "AND schema->>'cluster_id' = %s ORDER BY created_at LIMIT 2",
                 (cluster_id,),
-            ).fetchone()
-        return self._artifact_from_row(row) if row else None
+            ).fetchall()
+        if len(rows) > 1:
+            raise ConstraintViolation(
+                "cluster has more than one adapter bound to it",
+                {"cluster_id": cluster_id},
+            )
+        return self._artifact_from_row(rows[0]) if rows else None
 
     def artifacts_for_paths(self, paths: Sequence[str]) -> List[Artifact]:
         """Artifacts whose `fs_path` is exactly one of `paths`.
@@ -5597,7 +5693,9 @@ class PostgresStore:
             created_at=row.get("created_at", datetime.now(timezone.utc)),
             updated_at=row.get("updated_at", datetime.now(timezone.utc)),
             loss=row.get("loss"),
-            preference_event_ids=row.get("preference_event_ids") or [],
+            # NULL stays None: `or []` collapsed a live job and a pinned
+            # empty set into the same value, and they are opposites.
+            preference_event_ids=row.get("preference_event_ids"),
             dataset_path=row.get("dataset_path"),
             new_version=row.get("new_version"),
             meta=row.get("meta"),

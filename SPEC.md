@@ -1240,14 +1240,74 @@ shared:    different answer + different conversation + different person
    not universally true, and dispersion in this repo's embedding space
    would need its own census before it could be promotion authority.
 
-3. **the job's evidence is what gets trained.** the training job records
-   the exact `preference_event_ids` whose evidence crossed the bar, and
-   those events - filtered by the tenant scoping in §12, never widened by
-   it - are what is tokenized, split into train/holdout and evaluated.
-   re-deriving the set at training time let the two ends disagree about
-   what counts as positive, so a run could train on fewer examples than
-   the evidence that justified it.
-4. **graduation is gated** through §5.4.6; a failed or skipped gate leaves
+3. **the job's evidence is what gets trained, all of it or none.** the
+   training job records the exact `preference_event_ids` whose evidence
+   crossed the bar, and those are what is tokenized, split into
+   train/holdout and evaluated. re-deriving the set at training time let
+   the two ends disagree about what counts as positive - the gate accepts
+   feedback *or* a positive score, the old query asked for feedback alone.
+
+   resolution is all-or-nothing. training a subset is not a smaller
+   version of the decision that authorized the run, it is a different one
+   nobody made: nineteen of twenty messages, or two of three qualifying
+   contributors, still passes a holdout and still promotes weights while
+   `lifecycle.evidence` claims numbers the run never saw. so any named
+   event that fails to resolve refuses the whole run, and a *skill* job
+   that pinned no evidence trains nothing rather than falling back to a
+   fresh query.
+
+   **pinned or live is durable state on the job**, not something
+   re-derived from the adapter:
+
+   - `preference_event_ids IS NULL` - a **live** job. its evidence is
+     whatever the scoped query returns at run time. persona and background
+     training work this way, having no promotion gate to pin anything.
+   - `preference_event_ids = [...]` - a **pinned** job. exactly those
+     events, or the run refuses.
+   - `preference_event_ids = []` - pinned and invalid. refuse; this is not
+     the same as live, and the two must never collapse to one value.
+
+   a skill job is always created pinned. keying this off the adapter's
+   current `cluster_id` instead would let a skill adapter that later lost
+   or changed its cluster turn an already-authorized job back into a live
+   query.
+
+   **exactness holds through preparation, not only resolution.** resolving
+   twenty events and then building nineteen examples, or tokenizing
+   eighteen of those, is the same failure one stage later: the run trains
+   on less than the evidence that authorized it and still promotes. for a
+   pinned job every resolved event must produce an example and every
+   example must produce a supervised token sequence, and any shortfall
+   refuses the run - `pinned_evidence_unresolvable`,
+   `pinned_evidence_target_missing`, `pinned_evidence_not_tokenizable`.
+   deduplication by `(conversation_id, message_id)` is not a shortfall: it
+   is the normative normalization of §5.4.3, and the pinned set remains the
+   sole source. a live job keeps the older behaviour of dropping an
+   unusable example and training the remainder.
+
+   the boundary re-checked at resolution is **tenancy** (shared) or
+   **ownership** (personal), because those are the ones that would leak.
+   `cluster_id` is deliberately *not* re-required: reclustering moves
+   events between clusters as ordinary behaviour, so the job's ids are the
+   snapshot of membership and a reclustered event is still its evidence.
+
+4. **one replica decides.** §22 runs several replicas against one
+   Postgres, so both rung decisions are arbitrated by the database rather
+   than by a process-local read-then-write: creating a cluster's adapter
+   holds an advisory lock on the cluster, and enqueueing holds one on the
+   adapter before checking. `WHERE NOT EXISTS` is **not** sufficient for
+   the second - at READ COMMITTED the subquery takes no lock, so two
+   transactions both see no row and both insert - and a unique index on
+   `adapter_id` would be wrong, because an adapter legitimately trains
+   more than once over its life.
+
+   a cluster found with more than one adapter bound to it is **refused**,
+   not resolved. those rows exist, the pass that created them is fixed
+   above, and they are all live and routable: choosing the oldest would
+   turn historical ambiguity into authority and leave the rest serving
+   quietly. such a cluster is skipped with a warning until an operator
+   reconciles it.
+5. **graduation is gated** through §5.4.6; a failed or skipped gate leaves
    the adapter on the prompt rung; nothing regresses. the rules that make
    the ladder safe (histories in docs/decisions/adapter-resolution.md):
    - **two independent locks make "before graduation" unservable**, because
@@ -1290,7 +1350,7 @@ shared:    different answer + different conversation + different person
      injecting both gives the model the weights *and* the instructions
      they were distilled from - an input the eval gate never scored. a
      hybrid with nothing promoted keeps its prompt locally.
-5. **demotion mirrors promotion.** pruning (§7.4) can push an adapter back
+6. **demotion mirrors promotion.** pruning (§7.4) can push an adapter back
    down the ladder (disable weights, keep prompt) via the same ConfigOps
    pipeline.
 

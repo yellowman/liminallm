@@ -16,6 +16,7 @@ from liminallm.service.embeddings import (
     validate_centroid,
     validated_embedding,
 )
+from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     POSITIVE_FEEDBACK_VALUES,
     PreferenceEvent,
@@ -534,7 +535,19 @@ class SemanticClusterer:
             if len(messages) >= min_events_per_user
             and len(per_user_conversations[user_id]) >= min_conversations_per_user
         ]
-        stamps = sorted(e.created_at for e in positive if e.created_at)
+        # Span over the *first* rating of each distinct answer, for the same
+        # reason the counts are over distinct answers: re-rating one old
+        # reply two days later is not a second demonstration, and taking the
+        # raw min/max let exactly that manufacture 48 hours of independence
+        # out of a single sitting.
+        earliest_per_message: Dict[str, object] = {}
+        for event in positive:
+            if not event.created_at:
+                continue
+            seen = earliest_per_message.get(event.message_id)
+            if seen is None or event.created_at < seen:
+                earliest_per_message[event.message_id] = event.created_at
+        stamps = sorted(earliest_per_message.values())
         first, last = (stamps[0], stamps[-1]) if stamps else (None, None)
         span_hours = (last - first).total_seconds() / 3600.0 if stamps else 0.0
         return {
@@ -620,15 +633,17 @@ class SemanticClusterer:
                 **evidence,
             )
             return False
-        if any(j.adapter_id == adapter.id for j in self.store.list_training_jobs()):
-            return False
-        self.store.create_training_job(
+        # One statement decides and writes: reading the job list first and
+        # inserting second is a race two replicas both win (SPEC §5.5.2).
+        job = self.store.create_training_job_if_absent(
             user_id=owner_id,
             adapter_id=adapter.id,
             # The evidence that crossed the bar is the evidence the run
             # trains on (SPEC §5.5.3).
             preference_event_ids=[e.id for e in positive],
         )
+        if job is None:
+            return False
         self.logger.info(
             "skill_weights_enqueued", adapter_id=adapter.id, shared=shared, **evidence
         )
@@ -705,137 +720,179 @@ class SemanticClusterer:
         promoted: List[str] = []
         clusters = self.store.list_semantic_clusters()
         for cluster in clusters:
-            events = self.store.list_preference_events(cluster_id=cluster.id)
-            if len(events) < min_size:
-                continue
-            positive = [
-                e
-                for e in events
-                if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0
-            ]
-            ratio = len(positive) / len(events) if events else 0.0
-            if ratio < positive_ratio:
-                continue
-            # The cluster's existing adapter, not merely whether it has one:
-            # a skill is normally discovered long before it earns weights, so
-            # a bound cluster is revisited rather than skipped (SPEC §5.5).
-            # Skipping it made the weights rung unreachable for every skill
-            # that did not cross both bars in a single pass.
-            existing = self.store.adapter_for_cluster(cluster.id)
-            if existing is not None:
-                self._revisit_skill_adapter(
-                    existing,
-                    positive,
-                    shared=not cluster.user_id,
-                    weights_min_events=weights_min_events,
-                    weights_min_messages=weights_min_messages,
-                    weights_min_conversations=weights_min_conversations,
-                    shared_min_users=shared_min_users,
-                    personal_min_span_hours=personal_min_span_hours,
-                )
-                continue
-            # Tenant scoping (CLAUDE.md): a cluster-wide skill adapter is
-            # trained on several users' events, so it must stay inside the
-            # tenant those users belong to. "shared" visibility resolves the
-            # tenant through the owner, so a cross-user cluster is owned by its
-            # most frequent contributor and shared within that tenant - never
-            # "global", which every tenant can see.
-            contributor_counts: dict[str, int] = {}
-            for event in positive:
-                contributor_counts[event.user_id] = (
-                    contributor_counts.get(event.user_id, 0) + 1
-                )
-            top_contributor = (
-                max(contributor_counts, key=contributor_counts.get)
-                if contributor_counts
-                else None
-            )
-            owner_id = cluster.user_id or top_contributor
-            if not owner_id:
-                self.logger.warning("skill_promotion_no_owner", cluster_id=cluster.id)
-                continue
-            shared = not cluster.user_id
-            evidence = self._evidence(positive)
-            # SPEC §5.5.1: even the cheap rung needs more than one voice when
-            # what it produces is delivered to people who never contributed.
-            # Nothing here crosses a tenant boundary; the point is that one
-            # person's evidence must not change everyone else's behaviour.
-            if shared and evidence["users"] < shared_prompt_min_users:
-                self.logger.info(
-                    "shared_skill_needs_more_contributors",
+            try:
+                # One decision per cluster at a time across every replica:
+                # the check below and the create under it are otherwise a
+                # race both callers win (SPEC §5.5.2).
+                with self.store.hold_cluster_binding(cluster.id):
+                    self._promote_one_cluster(
+                        cluster,
+                        promoted,
+                        min_size=min_size,
+                        positive_ratio=positive_ratio,
+                        weights_min_events=weights_min_events,
+                        weights_min_messages=weights_min_messages,
+                        weights_min_conversations=weights_min_conversations,
+                        personal_min_span_hours=personal_min_span_hours,
+                        shared_prompt_min_users=shared_prompt_min_users,
+                        shared_min_users=shared_min_users,
+                    )
+            except ConstraintViolation as exc:
+                # An ambiguous cluster - more than one adapter bound to it -
+                # is refused rather than guessed at, and must not stop the
+                # other clusters in this pass from being considered.
+                self.logger.warning(
+                    "skill_promotion_refused",
                     cluster_id=cluster.id,
-                    users=evidence["users"],
-                    required=shared_prompt_min_users,
+                    error=str(exc),
                 )
-                continue
-            visibility = "private" if cluster.user_id else "shared"
-            owner = self.store.get_user(owner_id)
-            tenant_id = owner.tenant_id if owner else None
-            # base_model is required by the adapter schema; source it from the
-            # runtime/training base model so promotion validates instead of
-            # silently failing.
-            base_model = (
-                getattr(self.training, "runtime_base_model", None)
-                or getattr(self.llm, "base_model", None)
-                or "jax-base"
-            )
-            schema = {
-                "kind": "adapter.lora",
-                "base_model": base_model,
-                # "tenant" scope means pooled across the tenant's contributors;
-                # the training service keys its pooling decision on this.
-                "scope": "per-user" if cluster.user_id else "tenant",
-                "tenant_id": tenant_id,
-                # Born on the prompt rung of the adapter ladder (SPEC §5.6).
-                "mode": "prompt",
-                "prompt_instructions": self._skill_prompt_instructions(
-                    cluster, positive
-                ),
-                "lifecycle": {
-                    "stage": "prompt",
-                    "weights_min_events": weights_min_events,
-                    # Recorded so a skill that stayed on the prompt rung says
-                    # why, without re-running the query that rejected it.
-                    "evidence": evidence,
-                },
-                "rank": 4,
-                "layers": [0, 1, 2],
-                "matrices": ["attn_q"],
-                "cluster_id": cluster.id,
-                "centroid": cluster.centroid,
-                "label": cluster.label,
-                "description": cluster.description,
-                "current_version": 0,
-                "applicability": {
-                    "natural_language": "Skill: "
-                    + (cluster.label or "")
-                    + " - "
-                    + (cluster.description or ""),
-                },
-            }
-            adapter = self.store.create_artifact(
-                type_="adapter",
-                name=f"cluster_skill_{cluster.id[:8]}",
-                schema=schema,
-                description=cluster.description or "Cluster skill adapter",
-                owner_user_id=owner_id,
-                visibility=visibility,
-            )
-            # Weights rung: the same decision a later pass makes, so it lives
-            # in one place. A cluster that clears both bars at once graduates
-            # immediately; the usual case is that it does not, and the next
-            # pass revisits it.
-            self._maybe_enqueue_weights(
-                adapter,
+        return promoted
+
+    def _promote_one_cluster(
+        self,
+        cluster,
+        promoted: List[str],
+        *,
+        min_size: int,
+        positive_ratio: float,
+        weights_min_events: int,
+        weights_min_messages: int,
+        weights_min_conversations: int,
+        personal_min_span_hours: float,
+        shared_prompt_min_users: int,
+        shared_min_users: int,
+    ) -> None:
+        """One cluster's rung decision, under its binding lock."""
+        events = self.store.list_preference_events(cluster_id=cluster.id)
+        if len(events) < min_size:
+            return
+        positive = [
+            e
+            for e in events
+            if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0
+        ]
+        ratio = len(positive) / len(events) if events else 0.0
+        if ratio < positive_ratio:
+            return
+        # The cluster's existing adapter, not merely whether it has one:
+        # a skill is normally discovered long before it earns weights, so
+        # a bound cluster is revisited rather than skipped (SPEC §5.5).
+        # Skipping it made the weights rung unreachable for every skill
+        # that did not cross both bars in a single pass.
+        existing = self.store.adapter_for_cluster(cluster.id)
+        if existing is not None:
+            self._revisit_skill_adapter(
+                existing,
                 positive,
-                evidence,
-                owner_id=owner_id,
-                shared=shared,
+                shared=not cluster.user_id,
                 weights_min_events=weights_min_events,
                 weights_min_messages=weights_min_messages,
                 weights_min_conversations=weights_min_conversations,
                 shared_min_users=shared_min_users,
                 personal_min_span_hours=personal_min_span_hours,
             )
-            promoted.append(adapter.id)
-        return promoted
+            return
+        # Tenant scoping (CLAUDE.md): a cluster-wide skill adapter is
+        # trained on several users' events, so it must stay inside the
+        # tenant those users belong to. "shared" visibility resolves the
+        # tenant through the owner, so a cross-user cluster is owned by its
+        # most frequent contributor and shared within that tenant - never
+        # "global", which every tenant can see.
+        contributor_counts: dict[str, int] = {}
+        for event in positive:
+            contributor_counts[event.user_id] = (
+                contributor_counts.get(event.user_id, 0) + 1
+            )
+        top_contributor = (
+            max(contributor_counts, key=contributor_counts.get)
+            if contributor_counts
+            else None
+        )
+        owner_id = cluster.user_id or top_contributor
+        if not owner_id:
+            self.logger.warning("skill_promotion_no_owner", cluster_id=cluster.id)
+            return
+        shared = not cluster.user_id
+        evidence = self._evidence(positive)
+        # SPEC §5.5.1: even the cheap rung needs more than one voice when
+        # what it produces is delivered to people who never contributed.
+        # Nothing here crosses a tenant boundary; the point is that one
+        # person's evidence must not change everyone else's behaviour.
+        if shared and evidence["users"] < shared_prompt_min_users:
+            self.logger.info(
+                "shared_skill_needs_more_contributors",
+                cluster_id=cluster.id,
+                users=evidence["users"],
+                required=shared_prompt_min_users,
+            )
+            return
+        visibility = "private" if cluster.user_id else "shared"
+        owner = self.store.get_user(owner_id)
+        tenant_id = owner.tenant_id if owner else None
+        # base_model is required by the adapter schema; source it from the
+        # runtime/training base model so promotion validates instead of
+        # silently failing.
+        base_model = (
+            getattr(self.training, "runtime_base_model", None)
+            or getattr(self.llm, "base_model", None)
+            or "jax-base"
+        )
+        schema = {
+            "kind": "adapter.lora",
+            "base_model": base_model,
+            # "tenant" scope means pooled across the tenant's contributors;
+            # the training service keys its pooling decision on this.
+            "scope": "per-user" if cluster.user_id else "tenant",
+            "tenant_id": tenant_id,
+            # Born on the prompt rung of the adapter ladder (SPEC §5.6).
+            "mode": "prompt",
+            "prompt_instructions": self._skill_prompt_instructions(
+                cluster, positive
+            ),
+            "lifecycle": {
+                "stage": "prompt",
+                "weights_min_events": weights_min_events,
+                # Recorded so a skill that stayed on the prompt rung says
+                # why, without re-running the query that rejected it.
+                "evidence": evidence,
+            },
+            "rank": 4,
+            "layers": [0, 1, 2],
+            "matrices": ["attn_q"],
+            "cluster_id": cluster.id,
+            "centroid": cluster.centroid,
+            "label": cluster.label,
+            "description": cluster.description,
+            "current_version": 0,
+            "applicability": {
+                "natural_language": "Skill: "
+                + (cluster.label or "")
+                + " - "
+                + (cluster.description or ""),
+            },
+        }
+        adapter = self.store.create_artifact(
+            type_="adapter",
+            name=f"cluster_skill_{cluster.id[:8]}",
+            schema=schema,
+            description=cluster.description or "Cluster skill adapter",
+            owner_user_id=owner_id,
+            visibility=visibility,
+        )
+        # Weights rung: the same decision a later pass makes, so it lives
+        # in one place. A cluster that clears both bars at once graduates
+        # immediately; the usual case is that it does not, and the next
+        # pass revisits it.
+        self._maybe_enqueue_weights(
+            adapter,
+            positive,
+            evidence,
+            owner_id=owner_id,
+            shared=shared,
+            weights_min_events=weights_min_events,
+            weights_min_messages=weights_min_messages,
+            weights_min_conversations=weights_min_conversations,
+            shared_min_users=shared_min_users,
+            personal_min_span_hours=personal_min_span_hours,
+        )
+        promoted.append(adapter.id)

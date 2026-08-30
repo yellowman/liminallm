@@ -251,7 +251,12 @@ class TrainingJob:
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
     loss: Optional[float] = None
-    preference_event_ids: List[str] = field(default_factory=list)
+    #: None means a *live* job: its evidence is whatever the scoped query
+    #: returns at run time, which is how persona training works. A list
+    #: means a *pinned* job: exactly those events, or the run refuses
+    #: (SPEC §5.5.3). An empty list is pinned-but-invalid, not live, so
+    #: the two must not collapse to one value here.
+    preference_event_ids: Optional[List[str]] = None
     dataset_path: Optional[str] = None
     new_version: Optional[int] = None
     meta: Dict | None = None

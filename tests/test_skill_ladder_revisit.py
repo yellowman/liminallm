@@ -348,10 +348,18 @@ class TestTheJobsEvidenceIsWhatGetsTrained:
             "the score-positive event counted toward the gate but was not "
             "recorded on the job, so the trainer cannot reproduce the set"
         )
-        training = TrainingService(store, str(tmp_path))
-        selected = training.events_for_job(job)
+        # Resolved through the path training actually takes. An earlier
+        # version of this test called a helper that loaded the ids directly,
+        # so it asserted nothing about what a run would train on.
+        selected = TrainingService(store, str(tmp_path)).resolve_job_evidence(
+            job, user_id=owner.id
+        )
         assert {e.id for e in selected} == set(job.preference_event_ids), (
             "training resolved a different set of events than the job "
             "recorded; the evidence that earned the weights is not the "
             "evidence they were fitted to"
+        )
+        assert scored.id in {e.id for e in selected}, (
+            "the score-positive event was dropped by a feedback-only "
+            "re-query, which is the predicate disagreement itself"
         )
