@@ -48,14 +48,19 @@ VIEWPORT = {"width": 1440, "height": 900}
 
 #: The chat screen is captured before the extra threads are opened, so it
 #: shows a conversation rather than an empty new thread.
+#: Each row is (section, image, what to select in its pane first). The pane
+#: navigates and the workspace shows the selection, so a section with a pane
+#: is photographed with something selected: a shot of "Select a context to
+#: view details" documents the empty state rather than the screen. Files,
+#: Insights and Settings have no pane and select nothing.
 TABS = [
-    ("notes-tab", "03-notes"),
-    ("contexts-tab", "04-contexts"),
-    ("files-tab", "05-files"),
-    ("artifacts-tab", "06-artifacts"),
-    ("tools-tab", "07-tools"),
-    ("insights-tab", "08-insights"),
-    ("settings-tab", "09-settings"),
+    ("notes-tab", "03-notes", ".note-item"),
+    ("contexts-tab", "04-contexts", ".context-card"),
+    ("files-tab", "05-files", None),
+    ("artifacts-tab", "06-artifacts", "tr.clickable"),
+    ("tools-tab", "07-tools", ".tool-card"),
+    ("insights-tab", "08-insights", None),
+    ("settings-tab", "09-settings", None),
 ]
 
 FIRST_THREAD = [
@@ -332,15 +337,17 @@ def capture(args: argparse.Namespace, base: str) -> list[pathlib.Path]:
             time.sleep(1.2)
             ask([question])
 
-        for tab_id, name in TABS:
-            page.click(f"#main-tabs .tab-btn[data-tab='{tab_id}']")
+        for tab_id, name, pick in TABS:
+            page.click(f"#main-tabs .rail-btn[data-tab='{tab_id}']")
             page.wait_for_selector(f"#{tab_id}.active", state="visible")
             time.sleep(1.2)
-            if tab_id == "notes-tab":
-                # Open a note, so the screen shows the editor and not an
-                # empty right-hand pane.
-                page.click(f"#{tab_id} .note-item, #{tab_id} li")
-                time.sleep(1.2)
+            if pick:
+                item = f".pane-view[data-pane='{tab_id}'] {pick}"
+                if page.locator(item).count():
+                    page.locator(item).first.click()
+                    time.sleep(1.2)
+                else:
+                    print(f"  no {pick} to select for {name}", flush=True)
             shot(name)
 
         page.goto(f"{base}/admin", wait_until="domcontentloaded")

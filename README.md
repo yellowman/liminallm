@@ -31,22 +31,25 @@ and the refresh token in an http-only cookie the page cannot read.
 
 ![Sign-in screen with email and password fields.](docs/screenshots/01-sign-in.png)
 
-**chat.** conversations are listed on the left and titled from their first
-exchange. the thread keeps context across turns, so a follow-up that names
-nobody is still answered about the same subject. the row above the thread
-selects a knowledge context or a workflow for the next message.
+**chat.** the app rail down the left edge moves between sections; the pane
+beside it lists that section's items. conversations are titled from their
+first exchange. the thread keeps context across turns, so a follow-up that
+names nobody is still answered about the same subject. the bar carries the
+conversation's name and one action, with the knowledge context and workflow
+override behind its menu.
 
-![Chat screen showing a two-turn conversation. The answer cites its sources, and a follow-up question is answered from the conversation context.](docs/screenshots/02-chat.png)
+![Chat screen: a narrow icon rail, a conversation list, and a two-turn conversation filling the rest of the width. A follow-up question is answered from the conversation context.](docs/screenshots/02-chat.png)
 
-**notes.** a searchable vault. selecting a note opens it for editing, and
-sweep and graph operate across the whole set.
+**notes.** a searchable vault. the pane lists and searches it, selecting a
+note opens it for editing, and sweep and graph operate across the whole set.
 
-![Notes screen with a note list on the left and the selected note open in an editor.](docs/screenshots/03-notes.png)
+![Notes screen with a searchable note list in the pane and the selected note open in an editor.](docs/screenshots/03-notes.png)
 
-**contexts.** knowledge contexts group uploaded sources for retrieval. a
-conversation can be pointed at one from the chat screen.
+**contexts.** knowledge contexts group uploaded sources for retrieval. the
+pane lists them and the workspace shows the selected one. a conversation can
+be pointed at one from the chat screen's menu.
 
-![Contexts screen listing a knowledge context with its name and description.](docs/screenshots/04-contexts.png)
+![Contexts screen with a context list in the pane and the selected context's details and sources in the workspace.](docs/screenshots/04-contexts.png)
 
 **files.** uploads are attached to a context, or kept private when no context
 is given. the same screen browses everything already uploaded.
@@ -54,14 +57,16 @@ is given. the same screen browses everything already uploaded.
 ![Files screen with the upload form and the list of uploaded files.](docs/screenshots/05-files.png)
 
 **artifacts.** workflows, policies, adapters, and tools are all artifacts.
-they are filterable by type and visibility, and versioned.
+the pane filters them by type and visibility; the workspace shows the
+selected artifact and its version history.
 
-![Artifacts screen with type and visibility filters above a table of artifacts.](docs/screenshots/06-artifacts.png)
+![Artifacts screen with type and visibility filters above an artifact list in the pane, and the selected artifact's details and version history in the workspace.](docs/screenshots/06-artifacts.png)
 
-**tools.** the registered tool specifications a workflow can call, with
-workflow configuration beside them.
+**tools.** the pane lists the registered tool specifications a workflow can
+call, and the workflows themselves. the workspace shows the selected one and
+invokes it.
 
-![Tools screen listing registered tool specifications and workflows.](docs/screenshots/07-tools.png)
+![Tools screen with tool and workflow lists in the pane and the selected tool's details and invoke form in the workspace.](docs/screenshots/07-tools.png)
 
 **insights.** preference events are summarized here, so you can see what your
 feedback has shaped and which adapters it reached.

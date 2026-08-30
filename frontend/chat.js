@@ -271,10 +271,26 @@ const contextPane = $('context-pane');
 const paneToggle = $('pane-toggle');
 const topbarTitle = $('topbar-title');
 
-//: Whether the contextual pane is hidden, remembered per browser. The rail
-//: stays put: hiding it too is the distraction-free case, and one control
-//: cannot mean both without the common one becoming surprising.
+//: What the reader has chosen to hide, remembered per browser. Two keys
+//: because they are two controls: the pane's toggle in the bar, and the
+//: rail's own at the foot of the rail. A modifier gesture that hid the rail
+//: was not discoverable and did not survive a reload.
 const PANE_HIDDEN_KEY = 'liminal.paneHidden';
+const RAIL_HIDDEN_KEY = 'liminal.railHidden';
+
+//: Rows in the pane that open something in the workspace. Below 900px the
+//: pane is an overlay on top of that workspace, so choosing one has to
+//: close it or the choice is invisible.
+const PANE_ITEM_SELECTOR = [
+  '.conversation-item',
+  '.note-item',
+  '.context-card',
+  '.artifacts-list tr.clickable',
+  '.tool-card',
+  '.workflow-card',
+].join(', ');
+
+const paneIsOverlay = () => window.matchMedia('(max-width: 900px)').matches;
 
 // =============================================================================
 // API helpers
@@ -394,35 +410,100 @@ const updateAuthUI = () => {
  * It is deliberately the secondary gesture: losing the list is common, and
  * losing the way back to Notes and Files is not.
  */
-const setPaneHidden = (hidden, { alsoRail = false } = {}) => {
-  if (!appShell) return;
-  appShell.classList.toggle('pane-hidden', hidden);
-  if (!hidden) appShell.classList.remove('rail-hidden');
-  else if (alsoRail) appShell.classList.add('rail-hidden');
-  paneToggle?.setAttribute('aria-expanded', hidden ? 'false' : 'true');
-  if (paneToggle) paneToggle.title = hidden ? 'Show the list' : 'Hide the list';
+const remember = (key, value) => {
   try {
-    localStorage.setItem(PANE_HIDDEN_KEY, hidden ? '1' : '0');
+    localStorage.setItem(key, value ? '1' : '0');
   } catch {
-    // A browser that refuses storage still gets the toggle, just not the
+    // A browser that refuses storage still gets the control, just not the
     // memory of it.
   }
 };
 
-const initPaneToggle = () => {
-  let stored = null;
+const recall = (key) => {
   try {
-    stored = localStorage.getItem(PANE_HIDDEN_KEY);
+    return localStorage.getItem(key);
   } catch {
-    stored = null;
+    return null;
   }
+};
+
+/**
+ * Hide or show the contextual pane.
+ *
+ * `remembered` is false for the overlay closing itself after a choice: that
+ * is the drawer doing its job, not the reader saying they prefer no pane.
+ */
+const setPaneHidden = (hidden, { remembered = true } = {}) => {
+  if (!appShell) return;
+  appShell.classList.toggle('pane-hidden', hidden);
+  paneToggle?.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+  if (paneToggle) paneToggle.title = hidden ? 'Show the list' : 'Hide the list';
+  if (remembered) remember(PANE_HIDDEN_KEY, hidden);
+};
+
+/** Hide or show the rail. Its own control, and its own memory. */
+const setRailHidden = (hidden) => {
+  if (!appShell) return;
+  appShell.classList.toggle('rail-hidden', hidden);
+  remember(RAIL_HIDDEN_KEY, hidden);
+};
+
+/**
+ * The bar's overflow menu.
+ *
+ * The bar carries what a bar is for: what you are looking at, and the one
+ * action that view is about. Everything else - the thread's context and
+ * workflow settings, sharing, signing out - lives behind this, where it is
+ * one click away and none of it is competing for the row.
+ */
+const initBarMenu = () => {
+  const button = $('bar-menu-btn');
+  const panel = $('bar-menu-panel');
+  if (!button || !panel) return;
+
+  const close = () => {
+    panel.classList.add('hidden');
+    button.setAttribute('aria-expanded', 'false');
+  };
+
+  button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const opening = panel.classList.contains('hidden');
+    panel.classList.toggle('hidden', !opening);
+    button.setAttribute('aria-expanded', opening ? 'true' : 'false');
+  });
+
+  // A click inside the panel is a click on one of its controls, so only the
+  // ones outside dismiss it.
+  panel.addEventListener('click', (event) => event.stopPropagation());
+  document.addEventListener('click', close);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') close();
+  });
+};
+
+const initPaneToggle = () => {
+  const stored = recall(PANE_HIDDEN_KEY);
   // Below 900px the pane is an overlay over the workspace, so opening on it
   // would cover the thing the reader came for. Only until they say otherwise.
-  const narrow = window.matchMedia('(max-width: 900px)').matches;
-  setPaneHidden(stored === null ? narrow : stored === '1');
-  paneToggle?.addEventListener('click', (event) => {
-    const nowHidden = !appShell?.classList.contains('pane-hidden');
-    setPaneHidden(nowHidden, { alsoRail: event.shiftKey });
+  setPaneHidden(stored === null ? paneIsOverlay() : stored === '1');
+  setRailHidden(recall(RAIL_HIDDEN_KEY) === '1');
+
+  paneToggle?.addEventListener('click', () => {
+    setPaneHidden(!appShell?.classList.contains('pane-hidden'));
+  });
+  $('pane-close')?.addEventListener('click', () => setPaneHidden(true));
+  $('rail-toggle')?.addEventListener('click', () => setRailHidden(true));
+  $('rail-restore')?.addEventListener('click', () => setRailHidden(false));
+
+  // Choosing a row is choosing what to look at, and as an overlay the pane
+  // is on top of it. Not remembered: the drawer closing after a choice is
+  // not the reader saying they want no pane tomorrow.
+  contextPane?.addEventListener('click', (event) => {
+    if (!paneIsOverlay()) return;
+    if (event.target.closest(PANE_ITEM_SELECTOR)) {
+      setPaneHidden(true, { remembered: false });
+    }
   });
 };
 
@@ -468,6 +549,7 @@ const initTabs = () => {
   if (!mainTabs) return;
 
   initPaneToggle();
+  initBarMenu();
 
   mainTabs.querySelectorAll('.rail-btn[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {

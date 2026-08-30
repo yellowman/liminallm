@@ -34,16 +34,34 @@
           <button class="rail-btn" data-tab="insights-tab" title="Insights" aria-label="Insights"><svg class="rail-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.75 16.5v-4.25M8 16.5v-8M12.25 16.5v-3M16.5 16.5v-10"/></svg><span class="rail-name">Insights</span></button>
           <button class="rail-btn" data-tab="settings-tab" title="Settings" aria-label="Settings"><svg class="rail-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.25h7.5M14.25 6.25h2.75M3 13.75h2.75M9.5 13.75H17"/><circle cx="12.4" cy="6.25" r="1.9"/><circle cx="7.6" cy="13.75" r="1.9"/></svg><span class="rail-name">Settings</span></button>
           <a class="rail-btn" id="admin-link" href="/admin" title="Admin" aria-label="Admin console"><svg class="rail-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2.75 16.25 5.1v4.65c0 3.75-2.6 6.2-6.25 7.5-3.65-1.3-6.25-3.75-6.25-7.5V5.1Z"/></svg><span class="rail-name">Admin</span></a>
+          <button class="rail-btn rail-collapse" id="rail-toggle"
+                  title="Hide navigation" aria-label="Hide navigation">
+            <svg class="rail-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none"
+                 stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+                 stroke-linejoin="round">
+              <path d="M11.5 5.5 7 10l4.5 4.5"/><path d="M15.5 3.5v13"/>
+            </svg>
+          </button>
         </nav>
 
       <!-- Secondary navigation, present only where a list already drove a
            detail view. Files, Insights and Settings have no pane because
            inventing one would mean inventing the navigation to fill it. -->
       <aside class="context-pane" id="context-pane" aria-label="Section items">
+        <button class="pane-close" id="pane-close" title="Close the list"
+                aria-label="Close the list">
+          <svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor"
+               stroke-width="1.6" stroke-linecap="round">
+            <path d="M5.5 5.5l9 9M14.5 5.5l-9 9"/>
+          </svg>
+        </button>
         <div class="pane-view active" data-pane="chat-tab">
           <div class="pane-head">
             <h2>Chats</h2>
-            <button class="icon-btn" id="new-conversation-btn" title="New chat">+</button>
+            <span class="pane-head-actions">
+              <button class="icon-btn" id="refresh-conversations" title="Refresh history" aria-label="Refresh history"><svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 1 1-1.9-4.6"/><path d="M16.5 3v3.5H13"/></svg></button>
+              <button class="icon-btn" id="new-conversation-btn" title="New chat" aria-label="New chat">+</button>
+            </span>
           </div>
           <div class="sidebar-search">
             <input type="text" id="conversation-search" placeholder="Search conversations..." />
@@ -75,7 +93,7 @@
         </div>
         <!-- Selecting a context already drove the details and sources below it. -->
         <div class="pane-view" data-pane="contexts-tab">
-          <div class="pane-head"><h2>Contexts</h2></div>
+          <div class="pane-head"><h2>Contexts</h2><button class="icon-btn" id="refresh-contexts" title="Refresh contexts" aria-label="Refresh contexts"><svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 1 1-1.9-4.6"/><path d="M16.5 3v3.5H13"/></svg></button></div>
           <div class="pane-body">
             <h3>Your contexts</h3>
             <div id="contexts-list" class="contexts-list">
@@ -85,7 +103,7 @@
         </div>
         <!-- The filters travel with the list they filter. -->
         <div class="pane-view" data-pane="artifacts-tab">
-          <div class="pane-head"><h2>Artifacts</h2></div>
+          <div class="pane-head"><h2>Artifacts</h2><button class="icon-btn" id="refresh-artifacts" title="Refresh artifacts" aria-label="Refresh artifacts"><svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 1 1-1.9-4.6"/><path d="M16.5 3v3.5H13"/></svg></button></div>
           <div class="pane-body">
             <div class="input-grid mb-14">
               <div class="field compact">
@@ -116,7 +134,7 @@
         </div>
         <!-- Two lists, two detail views, one pane. -->
         <div class="pane-view" data-pane="tools-tab">
-          <div class="pane-head"><h2>Tools</h2></div>
+          <div class="pane-head"><h2>Tools</h2><button class="icon-btn" id="refresh-tools" title="Refresh tools and workflows" aria-label="Refresh tools and workflows"><svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.5 10a6.5 6.5 0 1 1-1.9-4.6"/><path d="M16.5 3v3.5H13"/></svg></button></div>
           <div class="pane-body">
             <h3>Available Tools</h3>
             <p class="subtext">System-registered tool specifications that can be invoked in workflows.</p>
@@ -134,6 +152,13 @@
 
       <div class="workspace">
         <header class="topbar">
+          <button class="pane-toggle rail-restore" id="rail-restore"
+                  title="Show navigation" aria-label="Show navigation">
+            <svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor"
+                 stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3.5 5.5h13M3.5 10h13M3.5 14.5h13"/>
+            </svg>
+          </button>
           <button class="pane-toggle" id="pane-toggle" aria-expanded="true"
                   aria-controls="context-pane" title="Hide the list">
             <svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor"
@@ -148,20 +173,41 @@
               <span class="dot"></span>
               <span id="conversation-label">New conversation</span>
             </div>
-            <div class="pill-row">
-              <select id="context-id" class="header-ctl" aria-label="Knowledge context"
-                      title="Knowledge context for RAG-grounded answers">
-                <option value="">No context</option>
-              </select>
-              <input type="text" id="workflow-id" class="header-ctl" aria-label="Workflow override"
-                     title="Optional workflow override" placeholder="workflow…" />
-              <button class="ghost" id="share-btn" disabled>Share It</button>
-              <button class="ghost" id="new-thread">New thread</button>
-              <button class="minor" id="refresh-conversations">Refresh history</button>
-            </div>
           </div>
+          <!-- One primary action per view, and a menu for the rest. The bar
+               used to carry eight controls doing four different jobs: the
+               thread's identity, its settings, list maintenance, and the
+               session. Only the first two belong in a bar, and only one of
+               them is a button. -->
           <div class="bar-actions" id="topbar-actions">
-            <button id="logout" class="ghost">Sign out</button>
+            <button class="ghost bar-primary" id="new-thread"
+                    data-section-only="chat-tab">New thread</button>
+            <div class="bar-menu">
+              <button class="pane-toggle" id="bar-menu-btn" aria-haspopup="true"
+                      aria-expanded="false" aria-controls="bar-menu-panel"
+                      title="More">
+                <svg viewBox="0 0 20 20" aria-hidden="true" fill="currentColor">
+                  <circle cx="4.5" cy="10" r="1.6"/>
+                  <circle cx="10" cy="10" r="1.6"/>
+                  <circle cx="15.5" cy="10" r="1.6"/>
+                </svg>
+              </button>
+              <div class="bar-menu-panel hidden" id="bar-menu-panel">
+                <div class="menu-group" data-section-only="chat-tab">
+                  <label for="context-id">Knowledge context</label>
+                  <select id="context-id" aria-label="Knowledge context"
+                          title="Knowledge context for RAG-grounded answers">
+                    <option value="">No context</option>
+                  </select>
+                  <label for="workflow-id">Workflow override</label>
+                  <input type="text" id="workflow-id" aria-label="Workflow override"
+                         title="Optional workflow override" placeholder="workflow…" />
+                  <button class="ghost" id="share-btn" disabled>Share It</button>
+                  <div class="menu-sep"></div>
+                </div>
+                <button id="logout" class="ghost">Sign out</button>
+              </div>
+            </div>
           </div>
         </header>
 
@@ -470,7 +516,7 @@
               <div class="section-header">
                 <h2>Knowledge Contexts</h2>
                 <div class="pill-row">
-                  <button class="minor" id="refresh-contexts">Refresh</button>
+                  
                 </div>
               </div>
               <p class="subtext">Create and manage knowledge contexts for RAG-powered conversations.</p>
@@ -540,7 +586,7 @@
               <div class="section-header">
                 <h2>Artifacts</h2>
                 <div class="pill-row">
-                  <button class="minor" id="refresh-artifacts">Refresh</button>
+                  
                 </div>
               </div>
               <p class="subtext">Browse and inspect system artifacts: workflows, policies, adapters, and tools.</p>
@@ -567,7 +613,7 @@
               <div class="section-header">
                 <h2>Tools & Workflows</h2>
                 <div class="pill-row">
-                  <button class="minor" id="refresh-tools">Refresh</button>
+                  
                 </div>
               </div>
               <p class="subtext">Browse available tools and workflows. Invoke tools directly or manage workflow configurations.</p>

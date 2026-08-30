@@ -192,6 +192,16 @@ class TestThePaneAppearsWhereNavigationAlreadyExisted:
                 assert width == 0, (
                     f"{tab} shows a {width}px pane with nothing in it"
                 )
+                # And no control offering to hide it. The click also wrote
+                # the remembered preference, so an idle click on Files took
+                # Chat's conversations away on the next visit.
+                toggle = page.evaluate(
+                    "() => document.querySelector('.pane-toggle')"
+                    ".getBoundingClientRect().width"
+                )
+                assert toggle == 0, (
+                    f"{tab} offers to hide a list it does not have"
+                )
         finally:
             context.close()
 
@@ -222,23 +232,29 @@ class TestTheChatColumnStillStartsHigh:
     """The reason the strip moved to the edge in the first place."""
 
     def test_the_title_and_controls_share_a_row(self, browser, server):
+        """The conversation's name and the bar's actions, on one line.
+
+        They used to be siblings inside `.conversation-header`; the actions
+        now sit in the bar's own group beside it. The property is the same
+        one either way - the bar must not wrap into a second band - so it is
+        measured between the two elements that actually carry them.
+        """
         context, page = _signed_in_page(browser, server, DESKTOP)
         try:
             same_row = page.evaluate(
                 """() => {
                     const b = document.querySelector(
-                        '.conversation-header .badge');
-                    const p = document.querySelector(
-                        '.conversation-header .pill-row');
-                    if (!b || !p) return null;
+                        '.topbar .conversation-header .badge');
+                    const a = document.querySelector('.topbar .bar-actions');
+                    if (!b || !a) return null;
                     return Math.abs(
                         b.getBoundingClientRect().top
-                        - p.getBoundingClientRect().top) < 4;
+                        - a.getBoundingClientRect().top) < 8;
                 }"""
             )
             assert same_row is True, (
-                "the conversation title wrapped onto its own line, which is "
-                "the row the layout change removed"
+                "the conversation name and the bar's actions are on "
+                "different lines, so the bar has become two bands"
             )
         finally:
             context.close()
@@ -336,10 +352,14 @@ class TestTheSignedOutShellShowsOneThing:
                         const el = document.querySelector(sel);
                         return el ? el.getBoundingClientRect().width : 0;
                     };
+                    const height = sel => {
+                        const el = document.querySelector(sel);
+                        return el ? el.getBoundingClientRect().height : 0;
+                    };
                     return {
                         rail: box('.app-rail'),
                         pane: box('.context-pane'),
-                        logout: box('#logout'),
+                        bar: height('.topbar'),
                         overflow: document.documentElement.scrollWidth
                             - window.innerWidth,
                     };
@@ -347,7 +367,233 @@ class TestTheSignedOutShellShowsOneThing:
             )
             assert seen["rail"] == 0, "the rail navigates nowhere signed out"
             assert seen["pane"] == 0, "the pane lists conversations nobody can open"
-            assert seen["logout"] == 0, "there is no session to sign out of"
+            assert seen["bar"] == 0, (
+                "the bar names a conversation there is not one of; emptying "
+                "it leaves a band of white above the sign-in card"
+            )
             assert seen["overflow"] <= 1
+        finally:
+            context.close()
+
+
+class TestTheBarStaysSmallInEveryView:
+    """A bar is for what you are looking at and the one action it is about.
+
+    Chat's bar once carried eight controls doing four different jobs: the
+    thread's identity, its settings, list maintenance, and the session. The
+    settings and the session moved behind an overflow menu, and each list's
+    refresh moved beside the list it refreshes, which is in the pane. What
+    is left is the pane toggle, at most one primary action, and the menu.
+    """
+
+    #: Toggle, menu, and at most one action for the view.
+    LIMIT = 3
+
+    ALL_TABS = WITH_PANE + WITHOUT_PANE
+
+    def _visible_controls(self, page):
+        return page.evaluate(
+            """() => [...document.querySelectorAll(
+                '.topbar button, .topbar select, .topbar input, .topbar a')]
+                .filter(el => el.getBoundingClientRect().width > 0)
+                .map(el => el.id || el.className)"""
+        )
+
+    def test_no_view_crowds_the_bar(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            for tab in self.ALL_TABS:
+                page.click(f'.rail-btn[data-tab="{tab}"]')
+                page.wait_for_timeout(150)
+                seen = self._visible_controls(page)
+                assert len(seen) <= self.LIMIT, (
+                    f"{tab} puts {len(seen)} controls in the bar: {seen}"
+                )
+        finally:
+            context.close()
+
+    def test_the_menu_holds_what_left_the_bar(self, browser, server):
+        """Moved, not deleted. Each one still has to be reachable."""
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click("#bar-menu-btn")
+            page.wait_for_timeout(200)
+            reachable = page.evaluate(
+                """() => ['context-id', 'workflow-id', 'share-btn', 'logout']
+                    .filter(id => {
+                        const el = document.getElementById(id);
+                        return el && el.getBoundingClientRect().width > 0;
+                    })"""
+            )
+            assert sorted(reachable) == [
+                "context-id",
+                "logout",
+                "share-btn",
+                "workflow-id",
+            ], f"the menu is missing {reachable}"
+        finally:
+            context.close()
+
+    def test_escape_closes_the_menu(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click("#bar-menu-btn")
+            page.wait_for_timeout(150)
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(150)
+            hidden = page.evaluate(
+                "() => document.getElementById('bar-menu-panel')"
+                ".classList.contains('hidden')"
+            )
+            assert hidden, "the menu stayed open after Escape"
+        finally:
+            context.close()
+
+    def test_each_list_refreshes_from_its_own_pane(self, browser, server):
+        """The control that reloads a list belongs beside the list."""
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            for tab, button in [
+                ("chat-tab", "refresh-conversations"),
+                ("contexts-tab", "refresh-contexts"),
+                ("artifacts-tab", "refresh-artifacts"),
+                ("tools-tab", "refresh-tools"),
+            ]:
+                page.click(f'.rail-btn[data-tab="{tab}"]')
+                page.wait_for_timeout(150)
+                inside = page.evaluate(
+                    """(id) => {
+                        const el = document.getElementById(id);
+                        return !!el && !!el.closest('.context-pane')
+                            && el.getBoundingClientRect().width > 0;
+                    }""",
+                    button,
+                )
+                assert inside, f"{button} is not in {tab}'s pane"
+        finally:
+            context.close()
+
+
+class TestThePaneCannotTrapAPhone:
+    """Below 900px the pane is an overlay, and an overlay must be closable.
+
+    It is fixed at `z-index: 30` over a bar at `10`, so it covers the very
+    control that opened it. With no close of its own and no reaction to a
+    row being chosen, a phone went: open Chats, choose a conversation, and
+    keep looking at the list.
+    """
+
+    def _phone(self, browser, server):
+        return _signed_in_page(browser, server, PHONE)
+
+    def test_the_pane_carries_its_own_close(self, browser, server):
+        context, page = self._phone(browser, server)
+        try:
+            page.click("#pane-toggle")
+            page.wait_for_timeout(250)
+            assert page.evaluate(
+                "() => document.querySelector('.context-pane')"
+                ".getBoundingClientRect().width > 0"
+            ), "the pane did not open"
+
+            close = page.evaluate(
+                """() => {
+                    const el = document.getElementById('pane-close');
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0) return null;
+                    // Nothing may sit on top of the way out.
+                    const hit = document.elementFromPoint(
+                        r.left + r.width / 2, r.top + r.height / 2);
+                    return !!hit && !!hit.closest('#pane-close');
+                }"""
+            )
+            assert close is True, (
+                "the overlay has no close of its own, and the bar's toggle "
+                "is underneath it"
+            )
+            page.click("#pane-close")
+            page.wait_for_timeout(250)
+            assert page.evaluate(
+                "() => document.querySelector('.context-pane')"
+                ".getBoundingClientRect().width === 0"
+            )
+        finally:
+            context.close()
+
+    def test_choosing_a_conversation_gets_out_of_the_way(self, browser, server):
+        """The choice is invisible if the list is still on top of it."""
+        import httpx
+
+        context, page = self._phone(browser, server)
+        try:
+            token = page.evaluate(
+                "() => sessionStorage.getItem('liminal.accessToken')"
+            )
+            made = httpx.post(
+                f"{server.base_url}/v1/conversations",
+                json={"title": "Network diagnostics"},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            )
+            assert made.status_code in (200, 201), made.text
+
+            page.click("#pane-toggle")
+            page.wait_for_timeout(250)
+            page.click("#refresh-conversations")
+            page.wait_for_selector(".conversation-item", timeout=15000)
+            page.locator(".conversation-item").first.click()
+            page.wait_for_timeout(400)
+
+            assert page.evaluate(
+                "() => document.querySelector('.context-pane')"
+                ".getBoundingClientRect().width === 0"
+            ), (
+                "the list stayed over the conversation it was used to choose"
+            )
+        finally:
+            context.close()
+
+
+class TestTheRailCollapsesInTheOpen:
+    """Hiding the rail was a shift-click: undiscoverable, and forgotten on
+    reload because only the pane's state was stored."""
+
+    def test_the_rail_has_a_control_and_a_way_back(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click("#rail-toggle")
+            page.wait_for_timeout(250)
+            state = page.evaluate(
+                """() => ({
+                    rail: document.querySelector('.app-rail')
+                        .getBoundingClientRect().width,
+                    restore: document.getElementById('rail-restore')
+                        .getBoundingClientRect().width,
+                })"""
+            )
+            assert state["rail"] == 0, "the rail's own control did not hide it"
+            assert state["restore"] > 0, "there is no way back to navigation"
+
+            page.click("#rail-restore")
+            page.wait_for_timeout(250)
+            assert page.evaluate(
+                "() => document.querySelector('.app-rail')"
+                ".getBoundingClientRect().width > 0"
+            )
+        finally:
+            context.close()
+
+    def test_the_choice_survives_a_reload(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click("#rail-toggle")
+            page.wait_for_timeout(250)
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_timeout(900)
+            assert page.evaluate(
+                "() => document.querySelector('.app-rail')"
+                ".getBoundingClientRect().width === 0"
+            ), "the rail came back on reload; the choice was not remembered"
         finally:
             context.close()
