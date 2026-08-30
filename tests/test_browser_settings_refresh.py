@@ -122,7 +122,7 @@ class TestTheSettingsTabRecoversFromAFailedLoad:
             # The outage is over. Nothing else reloads the panel, so whether
             # the screen recovers is entirely down to opening the tab.
             state["block"] = False
-            page.click("#main-tabs .tab-btn[data-tab='settings-tab']")
+            page.click("#main-tabs .rail-btn[data-tab='settings-tab']")
             page.wait_for_selector("#settings-tab.active", state="visible")
             page.wait_for_timeout(2500)
 
@@ -176,14 +176,14 @@ class TestTheSettingsTabRecoversFromAFailedLoad:
             page.wait_for_selector("#main-tabs", state="visible")
             page.wait_for_timeout(1500)
 
-            page.click("#main-tabs .tab-btn[data-tab='settings-tab']")
+            page.click("#main-tabs .rail-btn[data-tab='settings-tab']")
             page.wait_for_selector("#settings-tab.active", state="visible")
             page.select_option("#setting-locale", "ja-JP")
 
             # Step away without saving, then come back.
-            page.click("#main-tabs .tab-btn[data-tab='chat-tab']")
+            page.click("#main-tabs .rail-btn[data-tab='chat-tab']")
             page.wait_for_selector("#chat-tab.active", state="visible")
-            page.click("#main-tabs .tab-btn[data-tab='settings-tab']")
+            page.click("#main-tabs .rail-btn[data-tab='settings-tab']")
             page.wait_for_selector("#settings-tab.active", state="visible")
             page.wait_for_timeout(2500)
 
@@ -239,17 +239,17 @@ def _sign_in(browser, server, prefix):
         "() => !!sessionStorage.getItem('liminal.accessToken')", timeout=30000
     )
     page.wait_for_selector("#main-tabs", state="visible")
-    page.click("#main-tabs .tab-btn[data-tab='settings-tab']")
+    page.click("#main-tabs .rail-btn[data-tab='settings-tab']")
     page.wait_for_selector("#settings-tab.active", state="visible")
     return context, page
 
 
 def _revisit_settings(page):
     """Leave Settings and come back, waiting for the MFA reload to land."""
-    page.click("#main-tabs .tab-btn[data-tab='chat-tab']")
+    page.click("#main-tabs .rail-btn[data-tab='chat-tab']")
     page.wait_for_selector("#chat-tab.active", state="visible")
     with page.expect_response(lambda r: "/auth/mfa/status" in r.url):
-        page.click("#main-tabs .tab-btn[data-tab='settings-tab']")
+        page.click("#main-tabs .rail-btn[data-tab='settings-tab']")
     page.wait_for_selector("#settings-tab.active", state="visible")
     page.wait_for_timeout(500)
 

@@ -1,5 +1,5 @@
 /**
- * LiminalLM Chat Frontend
+ * liminallm chat frontend
  * Implements SPEC §17 frontend requirements with tabs, contexts, artifacts, and streaming.
  */
 
@@ -266,6 +266,33 @@ const fileUploadButton = $('upload-file-btn');
 const mainTabs = $('main-tabs');
 const conversationListEl = $('conversation-list');
 const conversationSearchEl = $('conversation-search');
+const appShell = document.querySelector('.app-shell');
+const contextPane = $('context-pane');
+const paneToggle = $('pane-toggle');
+const topbarTitle = $('topbar-title');
+
+//: What the reader has chosen to hide, remembered per browser. Two keys
+//: because they are two controls: the pane's toggle in the bar, and the
+//: rail's own at the foot of the rail. Only a click on one of those writes
+//: here: the responsive default below is a default, not a choice, and
+//: recording it would make a phone's first visit decide what a desktop
+//: shows later.
+const PANE_HIDDEN_KEY = 'liminal.paneHidden';
+const RAIL_HIDDEN_KEY = 'liminal.railHidden';
+
+//: Rows in the pane that open something in the workspace. Below 900px the
+//: pane is an overlay on top of that workspace, so choosing one has to
+//: close it or the choice is invisible.
+const PANE_ITEM_SELECTOR = [
+  '.conversation-item',
+  '.note-item',
+  '.context-card',
+  '.artifacts-list tr.clickable',
+  '.tool-card',
+  '.workflow-card',
+].join(', ');
+
+const paneIsOverlay = () => window.matchMedia('(max-width: 900px)').matches;
 
 // =============================================================================
 // API helpers
@@ -341,6 +368,10 @@ const updateAuthUI = () => {
   const isAuth = Boolean(state.accessToken);
   if (authPanel) authPanel.classList.toggle('hidden', isAuth);
   if (mainTabs) mainTabs.classList.toggle('hidden', !isAuth);
+  // Signed out there is one thing to do, so the shell shows one thing: no
+  // rail to navigate with, no list of conversations nobody can open, and no
+  // thread controls above a sign-in form.
+  appShell?.classList.toggle('signed-out', !isAuth);
 
   document.querySelectorAll('.tab-panel').forEach((p) => {
     if (isAuth) {
@@ -374,23 +405,176 @@ const updateAuthUI = () => {
 // Tab navigation
 // =============================================================================
 
+/** Store a shell preference, or carry on without one. */
+const remember = (key, value) => {
+  try {
+    localStorage.setItem(key, value ? '1' : '0');
+  } catch {
+    // A browser that refuses storage still gets the control, just not the
+    // memory of it.
+  }
+};
+
+const recall = (key) => {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Hide or show the contextual pane.
+ *
+ * `remembered` is false for the overlay closing itself after a choice: that
+ * is the drawer doing its job, not the reader saying they prefer no pane.
+ */
+const setPaneHidden = (hidden, { remembered = true } = {}) => {
+  if (!appShell) return;
+  appShell.classList.toggle('pane-hidden', hidden);
+  paneToggle?.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+  if (paneToggle) paneToggle.title = hidden ? 'Show the list' : 'Hide the list';
+  if (remembered) remember(PANE_HIDDEN_KEY, hidden);
+};
+
+/**
+ * Hide or show the rail. Its own control, and its own memory.
+ *
+ * `remembered` mirrors `setPaneHidden`: applying a stored state is not
+ * making one. The rail's default does not depend on the viewport today, so
+ * writing it on load was invisible rather than wrong - but the two halves of
+ * one storage contract should not have different rules, and the day the rail
+ * gains a responsive default is the day that asymmetry becomes the pane bug
+ * again.
+ */
+const setRailHidden = (hidden, { remembered = true } = {}) => {
+  if (!appShell) return;
+  appShell.classList.toggle('rail-hidden', hidden);
+  if (remembered) remember(RAIL_HIDDEN_KEY, hidden);
+};
+
+/**
+ * The bar's overflow menu.
+ *
+ * The bar carries what a bar is for: what you are looking at, and the one
+ * action that view is about. Everything else - the thread's context and
+ * workflow settings, sharing, signing out - lives behind this, where it is
+ * one click away and none of it is competing for the row.
+ */
+const initBarMenu = () => {
+  const button = $('bar-menu-btn');
+  const panel = $('bar-menu-panel');
+  if (!button || !panel) return;
+
+  const close = () => {
+    panel.classList.add('hidden');
+    button.setAttribute('aria-expanded', 'false');
+  };
+
+  button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const opening = panel.classList.contains('hidden');
+    panel.classList.toggle('hidden', !opening);
+    button.setAttribute('aria-expanded', opening ? 'true' : 'false');
+  });
+
+  // A click inside the panel is a click on one of its controls, so only the
+  // ones outside dismiss it.
+  panel.addEventListener('click', (event) => event.stopPropagation());
+  document.addEventListener('click', close);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') close();
+  });
+};
+
+const initPaneToggle = () => {
+  const stored = recall(PANE_HIDDEN_KEY);
+  // Below 900px the pane is an overlay over the workspace, so opening on it
+  // would cover the thing the reader came for. Only until they say otherwise.
+  //
+  // `remembered: false` because this applies a preference, it does not make
+  // one. Writing the responsive default here turned it into a choice that
+  // then outranked the default everywhere else: a first visit on a desktop
+  // stored "open" and the same browser on a phone opened the overlay over
+  // the thread; a first visit on a phone stored "hidden" and the desktop
+  // came back with no conversation list.
+  setPaneHidden(
+    stored === null ? paneIsOverlay() : stored === '1',
+    { remembered: false },
+  );
+  setRailHidden(
+    recall(RAIL_HIDDEN_KEY) === '1',
+    { remembered: false },
+  );
+
+  paneToggle?.addEventListener('click', () => {
+    setPaneHidden(!appShell?.classList.contains('pane-hidden'));
+  });
+  $('pane-close')?.addEventListener('click', () => setPaneHidden(true));
+  $('rail-toggle')?.addEventListener('click', () => setRailHidden(true));
+  $('rail-restore')?.addEventListener('click', () => setRailHidden(false));
+
+  // Choosing a row is choosing what to look at, and as an overlay the pane
+  // is on top of it. Not remembered: the drawer closing after a choice is
+  // not the reader saying they want no pane tomorrow.
+  contextPane?.addEventListener('click', (event) => {
+    if (!paneIsOverlay()) return;
+    if (event.target.closest(PANE_ITEM_SELECTOR)) {
+      setPaneHidden(true, { remembered: false });
+    }
+  });
+};
+
+/**
+ * Move to a section: the rail's selection, the pane beside it, and the
+ * workspace all name the same thing.
+ *
+ * A section without a pane collapses the middle band entirely rather than
+ * showing an empty one - Files, Insights and Settings have no list that
+ * drives a detail view, so there is nothing for a pane to hold.
+ */
+const showSection = (tabId) => {
+  if (!mainTabs) return;
+
+  mainTabs.querySelectorAll('.rail-btn').forEach((b) => {
+    const on = b.dataset.tab === tabId;
+    b.classList.toggle('active', on);
+    if (on) b.setAttribute('aria-current', 'true');
+    else b.removeAttribute('aria-current');
+  });
+
+  document.querySelectorAll('.tab-panel').forEach((panel) => {
+    panel.classList.toggle('active', panel.id === tabId);
+  });
+
+  let hasPane = false;
+  document.querySelectorAll('.pane-view').forEach((view) => {
+    const on = view.dataset.pane === tabId;
+    view.classList.toggle('active', on);
+    hasPane = hasPane || on;
+  });
+  appShell?.classList.toggle('no-pane', !hasPane);
+
+  const btn = mainTabs.querySelector(`.rail-btn[data-tab="${tabId}"]`);
+  if (topbarTitle) topbarTitle.textContent = btn?.title || '';
+  // The bar shows the conversation on Chat and the section name elsewhere;
+  // which one is a CSS decision keyed off this.
+  appShell?.setAttribute('data-section', tabId);
+  state.section = tabId;
+};
+
 const initTabs = () => {
   if (!mainTabs) return;
 
-  mainTabs.querySelectorAll('.tab-btn').forEach((btn) => {
+  initPaneToggle();
+  initBarMenu();
+
+  mainTabs.querySelectorAll('.rail-btn[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const tabId = btn.dataset.tab;
+      showSection(tabId);
 
-      mainTabs.querySelectorAll('.tab-btn').forEach((b) => {
-        b.classList.toggle('active', b === btn);
-        b.setAttribute('aria-selected', b === btn ? 'true' : 'false');
-      });
-
-      document.querySelectorAll('.tab-panel').forEach((panel) => {
-        panel.classList.toggle('active', panel.id === tabId);
-      });
-
-      // Lazy-load the data behind the tab; login only preloads a subset.
+      // Lazy-load the data behind the section; login only preloads a subset.
       if (state.accessToken) {
         if (tabId === 'notes-tab') fetchNotes();
         else if (tabId === 'contexts-tab') fetchContexts();
@@ -3712,6 +3896,9 @@ const initEventListeners = () => {
 
 const init = async () => {
   initTabs();
+  // The shell starts on Chat, so say so once rather than waiting for the
+  // first click to make the rail, the pane and the title agree.
+  showSection('chat-tab');
   initCollapsibleSections();
   initEventListeners();
   initComposerAttachments();
