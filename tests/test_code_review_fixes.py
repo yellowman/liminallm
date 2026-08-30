@@ -39,7 +39,7 @@ class TestZeroWeightAdapterHandling:
         """weight=0.0 reaches the gate, unconditionally.
 
         This was `if extra_body and "adapter_weights" in extra_body:` around
-        the assertion, which passes exactly when the weight is missing —
+        the assertion, which passes exactly when the weight is missing -
         measured, stopping the backend from sending `adapter_weights` at all
         left this green. Together advertises `gate_weights`, so the key is
         required rather than optional.

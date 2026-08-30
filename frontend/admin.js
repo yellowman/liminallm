@@ -52,7 +52,7 @@ const showFeedback = (msg) => {
 const requireAdmin = () => state.role === 'admin';
 
 // Everything the console shows on arrival. One list, called from both ways in
-// — a page opened with a live session, and an interactive sign-in — so the two
+// - a page opened with a live session, and an interactive sign-in - so the two
 // cannot drift into showing different things.
 const loadConsole = () => {
   fetchPatches();
@@ -460,7 +460,7 @@ const renderMcpServers = (servers) => {
     .map((s) => {
       const schema = s.schema || {};
       // Three states, because the resolver has three answers. `enabled`
-      // defaults to true when absent, the same way the resolver reads it — a
+      // defaults to true when absent, the same way the resolver reads it - a
       // blank cell would say "off" for a server that is on. And a row with no
       // owner is offered to nobody however `enabled` reads: the admin
       // attestation is what made it a capability, so a server whose publisher
@@ -468,7 +468,7 @@ const renderMcpServers = (servers) => {
       // as "enabled" tells an operator the opposite of what is true.
       let enabled;
       if (!s.owner_user_id) {
-        enabled = 'inert — publisher removed';
+        enabled = 'inert - publisher removed';
       } else if (schema.enabled === false) {
         enabled = 'disabled';
       } else {
@@ -681,7 +681,7 @@ const refreshDirtyState = () => {
     );
     settingsDirtyCountEl.textContent = count
       ? `${count} unsaved change${count === 1 ? '' : 's'}` +
-        (reloads ? ' — saving will reload the model services' : '')
+        (reloads ? ' - saving will reload the model services' : '')
       : '';
   }
   settingsFormEl.querySelectorAll('[data-setting]').forEach((row) => {
@@ -742,7 +742,7 @@ const renderField = (field) => {
     input = document.createElement('input');
     input.type = 'password';
     input.autocomplete = 'new-password';
-    input.placeholder = field.is_set ? 'Set — type to replace' : 'Not set';
+    input.placeholder = field.is_set ? 'Set - type to replace' : 'Not set';
     input.value = '';
   } else {
     input = document.createElement('input');
@@ -889,7 +889,7 @@ const saveSystemSettings = async () => {
     if (message) blocked = true;
   });
   if (blocked) {
-    showSettingsFeedback('Some settings are not valid — see the fields marked below.');
+    showSettingsFeedback('Some settings are not valid - see the fields marked below.');
     return;
   }
 
@@ -918,7 +918,7 @@ const saveSystemSettings = async () => {
     const fields = err.details?.fields;
     if (fields && typeof fields === 'object') {
       Object.entries(fields).forEach(([name, message]) => setFieldError(name, message));
-      showSettingsFeedback('The server rejected some settings — see the fields below.');
+      showSettingsFeedback('The server rejected some settings - see the fields below.');
     } else {
       showSettingsFeedback(err.message);
     }

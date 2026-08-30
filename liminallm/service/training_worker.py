@@ -91,7 +91,7 @@ class TrainingWorker:
         self.fs_root = fs_root
         # Periodic clustering and prune proposals are cluster-wide work, not
         # per-replica work: without this lock every replica repeats them.
-        # Queued jobs need no lock — claim_training_job() is an atomic
+        # Queued jobs need no lock - claim_training_job() is an atomic
         # conditional UPDATE, so exactly one replica wins each job.
         self.leader_lock = leader_lock or AdvisoryLock(None)
         self._running = False
@@ -158,14 +158,14 @@ class TrainingWorker:
         """Re-index files whose bytes were replaced.
 
         The replacing request empties the stale chunks itself and starts a
-        drain of its own, so this is not the usual path — it is what makes the
+        drain of its own, so this is not the usual path - it is what makes the
         queue durable rather than best-effort. A process that dies between
         recording the work and doing it would otherwise leave those files
         absent from their contexts permanently, which is the failure this
         design exists to avoid.
 
         Every poll, not on an interval: work here means a user is waiting for
-        a file to become searchable again. No leader lock either — the claim
+        a file to become searchable again. No leader lock either - the claim
         is an atomic UPDATE ... SKIP LOCKED, so replicas take different jobs,
         and the publication lock keeps two of them off one path.
         """

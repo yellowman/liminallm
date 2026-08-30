@@ -3,12 +3,12 @@
 SPEC §19.5 makes the vault the user's permanent, cross-conversation corpus and
 promotion into it a deliberate act by its owner. Everything here is a property
 of that sentence: who may promote, what a failed reading leaves behind, and
-what the stored note records about the file it is a reading *of* — because a
+what the stored note records about the file it is a reading *of* - because a
 note is treated as something the user wrote, and an extraction is not.
 
 The route already had the right shape before these tests: resolve beneath the
 authenticated user's own attachment root, extract first, create the note only
-after. So most of this is proof rather than repair — which is the point, since
+after. So most of this is proof rather than repair - which is the point, since
 the ordering is the whole defence and nothing was asserting it.
 """
 
@@ -92,7 +92,7 @@ class TestOnlyTheOwnerPromotes:
             resp = _promote(client, headers, name)
             assert resp.status_code in (400, 403, 404), (name, resp.status_code)
 
-        # The status code is not the property — the absence of the note is.
+        # The status code is not the property - the absence of the note is.
         for note in _notes(client, headers):
             full = runtime.store.get_note(note["id"])
             assert secret not in (full.content or ""), (
@@ -133,7 +133,7 @@ class TestAFailedReadingLeavesNothing:
         """The route's other refusal: the file is there and the read fails.
 
         Triggered by injection rather than by `chmod`, because the suite may
-        run as root — measured, it does here — and root reads a 000 file
+        run as root - measured, it does here - and root reads a 000 file
         happily, so the permission version of this passes for no reason.
         """
         from liminallm.api import routes
@@ -214,7 +214,7 @@ class TestTheSizeCapAndItsFlagAgree:
         assert len(note.content.encode("utf-8")) <= NOTE_FROM_FILE_MAX_BYTES
 
     def test_content_at_the_cap_is_whole_and_unflagged(self, client):
-        """Exactly at the limit is not over it — an off-by-one here would
+        """Exactly at the limit is not over it - an off-by-one here would
         mark a complete note as a partial one for the rest of its life."""
         from liminallm.service.notes import NOTE_FROM_FILE_MAX_BYTES
 
@@ -246,7 +246,7 @@ class TestTheSizeCapAndItsFlagAgree:
 class TestFileContentCannotForgeAVisionSlot:
     """The pending-image slots are private-use characters in the extracted
     text, and the parent substitutes into them. Anything that could put those
-    characters into the text could name a slot the parent then fills — so
+    characters into the text could name a slot the parent then fills - so
     every source of text is stripped of them before a slot is ever made.
     """
 

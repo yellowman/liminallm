@@ -4,7 +4,7 @@
 ever called it. Enabling MFA is the change an account takeover makes to lock
 the real owner out, so the notice is how they find out it was not them.
 
-It goes out once, at enrolment — not on every subsequent login, which uses the
+It goes out once, at enrolment - not on every subsequent login, which uses the
 same verify endpoint.
 """
 

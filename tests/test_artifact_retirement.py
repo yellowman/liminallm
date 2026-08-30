@@ -2,7 +2,7 @@
 
 SPEC §12.3 gives users CRUD over their *private* artifacts. There was no
 DELETE at all, and the PATCH that existed used a read-capability helper as its
-mutation rule — so an admin could edit a global system workflow through the
+mutation rule - so an admin could edit a global system workflow through the
 ordinary artifact endpoint, which is the change ConfigOps exists to review.
 
 Deletion is harder than the context case for two reasons. An artifact's
@@ -520,7 +520,7 @@ class TestPatchCarriesItsOwnPredicate:
 
         PATCH validated `private` and then called a generic update that locked
         and wrote by id alone. Anything that publishes the artifact in between
-        — config ops, an admin action, a future share endpoint — lands after
+        - config ops, an admin action, a future share endpoint - lands after
         the check and before the write, and the edit goes through on an
         artifact that is no longer the caller's alone.
         """
@@ -588,7 +588,7 @@ class TestTheGraceStartsAtRetirement:
     The first sweep took its grace period from the payload directory's mtime,
     which is the time of the last *write*, not of the deletion. An adapter
     trained a week ago and deleted a millisecond ago is seven days old by that
-    measure, so it was collected immediately — putting back the exact race the
+    measure, so it was collected immediately - putting back the exact race the
     delayed sweep exists to remove. The earlier grace test did not catch it
     because its fixture created the directory just before deleting it, so it
     proved that a recently *written* payload survives.
@@ -719,7 +719,7 @@ class TestTheSweepActuallyRunsInProduction:
         The cleanup loop already retires tmp directories, attachment
         generations and archive staging. Artifact payloads were added to
         neither it nor anything else, so at the previous commit a deleted
-        artifact's bytes stayed on disk forever — safe from use-after-delete
+        artifact's bytes stayed on disk forever - safe from use-after-delete
         only because nothing ever reclaimed them.
         """
         from liminallm.app import _run_cleanup_pass
@@ -750,7 +750,7 @@ class TestTheSweepActuallyRunsInProduction:
         """The retry is the point of putting this in the database.
 
         Before, cleanup happened inside the request and an `OSError` was
-        logged once and forgotten — a permanent orphan. The record is only
+        logged once and forgotten - a permanent orphan. The record is only
         cleared once the bytes are actually gone, so a full disk or a busy
         mount means "next sweep" rather than "never".
         """
@@ -881,7 +881,7 @@ class TestEveryDisappearanceEnrolls:
         """Self-healing, and conservative about when its clock starts.
 
         `create_artifact` writes its payload before publishing the row, so a
-        failed publication leaves a directory no artifact ever named — nothing
+        failed publication leaves a directory no artifact ever named - nothing
         to delete, so nothing to enrol. The old scanning sweep would have
         found it; the ledger cannot. Discovery is back, but it records a
         first-observed retirement instead of removing on sight, so the grace
@@ -944,7 +944,7 @@ def test_startup_refuses_a_database_without_the_retirement_ledger(client):
 
     Without the table an older database boots clean, the first artifact DELETE
     fails at request time, and the sweeper turns an unreadable queue into
-    "nothing to do" — which is the opposite of failing fast.
+    "nothing to do" - which is the opposite of failing fast.
     """
     import os
 
@@ -989,7 +989,7 @@ class TestAccountDeletionSerializesAgainstTraining:
 
     The route asked whether any job was running and then deleted. A worker's
     claim is an atomic `UPDATE ... WHERE status = 'queued'`, so a queued job
-    could become running in the window between the two — the same
+    could become running in the window between the two - the same
     writer-versus-retirement race already solved for individual artifacts, at
     the account level.
 
@@ -1181,8 +1181,8 @@ class TestCreationAndDiscoveryDoNotOverlap:
 
     `create_artifact` writes `artifacts/<id>/v1.json` before publishing the
     row, so a scan in that window sees a directory Postgres does not know
-    about and records a retirement for a live artifact. It looks harmless —
-    the sweep's recheck refuses to remove anything that exists — but the
+    about and records a retirement for a live artifact. It looks harmless -
+    the sweep's recheck refuses to remove anything that exists - but the
     record persists, and the delete trigger's `ON CONFLICT DO NOTHING` leaves
     that stale timestamp in place. Hours later the real deletion inherits a
     retirement that is already past its grace period, and the payload is
@@ -1194,9 +1194,9 @@ class TestCreationAndDiscoveryDoNotOverlap:
         """The scan waits for the creation rather than racing it.
 
         In a separate thread, because that is where a sweep actually runs.
-        Calling it inline from inside the creating transaction deadlocks —
+        Calling it inline from inside the creating transaction deadlocks -
         the transaction holds this artifact's lifetime lock and cannot commit
-        until the call returns — which is the lock doing its job, but not a
+        until the call returns - which is the lock doing its job, but not a
         schedule any deployment produces.
         """
         import threading
@@ -1330,7 +1330,7 @@ def test_startup_refuses_a_replica_only_trigger(client):
 
     Postgres has four states, and only two of them fire for ordinary
     application statements. A replica-only trigger sits in `pg_trigger`, is
-    not `'D'`, and does nothing when the app deletes an artifact — so
+    not `'D'`, and does nothing when the app deletes an artifact - so
     checking "not disabled" accepts a database where enrolment silently
     stopped.
     """
@@ -1365,7 +1365,7 @@ class TestARealDeletionOwnsTheClock:
     Before the creation lock, a scan could record a retirement for an artifact
     that was about to be published. Those records can already exist, and the
     trigger's `ON CONFLICT DO NOTHING` means a genuine deletion inherits the
-    stale timestamp instead of replacing it — so the payload of a live
+    stale timestamp instead of replacing it - so the payload of a live
     artifact deleted today can be due the moment it is deleted.
     """
 

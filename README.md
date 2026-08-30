@@ -2,13 +2,13 @@
 
 liminallm is an experiment in what a chatgpt-like system looks like if you **stop hard-coding product logic** and let the model help evolve itself.
 
-the core bet: **small models, deeply adapted.** a small self-hosted model with behavior baked into lora weights beats a small model begging through a long system prompt — weights survive context pressure, free the window for the user's actual content, and cost nothing per token. a frontier model can help as an offline teacher, but inference never depends on one.
+the core bet: **small models, deeply adapted.** a small self-hosted model with behavior baked into lora weights beats a small model begging through a long system prompt - weights survive context pressure, free the window for the user's actual content, and cost nothing per token. a frontier model can help as an offline teacher, but inference never depends on one.
 
 it’s a small kernel wrapped around:
 
-- a frozen base llm (jax — the primary training and serving framework)
+- a frozen base llm (jax - the primary training and serving framework)
 - per-user persona adapters + per-skill lora adapters trained on pooled cluster data
-- the adapter ladder: skills are born as prompts and only earn weights when the data justifies it — and an eval gate agrees
+- the adapter ladder: skills are born as prompts and only earn weights when the data justifies it - and an eval gate agrees
 - emergent “skills” from clusters + preference events
 - self-describing artifacts (workflows, routing policies, tools)
 - notebooklm-style grounding over filesystem-backed files
@@ -97,12 +97,12 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
   - text first; voice later
 
 - **deep behavioral memory (the adapter ladder)**
-  - per-user persona adapters (lora): small, low-stakes — tone and format
+  - per-user persona adapters (lora): small, low-stakes - tone and format
   - skill adapters born from usage: “when problems like this show up, start with this debugging workflow”
-  - every skill starts as a **prompt** (instructions distilled from cluster labels + highly-rated exemplars) — useful immediately on any backend
+  - every skill starts as a **prompt** (instructions distilled from cluster labels + highly-rated exemplars) - useful immediately on any backend
   - once a cluster pools enough positive feedback **across users**, a jax training job runs; one user’s thumbs are too sparse to train weights on
   - trained weights only ship if a **holdout eval gate** measures real improvement; a failed gate leaves the skill on the prompt rung. nothing regresses.
-  - passing the gate is the *only* thing that makes weights servable: the adapter's promoted version number is the authority, and serving reads exactly that version's weights. a file on disk, a `latest` pointer, the newest directory — none of them mean an adapter graduated.
+  - passing the gate is the *only* thing that makes weights servable: the adapter's promoted version number is the authority, and serving reads exactly that version's weights. a file on disk, a `latest` pointer, the newest directory - none of them mean an adapter graduated.
   - a graduated skill speaks once, not twice: where its weights apply it is carried by them, and where they cannot (an api backend) its prompt carries it instead
   - optionally, a teacher model distills raw chat transcripts into clean training exemplars first
   - continuous micro-training jobs in jax, only on adapters, never on the base model
@@ -115,30 +115,30 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
 - **a notes vault with a witness**
   - notes link to each other with `[[title]]`; links become a graph you can see
   - the model can search your vault mid-chat (`note_search`) and cite what you once wrote
-  - the witness puts two dated notes side by side and asks how they relate — agrees, contradicts, or the position quietly moved. contradiction isn’t the goal; it’s one honest result of the process
+  - the witness puts two dated notes side by side and asks how they relate - agrees, contradicts, or the position quietly moved. contradiction isn’t the goal; it’s one honest result of the process
   - when a position has moved, the report shows the trail: the chain of links between the two thoughts, with dates
   - a vault-wide sweep runs the same process over the strongest pairs across everything you’ve written
   - uploaded files stay chat-scoped by default; a file joins the vault only when you promote it (one click), because permanent cross-chat memory should be a decision, not a side effect
-  - promoted pdfs and images get fleeced for content: text layer → pypdf, images and scans → ocr, then model vision. install `tesseract-ocr` + `pip install 'liminallm[ocr]'` — technically optional, practically required
+  - promoted pdfs and images get fleeced for content: text layer → pypdf, images and scans → ocr, then model vision. install `tesseract-ocr` + `pip install 'liminallm[ocr]'` - technically optional, practically required
 
 - **context that fits the model you actually run**
-  - the prompt budget comes from the serving model's real window — asked of the provider (gemini and vllm both report it), else a known-family table, else a conservative default; `model_context_window` overrides when discovery guesses wrong
+  - the prompt budget comes from the serving model's real window - asked of the provider (gemini and vllm both report it), else a known-family table, else a conservative default; `model_context_window` overrides when discovery guesses wrong
   - recent turns go verbatim; older ones are folded into a rolling digest kept on the conversation, so a long chat degrades to “remembers less precisely” instead of “forgets entirely”
   - the digest is written off the hot path and never blocks a reply; the window is the same whether redis is up or down
 
 - **an openai-compatible responses api for agents**
-  - `POST /v1/responses` speaks the responses dialect, so any agent framework can point its base url here and get the kernel's whole enrichment stack — personas, skill adapters, hybrid rag, notes, memory — behind what looks like a plain model endpoint. a weak local model plus this kernel presents as a much richer model; the caller changes nothing but the base url.
+  - `POST /v1/responses` speaks the responses dialect, so any agent framework can point its base url here and get the kernel's whole enrichment stack - personas, skill adapters, hybrid rag, notes, memory - behind what looks like a plain model endpoint. a weak local model plus this kernel presents as a much richer model; the caller changes nothing but the base url.
   - stateful: `previous_response_id` continues the conversation server-side; pass `context_id` (a liminallm extension) on the first turn to ground the whole thread in a knowledge context
   - streaming: `stream: true` returns sse `response.*` events (created → tool items as they run → text deltas → completed), with the reply's id stable from the first event to the persisted message
   - serves what the turn learned, not just the text: server-side searches appear as `file_search_call`/`web_search_call` output items; grounding snippets, the full tool trace and active adapters ride under a namespaced `liminallm` key; usage includes reasoning/cached token details when the upstream reports them, and real totals from our own tokenizer on the local jax path
-  - auth via api keys (`sk-liminal-…`): mint, list, and revoke from the settings tab in the web ui, or at `/v1/auth/api-keys` with a logged-in session. keys are valid only on the agent surfaces (`/v1/responses`, `/v1/mcp`) — a leaked key can chat and search and nothing else, and in particular cannot mint or revoke keys. only a sha-256 of the key is stored; the plaintext is shown exactly once, at mint time.
+  - auth via api keys (`sk-liminal-…`): mint, list, and revoke from the settings tab in the web ui, or at `/v1/auth/api-keys` with a logged-in session. keys are valid only on the agent surfaces (`/v1/responses`, `/v1/mcp`) - a leaked key can chat and search and nothing else, and in particular cannot mint or revoke keys. only a sha-256 of the key is stored; the plaintext is shown exactly once, at mint time.
   - agent conversations appear in the web ui like any other chat, tagged “api” in the sidebar
-  - the kernel's internal tool loop (retrieval, notes, the reranker's out-of-band scoring) rides the provider tool-call transport wherever one exists — including the local jax backend via its advertised `<tool_call>` channel — so agents get the same grounded answers on every backend
+  - the kernel's internal tool loop (retrieval, notes, the reranker's out-of-band scoring) rides the provider tool-call transport wherever one exists - including the local jax backend via its advertised `<tool_call>` channel - so agents get the same grounded answers on every backend
 
 - **an mcp server for everyone else's agents**
-  - `POST /v1/mcp` speaks the model context protocol (streamable http, revision 2025-06-18): initialize, list tools, call tools — stateless, json responses, batching rejected as the spec now requires
+  - `POST /v1/mcp` speaks the model context protocol (streamable http, revision 2025-06-18): initialize, list tools, call tools - stateless, json responses, batching rejected as the spec now requires
   - two tools, both read-only, both the kernel's own retrieval: `note_search` over the notes vault and `knowledge_search` over knowledge contexts, the exact services the internal agent loop uses
-  - read-only is the point: nothing here can carry data off the box, so an injected document has no egress to abuse, and every result names its own text as document content — not instructions
+  - read-only is the point: nothing here can carry data off the box, so an injected document has no egress to abuse, and every result names its own text as document content - not instructions
   - same api keys as the responses api; the roadmap (resources, prompts, oauth, and an mcp *client* under the kernel's taint discipline) lives in the spec so growth is a decision, not drift
 
 - **small kernel, big data**
@@ -160,14 +160,14 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
   - no hard-coded `DEBUGGING`, `WRITING`, whatever
   - we cluster preference events in embedding space
   - llm labels clusters (“kernel panic debugging”, “multi-tenant billing schema design”, …)
-  - when a cluster is big + consistently positive, we auto-create a prompt-mode skill adapter tied to that cluster — weights come later, gated on data volume and a passing eval
+  - when a cluster is big + consistently positive, we auto-create a prompt-mode skill adapter tied to that cluster - weights come later, gated on data volume and a passing eval
 
 - **router as data, not code**
   - routing policies are artifacts (`policy.routing`) with a tiny expression language:
     - conditions over embeddings, clusters, safety flags
     - actions: activate/deactivate adapters, scale weights, etc.
   - the router engine is dumb and stable; policy is editable data
-  - a gate is an activation first and a strength second: weight `0` means the adapter is absent from the turn — no weights, no prompt, nothing sent to a provider, nothing in the kv cache key, and nothing claimed in what the turn reports it used. above zero it scales where scaling is defined; prompt text has no half-measure, so it goes in once, unchanged.
+  - a gate is an activation first and a strength second: weight `0` means the adapter is absent from the turn - no weights, no prompt, nothing sent to a provider, nothing in the kv cache key, and nothing claimed in what the turn reports it used. above zero it scales where scaling is defined; prompt text has no half-measure, so it goes in once, unchanged.
 
 - **llm as architect (under guardrails)**
   - a config-ops api lets the llm propose patches to:
@@ -182,8 +182,8 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
 
 - **language / runtime**
   - python (services, api, orchestration)
-  - jax + optax (base model, lora training, eval gates) — install with `pip install -e ".[train]"`
-  - the local serving path is a real plain-jax decoder — rmsnorm, rope, grouped-query attention with a kv cache, swiglu — loading `config.json` + `*.safetensors` straight from the model directory (no torch, no flax). incremental decode is tested to reproduce a full recompute, and a lora adapter at `B=0` is tested to change nothing. with no checkpoint on disk it falls back to a synthetic stand-in and says so in the log — that path moves tokens, it does not answer questions. training uses that same forward pass, so an adapter is fitted to the model that will serve it: the loss is taken over the real decoder with the lora matrices inside its attention projections, and weights only load onto the base they declare.
+  - jax + optax (base model, lora training, eval gates) - install with `pip install -e ".[train]"`
+  - the local serving path is a real plain-jax decoder - rmsnorm, rope, grouped-query attention with a kv cache, swiglu - loading `config.json` + `*.safetensors` straight from the model directory (no torch, no flax). incremental decode is tested to reproduce a full recompute, and a lora adapter at `B=0` is tested to change nothing. with no checkpoint on disk it falls back to a synthetic stand-in and says so in the log - that path moves tokens, it does not answer questions. training uses that same forward pass, so an adapter is fitted to the model that will serve it: the loss is taken over the real decoder with the lora matrices inside its attention projections, and weights only load onto the base they declare.
   - conversations reuse their own kv prefix across turns (content-addressed, adapter-keyed, strict-prefix only), so the reused prefill shows up honestly as `cached_tokens` in usage
   - remote multi-lora servers (lorax / vllm-style, openai-compatible) as an optional scale-out serving path; same artifacts, config change only
 
@@ -226,7 +226,7 @@ for v1 these can all live in one python app with clear module boundaries.
 - **early design / prototyping**
   - do not treat as production-ready
   - interfaces & schemas are expected to change
-- the training loop is real: jax + optax lora training with causal-lm sft batches, holdout eval, and a promotion gate — a skipped or regressed run never ships weights
+- the training loop is real: jax + optax lora training with causal-lm sft batches, holdout eval, and a promotion gate - a skipped or regressed run never ships weights
 - skill adapters follow the ladder end-to-end: prompt-mode birth → pooled-data training job → eval-gated graduation to hybrid
 - goal is to keep:
   - implementation minimal
@@ -237,7 +237,7 @@ for v1 these can all live in one python app with clear module boundaries.
 
 ## quick start
 
-See [INSTALL.md](INSTALL.md) — Docker on Linux, Linux without Docker, or
+See [INSTALL.md](INSTALL.md) - Docker on Linux, Linux without Docker, or
 OpenBSD.
 
 ## acceptance criteria (ready to test)
@@ -311,7 +311,7 @@ Run the automated smoke test:
 
 ### tests
 
-- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest`. the suite spins up a throwaway postgres cluster and a throwaway redis (`tests/harness.py`) and applies `sql/schema.sql`, so tests exercise the same store and cache production runs — set `TEST_DATABASE_URL` / `TEST_REDIS_URL` to point at existing services instead.
+- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest`. the suite spins up a throwaway postgres cluster and a throwaway redis (`tests/harness.py`) and applies `sql/schema.sql`, so tests exercise the same store and cache production runs - set `TEST_DATABASE_URL` / `TEST_REDIS_URL` to point at existing services instead.
 
 ### adapters: local LoRA vs remote fine-tune IDs vs prompt-distilled
 
@@ -368,7 +368,7 @@ Run the automated smoke test:
 - “Adapter-ID adapters” (multi-LoRA / adapter servers) surface `adapter_id` parameters on Together AI Serverless Multi-LoRA, LoRAX-style servers, or SageMaker adapter inference components. The backend keeps the base model string and passes `adapter_id` for one-or-more adapters per request when supported.
 - Hybrid patterns (local adapter-enabled “controller” + external API “executor”) flow through the same artifacts: the controller uses a local LoRA backend to plan, then the API backend executes with prompt or remote-model adapters.
 
-2. **configure env** — one variable
+2. **configure env** - one variable
    - `DATABASE_URL` – postgres dsn. that is the configuration.
 
    four others exist and none of them are settings you tune: `BUILD_SHA`
@@ -378,8 +378,8 @@ Run the automated smoke test:
    modules, so making it settable from a web form would mean remote code
    execution).
 
-   everything else — the model, credentials, rate limits, ttls, cors, smtp,
-   the signing key — lives in the database and is edited from the admin
+   everything else - the model, credentials, rate limits, ttls, cors, smtp,
+   the signing key - lives in the database and is edited from the admin
    console at `/admin.html`, applied to every replica without a restart.
    changing an smtp password should not require redeploying the app. for
    declarative deploys, seed on first boot with

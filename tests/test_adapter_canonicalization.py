@@ -1,7 +1,7 @@
 """Pass C: every adapter carries an explicit mode; legacy spellings are dead.
 
-The oracle below was frozen from the *old* resolvers — `get_adapter_mode`'s
-inference chain and `extract_prompt_instructions`' five-alias sweep — by
+The oracle below was frozen from the *old* resolvers - `get_adapter_mode`'s
+inference chain and `extract_prompt_instructions`' five-alias sweep - by
 running them over every legacy shape before they were deleted, in the same
 working tree. The repair in `sql/schema.sql` must give each shape the same
 meaning under the new, trivial resolvers. That proves semantic equivalence,
@@ -241,8 +241,8 @@ class TestTheRepairPreservesEveryLegacyMeaning:
     def test_every_repaired_adapter_would_pass_todays_validator(self, repaired):
         """"Canonicalized" has to mean what the validator means.
 
-        Checking `mode` alone let other shapes through — a numeric
-        `remote_model_id`, say — so a row could be repaired into something the
+        Checking `mode` alone let other shapes through - a numeric
+        `remote_model_id`, say - so a row could be repaired into something the
         current build would refuse to create.
         """
         from liminallm.service.artifact_validation import validate_artifact
@@ -269,7 +269,7 @@ class TestTheRepairPreservesEveryLegacyMeaning:
 
 class TestTheMigrationRefusesToLeaveCorruption:
     """A garbage explicit mode survived the repair, because explicit mode was
-    historically authoritative — but the current validator would refuse to
+    historically authoritative - but the current validator would refuse to
     create that row. Better for migrate.sh to name it than to boot with a
     current adapter the current schema forbids.
     """
@@ -352,7 +352,7 @@ class TestTheMigrationRefusesToLeaveCorruption:
         """The postcondition speaks for every row typed 'adapter'.
 
         Scoping it to `schema.kind = 'adapter.lora'` meant the one corruption
-        the write-path bypass actually produced — a wrong kind — was the one
+        the write-path bypass actually produced - a wrong kind - was the one
         shape the migration could not see. No faithful historical meaning is
         recoverable for these, so the migration refuses rather than inventing
         one.
@@ -383,7 +383,7 @@ class TestTheMigrationRefusesToLeaveCorruption:
         "version", [0, 1, 1.0], ids=["zero", "int", "float-integral"]
     )
     def test_a_version_the_validator_accepts_still_migrates(self, client, version):
-        """JSON Schema counts 1.0 as an integer, so the migration must too —
+        """JSON Schema counts 1.0 as an integer, so the migration must too -
         a postcondition stricter than the door it guards blocks an operator
         over a row this build would happily create."""
         import psycopg

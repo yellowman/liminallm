@@ -1,7 +1,7 @@
 # Issues: the campaign journal
 
 The working record of defect campaigns on this codebase: each entry is a
-tranche or review round — what was measured, what was reproduced, what was
+tranche or review round - what was measured, what was reproduced, what was
 fixed, and what was recorded but deliberately left for a later tranche.
 Newest entries are at the bottom. Entries stating "recorded, not fixed" or
 "observation, not this tranche" are the open list.
@@ -10,7 +10,7 @@ A numbered security-audit ledger (issues 1–82 across thirteen audit passes,
 December 2025, with per-pass severity tables) used to open this file. It was
 pruned on 2026-08-28: every item in it was either fixed, verified as a false
 positive, or superseded by the campaign entries below, and its one open TODO
-— a Playwright end-to-end lane in CI — has existed since (`make
+- a Playwright end-to-end lane in CI - has existed since (`make
 test-browser`, the `browser` CI job). Code comments citing `Issue N.M` refer
 to that ledger; the definitions live in this file's git history before the
 pruning commit.
@@ -25,14 +25,14 @@ later reader can find the mechanism rather than the plan.
 ### The four closure conditions
 
 They are now ordinary tests in `tests/test_invocation_lease.py`, and each one
-asserts on processes or files rather than on return values — every one of these
+asserts on processes or files rather than on return values - every one of these
 properties was false before in a way no assertion about results could see.
 
 - **No retry before the prior worker's process tree is dead.** The retry loop
   calls `Invocation.terminate()` and honours the answer; a tree that will not
   die fails the node with `tool_worker_unreaped` instead of running beside it.
   The old `_reap` waited `REAP_GRACE_SECONDS` and returned, which was the best
-  a thread worker could do — a thread cannot be killed.
+  a thread worker could do - a thread cannot be killed.
 - **A revoked invocation sends no web request.** The capability checks liveness
   before it acts, under the invocation's lock. The test counts calls into
   `web.fetch_url`/`web.search_web`; asserting on the returned error would pass
@@ -44,7 +44,7 @@ properties was false before in a way no assertion about results could see.
 - **Every broker-owned descendant and resource is killed and reaped first.**
   Sandbox children are the *parent's* children, so killing the worker never
   reached them; they are registered on `Invocation.resources` as they start.
-  Reaped, not merely signalled — a zombie still holds a process-table slot.
+  Reaped, not merely signalled - a zombie still holds a process-table slot.
 
 ### `_guards` lifetime
 
@@ -71,7 +71,7 @@ A durable step whose payload diverges at a taken position is refused
 (`RetryDivergence`) rather than answered with the earlier mutation's result; a
 read diverging there simply runs again. A step still `pending` when its attempt
 died becomes `unknown`, and a durable `unknown` is refused rather than
-repeated — nothing left can say whether it landed.
+repeated - nothing left can say whether it landed.
 
 `commit_guard` wraps the mutations themselves: artifact publication
 (`service/agent_tools.py`), the assistant message (`api/chat_turn.py`), and the
@@ -84,12 +84,12 @@ The first cut of this tranche put the architecture in place and left the
 boundary softer than the SPEC describing it. All five are fixed here, each with
 a test that fails when the fix is reverted (verified by reverting it).
 
-**BLOCKER — the worker was contained in name only.** `_worker_main` did
+**BLOCKER - the worker was contained in name only.** `_worker_main` did
 `setsid` and rlimits and nothing else. A `multiprocessing` spawn child inherits
 the service's environment, filesystem view and network namespace, so the
 process designated as the untrusted side still held `DATABASE_URL`,
 `open('/etc/passwd')` and an outbound socket. The bodies it runs are fixed, not
-model-written, so this was not a one-prompt RCE — but the broker being the
+model-written, so this was not a one-prompt RCE - but the broker being the
 *intended* channel is not the broker being the *only* one, and one body bug is
 the difference. The worker now confines itself with the same backend
 `run_python` uses, clears its environment wholesale, and refuses to run
@@ -97,47 +97,47 @@ anything if it cannot (including when given no scratch, so the check has no
 conditional form). Tested by asking the kernel from inside a real spawned
 child, not by reading the source.
 
-**BLOCKER — cancellation could `killpg` the API server.** `spawn` registered
+**BLOCKER - cancellation could `killpg` the API server.** `spawn` registered
 the child as `group=True` immediately, and `_kill` did
 `killpg(getpgid(pid))`. But `setsid` runs in the *child*, after `start()`
 returns: measured, `getpgid` on a just-started spawn child returns the parent's
 pgid, so a cancel landing in that window would SIGKILL the service and
-everything sharing its group. The group is now earned — the child sends a
+everything sharing its group. The group is now earned - the child sends a
 READY handshake carrying the pgid it reached, and only `pgid == pid` promotes
-the registration from single-pid to group — and `_kill` re-checks the same
+the registration from single-pid to group - and `_kill` re-checks the same
 thing, because the cost of the two disagreeing is the whole process group. The
 old test read the source for `setsid` ordering, which proved nothing about
 parent/child synchronization; the new one observes the window and asserts no
 `killpg` is aimed at our own group.
 
-**HIGH — a reaped sandbox pid stayed registered.** `run_in_sandbox` registered
+**HIGH - a reaped sandbox pid stayed registered.** `run_in_sandbox` registered
 the child and never released it, and teardown later signalled the stored pid.
 A pid outlives its process only as a number and the kernel reuses numbers, so
 that was a standing licence to SIGKILL a stranger. Registration now hands back
 the means to undo it and the normal exit path uses it. The previous test
-asserted the stale entry was still there — it encoded the defect — and now
+asserted the stale entry was still there - it encoded the defect - and now
 asserts registration and release as a pair.
 
-**HIGH — the rlimits failed open.** `setrlimit` failures were swallowed while
+**HIGH - the rlimits failed open.** `setrlimit` failures were swallowed while
 the comment beside them said a refused limit must not mean unbounded work. A
 wall-clock kill does not replace an address-space or file-size cap. They fail
 closed now: the body never runs.
 
-**HIGH — withdrawal was enforced one layer too high.** After an injection
-finding, `tools.round` refused `run_python`/`web_fetch`/`web_search` — but the
+**HIGH - withdrawal was enforced one layer too high.** After an injection
+finding, `tools.round` refused `run_python`/`web_fetch`/`web_search` - but the
 `web.fetch` and `web.search` capabilities themselves checked only liveness. The
 worker is the untrusted side by construction, so "it asks through the round" is
 a description of the intended protocol, not a constraint on a compromised one:
 a tainted worker could ask for `web.fetch` directly. The refusal is now on the
 capability, where the authority is.
 
-**MEDIUM — publication identity ignored the bytes.** The durable payload hashed
+**MEDIUM - publication identity ignored the bytes.** The durable payload hashed
 filenames only, so a retry whose code wrote the same name with different
 content replayed the earlier entry and skipped the copy: the user keeps
 attempt one's file while attempt two's answer describes what it computed. The
 digest now covers each file's contents.
 
-**MEDIUM — one upload path skipped the ingestion ledger.** The dedupe branch
+**MEDIUM - one upload path skipped the ingestion ledger.** The dedupe branch
 (same bytes, new context) called `ingest_file` outside `idem.commit`, so the
 claim that uploads and their ingestion are separately ledgered was true of one
 path and not the other. Both are ledgered now.
@@ -152,7 +152,7 @@ path and not the other. Both are ledgered now.
 - `ATTEMPT_HANDOVER_SECONDS` bounds how long the next attempt waits for the
   last attempt's parent-side serve loop to return. The worker is dead by then;
   the wait covers a capability that was mid-call when the kill landed, and each
-  of those carries a timeout of its own. It is a wait, not a grace period —
+  of those carries a timeout of its own. It is a wait, not a grace period -
   expiry fails the node rather than starting the retry anyway.
 - The filesystem/archive/signed-URL census the carry-forward deferred until
   after this boundary existed is now unblocked, and still to do.
@@ -177,7 +177,7 @@ in a directory they had no claim on.
 `service/fs.authorize_path` is now the single predicate: relative means the
 caller's own area and only that; absolute is refused unless an artifact row
 covering it authorizes this caller. Visibility is read from the persisted row
-and every unprovable claim refuses — an ownerless `shared` artifact has no
+and every unprovable claim refuses - an ownerless `shared` artifact has no
 tenant to match, a principal whose tenant did not resolve cannot match one, and
 an unrecognized visibility grants exactly the values nobody considered. This is
 the rule `get_latest_workflow` already followed, applied to paths.
@@ -193,18 +193,18 @@ Every surface that takes a caller-supplied path, checked behaviourally by
 having a second user name the first user's real file, both relatively and
 absolutely:
 
-- `POST /contexts/{id}/sources` — was the hole; fixed.
+- `POST /contexts/{id}/sources` - was the hole; fixed.
 - `GET /files/{name}/url`, `DELETE /files/{name}`, `POST /files/{name}/extract`,
-  `POST /notes/from-file` — the base is derived from the authenticated
+  `POST /notes/from-file` - the base is derived from the authenticated
   principal and the caller supplies only the leaf, so `safe_join` decides. All
   refuse another user's file.
-- `POST /files/upload` — filename sanitized, then joined under the caller's dir.
-- artifact `fs_path` — computed by the store from the artifact id
+- `POST /files/upload` - filename sanitized, then joined under the caller's dir.
+- artifact `fs_path` - computed by the store from the artifact id
   (`artifacts/{id}/vN.json`); never caller-supplied.
-- voice files — server-generated UUID names under the caller's directory.
-- adapter files — `adapter_root` binds the directory's final component to the
+- voice files - server-generated UUID names under the caller's directory.
+- adapter files - `adapter_root` binds the directory's final component to the
   adapter id, hardened in the ladder tranche.
-- ingestion — `ingest_path` re-checks against `allowed_base` independently.
+- ingestion - `ingest_path` re-checks against `allowed_base` independently.
 
 ### MEDIUM: the exception was wider than the rule it came from
 
@@ -214,7 +214,7 @@ Both are broader than §18, which states the exception with a destination in it:
 `artifact.visibility in ('shared','global')` **points into `/shared`**. So a row
 covering `artifacts/{id}/v1.json` conferred authority over the artifact store,
 and a private row could widen a caller's reach past their own `/users/{id}`
-area — the one thing the caller's own authority is already spent on.
+area - the one thing the caller's own authority is already spent on.
 
 Narrowed structurally rather than by adding conditions: the candidate must
 resolve under `shared_fs_root/shared` *before* any artifact is looked up,
@@ -247,7 +247,7 @@ enough to build it without inventing:
 - §12.2 describes `shared` as "selected users/groups (future)", which does not
   describe the tenant-scoped `shared` §18 locks in.
 - §12.3 lets an ordinary user CRUD private artifacts, and `global` is described
-  as system authority — so *who* may mint a filesystem grant is unstated.
+  as system authority - so *who* may mint a filesystem grant is unstated.
 
 Where §18 is locked and specific it controls, which is why the tenant-scoped
 `shared` rule is implemented and the older comments are treated as stale. But
@@ -292,14 +292,14 @@ licence to skip ownership.
 
 `f'attachment; filename="{path}"'` put a filename straight into a quoted
 header parameter. A name containing a quote closed the string and added a
-second parameter — observed, not theorised:
+second parameter - observed, not theorised:
 
     attachment; filename="evil";filename="innocent.txt"
 
 A client taking the last one saves the file under a name and extension chosen
 by whoever picked the filename. Uploads sanitize their own names, so that is
 not the route; `interpreter.publish_artifacts` refuses only `/` and a leading
-dot, and `.txt` is an allowed extension, so model-written code can create one —
+dot, and `.txt` is an allowed extension, so model-written code can create one -
 and the model's choices are attacker-influenced the moment it has read a page.
 
 Fixed by deleting the hand-built header and letting `FileResponse` construct
@@ -310,8 +310,8 @@ raw header, because the encoded payload legitimately contains the letters
 
 ## Tranche 2B.5: attachments become data, in the prompt as well as the docs
 
-§21.1 lists attachments beside web pages — "web pages, search results,
-**attachments**, notes, and recalled turns are all data, never instructions" —
+§21.1 lists attachments beside web pages - "web pages, search results,
+**attachments**, notes, and recalled turns are all data, never instructions" -
 and web content had the whole treatment while attachments had a bare
 delimiter:
 
@@ -327,7 +327,7 @@ current SPEC rather than a proposal.
 Found by grepping the class after the download-header fix: the filename
 delimiter was the visible corner of it, and the contents were the larger half.
 
-The envelope vocabulary is web.py's, not a second one — the decision
+The envelope vocabulary is web.py's, not a second one - the decision
 `rerank.py` already recorded. `neutralize_markers` defends those exact strings,
 so a private pair would be covered only by its generic `<<<CAPS>>>` fallback
 and a later tightening in web.py would never reach this prompt.
@@ -351,7 +351,7 @@ What the block now does:
 Tested on the assembled system message rather than on the helper: a helper
 returning a well-formed string proves nothing about what the model is handed.
 Three of the assertions were wrong on the first pass and were corrected toward
-structure rather than substrings — a filename that *contains* the text
+structure rather than substrings - a filename that *contains* the text
 `--- contents of ...` is displayed and must be, so what has to be absent is the
 delimiter as a line of its own, and a label is only structure inside the
 envelope body.
@@ -365,13 +365,13 @@ distinction the section already requires.
 
 §21.3 is four sentences and every clause is a property. Thirty tests now use
 real ZIP and TAR fixtures and assert on the filesystem afterwards rather than
-on the returned `skipped` list — a skip reason is the extractor's opinion of
+on the returned `skipped` list - a skip reason is the extractor's opinion of
 what it did, and the tree is what it actually did.
 
 Covered: `../x`, `../../x`, `a/../../x`, absolute paths, UNC and drive forms,
 backslash traversal, `....//`, over-deep names, tar symlinks, tar hardlinks,
 FIFOs, character and block devices, ZIP entries carrying a symlink type, and
-ZIP entries with permission bits but no type bits (which must still extract —
+ZIP entries with permission bits but no type bits (which must still extract -
 §21.3 names that case). Resources: entry count, one oversized member,
 aggregate bytes across members that are individually legal, compression ratio,
 truncated and corrupt archives, and that every resource failure removes the
@@ -383,18 +383,18 @@ All of those held except one.
 
 `charge_bytes` computed `ratio_cap = max(1 MiB, archive_bytes * max_ratio)`, so
 the configured 100:1 became roughly 1024:1 for a 1 KiB archive. Measured before
-changing anything: a 726-byte zip expanded to 614400 bytes — **846:1** — and
+changing anything: a 726-byte zip expanded to 614400 bytes - **846:1** - and
 extracted. §21.3 states the ratio cap with no small-archive exemption in it.
 
 The exemption's own justification was backwards. The comment read "tiny
 archives may legitimately expand far past the ratio cap (an empty-file tar is
 mostly header)"; measured, an empty-file tar is 10240 bytes on disk and expands
 to 0 bytes, a ratio of zero. Nothing about a header-heavy archive pushes it
-*past* a ratio cap — it pushes it below one.
+*past* a ratio cap - it pushes it below one.
 
 The floor is gone, so the cap is `archive_bytes * max_ratio`. One consequence
 worth stating rather than discovering later: a genuinely small, genuinely
-compressible upload — a 100 KB log that zips to 700 bytes — is now refused at
+compressible upload - a 100 KB log that zips to 700 bytes - is now refused at
 100:1. The per-member and total caps are unchanged. If that turns out to bite
 real uploads the answer is a different `max_ratio`, which is already a
 per-extraction limit, not a floor that silently suspends the rule.
@@ -422,7 +422,7 @@ disposable child because "assume the parsers are compromisable". Both spoke
 
 Unpickling runs `__reduce__`, so the dangerous operation happens **in the
 parent**, while it is decoding, before any check the parent might make. No
-exploit is needed — only the ability to return an object.
+exploit is needed - only the ability to return an object.
 
 Measured before changing anything, with a sandbox child returning an object
 whose `__reduce__` names a callback:
@@ -435,24 +435,24 @@ The pid the payload ran in is the pid of the API process. Both channels failed
 it: the sandbox's result channel and the sandbox's *error* channel, which sent
 exceptions as objects precisely so callers could catch their own types.
 
-`service/wire.py` replaces both with JSON over `send_bytes`/`recv_bytes` — a
+`service/wire.py` replaces both with JSON over `send_bytes`/`recv_bytes` - a
 grammar with no callable in it and no way to name a type. Errors cross as
 `{type, message}`. The type is a **name**, and the receiver decides what a name
 may become, from a vocabulary the receiver owns: a fixed set of builtins plus
 whatever the caller passes as `error_types`. Nothing is imported, resolved or
 constructed from the child's string. `ExtractError` and `ArchiveExtractionError`
-still reach their callers as themselves, because their callers translate them —
+still reach their callers as themselves, because their callers translate them -
 `rag.ingest_file` skips a file on `.reason` rather than failing the batch.
 
 Frames are bounded, and every bound is derived rather than picked:
 
-- **extraction** — `MAX_DOC_XML_BYTES` for the text (no reader inflates past
+- **extraction** - `MAX_DOC_XML_BYTES` for the text (no reader inflates past
   it) plus `MAX_SCANNED_PAGES` images of at most `MAX_IMAGE_BYTES`, base64 at
   four bytes for three. The image term dominates and is meant to: §19.5 puts
   the vision pass in the parent, so those bytes crossing is the architecture.
-- **archive** — one bounded record per entry, times the entry cap.
-- **interpreter** — two streams of `MAX_OUTPUT_CHARS` plus `MAX_ARTIFACTS`.
-- **worker** — what the parent has itself handed over. Everything a body
+- **archive** - one bounded record per entry, times the entry cap.
+- **interpreter** - two streams of `MAX_OUTPUT_CHARS` plus `MAX_ARTIFACTS`.
+- **worker** - what the parent has itself handed over. Everything a body
   returns is made of the plan plus the broker's replies, so the parent grants
   its own outbound total (`FrameBudget`) and an allowance for the model's new
   text. Not a guess about conversation sizes.
@@ -465,7 +465,7 @@ data-URL ceiling and an image above it has no vision pass waiting for it.
 
 Mutation testing found something worth writing down. Reverting the child's
 half of the sandbox codec left the tests green, because the parent's
-`recv_bytes` reads a pickle's *bytes* without running them — the property
+`recv_bytes` reads a pickle's *bytes* without running them - the property
 lives in the decoder, and the sender's cooperation is a courtesy that yields a
 clearer message. The same held for the size cap: either end alone refuses an
 oversized result. Both are deliberate, and the mutations now revert both ends
@@ -476,7 +476,7 @@ entirely, which only the parent's cap stops.
 ### HIGH: the shared sandbox's rlimits failed open
 
 `apply_resource_limits` caught every `setrlimit` failure, logged it, and
-recorded the result in a dict — which its only caller ignored. A refused cap
+recorded the result in a dict - which its only caller ignored. A refused cap
 therefore read as success and untrusted code ran unbounded. Reporting a
 failure to a caller that does not check is the same as not detecting it.
 
@@ -487,12 +487,12 @@ concern, not a bound on what the child can consume.
 
 ### HIGH: the wall-clock kill reached one pid, not the job
 
-§19.5's parsers spawn grandchildren — `pdftoppm`, tesseract — which are not
+§19.5's parsers spawn grandchildren - `pdftoppm`, tesseract - which are not
 the API process's children and outlive the child that started them. The
 timeout killed `proc` and reaped it, and the grandchild ran on.
 
 The child now `setsid`s and announces itself before doing any work, and
-teardown kills the group first and reaps second — in that order, because a
+teardown kills the group first and reaps second - in that order, because a
 group stops naming anything once its leader has been reaped and its pid
 recycled. The handshake is what makes the group safe to signal at all:
 `Process.start()` returns before the child has run a line, so a `killpg` in
@@ -530,7 +530,7 @@ SPEC §18 says "a worker's authority ends when its invocation ends, and so does
 the worker" and "what the invocation started, the invocation can kill". Neither
 sentence has a clause about how the worker finished. `terminate()` now carries
 the READY-proven group status and kills the group on every terminal path,
-before reaping — and deliberately does not consult `Process.is_alive()` first,
+before reaping - and deliberately does not consult `Process.is_alive()` first,
 because that joins an exited child and a reaped pid is a number the kernel may
 hand to anyone.
 
@@ -538,7 +538,7 @@ Two things surfaced while building the red, both worth keeping:
 
 A confined worker cannot `exec` anything here at all. `confine` binds the
 *realpaths* of the runtime, which on a merged-`/usr` system are `/usr/lib` and
-`/usr/lib64`, so the new root has no `/lib64` — and the interpreter's ELF
+`/usr/lib64`, so the new root has no `/lib64` - and the interpreter's ELF
 loader is `/lib64/ld-linux-x86-64.so.2`. `execve` finds the binary, the kernel
 fails on the loader, and Python reports `FileNotFoundError` for a path that
 `os.path.exists` says is there. So the test forks instead, which needs no
@@ -546,7 +546,7 @@ loader and produces the same group member.
 
 Getting a body into the worker takes no production seam. The child rebuilds
 `_BODIES` when it imports `tool_worker`, so a parent-side registration does not
-survive the spawn — but `multiprocessing` pickles a function by reference, so
+survive the spawn - but `multiprocessing` pickles a function by reference, so
 putting the body in the plan makes the child import the test module while
 unpickling its arguments, and the module's import registers it.
 
@@ -564,9 +564,9 @@ purpose would be to let one untrusted child dump core.
 
 ## Tranche 2D.3: what may become a note
 
-`tests/test_note_publication.py`. The route already had the right shape —
+`tests/test_note_publication.py`. The route already had the right shape -
 resolve beneath the authenticated user's own attachment root, extract, and
-only then create — so this tranche is proof rather than repair. Nothing was
+only then create - so this tranche is proof rather than repair. Nothing was
 asserting the ordering, and the ordering is the whole defence.
 
 Fourteen tests: a stranger cannot promote another user's upload by any
@@ -580,15 +580,15 @@ extractor contributes zero chunks rather than indexing decoded binary.
 The slot-forging cases are the interesting ones. Pending vision slots are
 private-use characters in the extracted text and the parent substitutes into
 them, so any text that reached the parent carrying those characters could name
-a slot. All three sources are stripped — file text, reader output, and the
-model's own transcription — and the tests assert the *characters* are gone
+a slot. All three sources are stripped - file text, reader output, and the
+model's own transcription - and the tests assert the *characters* are gone
 rather than that the slot is gone. Those differ exactly where it matters:
 `_PH_RE` erases a whole `<open>N<close>` group, so text that survived to that
 point would have content silently eaten instead of preserved.
 
 Two tests were wrong on the first pass and both passed for the wrong reason
 until measured. The unreadable-file case used `chmod(0o000)`; the suite runs as
-root here, which reads it happily, so the refusal never came — it injects an
+root here, which reads it happily, so the refusal never came - it injects an
 `OSError` now and says why. The traversal case used relative paths that were
 arithmetically wrong: from `<root>/users/<stranger>/files`, `../<victim>/...`
 lands on a path that exists for nobody, and the 404 it earned said nothing
@@ -599,8 +599,8 @@ watching the corrected test go red.
 
 §18 does not stop at "send SIGKILL": "reaping is confirmed rather than
 bounded: a tree that will not die fails the node instead of running alongside
-its successor." `Invocation.terminate()` implements exactly that — kill,
-re-check `live_children()`, refuse at the deadline — and the retry honours it.
+its successor." `Invocation.terminate()` implements exactly that - kill,
+re-check `live_children()`, refuse at the deadline - and the retry honours it.
 
 `_serve_invocation` walked around it. `WorkerHandle.terminate()` signalled,
 called `join(2)`, and returned nothing; the caller then dropped the pid from
@@ -616,7 +616,7 @@ registration. Two things make up the verdict:
   since handed to somebody else.
 - For a READY-proven group, the group being empty. A killed member stays in
   the group until its parent reaps it, and once the leader is gone that parent
-  is init — measured, a group outlives its reaped leader by about a second.
+  is init - measured, a group outlives its reaped leader by about a second.
   `ResourceRegistry.live_children()` asks the same question, so a leader whose
   group still holds somebody is not forgotten.
 
@@ -625,7 +625,7 @@ tool call, and the deadline that tells "draining" from "will not die" already
 exists one level up; it just needs an honest answer and a registration still
 there to re-check.
 
-One mutation survived the first pass — deleting the `exitcode` check changed
+One mutation survived the first pass - deleting the `exitcode` check changed
 nothing, because the group answer alone carried every test. The half is now
 asserted on its own, with `leads_group` set aside so the group answer cannot
 stand in for it.
@@ -638,7 +638,7 @@ CI, so each gates a real request at the point the window opens.
 
 ### The upload race
 
-Two uploads of one name, different bytes, different idempotency keys — two
+Two uploads of one name, different bytes, different idempotency keys - two
 requests, correctly, not a duplicate. Each phase succeeded and the order was
 the damage:
 
@@ -657,8 +657,8 @@ The fix is `fs.path_lock`, held across write → ingest → manifest, because th
 three are one generation and making each step atomic does not help. `flock`
 for two measured reasons: it is held by an open file description rather than
 by a process, so two threads in one API process serialise on it exactly as two
-replicas do — an in-process lock would be blind to the other replica, and §22
-puts `shared_fs_root` in common between them deliberately — and the kernel
+replicas do - an in-process lock would be blind to the other replica, and §22
+puts `shared_fs_root` in common between them deliberately - and the kernel
 drops it when the descriptor closes, so a replica that dies holding one does
 not wedge the name, which is the failure mode of a lock built from `O_EXCL`
 and a stale file.
@@ -675,7 +675,7 @@ a missing entry is a dedupe miss, so the next upload of that name re-ingests a
 file that never changed.
 
 So the manifest update takes a second lock on the manifest itself and re-reads
-under it. Always file lock then manifest lock, never the reverse — one order
+under it. Always file lock then manifest lock, never the reverse - one order
 for two locks is what stops two uploads each holding what the other waits for.
 
 ### Recorded, not fixed: re-ingestion leaves the old generation
@@ -686,7 +686,7 @@ return, as the contents of `notes.md`, text that file has not held since the
 first upload.
 
 It is a strict xfail rather than a fix because it is not this tranche's defect.
-No interleaving reaches it — two sequential uploads are enough, measured — and
+No interleaving reaches it - two sequential uploads are enough, measured - and
 the repair is a deletion semantic that does not exist yet: the store has
 `add_chunks` and no way to drop a path's chunks, and whatever answers this has
 to answer `DELETE /files/{name}` too, which leaves the same chunks behind for
@@ -701,7 +701,7 @@ skipped that step cost the work in `routes.py` and had to be reapplied.
 
 ## The last process-tree correction: a reaped pid is not a handle
 
-Retaining the registration while the group drains was right — the retry needs
+Retaining the registration while the group drains was right - the retry needs
 something to wait on. Retaining it *as a pid* was not. Once the leader has been
 positively reaped that number names nothing, and the kernel may give it to an
 unrelated process; §18 calls a registration left behind after a reap "a
@@ -711,26 +711,26 @@ The damage is not theoretical, and `_kill` is where it lands. Its group branch
 requires `os.getpgid(pid) == pid`, and a reissued pid belongs to somebody
 else's group, so the branch declines and the `else` sends a plain
 `os.kill(pid, SIGKILL)`. Measured, with the kernel made to answer as it would
-after a reissue — the pid exists and sits in another group — a single
+after a reissue - the pid exists and sits in another group - a single
 `Invocation.terminate(timeout=0.3)` aimed **sixteen** SIGKILLs at it.
 
 So a reaped leader's entry becomes group-observation only: `live_children()`
 asks `group_alive` and nothing else, and `kill_all()` skips it entirely. There
-is nothing left to signal — the SIGKILL that emptied the group has already
+is nothing left to signal - the SIGKILL that emptied the group has already
 been sent, and all that remains is to watch it drain and let
 `Invocation.terminate()`'s existing deadline decide.
 
 The first mutation pass left one survivor worth recording: restoring the pid
 probe in `live_children` failed nothing, because the safety test patches the
 group alive and both readings then say "alive". The harm of the probe is the
-opposite one — a *drained* group whose pid has been reissued reads as alive
+opposite one - a *drained* group whose pid has been reissued reads as alive
 forever, so the tree is never confirmed gone and the node fails for as long as
 some stranger holds the number. That is now its own test, and the mutation is
 red.
 
 ## 2E.1 closed: one generation, in the index too
 
-The tranche's own invariant named three records — disk, index, manifest — and
+The tranche's own invariant named three records - disk, index, manifest - and
 the concurrent test only proved the surviving generation was *somewhere* in the
 index, not that the dead one was absent. The strict xfail immediately below it
 said why: ingestion appended, so two uploads of one name left both generations
@@ -739,7 +739,7 @@ indexed.
 `replace_chunks_for_path` closes it narrowly. Within one context a path's
 chunks are made to *be* the new generation rather than to join the old one,
 deleting and inserting in a single transaction so a reader never sees the path
-with no chunks at all — an interrupted refresh that emptied a path would be a
+with no chunks at all - an interrupted refresh that emptied a path would be a
 worse answer than a stale one. §2.5 dedupes by checksum *and path* and
 refreshes a changed path by ingesting it, which describes one generation;
 returning text from an older checksum as the current contents of that path did
@@ -769,7 +769,7 @@ answer about the current bytes rather than permission to keep the last ones.
 Every named-path exit now goes through one `_commit_generation`.
 
 One cost is accepted and stated in the code: a *re-scan* of unchanged bytes
-whose extraction fails transiently — a sandbox timeout — drops that path from
+whose extraction fails transiently - a sandbox timeout - drops that path from
 retrieval until the next ingest. That is recoverable and logged; an index
 answering with text the file has not held since an earlier generation is not.
 
@@ -784,9 +784,9 @@ branch is reachable through the ingestion API, and is tested there.
 Two defects in the same few lines.
 
 The record was written after `_locked_publish` released. Classification comes
-from size — §19.5 makes inline/searchable/analyzable part of how a
+from size - §19.5 makes inline/searchable/analyzable part of how a
 conversation uses a file, and a `.md` is `inline` under `INLINE_MAX_BYTES` and
-`searchable` above it — so the loser's record could land last. Measured: the
+`searchable` above it - so the loser's record could land last. Measured: the
 conversation said 6000 bytes while the disk held 24000, and
 `read_inline_contents` would then open the winner's bytes under the loser's
 rules. `_record` now runs inside the critical section, so its order is the
@@ -797,7 +797,7 @@ and wrote it back whole. Two writers that both read before either wrote each
 stored their own copy; measured with two filenames uploaded at once, one
 record disappeared entirely. `upsert_conversation_attachment` does the whole
 edit in one transaction behind `SELECT ... FOR UPDATE`. A file lock could not
-have fixed this — the state is in Postgres, and §22 has several replicas
+have fixed this - the state is in Postgres, and §22 has several replicas
 sharing exactly that.
 
 The lost-update test drives `record_attachment` directly under a barrier
@@ -812,12 +812,12 @@ The counterexample is not two requests for one archive. `bundle.zip` and
 where they land: `archive_stem` maps both to `bundle/`. The route checked
 `dest_path.exists()` in the API process and started the sandbox much later,
 and inside the child `extract_archive` does `mkdir(parents=True,
-exist_ok=True)` — so both requests passed the check and both wrote into one
+exist_ok=True)` - so both requests passed the check and both wrote into one
 tree. Measured, `bundle/` held `zip.txt` and `tar.txt` with both requests
 returning 200.
 
 The failure path is worse. `extract_archive` removes the destination when it
-refuses, so a corrupt archive's cleanup deletes whatever is there — including
+refuses, so a corrupt archive's cleanup deletes whatever is there - including
 a tree the other request has already published. Measured with a valid
 `bundle.zip` racing a truncated `bundle.tar.gz`: the zip reported 200 and
 `bundle/` was gone.
@@ -827,7 +827,7 @@ loop, keyed on the **destination**. The key matters and has its own mutation:
 locking the archive path serialises nothing here, because the two archives are
 deliberately different files. A waiter that arrives after the winner finishes
 finds the completed tree and gets the ordinary 409, which is why the existing
-conflict response needed no new semantics — only to be asked at the right
+conflict response needed no new semantics - only to be asked at the right
 moment.
 
 Deliberately not in this tranche: staging plus atomic rename, locking the
@@ -859,21 +859,21 @@ checksum; a semantic refusal commits an empty generation for the new checksum;
 a transient failure preserves the existing generation and marks it
 refresh-failed only when the current checksum matches the indexed one. An
 `ExtractTransientError` alone would not be enough, and context sources cannot
-borrow the upload manifest — they name other authorized filesystem sources, so
+borrow the upload manifest - they name other authorized filesystem sources, so
 the identity has to belong to the ingestion record. Future work, not an open
 defect and not an xfail.
 
 ## Tranche 2E.3, first finding: the parent opened what the child named
 
-BLOCKER, found while asking the question 2E.3 opens with — whether readers
+BLOCKER, found while asking the question 2E.3 opens with - whether readers
 need source locks or descriptor-bound reads. The answer arrived from a
 different direction than expected.
 
 `run_python` confines its child (§21.2): the root is pivoted, so
 `shared_fs_root`, other users' files and every host path are absent from its
 view. But `publish_artifacts` and `_durable_identity` run in the **parent**,
-which is not confined, and both opened `workdir / name` — a name the child
-chose — by path. `Path.is_file()` follows links and `shutil.copy2` copies
+which is not confined, and both opened `workdir / name` - a name the child
+chose - by path. `Path.is_file()` follows links and `shutil.copy2` copies
 through them.
 
 A pathname is not a capability the child has to hold. It cannot open
@@ -891,7 +891,7 @@ symlink stolen.md -> <shared_fs_root>/users/<other>/files/private.md
 ```
 
 Confinement was intact and irrelevant. The child named the file and the parent
-read it — a confused deputy, and the check/use shape 2E.3 is about: the check
+read it - a confused deputy, and the check/use shape 2E.3 is about: the check
 ("is this a regular file I may publish?") and the use ("read it") were two
 operations against a name rather than one against an object.
 
@@ -902,12 +902,12 @@ destination is opened the same way. Both readers use it.
 
 ### The first version of that fix could hang the API process
 
-Mutation testing flagged an untested branch — "a non-regular file is
-published" survived — and following it up found a regression in the fix
+Mutation testing flagged an untested branch - "a non-regular file is
+published" survived - and following it up found a regression in the fix
 itself. `O_NOFOLLOW` refuses a link and says nothing about a fifo, and opening
 a fifo for reading waits for a writer. Measured: `os.open` on a fifo never
 returned. Model-written code could have named `result.txt` as a fifo and
-parked a thread of the API process for as long as it liked — a worse outcome
+parked a thread of the API process for as long as it liked - a worse outcome
 than the `is_file()` it replaced, which merely skipped it.
 
 `O_NONBLOCK` makes the open return so `fstat` can answer; on a regular file
@@ -918,7 +918,7 @@ a hang rather than a wrong answer.
 
 Writing is guarded the same way and the test plants the link by hand, because
 no writer under `files/` can plant one today. Stated as defence in depth
-rather than as a fix for something reachable — the write side deserves it
+rather than as a fix for something reachable - the write side deserves it
 because it is the same mistake, trusting a name to still mean the object it
 meant.
 
@@ -982,7 +982,7 @@ interpreter's file.
 SPEC does not say whether a model-produced artifact may overwrite an existing
 user filename, so this does not decide that it may. `O_EXCL` makes publication
 never replace a name that is already there, and the artifact keeps the first
-free variant — `report (2).txt` — which is how `notes/from-file` already
+free variant - `report (2).txt` - which is how `notes/from-file` already
 disambiguates a title. Nothing is dropped and nothing is clobbered.
 
 `O_EXCL` also makes the claim atomic, so two concurrent producers cannot both
@@ -995,7 +995,7 @@ take one name. No lock is needed for that part, which is why none was added.
 `add_context_source` authorizes the source correctly and then hands
 `ingest_path` the *shared root* as its allowed base, which discards the
 narrower authority it just established. `ingest_path` validated only the
-starting path, then globbed descendants and called `is_file()` on each —
+starting path, then globbed descendants and called `is_file()` on each -
 which follows a link.
 
 Measured, both through the real route:
@@ -1020,7 +1020,7 @@ so each has a case of its own now:
 - A link resolving *inside* the source is refused by the link test, which
   containment accepts.
 - A file reached through a symlinked parent is refused by containment, which
-  the link test accepts — `glob` does not descend into a symlinked directory
+  the link test accepts - `glob` does not descend into a symlinked directory
   today, and that is a property of the Python version rather than of this
   code.
 - A **hardlink** is refused by neither of the others. It *is* the file it
@@ -1052,7 +1052,7 @@ No ordering of those two requests produces it.
 
 And the manifest is one object for every name in the directory, so deletion's
 unlocked read-modify-write dropped an entry belonging to a concurrent upload
-of a *different* file — the false dedupe hit 2E.1 removed, reintroduced from
+of a *different* file - the false dedupe hit 2E.1 removed, reintroduced from
 the other side.
 
 `_locked_delete` runs synchronously in a thread: namespace lock, re-check,
@@ -1062,7 +1062,7 @@ manifest, the same order upload uses.
 The lock key is the top-level namespace entry, not the target. Extraction
 publishes `bundle/` under a lock on `bundle`, so deleting `bundle/subdir`
 must conflict with it. That has its own test and its own mutation, and the
-test asserts the *contention* rather than the final tree — a delete that runs
+test asserts the *contention* rather than the final tree - a delete that runs
 after a completed extraction is a correct ordering and legitimately removes
 what it was asked to.
 
@@ -1098,7 +1098,7 @@ The ancestor case survives the naive delete-side patch because the delete
 target *is* the top-level component there, so the two keys coincide by
 accident. What holds it is the extraction side: with `str(dest_path)` the
 nested extraction locks `outer/dir/inner` while the delete locks `outer`, and
-the delete walks straight through a tree the child is still writing —
+the delete walks straight through a tree the child is still writing -
 measured, the delete completed while the extraction still owned its
 destination.
 
@@ -1129,7 +1129,7 @@ download body: 524288 bytes, made of [65, 66]
 
 Half `A`, half `B`: 512 KiB that no generation ever held. Publication is now
 staged beside the destination and renamed onto it, so a rename replaces the
-*name* — an open descriptor keeps the inode it has, and the next open gets
+*name* - an open descriptor keeps the inode it has, and the next open gets
 the new one. A signed URL names a path, not a generation, so it may resolve
 to either one; it may not resolve to half of one.
 
@@ -1143,7 +1143,7 @@ issued from another thread:
 RuntimeError: File at path /srv/.../files/payload.txt does not exist.
 ```
 
-The route now opens the file itself — `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` —
+The route now opens the file itself - `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` -
 checks `S_ISREG` on the descriptor, and streams from it. The check and the
 open are one operation on one object, and a delete afterwards unlinks the
 name while the download finishes, which is what POSIX already promises. The
@@ -1153,8 +1153,8 @@ is what holds it, and it passes under both versions.
 
 ### MEDIUM: a listing failed because someone else deleted a file
 
-`GET /files` asked `is_file()` and then `stat()` — two questions about one
-name — and caught only `PermissionError`. Measured, with the name removed
+`GET /files` asked `is_file()` and then `stat()` - two questions about one
+name - and caught only `PermissionError`. Measured, with the name removed
 between them:
 
 ```
@@ -1169,7 +1169,7 @@ The regression guard is the harder half. A route that asks once cannot be
 caught by a gate placed between two questions, so the test unlinks the name
 after the *first* successful `stat` of it: the current code asks no second
 question and passes, and anything that reintroduces one fails. A second test
-covers the tolerated path directly — a name that vanishes before it is
+covers the tolerated path directly - a name that vanishes before it is
 measured is omitted from the listing, and the count agrees with the list.
 
 ### MEDIUM: two §13.3 response shapes
@@ -1177,7 +1177,7 @@ measured is omitted from the listing, and the count agrees with the list.
 `DELETE /files/{name}` returned the filename beside `deleted`; the filename
 is already the request path. `GET /files/{name}/url` returned only
 `expires_in`. §13.3 names `expires_at`, which is now returned beside
-`expires_in` rather than replacing it — removing a field clients may already
+`expires_in` rather than replacing it - removing a field clients may already
 read is a break the SPEC does not ask for. `delete_note` returns the same
 `{"deleted": true}` shape and was already correct.
 
@@ -1194,7 +1194,7 @@ A hook on `http.response.start` looks like it would name the moment after the
 headers and before the file is opened. It does not: the app wraps five
 `BaseHTTPMiddleware` layers, each relaying messages through a memory stream,
 so the inner response is already past that point when the outermost `send` is
-called — measured, the `FileResponse` revert survived that hook and was
+called - measured, the `FileResponse` revert survived that hook and was
 killed only once the window was held inside the route.
 
 ## Tranche 2E.4: one path, one generation, all consumers
@@ -1238,7 +1238,7 @@ Four mutations, four tests:
 
 The owner predicate needed a test written against the store rather than the
 routes, and finding that out cost a wrong mutation first. The route-level
-version — two accounts, one filename, one of them deletes — passes either
+version - two accounts, one filename, one of them deletes - passes either
 way, because every account's files live under its own directory and the two
 absolute paths already differ. The predicate decides nothing there. It
 decides when two contexts describe one absolute path, which is the shape a
@@ -1249,7 +1249,7 @@ shared corpus would produce, so that is what the test builds.
 No transaction spans Postgres and the filesystem, so one half can be left
 behind. The halves are not equally bad. Removing the pathname first leaves
 "the file is gone, its contents are still retrievable, and the request
-failed" — the user is told the deletion did not happen while the thing they
+failed" - the user is told the deletion did not happen while the thing they
 wanted deleted is still readable. Doing the durable work first leaves
 "nothing was deleted and the request failed", which the user can act on.
 
@@ -1270,7 +1270,7 @@ chunks    what the source had read
 
 Both requests returned success, and no serial ordering produces it.
 
-Ingestion now runs in a thread — it was blocking the event loop anyway — and,
+Ingestion now runs in a thread - it was blocking the event loop anyway - and,
 for a path inside the caller's own files, under the same top-level namespace
 lock every other writer of those names takes. Only for the caller's own
 files: a shared corpus may have writers outside this application, and a lock
@@ -1283,7 +1283,7 @@ Upload caught every exception around its manifest write, logged a warning and
 returned 200. That reopens the false-dedupe history 2E.1 closed, from the
 other end: the manifest keeps naming the previous checksum and the previous
 context set, so re-uploading those previous bytes matches a record no file
-has — no write, no ingest, and a 200 over a file that still holds something
+has - no write, no ingest, and a 200 over a file that still holds something
 else. Measured end to end, including the repair: the failed request is
 retried under the same idempotency key, which re-runs the publication and
 fixes the record.
@@ -1293,7 +1293,7 @@ gone.
 
 The read side needed a distinction rather than a removal. A read failure was
 swallowed and the manifest treated as empty, and the write that follows
-rebuilds the whole object from that empty copy — so one transient read error
+rebuilds the whole object from that empty copy - so one transient read error
 dropped every other name's entry. Corruption is different from a failure to
 find out: invalid JSON still reads as empty, because rebuilding is the
 recovery, and only `ValueError` counts as corrupt. `UnicodeDecodeError` is a
@@ -1303,7 +1303,7 @@ recovery, and only `ValueError` counts as corrupt. `UnicodeDecodeError` is a
 
 `publish_artifacts` claimed the visible name with `O_CREAT|O_EXCL` and then
 filled it. The claim is atomic, which is what stops two producers taking one
-name and what stops an artifact replacing an upload — and it also makes the
+name and what stops an artifact replacing an upload - and it also makes the
 name appear before the bytes do. Measured, a reader found 65536 bytes of an
 artifact that was 300000; and a copy that failed partway left the truncated
 remains behind under a name the tool reported publishing nothing about.
@@ -1338,8 +1338,8 @@ upload report.md = B into C2     C2 = B, disk = B, manifest = B
                                  C1 = A
 ```
 
-Upload already stops *recording* the previous contexts — the manifest's
-context set starts empty when the checksum changes — and left their chunks
+Upload already stops *recording* the previous contexts - the manifest's
+context set starts empty when the checksum changes - and left their chunks
 in place. That is the record forgetting them while the index does not, and
 C1 goes on answering with text the file has not held since. The simplest
 form needs only one context: replacing the bytes while naming no context at
@@ -1412,7 +1412,7 @@ the chat noticing. Reopening by name is safe here in a way it never was for
 
 Copied, not hard-linked from `/files/{name}`. A link would be free and would
 leave that file with two links, which is exactly what `rag._within_source`
-refuses — a context source covering the user's files would then skip every
+refuses - a context source covering the user's files would then skip every
 attached file.
 
 `resolved_sources` returns the display name and the object together, because
@@ -1425,13 +1425,13 @@ workdir.
 Records written before the store existed carry no generation. Their bytes
 cannot be reconstructed, and today's contents of the pathname are not
 evidence of what was attached, so they resolve to nothing rather than to
-whatever is there now — otherwise an upgrade would carry the old
+whatever is there now - otherwise an upgrade would carry the old
 substitution behaviour forward for every existing conversation.
 
 Reclamation is a mark-and-sweep on the same loop and the same age as the
 scratch sweep, because it answers the same question: how long is something
-nobody claims kept. The marks already exist — every attachment record names
-its generation — so a reference count would be a second record of the same
+nobody claims kept. The marks already exist - every attachment record names
+its generation - so a reference count would be a second record of the same
 fact, to be kept correct across every way a conversation is created, edited
 and deleted. The age doubles as the grace period covering the window between
 storing a generation and recording the attachment that names it. An account
@@ -1472,13 +1472,13 @@ which has its own test.
 The first pass made a failed manifest write fail the request. It did not stop
 the state that write leaves behind from causing a later success. After the
 injected failure the disk holds B, the index holds B and the manifest still
-names A — and a client that abandons the request rather than retrying leaves
+names A - and a client that abandons the request rather than retrying leaves
 it that way. A *fresh* upload of A then matches the manifest, skips the
 write, and reports success over a file still holding B.
 
 The manifest nominates a dedupe hit; the disk confirms it. The destination is
 stream-hashed under the namespace lock, and only when the record already
-claims a match — so an ordinary upload of new bytes pays nothing for it.
+claims a match - so an ordinary upload of new bytes pays nothing for it.
 
 ### HIGH: a refused request had already replaced the file
 
@@ -1494,8 +1494,8 @@ report.md absent, manifest still A, chunks still A, request rejected
 An explicit `context_id` is now checked before any mutation.
 
 The failure path itself was the same mistake in a different form. Unlinking
-the destination does not restore what it replaced — those bytes are already
-gone — so it removed the pathname while the manifest and the index went on
+the destination does not restore what it replaced - those bytes are already
+gone - so it removed the pathname while the manifest and the index went on
 describing a generation no file had. The new bytes are the only generation
 that exists by then, so they are kept, recorded with the failed context left
 out of the set, and the target context's chunks for that path are emptied
@@ -1522,7 +1522,7 @@ in place and re-runs only the ingestion.
 
 That last row is one a mutation had to find twice. The first version of the
 listing said "no longer stored" for any inline attachment missing from the
-envelope, and reverting the wording killed nothing — because the branch it
+envelope, and reverting the wording killed nothing - because the branch it
 changed is reached only when a file *is* stored and the shared inline budget
 filled up before it. Two different facts had been given one sentence. They
 have two now, and the budget case has the test it needed.
@@ -1537,7 +1537,7 @@ identity moved and a piece of state that depended on it did not.
 
 `extract_text` routes by `path.suffix`, and a generation is named by its
 digest. So a searchable PDF reached the extractor as an extensionless
-object, fell through to the generic byte decode, and was refused as binary —
+object, fell through to the generic byte decode, and was refused as binary -
 the upload reported success with `chunk_count: 0`.
 
 The extension does not go into the key. The key is the identity of the bytes
@@ -1555,7 +1555,7 @@ Flate-compressed now, which no byte decode recovers.
 ### HIGH: re-attaching a name left the generation it replaced searchable
 
 `replace_chunks_for_path` replaces the rows for the path it is given, and a
-second attachment under the same name is a *different* generation — so its
+second attachment under the same name is a *different* generation - so its
 ingestion replaced nothing. The conversation's record named the new bytes
 while its index held both, and measured, `file_search` returned only the
 retired edition, ranked above the one the chat actually held.
@@ -1567,7 +1567,7 @@ contains is not a capability. Two layers, and each has its own mutation:
   conversation's index that its records no longer name.
 - **Filtering.** Retrieval from an implicit context keeps only chunks whose
   path is currently authorized. That covers the window before pruning runs,
-  and covers a generation whose object the sweep has already reclaimed —
+  and covers a generation whose object the sweep has already reclaimed -
   the sweep removes blobs, not rows, so without it `file_search` answered
   from bytes that no longer existed.
 
@@ -1579,7 +1579,7 @@ paths on purpose, and its rows are its own answer.
 The previous pass took `namespace_key` for the source pathname. That works
 while the source *is* the file. A source rooted at `files/` takes a key
 nothing else takes, while an upload of `files/report.md` takes that name's
-key — so the same interleaving reappeared one level up, entirely
+key - so the same interleaving reappeared one level up, entirely
 sequentially, and the walk's commit landed after the upload had published.
 
 `ingest_path` takes an optional `file_guard` held around each file's own
@@ -1596,7 +1596,7 @@ shape the previous pass shipped.
 `store_generation` returns an existing object without touching it, so its age
 says when it was first written. An object unreferenced long enough to be
 swept can be adopted by a new attachment, and the sweep then unlinked it
-during that attachment's own operation — the record landed naming bytes that
+during that attachment's own operation - the record landed naming bytes that
 were already gone.
 
 A checksum-scoped lock, `attachment-generation:<user>:<sha>`, held by the
@@ -1611,8 +1611,8 @@ the two orders cannot meet.
 
 ### MEDIUM: a conversation's index was writable as an ordinary context
 
-`meta.auto` is load-bearing — the invalidation sweep skips these contexts,
-and retrieval from them is filtered — and `POST /contexts/{id}/sources`
+`meta.auto` is load-bearing - the invalidation sweep skips these contexts,
+and retrieval from them is filtered - and `POST /contexts/{id}/sources`
 checked ownership and nothing else. The id is not hidden either: a searchable
 attachment upload returns it. So a path-following source could be added to a
 context covered by neither rule.
@@ -1627,7 +1627,7 @@ routes that take a context id, so there was no sibling to miss.
 
 The archive route validated its `context_id` after the extraction, so a
 request refused for naming an unknown context published the whole tree
-first — and the corrected retry then got 409, because the destination the
+first - and the corrected retry then got 409, because the destination the
 refused request created was in the way. The same ordering rule the upload
 route now follows: a parameter the route will refuse is knowable before any
 mutation.
@@ -1637,7 +1637,7 @@ mutation.
 `_write_member` creates each member at its final path and streams into it,
 inside a destination directory that already exists under its real name.
 Measured, with an extractor paused after writing a partial member, that
-member was signable — and a download would have returned a short file with a
+member was signable - and a download would have returned a short file with a
 content-length that agreed with it.
 
 Extraction now fills a staging tree and renames it into place under the lock
@@ -1665,7 +1665,7 @@ plus one weakness in where authorization is applied.
 
 `meta.auto` had been made load-bearing on the write side, and the read side
 still accepted one when a caller named it. `_validate_context_scope` checks
-ownership, and ownership is not the boundary here — §19.5 scopes an
+ownership, and ownership is not the boundary here - §19.5 scopes an
 attachment to the chat that received it. Measured, a second conversation
 named the first conversation's index and read its attachment, with the
 generation filtering never applied because that filtering keys on the
@@ -1676,15 +1676,15 @@ it.
 
 One rule, in one place. `_get_owned_context` reports an auto context as
 absent before it considers ownership, so the answer is the same for every
-caller and every route that takes a context id — upload, archive extraction,
+caller and every route that takes a context id - upload, archive extraction,
 conversation creation, both context GETs, and the sources route, whose own
 check this replaces. `_validate_context_scope` skips them too, so an auto
 context enters the workflow only through `_attachment_context_ids` for the
 conversation that owns it.
 
 The upload response no longer carries the implicit context id. Enforcement
-does not depend on that — the point of the rule above is that nothing accepts
-the id — but an identifier nobody needs is one more thing to keep refusing.
+does not depend on that - the point of the rule above is that nothing accepts
+the id - but an identifier nobody needs is one more thing to keep refusing.
 
 ### HIGH: concurrent attachments retired each other
 
@@ -1704,15 +1704,15 @@ Moving the prune inside the row-locked transaction is necessary and not
 sufficient: chunks exist before the record that names them, so an absolute
 set computed under the lock still deletes a generation whose upload has not
 finished. That variant has its own mutation, and the first version of the red
-could not see it — the gate sat after the record rather than before it, which
+could not see it - the gate sat after the record rather than before it, which
 is the ordering that distinguishes them.
 
 So the transaction that displaces a record retires what it displaced, and
 only that. A generation whose record has not been written is not
 unauthorized, it is unfinished. The displaced object survives if another
 record still names it, which is what makes two names sharing identical bytes
-work. Rows that can never become authorized — anything in the context that is
-not a generation reading at all — are removed by prefix in the same
+work. Rows that can never become authorized - anything in the context that is
+not a generation reading at all - are removed by prefix in the same
 transaction.
 
 ### HIGH: one object cannot hold two readings
@@ -1720,8 +1720,8 @@ transaction.
 Keeping the extension out of the store key was right: the bytes are the
 bytes, and two names holding identical bytes cost one copy. The index cannot
 use that key. `replace_chunks_for_path` replaces by path, so attaching the
-same bytes as `report.pdf` and then as `report.md` made the second reading —
-a refusal, since a PDF is not text — delete the document's chunks. Both
+same bytes as `report.pdf` and then as `report.md` made the second reading -
+a refusal, since a PDF is not text - delete the document's chunks. Both
 records stayed valid, both named the same object, and one reading could
 exist.
 
@@ -1731,7 +1731,7 @@ object, `_commit_generation` keys the chunks by the reading, and the sweeper
 still works from the checksum, because the object is what it reclaims.
 
 The red needed the document's text to be long enough to survive retrieval's
-minimum chunk size — a five-word document is indexed and never returned,
+minimum chunk size - a five-word document is indexed and never returned,
 which would have made the search assertion prove nothing.
 
 ### MEDIUM: a lock that could not be taken looked like an unreadable file
@@ -1739,7 +1739,7 @@ which would have made the search assertion prove nothing.
 The per-file guard sat inside the walk's best-effort catch, which exists so
 one unreadable document does not abandon a whole tree. A `PathLockTimeout`
 entering the guard was swallowed the same way, so a source that never got its
-lock returned 201 with zero chunks and kept its source record — while the
+lock returned 201 with zero chunks and kept its source record - while the
 route's own 409 handler, the one that removes that record, could not be
 reached. The guard is outside the catch now.
 
@@ -1753,7 +1753,7 @@ matched, while the file the conversation actually held sat just outside the
 cut.
 
 A per-context path scope now reaches `_chunk_scope`, which is the predicate
-every pgvector-path channel shares — lexical, dense and late — and the local
+every pgvector-path channel shares - lexical, dense and late - and the local
 path filters its own per-context pool before its cut. Unscoped contexts are
 unrestricted; an ordinary knowledge context follows paths on purpose. The
 post-retrieval filter stays as well, because a retriever that ignores the
@@ -1762,7 +1762,7 @@ scope is a retriever that would otherwise disclose.
 `allowed_paths` is part of the store interface rather than an optional
 argument. A store that cannot scope a context cannot serve a conversation's
 index, and passing the argument only when a store accepts it would authorize
-by omission — so the legacy-store double in `tests/test_rag.py` implements it
+by omission - so the legacy-store double in `tests/test_rag.py` implements it
 too.
 
 ## Tranche 2E.6: implicit context identity and scoped enumeration
@@ -1776,7 +1776,7 @@ and that two enumerations which look like filters were really page cuts.
 Identity was "the first row a 500-context listing matched", and creation was
 `upsert_context`, which always inserts a fresh UUID with nothing in the schema
 forbidding a second row for the same conversation. §22 shares Postgres across
-replicas, so lookup-then-insert was never a guard — and measured, it was not
+replicas, so lookup-then-insert was never a guard - and measured, it was not
 one inside a single process either.
 
 Two first attachments racing both looked, both found nothing, and both
@@ -1787,7 +1787,7 @@ a file the API had accepted was searchable from nowhere.
 The horizon needed no concurrency at all. An account that accumulates more
 than 500 contexts loses an older conversation's index off the end of the page,
 and its attachments stop being searchable while their records and immutable
-objects are both intact — and the next attachment to that conversation creates
+objects are both intact - and the next attachment to that conversation creates
 yet another index, because `ensure_conversation_context` cannot see the first
 either.
 
@@ -1798,8 +1798,8 @@ The database decides now. A partial unique index over
 comes back with the same row. Lookup is a direct predicate, not a page.
 
 Duplicates that already exist are merged before the index is added: the
-losers' chunks move to the oldest row — the one any earlier lookup would have
-returned — and only then are the losers removed. Deleting a loser outright
+losers' chunks move to the oldest row - the one any earlier lookup would have
+returned - and only then are the losers removed. Deleting a loser outright
 would take chunks the winner does not have. The mutation that skips the
 repair makes the index creation fail against exactly the state an upgrade
 would find, which is what the test asserts.
@@ -1808,7 +1808,7 @@ would find, which is what the test asserts.
 
 The pgvector lane carries the path scope into SQL. The local lane read
 `list_chunks(context_id, limit=candidate_limit * 5)` and filtered the result
-in Python — and the comment above it said the filter came first, which was the
+in Python - and the comment above it said the filter came first, which was the
 part that made it look finished. The bounded read had already happened, and
 `list_chunks` orders by `chunk_index, id`: every generation starts at index 0,
 so unauthorized rows inserted earlier hold the lower ids and fill the whole
@@ -1827,7 +1827,7 @@ written above code that did the opposite. A comment is not evidence.
 `/contexts` fetched a page plus a sentinel, then dropped the implicit indexes
 from what came back. The ordering and the limit happen in the store, so a page
 whose sentinel row was an implicit context reported no next page with ordinary
-contexts still unreached — and enough recent ones make a page empty while
+contexts still unreached - and enough recent ones make a page empty while
 claiming there is nothing after it.
 
 `list_contexts(include_auto=False)` puts it in the query domain, before
@@ -1839,7 +1839,7 @@ One mutation run was killed by an outer command timeout before the harness
 restored the file it had edited, leaving a mutated working tree that later
 commands would have been measured against. It was caught by checking the tree
 rather than by trusting the harness, and repaired by reversing the edit in
-place — never by `git checkout`, which would have discarded the whole
+place - never by `git checkout`, which would have discarded the whole
 uncommitted tranche. Mutations are run one at a time now, with room to finish.
 
 ## Tranche 2E.7: identity is never a page
@@ -1851,8 +1851,8 @@ primitive was still answering two other questions it cannot answer.
 
 `_validate_context_scope` built its owned set from `list_contexts`, which
 defaults to one 100-row page and really does `LIMIT` it in SQL. So a context
-the request had already validated by direct id lookup — accepted, recorded on
-the conversation, in use — dropped out of retrieval as soon as the account had
+the request had already validated by direct id lookup - accepted, recorded on
+the conversation, in use - dropped out of retrieval as soon as the account had
 a hundred newer contexts. The turn succeeded and the model was given no
 grounding at all, which is the worst shape a failure can take: nothing to see
 in any status code.
@@ -1872,8 +1872,8 @@ copies of every chunk of it. There is no uniqueness on
 `(context_id, fs_path, chunk_index)` to prevent that.
 
 That satisfies "one implicit context" while breaking the invariant
-`_commit_generation` is built on — one `fs_path` is one complete current
-generation — because the merge bypasses `replace_chunks_for_path`. The copies
+`_commit_generation` is built on - one `fs_path` is one complete current
+generation - because the merge bypasses `replace_chunks_for_path`. The copies
 also spend candidate slots belonging to other attachments. The repair now
 collapses duplicates by `(fs_path, chunk_index)` after moving them, keeping
 the lowest id; segment vectors cascade with the rows removed.
@@ -1888,7 +1888,7 @@ partial unique index exists: `ON CONFLICT DO NOTHING` needs a constraint to
 collide with. An install that deployed the code without successfully applying
 the schema booted clean, and the duplicate-context race was silently back.
 
-This codebase already settled that principle for `content_tsv` — code can be
+This codebase already settled that principle for `content_tsv` - code can be
 newer than the database, so a load-bearing schema feature is checked at
 startup and the operator is told which script to run. The index is checked by
 shape rather than by name, so an index that merely carries the name does not
@@ -1975,14 +1975,14 @@ The property that has to hold is one sentence: for every auto context,
 steps, and the first step was still a substring test.
 
 It first matched the index by the words in `pg_get_indexdef`, which a unique
-partial index keyed on `(id, (meta ->> 'conversation_id'))` satisfies — that
+partial index keyed on `(id, (meta ->> 'conversation_id'))` satisfies - that
 index contains `conversation_id`, has an `auto` predicate, and is unique for
 free because every row has a distinct id. Tightening it to require two key
 attributes with `owner_user_id` first killed that impostor and left two more:
 
-- second key `((meta ->> 'conversation_id') || ':' || id::text)` — the same
+- second key `((meta ->> 'conversation_id') || ':' || id::text)` - the same
   trick moved inside the second key, still unique for free;
-- predicate `COALESCE((meta ->> 'auto')::boolean, false) AND id IS NULL` — a
+- predicate `COALESCE((meta ->> 'auto')::boolean, false) AND id IS NULL` - a
   primary key is never NULL, so the index covers no rows at all.
 
 Both were installed against a real cluster and confirmed to pass the tightened
@@ -1999,7 +1999,7 @@ key kills the other.
 
 Running `scripts/migrate.sh` proves the command executes. It does not prove the
 command built anything, because `tests/conftest.py` then applied
-`sql/schema.sql` unconditionally — including when `TEST_DATABASE_URL` pointed
+`sql/schema.sql` unconditionally - including when `TEST_DATABASE_URL` pointed
 at the database CI had just migrated.
 
 So this mutation escaped: reduce `migrate.sh` to `echo; exit 0`. The "Apply
@@ -2037,8 +2037,8 @@ second requires one.
 It also embeds project status as a permanent premise. §364 is a build note
 (`**verified and fixed:** ...`) rather than a specification, and it derives a
 design decision from the sentence "this project has never been deployed". That
-fact expires on the first deployment, and the conclusion drawn from it — "there
-is no upgrade path to get wrong" — becomes false silently, with nothing in the
+fact expires on the first deployment, and the conclusion drawn from it - "there
+is no upgrade path to get wrong" - becomes false silently, with nothing in the
 document marking the dependency. Eight lines in SPEC carry this kind of
 verification narrative; one of them carries the expiring fact.
 
@@ -2073,7 +2073,7 @@ that transformation ships. The decision is revisitable on evidence instead of
 being sealed by a premise that expires.
 
 `sql/schema.sql`'s own header carried the same expiring premise and is rewritten
-the same way — the repeat-safety requirement is now stated as a rule for
+the same way - the repeat-safety requirement is now stated as a rule for
 anything added to the file, not as an observation about what it happens to
 contain.
 
@@ -2109,9 +2109,9 @@ deletion did not exist.
 `sql/schema.sql` is `CREATE TABLE IF NOT EXISTS`. It is not: the file also has
 5 `ALTER TABLE`, 29 `CREATE INDEX`, and 3 `DO $$` blocks. The conclusion drawn
 from it was right and the reason was wrong, which is the shape that survives
-review longest. Both now say the specific true thing — a vector column's width
+review longest. Both now say the specific true thing - a vector column's width
 comes from the `CREATE TABLE IF NOT EXISTS` that creates it, so re-running
-finds the table present, skips the declaration, and leaves the type alone —
+finds the table present, skips the declaration, and leaves the type alone -
 and the general rule stays where it belongs, as the repeat-safety requirement
 in the schema header.
 
@@ -2133,7 +2133,7 @@ happen. `status` is an enumeration, so free text is refused at the boundary.
 
 `delete_conversation` removed the conversation row and its messages. The
 implicit attachment index is a `knowledge_context` in a different table, and
-its tie to the chat lived only in `meta.conversation_id` — a JSON string that
+its tie to the chat lived only in `meta.conversation_id` - a JSON string that
 could not be enforced, could not cascade, and could not be joined on. Exposing
 the existing method would have produced:
 
@@ -2152,8 +2152,8 @@ which is the opposite of what §19.5 promises.
 The upload validates the conversation, then does seconds of file, hashing and
 indexing work, then persists the attachment record under the conversation's
 row lock. `upsert_conversation_attachment` already returned `None` when the
-conversation had disappeared, and `record_attachment` turned that into `[]` —
-indistinguishable from "recorded, and the list is empty" — so the route built
+conversation had disappeared, and `record_attachment` turned that into `[]` -
+indistinguishable from "recorded, and the list is empty" - so the route built
 a successful response and answered 200. The chat was gone; its index and
 chunks were not.
 
@@ -2170,7 +2170,7 @@ NULL. That makes PostgreSQL the arbiter rather than a cleanup pass:
 
 `meta.auto` and `meta.conversation_id` remain as description for the UI. Every
 exclusion filter in the store, and the capability guard that stops one chat
-naming another chat's index, key on the column instead — a row can carry the
+naming another chat's index, key on the column instead - a row can carry the
 relationship without the JSON, and under the old guard such a row was treated
 as an ordinary context.
 
@@ -2185,7 +2185,7 @@ Checking the old JSON-expression index took three rounds, because "unique, two
 keys, owner first, mentions the right words" is satisfied by indexes that
 enforce nothing. A single key on a foreign-key column admits none of those:
 there is no expression to substitute and no room for an extra key. Two facts
-are checked now — the unique index, and that the foreign key cascades — and
+are checked now - the unique index, and that the foreign key cascades - and
 the second is what makes deletion complete.
 
 ### Mutations
@@ -2205,8 +2205,8 @@ Two of these are worth recording for how they failed first.
 
 The searchable-race red and the inline-race red look like duplicates and are
 not: the foreign key catches the first before the attachment record is
-reached, and only the inline path — a small text file, injected into the
-prompt rather than indexed, so no context is ever created — reaches the
+reached, and only the inline path - a small text file, injected into the
+prompt rather than indexed, so no context is ever created - reaches the
 `None`. Removing the `None` guard leaves the searchable test green.
 
 The guard test passed against its own mutation at first. It asserted 404 from
@@ -2222,7 +2222,7 @@ no implicit context at all.
 ### 2G.1 carry-over: two residuals found reviewing 1d4eda3
 
 **MEDIUM: the unique index was verified without its predicate.** The check
-required unique, one key, `conversation_id` — and said nothing about the
+required unique, one key, `conversation_id` - and said nothing about the
 partial predicate the schema declared. `WHERE conversation_id IS NULL` passes
 all three and constrains none of the implicit contexts, because every one of
 them has a non-NULL `conversation_id`.
@@ -2237,7 +2237,7 @@ substitute.
 The foreign-key check was finished at the same time: it confirmed a cascading
 single-column reference into `conversation`, not that the reference is to
 `conversation.id`. That clause shipped without a test and its mutation
-survived — an FK pointing at `conversation(active_context_id)` satisfied every
+survived - an FK pointing at `conversation(active_context_id)` satisfied every
 other clause. It has a red now.
 
 **MEDIUM: deleting a chat left its text in Redis.** `chat:summary:<id>` caches
@@ -2250,7 +2250,7 @@ failure the user retries against a chat that is already gone.
 
 The second family was `workflow:state:<tenant>:<conversation>:<workflow>`. The
 engine wrote `completed`, `failed` and `timeout` states holding result content,
-traces, context snippets and vars, and nothing read one back —
+traces, context snippets and vars, and nothing read one back -
 `get_workflow_state` had no caller outside the cache module. Rather than build
 enumeration machinery so deletion could find them, terminal states are no
 longer written. Running state still exists while the workflow does.
@@ -2262,7 +2262,7 @@ retire now.
 ## Tranche 2G.2 (contexts): owner-controlled retirement
 
 SPEC §12.3 gives users CRUD over their contexts. The API had create, list,
-chunks and source add/list — no direct read, no edit, no delete.
+chunks and source add/list - no direct read, no edit, no delete.
 
 ### HIGH: the binding that makes deletion safe was installed by name
 
@@ -2271,7 +2271,7 @@ NULL`, or retiring a context leaves every conversation bound to it pointing at
 a row that is gone. The schema created it conditionally, and the condition was
 a name lookup in `information_schema.table_constraints`, which lists every
 constraint type. Anything wearing the name `conversation_active_context_id_fkey`
-— a `CHECK` included — satisfied the guard, so the foreign key was never
+- a `CHECK` included - satisfied the guard, so the foreign key was never
 created and the column held arbitrary UUIDs.
 
 Both halves are fixed. The schema asks `pg_constraint` for the shape and
@@ -2288,30 +2288,30 @@ forbids the rest: `meta` and `conversation_id` are how a row would claim to be
 a conversation's implicit index, and `fs_path` and `text` are ingestion, which
 is a separate mutation with its own path authority.
 
-The ordinary-context predicate — `owner_user_id = ? AND conversation_id IS
-NULL` — is in the SQL of `update_context`, `delete_context` and
+The ordinary-context predicate - `owner_user_id = ? AND conversation_id IS
+NULL` - is in the SQL of `update_context`, `delete_context` and
 `get_ordinary_context`, not only in `_get_owned_context`. A route helper
 guards the callers that use it; the predicate guards the row.
 
 Deletion is one statement. `context_source` and `knowledge_chunk` cascade from
 the context and segment vectors cascade with the chunks; conversations bound
-to it are released by the `SET NULL` key. The indexed files are untouched — a
+to it are released by the `SET NULL` key. The indexed files are untouched - a
 context references paths, it does not own them.
 
 ### MEDIUM: a source could be reported as added to a deleted context
 
 `add_context_source` records the source, and the reading, chunking and
 embedding happen afterwards. A delete inside that window is refused by the
-database — chunks reference the context, and the source row went with it by
-cascade — but `ingest_path` treats a failed file as a warning and continues,
+database - chunks reference the context, and the source row went with it by
+cascade - but `ingest_path` treats a failed file as a warning and continues,
 which is right for one unreadable file in a tree and wrong for the context
 being gone. Measured: `ingest_path_file_failed: context not found`, clean
 durable state, and `201 Created` returned with a source record that no longer
 existed. The route now confirms the context survived and answers 409.
 
-Source *removal* is deliberately not added. Sources may overlap — a recursive
+Source *removal* is deliberately not added. Sources may overlap - a recursive
 source at `files/` and a second at `files/report.md` both entitle the context
-to that path — so deleting one source record cannot imply deleting the chunks
+to that path - so deleting one source record cannot imply deleting the chunks
 under its path. Context deletion is well defined; individual source retirement
 is not yet.
 
@@ -2330,8 +2330,8 @@ Two mutations survived their first pass and are worth recording.
 The schema-guard mutation was invisible because the red dropped the CHECK
 constraint by hand before re-applying the schema, so the name-based guard
 found nothing and created the key anyway. The test that kills it re-applies
-the schema *with the CHECK still in place* — which is the actual state an
-operator would be in — and asserts the constraint is a foreign key with
+the schema *with the CHECK still in place* - which is the actual state an
+operator would be in - and asserts the constraint is a foreign key with
 `confdeltype = 'n'` afterwards. Refusing to start is only useful if the
 command the error names then repairs it.
 
@@ -2343,7 +2343,7 @@ with a contrived test for a redundant guard.
 
 `list_contexts` hand-built `KnowledgeContext` from rows and predated
 `conversation_id`, so it silently dropped the field. It uses
-`_context_from_row` now — one mapping, so a column added to the model reaches
+`_context_from_row` now - one mapping, so a column added to the model reaches
 every reader.
 
 ### Shared-store regressions: what a 2636-green run did not reveal
@@ -2354,11 +2354,11 @@ clock and moved two facts about the environment that nothing was asserting.
 **HIGH: the store wrote under a different root than the runtime resolved.** A
 runtime-built store is handed `settings.shared_fs_root`, so the two agreed by
 construction. `get_test_store()` minted its own `liminallm_store_*` directory,
-and `Runtime` then adopted that store wholesale — leaving
+and `Runtime` then adopted that store wholesale - leaving
 `store.fs_root != settings.shared_fs_root` for the whole run. Artifact payload
 locations derive from the first; filesystem authority, adapters, archive
 staging and the interpreter derive from the second. Almost nothing reads both,
-which is why it stayed invisible — and artifact retirement reads both.
+which is why it stayed invisible - and artifact retirement reads both.
 
 Investigating it turned up an older, quieter version of the same thing:
 `shared_fs_root` is a database-managed field with **no environment variable**,
@@ -2372,7 +2372,7 @@ the setting now, and the dead line is gone.
 default chat workflow and tool specs. While the store was rebuilt twice per
 test, the per-test TRUNCATE was undone by the next construction. With one
 store for the session, the first TRUNCATE removed the defaults and the
-remaining ~2600 tests ran in a boot state production never has — exercising
+remaining ~2600 tests ran in a boot state production never has - exercising
 fallbacks where the application runs on seeded rows.
 
 **MEDIUM: `PostgresStore.sessions` accumulated for the whole run.** An
@@ -2387,7 +2387,7 @@ what rebuilding a connection pool and rerunning the whole startup verifier
 twice per test cost, so the isolation is restored without giving back the time.
 
 Three mutations, each killed by exactly one test. The session-cache test is an
-ordered pair — the first dirties the cache, the second requires it cleared —
+ordered pair - the first dirties the cache, the second requires it cleared -
 because a single test asserting an empty dictionary passes whenever it happens
 to run first.
 
@@ -2397,7 +2397,7 @@ to run first.
 
 `_get_owned_artifact` lets an admin through to another user's artifact and to
 ownerless system artifacts. That is right for viewing and wrong as the rule
-for `PATCH /v1/artifacts/{id}`, which used it — so an admin could edit a
+for `PATCH /v1/artifacts/{id}`, which used it - so an admin could edit a
 global system workflow directly through the ordinary user route, which is the
 change ConfigOps exists to review. Reproduced: the PATCH returned 200 and the
 description changed.
@@ -2407,7 +2407,7 @@ DELETE: `owner_user_id = caller AND visibility = 'private'`, enforced in the
 store's SQL. Visibility is part of it rather than ownership alone, because
 publishing an artifact binds it into other people's work.
 
-The owner of a *published* artifact gets 403 naming the reason, not 404 —
+The owner of a *published* artifact gets 403 naming the reason, not 404 -
 they can already read it, so "not found" would only be confusing where the
 real answer is that publishing moved it out of their sole control. Everyone
 else gets 404.
@@ -2429,7 +2429,7 @@ Order: revoke the database capability, commit, then remove the directories the
 server derives from the artifact's id. Filesystem-first would leave a live
 artifact pointing at missing bytes if the delete then failed; this way a
 failed cleanup leaves storage nothing can reach. Cleanup errors are logged,
-not raised — a committed, irreversible deletion must not be reported as a
+not raised - a committed, irreversible deletion must not be reported as a
 failure the caller would retry.
 
 `schema.fs_dir` is never a deletion target. `adapter_root` accepts an explicit
@@ -2444,7 +2444,7 @@ naming someone else's data. `server_owned_artifact_dirs` derives
 
 `POST /v1/artifacts` and `POST /v1/contexts` accept `Idempotency-Key` per
 SPEC §18. The guard cached `envelope.model_dump()`, which leaves `datetime`
-objects as objects, and the record is JSON-encoded on the way to the cache —
+objects as objects, and the record is JSON-encoded on the way to the cache -
 so every route whose response carries `created_at` failed with
 `TypeError: Object of type datetime is not JSON serializable` the moment a
 client sent the header it is invited to send. The same request without the
@@ -2474,7 +2474,7 @@ The artifact row mapping was written out by hand in four places, which is how
 
 Adapter DELETE locked against training. Local inference is the other live user
 of the same files, and it was not covered: a turn resolves a promoted adapter
-from Postgres and only then touches disk — `params_path.stat()` comes after the
+from Postgres and only then touches disk - `params_path.stat()` comes after the
 capability has been acquired, and the in-memory cache is consulted after that
 stat. DELETE committed the row removal and immediately `rmtree`'d the tree, so
 a turn holding the pre-delete capability read a post-delete filesystem.
@@ -2493,7 +2493,7 @@ logged once and kept forever. `schema.fs_dir` is still never a target.
 ### HIGH: the same split-root condition existed in production
 
 `shared_fs_root` was a database-managed setting. `Runtime` must construct the
-Postgres store — and hand it this root — before it can read any managed
+Postgres store - and hand it this root - before it can read any managed
 setting, so a stored value moved the root for every service built afterwards
 while the store went on writing where it started. A database holding
 `shared_fs_root=/mnt/liminal` boots with artifact payloads under
@@ -2502,15 +2502,15 @@ A live admin edit is worse: non-model settings are refreshed into the running
 runtime, and the admin route reports the saved settings as live.
 
 It is now `env_field("/srv/liminallm", "SHARED_FS_ROOT")`, removed from the
-admin Infrastructure group, and out of `SYSTEM_SETTINGS_DEFAULTS` — which is
+admin Infrastructure group, and out of `SYSTEM_SETTINGS_DEFAULTS` - which is
 what `_seed_settings_from_env` filters against, so `INSTANCE_SETTINGS_JSON`
 cannot seed it either. SPEC's environment-only list goes from five to six with
 the reason recorded.
 
 The harness had the mirror of this problem. `SHARED_FS_ROOT` was inert, so
 `get_test_store()` read the shipped default and the suite wrote artifact
-payloads, adapters, files and lock files into `/srv/liminallm` — the production
-data root — with nothing removing it at session end. `conftest` exports a real
+payloads, adapters, files and lock files into `/srv/liminallm` - the production
+data root - with nothing removing it at session end. `conftest` exports a real
 temporary root before any import now, which is what that line always looked
 like it was doing, and removes it at session end.
 
@@ -2540,7 +2540,7 @@ artifact in between landed after the check and before the write.
 | `list_artifacts` hand-builds again | the mapper red |
 
 Two notes on how the mutations went. The sweep originally asked
-`get_artifact` twice — once during the scan and once before removing — and
+`get_artifact` twice - once during the scan and once before removing - and
 *neither* copy was individually killable, because artifact ids are never reused
 so no test can construct the window the first one guards. That is a redundant
 check dressed as a careful one; there is one now, taken at the point of
@@ -2553,7 +2553,7 @@ and the other three reds kill it in under a second.
 ### 2G.3 carry-over: the clock, the caller, and the deployment
 
 **HIGH: the grace period measured the wrong event.** The sweep took its cutoff
-from the payload directory's mtime — the time of the last *write*. An adapter
+from the payload directory's mtime - the time of the last *write*. An adapter
 trained a week ago and deleted a millisecond ago is a week old by that
 measure, so it was collected immediately and the reader race came straight
 back. The grace test did not catch it because its fixture created the
@@ -2562,7 +2562,7 @@ survives, which is a different sentence.
 
 Retirement is durable state now. `artifact_payload_retirement` is written in
 the same transaction as the artifact delete, so "retired at T" means "the
-capability stopped existing at T" — exact, restart-proof, identical across
+capability stopped existing at T" - exact, restart-proof, identical across
 replicas, and involving no user-editable path. The sweep selects records past
 the grace period, removes only the directories derived from the id, and clears
 the record only once the bytes are gone, so a failed cleanup is retried rather
@@ -2570,7 +2570,7 @@ than becoming an orphan logged once and kept.
 
 **MEDIUM/HIGH: nothing ran the sweep.** `sweep_artifact_payloads` was added and
 wired to nothing. The deployed behaviour was: delete an artifact, the database
-state goes, the payload stays — forever, across restarts. Safe from
+state goes, the payload stays - forever, across restarts. Safe from
 use-after-delete only because reclamation never happened, and an unbounded disk
 leak of adapter weights and version payloads.
 
@@ -2582,8 +2582,8 @@ scope, so the loop would have raised `NameError` on its first iteration and no
 test would have noticed.
 
 **MEDIUM: Docker still implemented the old configuration model.** Compose
-seeded `shared_fs_root` through `INSTANCE_SETTINGS_JSON` — now filtered out as
-unknown, silently — and never passed `SHARED_FS_ROOT` to the app, so the newly
+seeded `shared_fs_root` through `INSTANCE_SETTINGS_JSON` - now filtered out as
+unknown, silently - and never passed `SHARED_FS_ROOT` to the app, so the newly
 documented way to move the data root did nothing under Compose. The stack kept
 working only because the environment default happened to equal the mounted
 path. Compose now passes `SHARED_FS_ROOT` and mounts the volume at the same
@@ -2613,11 +2613,11 @@ retirement clock and quietly gave up discovery. The trade was unguarded.
 `delete_user` removes a user's artifacts with `DELETE FROM artifact WHERE
 owner_user_id = ...` and wrote no retirement row, so an adapter's weights
 outlived the whole account and the ledger-driven sweep had nothing to look at
-— permanently. The previous scanning sweep would eventually have found them.
+- permanently. The previous scanning sweep would eventually have found them.
 
 Enrolment belongs to the table now: an `AFTER DELETE ON artifact` trigger
 writes the retirement row, so every path gets the rule without remembering it
-— the artifact route, account deletion, an FK cascade, a future maintenance
+- the artifact route, account deletion, an FK cascade, a future maintenance
 statement. The hand-written insert is gone from `delete_private_artifact`.
 
 The same endpoint also bypassed the running-training protection. It now
@@ -2628,7 +2628,7 @@ try to promote a version onto an artifact the deletion would cascade away.
 **MEDIUM: the new load-bearing table was not verified at startup.** An older
 database booted clean, the first artifact DELETE failed at request time, and
 the sweeper turned an unreadable queue into "nothing to do". Both the table
-and the trigger are checked now — the table alone is not the rule, and a
+and the trigger are checked now - the table alone is not the rule, and a
 database can hold it while silently failing to populate it.
 
 **MEDIUM: a failed artifact creation made an orphan nothing could discover.**
@@ -2652,7 +2652,7 @@ self-healing if a future deletion path ever escapes the trigger.
 | sweep stops enrolling unknown orphans | the unenrolled-orphan red |
 | enrolment ignores whether the artifact is live | the live-payload red |
 
-The first mutation is the blunt kind — dropping the trigger trips the startup
+The first mutation is the blunt kind - dropping the trigger trips the startup
 verifier, so the suite refuses to boot rather than failing one test. Mutating
 the trigger's *body* instead keeps startup happy and is the precise version;
 it is the one that proves the reds.
@@ -2662,14 +2662,14 @@ it is the one that proves the reds.
 **HIGH: account deletion's training guard was a check-before-act.** The route
 asked `user_has_running_training` and then deleted. A worker's claim is an
 atomic `UPDATE ... WHERE status = 'queued'`, so a job could become running in
-between — the writer-versus-retirement race already solved for individual
+between - the writer-versus-retirement race already solved for individual
 artifacts, at the account level. The identity was wrong too: a tenant adapter
 can be trained by one user and owned by another, so `training_job.user_id = A`
 misses a job by B against A's adapter.
 
 The guard is inside `delete_user`'s transaction now. It locks the account (no
 new job for it), its artifacts (nobody else can start training one of its
-adapters), and the unfinished jobs themselves — which is what makes
+adapters), and the unfinished jobs themselves - which is what makes
 queued → running wait for the deletion and then find nothing. Both identities
 are asked. The route's precheck is gone; the store raises `TrainingInProgress`
 and the handler answers 409.
@@ -2677,19 +2677,19 @@ and the handler answers 409.
 **HIGH: orphan discovery raced a successful creation.** `create_artifact`
 writes `artifacts/<id>/v1.json` before publishing the row, so a scan in that
 window recorded a retirement for an artifact that was about to exist. Harmless
-while it lived — the sweep refuses to remove anything Postgres knows about —
+while it lived - the sweep refuses to remove anything Postgres knows about -
 but the delete trigger's `ON CONFLICT DO NOTHING` left the stale timestamp in
 place, so the real deletion hours later inherited a grace period that had
 already elapsed and the payload went immediately. The reader race, back
 through another door. It could also record the wrong `artifact_type`.
 
-Both sides take a per-artifact `pg_advisory_xact_lock` — creation before it
+Both sides take a per-artifact `pg_advisory_xact_lock` - creation before it
 writes the canonical directory, enrolment before it looks. An advisory lock
 rather than a file lock because §22 puts several replicas on one Postgres.
 
 **MEDIUM: startup checked the trigger's name.** `ALTER TABLE ... DISABLE
 TRIGGER` leaves the row in `pg_trigger`, as does a same-named trigger on
-INSERT or one calling a different function. Startup verifies the shape now —
+INSERT or one calling a different function. Startup verifies the shape now -
 enabled, `FOR EACH ROW`, `AFTER DELETE`, and the right `tgfoid`.
 
 ### Mutations
@@ -2710,7 +2710,7 @@ artifact's lifetime lock and cannot commit until the call returns. That is the
 lock working, but it is not a schedule any deployment produces. The scan runs
 in a thread now.
 
-The account-deletion red first asserted the outcome pair — either the worker
+The account-deletion red first asserted the outcome pair - either the worker
 won and the deletion is refused, or the deletion won and the claim fails. That
 cannot distinguish a held lock from an absent one, because both orders are
 legal answers, and the mandatory mutation survived it. A second attempt held
@@ -2718,7 +2718,7 @@ the job row the way a claiming worker does, and that survived too: the
 deletion blocks at its `DELETE FROM training_job` regardless, so the wait
 proved nothing about the guard.
 
-What the lock actually protects is one ordering — the guard decides nothing is
+What the lock actually protects is one ordering - the guard decides nothing is
 running, and only *then* does a worker claim. Forcing it needed a seam between
 the lock and the deletion, so the locking read is now a named method,
 `_lock_unfinished_training`. The test claims from a thread at that moment: with
@@ -2730,7 +2730,7 @@ and the account is deleted under a running worker.
 **MEDIUM: `tgenabled <> 'D'` accepts a replica-only trigger.** PostgreSQL has
 four trigger states and only two fire for ordinary application statements:
 `'O'` (origin, the default) and `'A'` (always). `ENABLE REPLICA` leaves a
-trigger present, not disabled, and inert for everything the app does — so the
+trigger present, not disabled, and inert for everything the app does - so the
 check accepted a database where enrolment had silently stopped. It requires
 `tgenabled IN ('O', 'A')` now.
 
@@ -2739,7 +2739,7 @@ create-versus-discovery poison, but records from before it can already exist:
 a retirement whose `retired_at` is hours old, attached to an artifact that is
 perfectly alive. The trigger's `ON CONFLICT DO NOTHING` meant a genuine
 deletion inherited that stale timestamp instead of replacing it, so the
-payload could be due the instant the artifact was deleted — the reader race
+payload could be due the instant the artifact was deleted - the reader race
 again, from stored state rather than from a live race.
 
 Two changes, because the durable state and the rule both need fixing. The
@@ -2776,8 +2776,8 @@ an admin deletion and a signup.
 The token records `user.id` now, in Redis and in the in-process fallback
 alike, and completion calls `get_user(user_id)`. Ids are never reused, so the
 token expires with the account instead of transferring with the address. This
-is the shape `request_email_verification` already had — it stored `user.id`
-from the beginning — which is why the fix is to make the two the same rather
+is the shape `request_email_verification` already had - it stored `user.id`
+from the beginning - which is why the fix is to make the two the same rather
 than to invent something for the reset path.
 
 ### HIGH: deleting an account left its whole filesystem namespace
@@ -2797,7 +2797,7 @@ on their own schedules, and each measured age from something on disk:
 
 `sweep_generations` marks from what the account's conversations reference.
 Once the rows are gone that mark set is empty, so every generation the account
-ever made looks unreferenced and is judged by the blob's own mtime — which is
+ever made looks unreferenced and is judged by the blob's own mtime - which is
 as old as the day it was attached. The deletion's grace period was therefore
 undercut by whichever cleanup pass ran next, and a turn that resolved one of
 those blobs a moment before the deletion read a filesystem where it had gone.
@@ -2806,7 +2806,7 @@ So the account's retirement outranks every lifetime inside it. An `AFTER
 DELETE ON app_user` trigger writes `user_namespace_retirement`; while that row
 exists all three sweeps skip the user entirely; and when the grace period
 elapses both identity-derived trees go at once. There is deliberately no
-per-subdirectory logic — deleting the whole namespace makes it impossible to
+per-subdirectory logic - deleting the whole namespace makes it impossible to
 forget the next subdirectory somebody adds.
 
 Enrolment is the trigger's, not a caller's, for the reason artifact payload
@@ -2817,7 +2817,7 @@ over a table of expectations, because two hand-written copies of a nine-clause
 predicate is how the second one ends up missing the clause the first one
 earned.
 
-Discovery covers what no deletion produced — a namespace left behind before
+Discovery covers what no deletion produced - a namespace left behind before
 any of this existed. Those are enrolled at first observation and collected a
 grace period later, never removed on sight. A namespace whose account still
 exists is refused at enrolment and filtered out of every read, so a directory
@@ -2870,7 +2870,7 @@ and its own readers.
 ### 2G.4 carry-overs: a snapshot is not a serialization point
 
 **HIGH: the subordinate-sweep exclusion was read, not held.** Every red in the
-first pass established the same order — delete, then sweep — which a set read
+first pass established the same order - delete, then sweep - which a set read
 at the top of the cleanup pass answers correctly. The other order was never
 forced:
 
@@ -2964,7 +2964,7 @@ Two reds had to be rewritten, and both were assertions that could not fail.
 The path-sweep red first asserted that a week-old scratch file survives a
 deletion landing mid-sweep. It does not, and should not: while the account is
 alive that file is legitimately collectable, so the assertion was asking a
-correct sweep to do nothing. It asserts the schedule instead — while the sweep
+correct sweep to do nothing. It asserts the schedule instead - while the sweep
 holds the account, the deletion is still waiting.
 
 It then paused at the guard rather than at the removal, which proved only that
@@ -3016,8 +3016,8 @@ it first and the deletion waits, so the purge that follows removes what was
 just written; or the deletion holds it first and the writer then finds no
 account and writes nothing.
 
-`cache_conversation_state` takes `user_id` with no default. It may be None — a
-caller without one is not a principal's turn — but it has to be passed,
+`cache_conversation_state` takes `user_id` with no default. It may be None - a
+caller without one is not a principal's turn - but it has to be passed,
 because a default is how a call site loses the guard without anyone noticing.
 
 The idempotency slot is guarded as well as the result. Guarding only the
@@ -3038,21 +3038,21 @@ if runtime.cache:
 ```
 
 which is the write-after-purge shape again, for the claim instead of the
-result — the deletion commits and purges in the gap, and the claim lands
+result - the deletion commits and purges in the gap, and the claim lands
 afterwards. The whole acquisition is inside the guard now.
 
 The red that had covered the slot deleted the account *before* entering the
 guard, which proves the liveness predicate and says nothing about where the
 lock is held. Deletion-first reds cannot distinguish those two, and neither
 can a mutation that removes the guard: both die either way. The red pauses at
-`acquire_idempotency_slot` itself now — the statement that creates the key —
+`acquire_idempotency_slot` itself now - the statement that creates the key -
 and fails against the released-early version without needing a mutation at all.
 
 A name that is not a user id is *not* refused by this guard, and the reasoning
 is the opposite of the collector's. `app_user.id` is a UUID, so such a name can
 never have been an account, can never be erased, and can therefore never have
 anything to resurrect; refusing it would only break idempotency for a caller
-the erasure has no claim on. The two guards differ where it matters — an id
+the erasure has no claim on. The two guards differ where it matters - an id
 with no account row and no retirement is debris to a collector and not a
 principal to a writer.
 
@@ -3064,14 +3064,14 @@ hot path. The two content-bearing writers are guarded.
 
 **Operational: the generation sweep's critical section was not bounded by its
 own work.** The account's lifetime is held for a user's whole generation pass,
-and inside it `generation_lock` waited up to 30 seconds per candidate blob —
+and inside it `generation_lock` waited up to 30 seconds per candidate blob -
 so a pathological account produced `scan + N × 30s`, and its own deletion
 inherited all of it.
 
 The sweep takes each blob's lock without waiting now. The upload has to wait,
 because it must publish that object; the sweep does not, because a blob it
-skips is collected on the next pass. The alternative — shrinking the critical
-section to each blob — would have nested the account lock inside the file lock
+skips is collected on the next pass. The alternative - shrinking the critical
+section to each blob - would have nested the account lock inside the file lock
 and created a lock ordering that does not exist anywhere else in the system.
 
 ### Mutations
@@ -3098,7 +3098,7 @@ blocking wait survived. It holds an unreferenced generation now, which is the
 only kind the sweep tries to take.
 
 The write guard first refused a name that is not a user id, which broke three
-idempotency tests that use a synthetic principal — correctly, because such a
+idempotency tests that use a synthetic principal - correctly, because such a
 principal has no account to erase and lost its idempotency for nothing. The
 red that was meant to separate the two guards had been asserting that
 over-correction, so it asserts the real distinction instead: an id with no
@@ -3125,8 +3125,8 @@ The resource-lifetime and erasure series is complete. The model it leaves:
 
 One residual is carried into 2H.1 rather than left open: reset and
 verification issuance wrote its token outside the account's lifetime, so a
-purge could be followed by a fresh token naming the erased account. Inert —
-completion re-resolves the immutable id and finds nothing — and it belongs
+purge could be followed by a fresh token naming the erased account. Inert -
+completion re-resolves the immutable id and finds nothing - and it belongs
 with the token mechanics rather than with the filesystem model.
 
 ## Tranche 2H.1: a one-time token is consumed, not observed
@@ -3150,7 +3150,7 @@ reachable by anyone who has read the message, and by an ordinary double-click.
 
 `pop_oauth_state` had already solved this for OAuth state, with GETDEL and a
 Lua fallback for a Redis older than 6.2. The guarantee lives in one place now
-— `consume_identity_token(prefix, token)` — and all three callers use it:
+- `consume_identity_token(prefix, token)` - and all three callers use it:
 OAuth state, password reset, email verification. Writing it a fourth time
 inline is how the third one ended up different from the first.
 
@@ -3189,13 +3189,13 @@ address that never existed, so the distinction stays invisible from outside.
 Two reds were missing rather than wrong, and the battery found both.
 
 Reverting the primitive to `GET` then `DELETE` survived every flow-level red,
-because each of those pauses a caller *after* its consume returned — they test
+because each of those pauses a caller *after* its consume returned - they test
 the order the service does things in, not whether the read and the removal are
 one step. A direct red does: eight callers, one key. Measured, GETDEL hands
 the subject to one of them and `GET`-then-`DELETE` hands it to all eight.
 
 Removing the route's `if token:` guard also survived, because the red deleted
-the account before the request and the route's own lookup failed first — the
+the account before the request and the route's own lookup failed first - the
 guarded line was never reached. The line is only reachable when the account
 was live at the lookup and gone at the write, so its red drives the route by
 that contract instead.
@@ -3204,7 +3204,7 @@ that contract instead.
 
 The suite wipes its database before every test. That is what makes tests
 independent of each other, and it is only true while one process owns the
-database — point four workers at one and `TRUNCATE every table` stops being
+database - point four workers at one and `TRUNCATE every table` stops being
 isolation and becomes every test deleting every other test's rows. So
 parallelism is a provisioning problem before it is a scheduling one.
 
@@ -3214,12 +3214,12 @@ shape depends on them:
 | question | answer |
 |---|---|
 | does the xdist controller import conftest? | yes |
-| does it import test modules? | **no** — only workers collect |
+| does it import test modules? | **no** - only workers collect |
 | is `PYTEST_XDIST_WORKER` set before conftest is imported? | yes |
 | does `os.environ.setdefault` in the controller reach workers? | yes |
 
 The second is what settles the design. The controller runs no tests, so it
-needs no database, no Redis and no store — and provisioning at module import
+needs no database, no Redis and no store - and provisioning at module import
 gave it all three, including a connection pool on the database its workers
 were about to clone, which `CREATE DATABASE ... TEMPLATE` refuses while any
 session holds it. Provisioning moved into `pytest_configure`, where
@@ -3244,7 +3244,7 @@ one:
 `TEST_SCHEMA_PREPARED` is the constraint that shapes provisioning. CI runs
 `scripts/migrate.sh` and then sets it, precisely so conftest cannot quietly
 repair a deploy command that does nothing. A worker therefore *clones* a
-prepared database rather than building its own — otherwise four workers would
+prepared database rather than building its own - otherwise four workers would
 each rebuild from `schema.sql` and restore exactly the hole the flag closed.
 
 `make test`, `make qa` and CI are untouched. The parallel lane is
@@ -3261,14 +3261,14 @@ A parametrization built two of its cases with `uuid.uuid4()` at collection
 time. Each worker collects independently, so four workers produced four
 different suites and xdist refused to run at all.
 
-The parallel lane fails loudly on this, so it is not a silent defect — but it
+The parallel lane fails loudly on this, so it is not a silent defect - but it
 is worth naming on its own, because it also means a test that cannot be re-run
 from a failure report: `pytest ...::test_x[309601fa-...]` is a command that
 works exactly once. Fixed ids now, and a red collects the suite twice and
 compares name for name.
 
 Two neighbouring parametrizations pass dicts containing fresh uuids and are
-fine — pytest ids non-primitives positionally, `payload0`, `payload1` — which
+fine - pytest ids non-primitives positionally, `payload0`, `payload1` - which
 was checked rather than assumed.
 
 ### Mutations
@@ -3295,7 +3295,7 @@ would pass having compared a worker with itself.
 
 Nothing was serial-marked. The two replicas in an advisory-lock test share
 their worker's Postgres and the actors in a path-race test share its
-filesystem root, so both still contend exactly as before — worker isolation
+filesystem root, so both still contend exactly as before - worker isolation
 keeps unrelated tests out, it does not stand between a test and itself. A red
 runs both under xdist to keep that true.
 
@@ -3304,7 +3304,7 @@ runs both under xdist to keep that true.
 **MEDIUM: two pytest runs at once shared their Redis databases.** The Postgres
 name carries a run id exactly so two invocations cannot both take `gw0`. The
 Redis number did not: it was a function of the worker id, so every invocation
-mapped `gw0 → /1` — and each worker flushes its database before every test,
+mapped `gw0 → /1` - and each worker flushes its database before every test,
 believing it owns it.
 
 ```
@@ -3319,8 +3319,8 @@ reads its state
 
 Two runs at once is one terminal and one editor, not an exotic schedule.
 
-The number cannot carry a run id the way the database name does — there are
-fifteen numbers, not an alphabet — so possession is recorded instead of
+The number cannot carry a run id the way the database name does - there are
+fifteen numbers, not an alphabet - so possession is recorded instead of
 encoded. A lease in database 0, claimed with `SET NX EX`, renewed from the
 per-test reset that already talks to Redis, and released with a
 compare-and-delete. A run that dies stops renewing and its database comes back
@@ -3331,13 +3331,13 @@ belongs to somebody else. Database 0 is never a worker's, so the per-test
 **LOW: a pinned scratch port under xdist sent every worker to one port.**
 `TEST_PG_PORT` and `TEST_REDIS_PORT` override the free-port search, which is
 the opposite of what parallel workers need. The second worker used to fail
-somewhere inside `pg_ctl` — loud, but silent about why. Refused now, where the
+somewhere inside `pg_ctl` - loud, but silent about why. Refused now, where the
 reason can be stated.
 
 **Carried forward from 2I.2, because this pass touched the same lines:** the
 worker id now comes from `config.workerinput`, not from the environment
-variable it was set in. A serial pytest launched from inside a worker — which
-the harness's own tests do — inherits `PYTEST_XDIST_WORKER` and would
+variable it was set in. A serial pytest launched from inside a worker - which
+the harness's own tests do - inherits `PYTEST_XDIST_WORKER` and would
 otherwise provision itself as a worker of a run it is not part of.
 
 ### Mutations
@@ -3361,7 +3361,7 @@ state is still there. It fails against the previous commit.
 
 Adopted, but not for the reason it was suggested. Measured over three paired
 runs on four workers: `load` 121.9s, 129.0s, 128.5s; `loadfile` 125.6s,
-128.0s, 128.9s. That is parity, not a third — and the mechanism proposed for
+128.0s, 128.9s. That is parity, not a third - and the mechanism proposed for
 the difference is not present here: there are no `ast.parse` or source-tree
 scanning tests in `tests/` at all.
 
@@ -3383,7 +3383,7 @@ destructive:
 TEST_REDIS_URL=redis://host:6379/1
 ```
 
-The first worker claimed database 1 — the caller's — and then flushed it
+The first worker claimed database 1 - the caller's - and then flushed it
 before every test, because the lease said it owned it. Every base-preservation
 red missed it, because the fixture's Redis was `/0`.
 
@@ -3394,7 +3394,7 @@ was pointed at.
 
 **MEDIUM: a worker that lost its lease flushed anyway.** Renewal read the
 holder and extended the claim if it matched, returned nothing, and swallowed
-its errors — and the caller flushed regardless:
+its errors - and the caller flushed regardless:
 
 ```
 RUN A                         RUN B
@@ -3438,7 +3438,7 @@ the same outcome and can be forced.
 
 **HIGH: `?db=N` reached past the base exclusion.** The previous commit read
 the base database off the URL path. redis-py does not: a `db=` query argument
-outranks the path, measured —
+outranks the path, measured -
 
 ```
 redis://127.0.0.1:6379/3?db=7   ->  redis-py connects to database 7
@@ -3447,7 +3447,7 @@ redis://127.0.0.1:6379/3?db=7   ->  redis-py connects to database 7
 So `TEST_REDIS_URL=redis://host:6379/0?db=7` protected database 0, which
 nobody was using, and left 7 unprotected. Worse, the URL handed to a worker
 was built by replacing the path and keeping the query, so
-`redis://host:6379/1?db=7` still reached 7 — every worker connected to the
+`redis://host:6379/1?db=7` still reached 7 - every worker connected to the
 caller's database whatever number it had been leased, and flushed it before
 every test. Reproduced against the previous commit: the sentinel in the
 caller's database is gone.
@@ -3459,7 +3459,7 @@ defect; asking the client that will do the connecting cannot disagree with
 itself.
 
 **MEDIUM: two base databases on one server kept two ledgers.** Moving the
-ledger into the caller's database — the previous commit's fix for the flush —
+ledger into the caller's database - the previous commit's fix for the flush -
 fragmented the one thing a lease exists for. Two runs given different base
 databases on one server could not see each other's claims:
 
@@ -3468,7 +3468,7 @@ RUN A, base /1                 RUN B, base /2
 claim  [ledger in DB1]         claim  [ledger in DB2]
 ```
 
-Measured against the previous commit: A leased `[2, 3]`, B leased `[1, 3]` —
+Measured against the previous commit: A leased `[2, 3]`, B leased `[1, 3]` -
 database 3 handed to both, and each run leased the other's base, which it then
 flushed before every test.
 
@@ -3479,7 +3479,7 @@ expiring on their own. The database the caller named is still never leased and
 never flushed, which was the defect the move was meant to fix.
 
 **A third case the reds found: a run cannot see somebody else's base.**
-Excluding our own base protects us from ourselves and from nothing else — run
+Excluding our own base protects us from ourselves and from nothing else - run
 B, base `/2`, has no reason not to lease database 1, which is run A's. So a
 run now records the database it was given under `liminallm:test:redis-db-base`
 where every caller can see it, and a claim tests that in the same Lua step
@@ -3491,7 +3491,7 @@ several workers of one run share a base, so it is not one holder's to give
 back. It expires, which errs towards leaving a database alone.
 
 **Residual, stated rather than fixed:** a run is protected from every run that
-starts after it, not from one that finished claiming before it started — at
+starts after it, not from one that finished claiming before it started - at
 that moment nothing on the server knew the base was spoken for. Closing it
 needs a reservation that predates the server, which the harness cannot have.
 The test reserves both bases before either claims, which is the order
@@ -3499,7 +3499,7 @@ provisioning actually uses.
 
 **HIGH: the same defect on Postgres, found by looking for it.** Only the Redis
 instance was reported. libpq also takes connection keywords from a URL's query
-string, and `dbname` there outranks the path — measured:
+string, and `dbname` there outranks the path - measured:
 
 ```
 postgresql://host:5432/mydb?dbname=other   ->  libpq connects to other
@@ -3520,7 +3520,7 @@ sentinel in the base is gone. `drop_worker_database`'s refusal to drop the
 base compared path to path, so it did not see this either.
 
 `postgres_database_name` asks psycopg which database a URL reaches, and
-`postgres_url_for_database` drops any `dbname` as well as replacing the path —
+`postgres_url_for_database` drops any `dbname` as well as replacing the path -
 the same pair as on the Redis side, and used by the maintenance URL, the
 clone, and the drop guard. Only `dbname` is normalized: `host` and `port` in a
 query redirect the maintenance connection and the worker's together, which is
@@ -3541,7 +3541,7 @@ database and reach another.
 
 The Redis exclusion is asserted on the candidate list and not only through a
 run, because a run with one worker is handed the first free number and that is
-database 1 whichever way the exclusion was computed — measured. The end-to-end
+database 1 whichever way the exclusion was computed - measured. The end-to-end
 red catches the URL half and cannot see the other. Two reds, one per half.
 
 The `dbname` red truncates through the URL the worker was actually given and
@@ -3556,10 +3556,10 @@ mutations are killed.
 
 ### Production sibling: the log mask read only one password spelling
 
-Found by grepping the class the harness tranche fixed — a URL carrying the
+Found by grepping the class the harness tranche fixed - a URL carrying the
 same fact in two places while code reads one. `_mask_url_password`
 (`liminallm/service/runtime.py`) rewrote the userinfo and passed the query
-through, and both drivers read `?password=` from the query — measured, both:
+through, and both drivers read `?password=` from the query - measured, both:
 
 ```
 redis://cache:6379/0?password=hunter2          ->  logged verbatim
@@ -3567,16 +3567,16 @@ postgresql://db/prod?password=hunter2          ->  logged verbatim
 redis://:hunter2@cache:6379                    ->  redis://:***@cache:6379
 ```
 
-The mask now covers both spellings — userinfo, and `password` /
-`sslpassword` (libpq's other one) in the query — and leaves innocent
+The mask now covers both spellings - userinfo, and `password` /
+`sslpassword` (libpq's other one) in the query - and leaves innocent
 arguments alone. The red (`tests/test_url_redaction.py`) fails against the
 unfixed mask on exactly the query half; the mutation that stops reading the
 query is killed by it.
 
 Corrected in the same pass, because the same verification measured it: a
-`JWT_SECRET` environment variable reaches nothing — `Settings` reads env
+`JWT_SECRET` environment variable reaches nothing - `Settings` reads env
 only through `env_field` and jwt_secret is a `secret_field` generated on
-first boot — while the `secret_field` docstring and `docs/CONFIGURATION.md`
+first boot - while the `secret_field` docstring and `docs/CONFIGURATION.md`
 both claimed it was an env-read bootstrap secret. Both texts now state what
 the code does. The inert `JWT_SECRET` exports in `tests/conftest.py`,
 `tests/test_performance.py`, `docker-compose.test.yml` and
@@ -3588,21 +3588,21 @@ not defects, and removing them belongs to a pass of its own.
 The editorial pass (commit "The SPEC says what must remain true") resolved
 every case of the same document answering one question twice. Recorded here
 so the list survives the commit message, and because two entries were found
-after the pass by the rule the pass itself established — a default or limit
+after the pass by the rule the pass itself established - a default or limit
 has exactly one normative home.
 
 | Question | The answers that coexisted | Canonical (measured in code) |
 |---|---|---|
-| reset token TTL | 30m (§12.1) vs 15m (§18) | 15m — `auth.py` |
+| reset token TTL | 30m (§12.1) vs 15m (§18) | 15m - `auth.py` |
 | reset endpoints | `/auth/request_reset` (§12) vs `/auth/reset/...` (code) | `/auth/reset/request`, `/auth/reset/confirm` |
 | tenant transport | host-only (§12.2) vs `X-Tenant-ID` + frame `tenant_id` (§17.11) | host-derived only; the server reads neither field |
 | websocket tenant | "no tenant_id" (§18) vs §17.11's frame | host-derived only |
 | token storage | sessionStorage (§17.10) vs HttpOnly (§18) | HttpOnly refresh; the SPA's copy is a named deviation (roadmap) |
 | `notes_enabled` precedence | admin → env → code (§19.7) vs no env var (§18) | admin → code; managed settings have no env vars |
-| configops endpoints | §10's routes vs §18's `/v1/config/apply` | §10 — `/v1/config/apply` never existed |
-| node retry defaults | 1 retry/200ms (§9.2) vs 2 retries/1s quadrupling (§18) vs sketch `default: 1` (§6.1) | 2 retries, 1s quadrupling, caps 3 and 60s — `workflow.py`; stated once in §18.3, referenced from §6.1 and §9.2 |
+| configops endpoints | §10's routes vs §18's `/v1/config/apply` | §10 - `/v1/config/apply` never existed |
+| node retry defaults | 1 retry/200ms (§9.2) vs 2 retries/1s quadrupling (§18) vs sketch `default: 1` (§6.1) | 2 retries, 1s quadrupling, caps 3 and 60s - `workflow.py`; stated once in §18.3, referenced from §6.1 and §9.2 |
 | sweep-report archive | "not yet built" (§19.6) vs `GET /v1/notes/sweeps` (code) | built; §19.6 describes it |
-| upload panel | Chat tab (§17.8) vs Files tab (§17.3, markup) | Files tab — `index.html` |
+| upload panel | Chat tab (§17.8) vs Files tab (§17.3, markup) | Files tab - `index.html` |
 | signed-URL expiry | 10m in §13.3 and again in §18 | §13.3 owns it |
 | pagination bounds | "default 100, max 500" in §13.0, §13.3, §13.4 | `default_page_size` / `max_page_size` settings own them; §13.0 names the settings, the endpoints cite §13.0 |
 
@@ -3612,7 +3612,7 @@ example, and an example carrying its own default is a second configuration
 source that happens to be indented. Schema sketches now describe fields and
 cite §18.3; the code's five retry-comment citations moved with the rule.
 
-Checked while closing it: the code has no fourth copy — no artifact-kind
+Checked while closing it: the code has no fourth copy - no artifact-kind
 schema declares a `max_retries` default; the engine's
 `DEFAULT_NODE_MAX_RETRIES = 2` in `workflow.py` is the only value, and the
 seed workflows in `storage/common.py` set none.
@@ -3635,7 +3635,7 @@ next test: renews /2, FLUSHDB
 The previous commit called this residual unavoidable without a reservation
 predating the run. That was wrong, and the reviewer was right to push: DB0
 already held the fact needed to decide. `_RESERVE_IF_UNLEASED` mirrors
-`_CLAIM_IF_FREE` — each transition tests the other's key in the same Lua step
+`_CLAIM_IF_FREE` - each transition tests the other's key in the same Lua step
 it writes its own, so of two runs reaching for one number in either order
 exactly one wins and the loser is told. `reserve_base_database` returns a
 boolean, and provisioning raises a message naming the database and the remedy.
@@ -3666,7 +3666,7 @@ five seconds instead of waiting a quarter of an hour.
   consumed almost the whole budget still slept a full backoff on top.
 
 `MAX_NODE_TIMEOUT_SECONDS` existed but capped the tool spec's
-`timeout_seconds`, not this outer node timeout — the constant was right and
+`timeout_seconds`, not this outer node timeout - the constant was right and
 unused where it mattered. The attempt now gets `min(node ask, kernel cap,
 remaining budget)`, and `remaining_ms` is recomputed after the attempt.
 
@@ -3677,7 +3677,7 @@ surrounding prose says examples are. Removed, leaving the §18.3 pointer. No
 
 **LOW: a stale test description.** `test_exponential_backoff_timing` said
 "1s, 2s, 4s" while asserting 1s, 4s, 16s. Fixed, and the file's eleven
-`SPEC §9`/`SPEC §18` citations moved to `§18.3` with it — the same stale-copy
+`SPEC §9`/`SPEC §18` citations moved to `§18.3` with it - the same stale-copy
 class the SPEC pass cleaned out, one directory over.
 
 ### Mutations
@@ -3698,7 +3698,7 @@ nothing:
 
 * the serial-reservation mutation removed the provisioning call but left
   `_REDIS_BASE` set, so the per-test hook still reserved and the code stayed
-  correct. The mutation was wrong, not the red — but rewriting it exposed that
+  correct. The mutation was wrong, not the red - but rewriting it exposed that
   nothing tested the refresh at all, which is where the TTL override and the
   forced-expiry red came from;
 * the 60s-cap mutation survived because the red gave the workflow a 5-second
@@ -3713,7 +3713,7 @@ red, and answering it honestly is what finds the untested guarantee.
 
 **The masked value was percent-encoded.** `urlencode` escapes by default, so
 every masked query value came out `password=%2A%2A%2A`. The secret was gone
-either way — this is a log line's legibility, and a function agreeing with its
+either way - this is a log line's legibility, and a function agreeing with its
 own docstring. `safe="*"` fixes it, and the red asserts the exact output
 rather than a substring, because a substring check passes on the encoded form
 too.
@@ -3729,14 +3729,14 @@ an environment variable nothing consumes.
 
 Two troubleshooting entries went with them. `TESTING.md` and
 `docs/QA_RUNBOOK.md` both described a "JWT_SECRET must mix character classes"
-failure and offered an *empty* code block as the remedy — debris from the
+failure and offered an *empty* code block as the remedy - debris from the
 earlier correction. The validator fires on the stored setting, not on an
 environment variable, so the advice could not have worked.
 
 **A scrubbing assertion that was about to go vacuous.** `test_invocation_lease`
 asserted `DATABASE_URL`, `JWT_SECRET` and `REDIS_URL` do not survive into a
 confined worker. Only the first was ever set by this suite: `REDIS_URL` never
-was, and `JWT_SECRET` stopped being when the dead exports went — so two thirds
+was, and `JWT_SECRET` stopped being when the dead exports went - so two thirds
 of that check proved nothing, and removing the exports would have quietly made
 it three thirds of nothing.
 
@@ -3745,7 +3745,7 @@ whether the worker saw it, so the check cannot pass by being about a variable
 nobody exported. That also matches what the implementation says about itself:
 `tool_worker` replaces the environment wholesale rather than filtering,
 "because a denylist of secret names is a guess about what the deployment
-exported" — and a test that names three secrets was making exactly that guess.
+exported" - and a test that names three secrets was making exactly that guess.
 
 Killing `os.environ.clear()` in `tool_worker` fails the test; it did not have
 to before.
@@ -3757,7 +3757,7 @@ somewhere inside the ledger with a message about the wrong thing.
 ### Not fixed here: the QA compose environment has no Redis
 
 Found while checking whether `JWT_SECRET`'s neighbours were equally dead. They
-are — `USE_MEMORY_STORE`, `JWT_ISSUER` and `JWT_AUDIENCE` reach nothing — but
+are - `USE_MEMORY_STORE`, `JWT_ISSUER` and `JWT_AUDIENCE` reach nothing - but
 `REDIS_URL` in `docker-compose.test.yml` is worse than dead. It is the only
 thing pointing that deployment at the `redis` service, and it reaches nothing,
 while `redis_url` defaults to `redis://localhost:6379/0`. Inside the app
@@ -3773,7 +3773,7 @@ cleanup. Left as it is, and raised.
 environment "has been running on the in-process fallback". That was wrong, and
 wrong in the optimistic direction. `allow_redis_fallback_dev` is also a
 managed setting, so compose's `ALLOW_REDIS_FALLBACK_DEV: "false"` reached
-nothing either — but its default is already `False`, and `TEST_MODE` *is* one
+nothing either - but its default is already `False`, and `TEST_MODE` *is* one
 of the six, set to `"false"`. So the app reaches `runtime.py`'s
 
 ```python
@@ -3791,7 +3791,7 @@ this environment has no Docker daemon.
 
 Fixed rather than only raised. `redis_url` is a managed setting, so
 `REDIS_URL:` in `docker-compose.test.yml` configured nothing and left the
-default pointing at `localhost` — inside the app container, nowhere. Both
+default pointing at `localhost` - inside the app container, nowhere. Both
 services now seed it through `INSTANCE_SETTINGS_JSON`, which is the mechanism
 that already existed for exactly this: `Runtime._seed_settings_from_env` runs
 before the cache is built, and `bootstrap_admin` constructs a full `Runtime`,
@@ -3805,15 +3805,15 @@ them mattered:
 | Variable | Verdict |
 |---|---|
 | `REDIS_URL` | managed setting; seeded now |
-| `ENABLE_MFA` | managed setting, default `True` — QA has had MFA **on** while the file said "Disable MFA for easier testing". Seeded now |
+| `ENABLE_MFA` | managed setting, default `True` - QA has had MFA **on** while the file said "Disable MFA for easier testing". Seeded now |
 | `JWT_SECRET`, `JWT_ISSUER`, `JWT_AUDIENCE` | reach nothing; removed |
 | `ALLOW_REDIS_FALLBACK_DEV` | managed setting; its default is already `False`, so removing it changes nothing |
-| `REQUIRE_EMAIL_VERIFICATION` | names no setting at all — there is no email-verification setting. Removed |
+| `REQUIRE_EMAIL_VERIFICATION` | names no setting at all - there is no email-verification setting. Removed |
 | `TEST_MODE`, `SHARED_FS_ROOT`, `DATABASE_URL` | genuinely environment-only; kept |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD` | read directly by `bootstrap_admin`; kept |
 
 Every seed key is checked against `SYSTEM_SETTINGS_DEFAULTS`, because
-`_seed_settings_from_env` drops unknown keys with a warning — a typo there
+`_seed_settings_from_env` drops unknown keys with a warning - a typo there
 would be a setting that silently stayed on its default, which is the whole
 defect again.
 
@@ -3825,7 +3825,7 @@ three response shapes, including the one where `checks` has no `redis` key.
 That check first called `python3` unconditionally, while the script's own
 `check_dependencies` requires only `curl` and treats `jq` as optional. The
 predicted failure was that `set -euo pipefail` would kill the run at the
-assignment; measured, it does not — the call site is
+assignment; measured, it does not - the call site is
 `test_redis_is_actually_configured || true`, and `set -e` is suppressed for a
 function whose status is tested. The real failure was worse in a quieter way:
 `status` came back empty and the check blamed the *deployment* for a parser
@@ -3834,12 +3834,12 @@ missing on the *test host*.
 It reads the field through `jq` when the script already found it and `python3`
 otherwise. `extract_json` could not be reused: its jq-less branch greps for a
 flat `"key": "value"` pair and this path is three deep. Both parsers were
-exercised against all four inputs — healthy, not_configured, no `redis` key,
-and malformed JSON — and agree.
+exercised against all four inputs - healthy, not_configured, no `redis` key,
+and malformed JSON - and agree.
 
 The first version of that fallback reported "no parser" as a *skip* returning
 0, which was wrong twice over. This suite exists to establish that Redis is
-healthy, and a run that could not look is not a run that found nothing wrong —
+healthy, and a run that could not look is not a run that found nothing wrong -
 it would have exited 0 without ever testing the invariant. It also called
 `run_test` (which increments `TESTS_RUN`) without ever reaching `log_pass` or
 `log_fail` (which increment the other two), so the summary's arithmetic no
@@ -3890,12 +3890,12 @@ We serve the Responses shape on `/v1/responses`, and in that shape
 visible output as `output - reasoning` and expect `input + output == total`.
 The backends feeding that block do not agree on the equation. OpenAI counts
 reasoning inside its output count. Gemini counts thoughts *alongside*
-candidates — measured on our own fixture, `promptTokenCount 10 +
+candidates - measured on our own fixture, `promptTokenCount 10 +
 candidatesTokenCount 5 = 15` against `totalTokenCount 22`, which only
 reconciles once the 7 thought tokens are added.
 
 Passed straight through, a Gemini-backed turn served `reasoning_tokens: 7`
-inside `output_tokens: 5` and a total that did not add up — two states no
+inside `output_tokens: 5` and a total that did not add up - two states no
 client of this shape should ever see, and the kind that turns into a
 mis-billed dashboard rather than an error.
 
@@ -3908,14 +3908,14 @@ reconciles without the fold and is left alone; a backend that reports no
 total (the local tokenizer path) gets `input + output`.
 
 Five reds: the fold, the leave-alone, reasoning bounded by output across four
-shapes, cached bounded by input (already true — both providers count cached
-inside the prompt — pinned so it stays true), and the derived total. Four
+shapes, cached bounded by input (already true - both providers count cached
+inside the prompt - pinned so it stays true), and the derived total. Four
 mutations, each killed: never fold, fold unconditionally, reconcile with `>=`
 instead of `==`, and drop the derived total.
 
 ## Deletion tranche B: one retrieval engine
 
-The owner authorized a deletion campaign — concepts, not syntax — with RAG
+The owner authorized a deletion campaign - concepts, not syntax - with RAG
 first: *"we're not deleting the interesting system. We're deleting the
 obsolete second implementation of it."* The keeper architecture (lexical FTS +
 BM25 ordering, dense pgvector, segment MaxSim, rank fusion, reranker, the
@@ -3923,12 +3923,12 @@ hash-encoder silence rule, access and path scoping) is untouched.
 
 Deleted, −498 lines net before this entry:
 
-* `_retrieve_local_hybrid` — the second engine: its own authorization pass,
+* `_retrieve_local_hybrid` - the second engine: its own authorization pass,
   per-context collection, python cosine, interleave, and fusion call.
-* `PostgresStore.search_chunks` — the in-Python candidate scorer that existed
+* `PostgresStore.search_chunks` - the in-Python candidate scorer that existed
   only to feed it, with five imports that fed only that method.
 * `RagMode`, the `rag_mode` managed setting, its validator, its admin-console
-  group entry, its model-affecting entry, and the `RAG_MODE` env read —
+  group entry, its model-affecting entry, and the `RAG_MODE` env read -
   measured first: `apply_managed_settings` filters stored keys against the
   model's declared managed set, so an existing deployment with `rag_mode` in
   `instance_config` boots unchanged and the stored key is inert. No migration.
@@ -3939,7 +3939,7 @@ Deleted, −498 lines net before this entry:
 * Six tests of the dead engine, the fake store built for them, the dead-lane
   candidate-window class in `test_generation_lifecycle` (its SQL-lane twin is
   `test_pgvector_filters_fs_path`), and the `RAG_MODE` allowlist entry in the
-  env-var census test — which is *stronger* now: the variable may not appear
+  env-var census test - which is *stronger* now: the variable may not appear
   in `liminallm/` at all.
 
 `_retrieve_pgvector` is `_retrieve_hybrid` now. The old name described the
@@ -3948,15 +3948,15 @@ the whole architecture.
 
 **A property retired with the engine, stated rather than hidden:** the dead
 engine's explicit interleave guaranteed every matching context a share of the
-answer on *exact ties*. The survivor's fusion does not — ported as a red, it
+answer on *exact ties*. The survivor's fusion does not - ported as a red, it
 fails: two contexts with identical content and one takes all four slots. Under
 this tranche's no-behavior-change rule the fusion was not altered. The
-substantive cross-context property — relevance decides, however early an
-irrelevant context was listed — was ported and holds.
+substantive cross-context property - relevance decides, however early an
+irrelevant context was listed - was ported and holds.
 
 **Found by the tranche's own mutation rule:** removing BM25's reordering of
 the lexical pool (leaving ts_rank arrival order) survived every retrieval
-test. A pre-existing hole, not one the deletion made — the two scorers agree
+test. A pre-existing hole, not one the deletion made - the two scorers agree
 too often on small fixtures for the end-to-end reds to see the difference.
 Pinned deterministically at the fusion seam with a pool whose arrival order
 disagrees with its BM25 order. Three mutations on the survivor, all killed:
@@ -3968,13 +3968,13 @@ The reviewer's condition before pass C, and the reason it matters now: adapter
 canonicalization is about to retire more names, and "removed from the declared
 model" has to mean dead, not "the main runtime happens to ignore it".
 
-`apply_managed_settings` filtered stored keys, so `runtime.settings` was safe —
+`apply_managed_settings` filtered stored keys, so `runtime.settings` was safe -
 the measurement behind the rag_mode deletion was correct but incomplete. The
 store handed the raw blob to everyone else:
 
 * the first-boot seed counts stored keys as "an operator configured this
   instance"; a database whose only history was an older build storing
-  `rag_mode` refused a fresh `INSTANCE_SETTINGS_JSON` seed — reproduced;
+  `rag_mode` refused a fresh `INSTANCE_SETTINGS_JSON` seed - reproduced;
 * the admin settings API merged the raw blob over defaults, echoing the
   deleted name forever;
 * `set_system_settings` merged the raw blob back on every write, so the stale
@@ -3987,8 +3987,8 @@ Generic by construction: the next setting deletion is inert for free.
 
 Three reds, written first and each red on the exact symptom: absent from every
 reader, seed not blocked (the fixture is a blob holding only `jwt_secret` plus
-the retired key — exactly an old database that booted once), and the write
-prunes. Two mutations — each half of the filter reverted — both killed.
+the retired key - exactly an old database that booted once), and the write
+prunes. Two mutations - each half of the filter reverted - both killed.
 
 The seed's own writer (`merge_instance_config`) still merges into the raw
 blob, deliberately: it writes only filtered keys, readers filter what it
@@ -4000,7 +4000,7 @@ candidate pools".
 
 Scope per the reviewer's correction: canonicalize the *representation*, not
 the capability. `remote_model_id` and `remote_adapter_id` are the two current
-remote execution mechanisms — model-id selection and adapter-param selection —
+remote execution mechanisms - model-id selection and adapter-param selection -
 and stay. What goes is every historical way of spelling one fact.
 
 **The equivalence harness came first.** Before deleting a resolver, its
@@ -4008,7 +4008,7 @@ answers were frozen: `get_adapter_mode`'s inference chain and
 `extract_prompt_instructions`' five-alias sweep were run over 29 legacy shapes
 in the same working tree, and the results became the oracle in
 `tests/test_adapter_canonicalization.py`. The repair must give each shape the
-same *meaning* — mode, effective prompt, weights directory, remote ids — not
+same *meaning* - mode, effective prompt, weights directory, remote ids - not
 merely acquire a `mode` key. Old precedence is preserved exactly:
 `behavior_prompt` beats `system_prompt`, a top-level alias beats a nested
 canonical field, non-strings and blanks are skipped, and `cephfs_dir` wins a
@@ -4019,7 +4019,7 @@ Deleted: `backend`, `provider`, `cephfs_dir`, the four prompt aliases,
 migrate-on-access, `_infer_adapter_mode`, `_mode_to_backend`,
 `_mode_to_provider`, and three compatibility test files
 (`test_adapter_dual_mode_fixes`, `test_adapter_mode_handling`,
-`test_training_adapter_modes` — 1,531 lines). `get_adapter_mode` is now a
+`test_training_adapter_modes` - 1,531 lines). `get_adapter_mode` is now a
 two-line read of a stated field.
 
 **The door is shut**, which is what makes the deletion durable rather than
@@ -4034,14 +4034,14 @@ validator, which is where canonicalization belongs.
 **Found by the door, not by the census:** `clustering.promote_skill_adapters`
 was still writing `backend`/`provider` on every skill adapter it created. The
 grep for writers had missed it because it builds the schema dict inline. Eight
-slow-lane failures named it immediately — the fast lane could not, since those
+slow-lane failures named it immediately - the fast lane could not, since those
 tests are slow-marked, which is the lane policy earning itself.
 
 Two tests were retired with the concept rather than ported:
 `TestModeIsAuthoritative`'s pair asserted that `mode` beats a *disagreeing*
 `backend` field. There is no `backend` field to disagree. A third,
 `test_an_inferred_prompt_rung_never_loads_weights`, became
-`test_a_prompt_rung_never_loads_weights_even_when_they_exist` — same fixture,
+`test_a_prompt_rung_never_loads_weights_even_when_they_exist` - same fixture,
 same lock, stated mode.
 
 Net −1,346 lines. Three mutations, each killed: the repair removed from
@@ -4054,12 +4054,12 @@ Two findings from the review of `6c64a9a`, both inside the canonicalization
 contract rather than beside it.
 
 **HIGH: ConfigOps bypassed the validator.** `apply_config_patch` persisted
-whatever schema the service handed it — no validation between the approved,
+whatever schema the service handed it - no validation between the approved,
 model-authored patch and the `UPDATE` plus the `artifact_version` insert. So
 an approved patch of `{"op":"remove","path":"/mode"}` or
 `{"op":"add","path":"/backend","value":"prompt"}` put back exactly the format
 Pass C deleted, as a new historical version. Reproduced through the product
-path: propose, approve, apply — all four variants succeeded before the fix.
+path: propose, approve, apply - all four variants succeeded before the fix.
 
 The validation is at the store's mutation boundary, inside the transaction and
 before `_persist_payload`, so a refusal leaves no row, no version and no
@@ -4069,12 +4069,12 @@ be unchanged.
 
 Deleted with it: ConfigOps' partial-success machinery. The store does artifact
 update, version insert and patch status in one transaction, so there is no
-partial state to report — and the recovery path referenced `updated` before
+partial state to report - and the recovery path referenced `updated` before
 assignment, so the "graceful" branch would have raised `UnboundLocalError`.
 
 **HIGH, same finding's tail: missing mode read as hybrid.** `get_adapter_mode`
 still ended `or AdapterMode.HYBRID`, so anything that slipped past a validator
-was interpreted rather than refused — the deleted compatibility behaviour in a
+was interpreted rather than refused - the deleted compatibility behaviour in a
 shorter spelling. It returns `""` now, which is in no backend's compatibility
 matrix, so such an adapter is filtered out rather than served.
 
@@ -4086,7 +4086,7 @@ behaviour regression. Fixing them is the same work the schema.sql repair does
 for stored rows.
 
 **MEDIUM: the SQL oracle claimed more coverage than it had.** Every old Python
-reader used `or` — truthiness — while the repair keyed on `?`, key presence.
+reader used `or` - truthiness - while the repair keyed on `?`, key presence.
 Confirmed against the deleted code in git rather than from memory: `mode =
 adapter.get("mode") or ...; if mode:`, `cephfs_dir or fs_dir`,
 `remote_model_id or model_id`, `remote_adapter_id or adapter_id or id`. Ten
@@ -4107,7 +4107,7 @@ The oracle is 39 cases.
 **A post-repair assertion.** A nonempty but invalid explicit mode
 (`"mode": "whatever"`) survives the repair, because an explicit mode was
 historically authoritative and the repair must not invent a meaning the old
-runtime never gave it — but it is a row the current validator would refuse to
+runtime never gave it - but it is a row the current validator would refuse to
 create. `schema.sql` now raises, naming the count and the four legal values,
 so `migrate.sh` reports the corruption rather than booting over it. The red
 runs psql directly rather than through `apply_schema`, which sends output to
@@ -4116,7 +4116,7 @@ them.
 
 Five mutations, each killed: the store persisting without validating, missing
 mode read as hybrid, the repair keyed on presence, the migration downgraded to
-a NOTICE, and the fail-closed resolver. The fourth was written twice — the
+a NOTICE, and the fail-closed resolver. The fourth was written twice - the
 first version of the fail-closed mutation survived, because nothing tested
 that behaviour at all until the red above was written for it.
 
@@ -4126,12 +4126,12 @@ that behaviour at all until the red above was written for it.
 helper picked its validator from the incoming schema's `kind`, so a patch
 could choose which rules it would be judged by. An adapter row rewritten as
 `kind: tool.spec` with the two fields the tool schema requires passed the tool
-validator — and only `schema` is updated, so the row stayed `type='adapter'`.
+validator - and only `schema` is updated, so the row stayed `type='adapter'`.
 The door was there; the patch walked to a different one. `update_artifact` had
 the same shape, and validated before it had even read the row.
 
 Both are anchored to `artifact.type` now, which is immutable through every
-mutation path — an adapter row must remain a valid adapter. The kind-dispatch
+mutation path - an adapter row must remain a valid adapter. The kind-dispatch
 helper is deleted rather than given another rule, and `update_artifact`'s
 validation moved inside the transaction after the `FOR UPDATE`, which is where
 the row's type is known and still before `_persist_payload`.
@@ -4149,7 +4149,7 @@ nothing type-checked them.
 Ten more cases, all failing. `{"cephfs_dir": false, "fs_dir": "/good/a1"}`
 meant `/good/a1` and became the string `"false"`. The repair uses a
 `_jsonb_python_truthy` helper that reproduces Python's rule per JSON type,
-created for the repair and dropped after it — it is a tool, not schema. The
+created for the repair and dropped after it - it is a tool, not schema. The
 oracle is 49 cases.
 
 **The postcondition now means what "canonical" means.** Checking `mode` alone
@@ -4157,7 +4157,7 @@ let other shapes through: a numeric `remote_model_id` would have been
 "repaired" into a row this build would refuse to create. `schema.sql` also
 rejects any surviving retired spelling and any non-string canonical field, and
 the test asserts every repaired adapter passes `validate_artifact("adapter",
-...)` — the strongest available statement of the property.
+...)` - the strongest available statement of the property.
 
 That assertion immediately found the fixtures were unrealistic: they omitted
 `base_model` and `current_version`, which the adapter schema required *before*
@@ -4172,8 +4172,8 @@ postcondition narrowed back to the mode alone.
 
 The repair and its postcondition both filtered on `schema->>'kind' =
 'adapter.lora'`. That made the one corruption the pre-C.2 write-path bypass
-actually produced — an adapter row rewritten as another kind, with
-`artifact.type` untouched, because only `schema` is updated — the single shape
+actually produced - an adapter row rewritten as another kind, with
+`artifact.type` untouched, because only `schema` is updated - the single shape
 the migration could not see. The same bypass could remove a required field, and
 the postcondition only type-checked fields that were present.
 
@@ -4185,8 +4185,8 @@ The postcondition now covers every row typed `adapter`, whatever its schema
 claims to be: the kind must still be `adapter.lora`, the mode one of four,
 `base_model` a string and `current_version` a non-negative integer, no retired
 spelling, and every optional canonical field a string. None of these are
-repaired — there is no faithful historical meaning to recover for a row whose
-kind was swapped or whose required field was deleted — so the migration names
+repaired - there is no faithful historical meaning to recover for a row whose
+kind was swapped or whose required field was deleted - so the migration names
 them and stops.
 
 Three mutations, each killed: the scope narrowed back to the kind, required
@@ -4204,7 +4204,7 @@ One parity defect in the previous round, found by measuring rather than
 reading: JSON Schema accepts `1.0` as an `integer`, and the `^[0-9]+$` regex
 on the rendered text did not. A postcondition stricter than the door it guards
 blocks an operator over a row this build would happily create. The test is
-numeric now — non-negative and equal to its own truncation — and a red asserts
+numeric now - non-negative and equal to its own truncation - and a red asserts
 that `0`, `1` and `1.0` all pass the validator *and* migrate.
 
 Pass C is closed.
@@ -4222,8 +4222,8 @@ verified by re-running the entire mutation set against the reduced suite.
 ### Pass E.1: the erasure cluster, and a mutation that measured nothing
 
 The cluster is `test_account_erasure.py` with `test_artifact_retirement.py`.
-The starting signal was a coarse mutation — make `delete_user` purge no hot
-state — that twenty-five tests appeared to kill. Twenty-five tests killing one
+The starting signal was a coarse mutation - make `delete_user` purge no hot
+state - that twenty-five tests appeared to kill. Twenty-five tests killing one
 mutation is the shape subsumption lives in, so it looked like the place to
 begin.
 
@@ -4241,18 +4241,18 @@ error cascade, which is the cheap check that a mutation is behavioural.
 
 ### Four dominated tests, each verified rather than argued
 
-* `test_deleting_an_account_revokes_its_cached_sessions` — the cached session
+* `test_deleting_an_account_revokes_its_cached_sessions` - the cached session
   stops resolving after erasure. `test_the_session_index_is_not_the_authority_on_sessions`
   is the same test with one extra step: it drops `auth:user_sessions:<uid>`
   first. The stronger one is also the only test that kills a purge derived from
   Redis's own index instead of from the deleting transaction.
-* `test_a_completed_idempotency_record_goes_with_the_account` — writes through
+* `test_a_completed_idempotency_record_goes_with_the_account` - writes through
   the store's own setter and asserts the key is gone. Both in-flight
   idempotency tests close on that assertion, having written through the
   production path under a forced schedule.
-* `test_deleting_an_account_retires_its_cached_conversations` — same shape,
+* `test_deleting_an_account_retires_its_cached_conversations` - same shape,
   covered twice: by the in-flight summary test and by the independence test.
-* `test_an_old_generation_survives_the_pass_that_follows_deletion` — a week-old
+* `test_an_old_generation_survives_the_pass_that_follows_deletion` - a week-old
   blob survives a real cleanup pass after deletion. `_populate` already
   backdates everything a week, so `test_a_pending_retirement_is_not_collected_early`
   runs the same pass over the same aged fixture and asserts that blob plus two
@@ -4265,7 +4265,7 @@ error cascade, which is the cheap check that a mutation is behavioural.
 family table below, which also asserts a `reset:` key naming the account is
 gone. It is not: the table writes its own fixture and so asserts its own shape,
 while this one issues a real token through `initiate_password_reset`. Measured
-— store `user.email` under `reset:<token>` instead of `user.id` and only this
+- store `user.email` under `reset:<token>` instead of `user.id` and only this
 test and the ordinary-reset test fail. It holds the shape contract between the
 issuer and the purge, and the table cannot.
 
@@ -4276,7 +4276,7 @@ honest result for this cluster and the reason this commit is five lines longer
 rather than shorter.
 
 Every assertion in `test_a_pending_retirement_is_not_collected_early` is that
-something still exists — which is also what a pass that ran no sweeps produces.
+something still exists - which is also what a pass that ran no sweeps produces.
 Measured: unwire the scratch, generation or archive-staging sweep from
 `_run_cleanup_pass` and that test still passed, so the exclusion under test was
 never what kept those files. The artifact-payload sweep in the same tuple has a
@@ -4284,9 +4284,9 @@ witness whose name says so, `TestTheSweepActuallyRunsInProduction`; the other
 three had only `_run_cleanup_pass`'s docstring. Its pair test now runs the same
 fixture and the same pass against a live account, one assertion per collector.
 
-Seven of `purge_user_state`'s families — the session index, session activity,
+Seven of `purge_user_state`'s families - the session index, session activity,
 session rotation, MFA, router cache, concurrency slots and verification tokens
-— could be disabled one at a time with the whole suite still passing. A family
+- could be disabled one at a time with the whole suite still passing. A family
 purged only by code nothing exercises stops being purged the next time its key
 shape changes, and says nothing when it does. One table-driven test now seeds a
 key per family and names the families that survive erasure.
@@ -4307,7 +4307,7 @@ makes the refusal happen.
 
 Thirty, all behavioural, re-run against the reduced suite: no mutation that had
 a killer lost one, and eleven that had none now have one. Three still have no
-witness and are left open — the two identity-token issuance paths under
+witness and are left open - the two identity-token issuance paths under
 `hold_live_user`, which want a fifth in-flight red, and the generation sweep's
 own age check, which no test in this cluster depends on.
 
@@ -4330,7 +4330,7 @@ an allowlist that would need maintaining.
 Measured before landing, against planted variables rather than by reading:
 the check passes on both files as they stand, and fails on each of
 `REDIS_URL`, `JWT_ISSUER`, `JWT_AUDIENCE` and `USE_MEMORY_STORE` replanted one
-at a time — the four names the hand audit found — while `TEST_MODE` and
+at a time - the four names the hand audit found - while `TEST_MODE` and
 `SHARED_FS_ROOT` still pass. All twenty-nine variables the two files declare
 on built services are read, so "remove the other known-dead compose variables
 once individually confirmed" is confirmed by the check rather than by a claim.
@@ -4344,7 +4344,7 @@ produced no deletions and six surviving mutations. One of the six is a
 security boundary.
 
 `generation_path` builds `<store>/<first two>/<checksum>` and its consumers
-reopen whatever comes back — the inline reader calls `read_text`, the
+reopen whatever comes back - the inline reader calls `read_text`, the
 interpreter stages the file into a workdir. An attachment record is a stored
 jsonb value, so its `checksum` field chooses that path. The docstring says the
 checksum is "validated rather than trusted"; nothing checked that it was.
@@ -4362,7 +4362,7 @@ validation replaced by a bare emptiness check:
 `generation_key` carries the same rule for the index, where the consequence is
 authorization rather than traversal: a reading of an object nothing can name
 is not a reading anybody may be authorized for. Both were unwitnessed, and
-both are one rule, so one red covers them — six spellings, asserted at the two
+both are one rule, so one red covers them - six spellings, asserted at the two
 functions and again end to end through the inline reader, which must be handed
 nothing rather than something it will read. Uppercase is in the table because
 the store writes lowercase digests: an uppercase spelling is a name for a path
@@ -4377,21 +4377,21 @@ The other four survivors were recorded rather than closed: `resolve_attachment`
 returning a path for an object that is not a file, `keep = set()` in the
 displacement prune (two names sharing identical bytes), the
 `generation_prefix` sweep of rows that can never become authorized, and the
-record written after the prune rather than before it — a real reorder this
+record written after the prune rather than before it - a real reorder this
 time, which nothing forces a schedule against. `keep = set()` is closed
 below; the rest stand.
 
 Two mutations in the first round measured nothing and are recorded so the
 mistake is not repeated. `the_record_is_written_after_the_prune` deleted the
 `UPDATE` instead of moving it, so sixteen tests died to "attachments never
-persist". And one structural mutation — make `resolve_attachment` hand back
-the pathname again — was killed by nine tests at once, which reads as
+persist". And one structural mutation - make `resolve_attachment` hand back
+the pathname again - was killed by nine tests at once, which reads as
 redundancy and is not: the store has three consumers, and one mutation on the
 shared resolver cannot tell them apart. Split per consumer, the nine separate
 into the workdir stager, the inline reader and the availability check.
 
 Seven tests still die together to the inline-reader mutation, and they are not
-interchangeable: each forces a different schedule against that one consumer —
+interchangeable: each forces a different schedule against that one consumer -
 another chat's upload, a name recreated after a delete, a replacement between
 the check and the read, the pathname deleted, the pathname replaced. Telling
 them apart needs mutations that are schedule-sensitive at the reader, not one
@@ -4412,7 +4412,7 @@ no longer search a file it still holds.
 
 One red: same bytes under `first.md` and `second.md`, asserted to produce the
 same generation key rather than assumed to, then `first.md` replaced and the
-shared reading required to survive — in the index and through
+shared reading required to survive - in the index and through
 `_run_file_search`, so the assertion is the user-visible consequence. It kills
 `keep = set()` and, correctly, kills neither of the two displacement mutations
 already witnessed elsewhere: it is a witness for `keep`, not a broad one.
@@ -4429,8 +4429,8 @@ asked of the live `Settings` model, the provider credential table, and
 excluded because it writes.
 
 Shell is excluded too, and that is a strengthening rather than a gap. Matching
-`$VAR` in `scripts/*.sh` admits every local a script sets for itself —
-`GREEN`, `TESTS_RUN`, `BASE_URL` — and, measured, `ALLOW_REDIS_FALLBACK_DEV`,
+`$VAR` in `scripts/*.sh` admits every local a script sets for itself -
+`GREEN`, `TESTS_RUN`, `BASE_URL` - and, measured, `ALLOW_REDIS_FALLBACK_DEV`,
 one of the four dead names this guard exists to catch. No compose variable
 needs the shell pass: all eighteen distinct names across the two files are
 consumed through the three interfaces above. A variable only a shell script
@@ -4445,7 +4445,7 @@ and the counterexample, green on `TEST_MODE`, `OPENAI_API_KEY` and
 **And the same defect one layer over.** Excluding shell surfaced two writes of
 `ALLOW_REDIS_FALLBACK_DEV` that reach nothing: `os.environ.setdefault` in
 `scripts/bootstrap_admin.py` and an `export` in `scripts/run_tests.sh`. The
-setting is admin-managed with no `env` key, so `os.environ` cannot reach it —
+setting is admin-managed with no `env` key, so `os.environ` cannot reach it -
 dead by construction, not by circumstance. Both sit beside `TEST_MODE`, which
 is a real `env_field` and short-circuits the same branch in `Runtime`, so
 removing them cannot change what either script does.
@@ -4454,7 +4454,7 @@ removing them cannot change what either script does.
 
 `test_code_review_fixes.py` was the next candidate because its name records
 when a bug was found rather than what owns the invariant, and because it
-showed clusters — three zero-weight adapter tests, two chunking tests, three
+showed clusters - three zero-weight adapter tests, two chunking tests, three
 envelope tests. The expected finding was overlap. The actual finding was
 worse and easier to act on.
 
@@ -4469,8 +4469,8 @@ Reading says why, and running proves it:
   `training.py` into the test body and asserts on its own copy. `training.py`
   is never imported. Measured: take the first training step instead of the
   last, or drop the assignment entirely, and both tests stay green.
-* `TestPgvectorUserIdRequired` defines `search_with_empty_user_id` locally —
-  "Mock the behavior we expect" — and asserts on that. Measured: remove the
+* `TestPgvectorUserIdRequired` defines `search_with_empty_user_id` locally -
+  "Mock the behavior we expect" - and asserts on that. Measured: remove the
   real defence-in-depth check from `search_chunks_pgvector` and the test
   passes.
 * `TestPaginationValidation` defines its own `PaginationParams(BaseModel)` and
@@ -4493,7 +4493,7 @@ and returns every user's chunks in the named contexts. Measured against the
 whole fast lane, not just this file: removing it left 2,606 tests green.
 
 Two reds replace the fake one, each beside the corpus that can exercise its
-channel — the chunk channels with the hybrid fixture in `test_rag.py`, late
+channel - the chunk channels with the hybrid fixture in `test_rag.py`, late
 interaction with the segmented corpus in `test_late_interaction.py`. Both open
 with a positive control, because a refusal that returns nothing is
 indistinguishable from a query that would have matched nothing. All three
@@ -4502,12 +4502,12 @@ guards are now killed.
 ### Three assertions that passed by being skipped
 
 `test_zero_weight_in_format_remote_adapters` wrapped its whole assertion in
-`if extra_body and "adapter_weights" in extra_body:` — which is true exactly
+`if extra_body and "adapter_weights" in extra_body:` - which is true exactly
 when the behaviour under test is present, so the test passed when the backend
 stopped sending gate weights altogether. Measured, and now unconditional: the
 Together capability table advertises `gate_weights`, so the key is required.
-Production was correct all along — `weight: 0.0` reaches
-`adapter_weights: 0.0`, and a missing weight becomes `1.0` — which is why this
+Production was correct all along - `weight: 0.0` reaches
+`adapter_weights: 0.0`, and a missing weight becomes `1.0` - which is why this
 never surfaced as a failure.
 
 The two chunking tests had the same shape (`if chunk.meta:`) and, measured, do
@@ -4533,9 +4533,9 @@ rather than a loss-extraction one.
 
 `_run_jax_optax_training` returns `status="skipped"` for a run that did not
 train: JAX absent, no base checkpoint, no loadable tokenizer, no LoRA matrices
-matching the model. `_promotion_gate` agrees — any non-`ok` trace is
+matching the model. `_promotion_gate` agrees - any non-`ok` trace is
 `promoted=False`, reason "training did not run". Then `train_from_preferences`
-wrote the job `succeeded` regardless, carrying `1.0 / (1 + len(dataset))` — a
+wrote the job `succeeded` regardless, carrying `1.0 / (1 + len(dataset))` - a
 number that says the run went well because the dataset was large. The worker
 overwrote it afterwards with `succeeded if promoted else gate_rejected`, whose
 own comment defines `gate_rejected` as "a run that trained but failed the eval
@@ -4570,7 +4570,7 @@ worker's retry and dead-letter path, and "no preference events" was already
 One layer lower, the same shape: the loop is `for batch in batches`, so an
 empty list ran nothing and returned `ok` with `steps: []`. The gate then
 judged it on an eval the run had never moved. The check is now the first thing
-the function does — before the JAX import, because "no batches" is not a JAX
+the function does - before the JAX import, because "no batches" is not a JAX
 question, which also makes it reachable without a checkpoint.
 
 ### Reds and mutations
@@ -4579,7 +4579,7 @@ Four reds, none needing JAX: the expensive execution is replaced rather than
 exercised. A skipped trace must produce `skipped`, no loss, no new version and
 a preserved `jax_trace.reason`; the same trace through the worker must keep
 that status and earn no router credit; an `ok` trace the gate refuses must be
-`gate_rejected` carrying the loss the loop produced — which is also the
+`gate_rejected` carrying the loss the loop produced - which is also the
 witness E.3 left missing; and an empty batch list must be `skipped` before
 anything else.
 
@@ -4588,8 +4588,8 @@ the heuristic loss reaching a skipped run, the worker re-deriving from
 `promoted` alone, `terminal_status` ignoring the trace, the no-batch check
 removed, and the gate-rejected path losing the training loss.
 
-SPEC §5.4 stated the defect — step 7 said "mark the job `succeeded` with its
-loss" unconditionally — and its `training_job` vocabulary was three statuses
+SPEC §5.4 stated the defect - step 7 said "mark the job `succeeded` with its
+loss" unconditionally - and its `training_job` vocabulary was three statuses
 out of date, listing a `failed` the code does not write while omitting
 `gate_rejected`, `skipped` and `dead_letter`. Both corrected, along with the
 "what skipped covers" list.
@@ -4612,13 +4612,13 @@ nothing about the other fields being cleared.
 
 The route is not synthetic. The worker retries the same claimed `job_id`, and
 the service writes its terminal result before the worker re-reads and
-finalizes the job — so a transient failure in that later database work leaves
+finalizes the job - so a transient failure in that later database work leaves
 a second attempt running against a job that already carries the first
 attempt's `loss` and `new_version`. A skipped second attempt then reads as a
 run that never trained and yet produced version 7 at loss 0.42.
 
 `_UNSET` separates the two meanings: omitted preserves, explicit `None` writes
-SQL NULL. Only `loss` and `new_version` need it — they are the fields a
+SQL NULL. Only `loss` and `new_version` need it - they are the fields a
 terminal status can deny.
 
 One companion change, and it is the reason this is not a one-line fix. The
@@ -4638,7 +4638,7 @@ service omitting the fields on a skipped run, the worker passing
 The sibling call site got the same rule: "no preference events" is a skipped
 run too, so it now clears both fields rather than leaving an earlier attempt's
 numbers under a status that says nothing ran. `dead_letter` deliberately does
-not — it says the worker gave up, not that nothing happened, and if an attempt
+not - it says the worker gave up, not that nothing happened, and if an attempt
 promoted a version before the failure the artifact really carries it.
 
 The dataset-size fallback is gone with it. The loop appends a step per batch
@@ -4649,7 +4649,7 @@ either. `None` is the honest answer there.
 
 SPEC: `gate_rejected` now reads "trained, but the promotion gate did not
 approve it", covering both a measured regression and a dataset too small to
-hold anything out — the branch the gate-rejected red actually exercises, now
+hold anything out - the branch the gate-rejected red actually exercises, now
 asserted by name so it cannot drift to the other one. The retry paragraph said
 "max 3 attempts, then failed with reason"; `failed` is not a status this code
 writes, and the correct one is `dead_letter`.
@@ -4660,7 +4660,7 @@ The served `/v1/responses` exists so an agent framework changes only its base
 URL (SPEC §16), and the SPEC says wire shapes are OpenAI's both ways. The
 tests asserting that transcribed what we believed those shapes were, which
 proves we were consistent with ourselves and nothing else. The arbiter here is
-the installed SDK's generated types — built from OpenAI's OpenAPI schema, and
+the installed SDK's generated types - built from OpenAI's OpenAPI schema, and
 the thing a caller's client actually is.
 
 `model_validate` rather than the SDK's own response parser: that parser
@@ -4682,7 +4682,7 @@ Response             missing ['parallel_tool_calls', 'tool_choice', 'tools']
 `file_search_call` got its `queries`; `web_search_call` got `type`, `id` and
 `status` and nothing else. `action` is required and distinguishes a search
 from opening a page or finding within one, and `ActionSearch` requires the
-query as well — so the item was not merely thin, it failed the generated type.
+query as well - so the item was not merely thin, it failed the generated type.
 
 Nothing had to be invented: `run_web_search` is always a search and the
 workflow trace already carries the query. An unrecorded query is the empty
@@ -4694,7 +4694,7 @@ event that has no arguments yet, so there the query is empty at
 `response.output_item.added`. Both paths now validate.
 
 Why this survived: the served-Responses tests have a good dialect-native
-file-search witness including its query, and — measured — no `web_search`
+file-search witness including its query, and - measured - no `web_search`
 witness at all.
 
 ### The text stream omitted a field the SDK's own accumulator reads
@@ -4708,7 +4708,7 @@ zero-valued usage details.
 ### The three caller-tool fields
 
 `tools`, `tool_choice` and `parallel_tool_calls` are required, and all three
-describe the *caller-supplied* tool surface — which this endpoint refuses by
+describe the *caller-supplied* tool surface - which this endpoint refuses by
 name, because it runs the kernel's own loop server-side. So `[]`, `"none"` and
 `false`: no caller tools were in effect, none were available to choose
 between, and none were emitted in parallel. What the server ran is reported
@@ -4740,7 +4740,7 @@ Validating only the shapes we had reason to doubt is backwards for a finite
 public protocol. Several independent required-field omissions in one surface
 is reason to check the whole surface. `ResponseStreamEvent` is the dialect's
 own discriminated union over every server event, so each payload goes to it
-whole — measured first to reject an unknown `type`, a missing required field,
+whole - measured first to reject an unknown `type`, a missing required field,
 and an invalid nested item, so it is an arbiter rather than a formality.
 
 One successful stream carrying a tool and text, one failure stream, and every
@@ -4758,7 +4758,7 @@ ones.
 
 The conformance pass did surface one behavioural defect. A streamed tool item
 is built when the trace event opens it, and the trace event carries no
-arguments — so the item's query is the empty-when-unknown form. Nothing ever
+arguments - so the item's query is the empty-when-unknown form. Nothing ever
 revisited it, so the *finished* response reported an empty query for a run
 whose trace named one.
 
@@ -4769,7 +4769,7 @@ streaming dropped it.
 
 The finished response is where a caller reads what the run did, so that is
 where the trace lands. The already-emitted `output_item.added`/`.done` keep
-the empty form — it was true when it was serialized — and the id is untouched,
+the empty form - it was true when it was serialized - and the id is untouched,
 so a caller correlating the finished item with the one it saw open finds the
 same item. The witness is parametrized over both item types and asserts the
 id, the empty form at open, and the filled form at the end.
@@ -4783,14 +4783,14 @@ of the two item types, minting a new id, `content_part.added` losing its
 ### The arbiter has to be installable
 
 `openai>=1.30` is the declared floor, and `openai.types.responses` does not
-exist there — so a minimum-version environment could not collect these tests
+exist there - so a minimum-version environment could not collect these tests
 at all. The floor is not raised: the API backend deliberately supports SDKs
 and providers with no Responses endpoint and falls back to chat completions,
 and raising it would contradict that.
 
 `openai>=2.8.1` goes in the `dev` extra instead. Product runtime keeps the old
 SDK, the conformance suite gets the generated types, and `uv.lock` records
-which schema snapshot was qualified — it already resolved 2.8.1, and now
+which schema snapshot was qualified - it already resolved 2.8.1, and now
 carries the dev specifier too. Relocking also picked up `pytest-xdist`, which
 was declared in `dev` and had never been locked.
 
@@ -4808,7 +4808,7 @@ anyway. Both SPAs did: `liminal.refreshToken` and `liminal.sessionId` in
 
 A copy in `sessionStorage` is a durable credential any script reaching the
 page can take, and it outlives the short-lived token it was supposed to
-replace — which is the entire reason the cookie exists. The cookie was being
+replace - which is the entire reason the cookie exists. The cookie was being
 set the whole time; keeping the copy only removed the protection.
 
 ### Two transports, one credential
@@ -4819,7 +4819,7 @@ takes the credential from the body *or* the cookie, for refresh and for both
 MFA routes, and refuses when the two are present and disagree.
 
 The refusal is the security-relevant half. Choosing either silently lets a
-caller who can write one transport speak as the account the other names —
+caller who can write one transport speak as the account the other names -
 and the first version of that red proved nothing, because a *nonsense* body
 token is refused whether or not the conflict is detected. Measured: the check
 could be removed and the test stayed green. The witness now signs in a second
@@ -4840,7 +4840,7 @@ as authority, not about shrinking a public response.
 The chat page's `persistedKeys` lost both credentials, so nothing writes them;
 `resetAuth` still clears them, because a tab open across the change still has
 them. The admin console has its own `persistAuth` and lost the same two. The
-socket's init frame carries the access token alone — the `session_id` fallback
+socket's init frame carries the access token alone - the `session_id` fallback
 is unreachable in a browser now, and `tenant_id` was always dead weight the
 server derives from the hostname. The refresh body is `{}`.
 
@@ -4858,7 +4858,7 @@ keep in step.
 Five tests: login leaves only the access token, on chat and on the admin
 console; the cookies that matter are `HttpOnly` and invisible to
 `document.cookie` while the CSRF cookie is deliberately readable; signing out
-takes what an older session left behind; and the lifecycle — sign in, break
+takes what an older session left behind; and the lifecycle - sign in, break
 the access token, make the app do real work, and require that it recovered on
 the cookie alone, sending no `refresh_token` and no `tenant_id`, exactly once,
 with the original operation completing afterwards.
@@ -4866,7 +4866,7 @@ with the original operation completing afterwards.
 It is its own lane (`make test-browser`, `-m browser`) and its own CI job,
 excluded from every default target: it needs a Chromium binary that
 `pip install playwright` does not provide. `playwright>=1.40` joins the dev
-extra beside `openai>=2.8.1`, for the same reason — the qualification suite
+extra beside `openai>=2.8.1`, for the same reason - the qualification suite
 needs more than the product runtime does.
 
 ### Mutations
@@ -4883,7 +4883,7 @@ repeated. Adding a key back to `persistedKeys` does nothing when no code
 assigns the field, so that mutation had to move to `persistAuth`. The
 disagreement mutation needed a valid foreign credential, as above. And the
 first admin and logout mutations survived because the browser lane covered
-only the chat page — the admin console has its own copy of the rule, which is
+only the chat page - the admin console has its own copy of the rule, which is
 its own place to break it, so it got its own witness.
 
 ### One CI variable removed on the way past
@@ -4895,8 +4895,8 @@ class as the compose variables, one file over.
 
 ### Carry-over: the browser MFA witness, and two vacuous waits
 
-Added against the reviewer's steer — "mostly ceremony around code generation
-unless an actual UI defect appears" — because measurement partly disagreed. No
+Added against the reviewer's steer - "mostly ceremony around code generation
+unless an actual UI defect appears" - because measurement partly disagreed. No
 UI defect appeared, so that half was right. But three mutations die only here:
 the SPA putting a `session_id` back in the `mfa/request` body, the same in the
 `mfa/verify` body, and `verify` issuing tokens for `body.session_id` rather
@@ -4907,7 +4907,7 @@ Building it produced two vacuous waits worth recording, both of which made the
 test pass while the thing it checks was broken:
 
 * `page.wait_for_function` polls a **synchronous** predicate, and an `async`
-  arrow hands it a Promise — always truthy, so the wait returned on the first
+  arrow hands it a Promise - always truthy, so the wait returned on the first
   poll. Measured: that version passed with the entire verify path mutated
   away. `page.evaluate` awaits the promise and the assertion is separate.
 * `page.wait_for_selector("#x.hidden")` defaults to `state="visible"`, so it
@@ -4926,7 +4926,7 @@ session, and the SPA restoring a session id to either body.
 
 A Liminal turn can now use tools that live on a remote MCP server. The
 constraint that shaped the whole tranche: no protocol code here.
-`mcp>=2,<3` is a runtime dependency and the wire arbiter — version
+`mcp>=2,<3` is a runtime dependency and the wire arbiter - version
 negotiation, Streamable HTTP, the message types and the fallback handshake are
 all the SDK's. Measured, not assumed: `Client(url)` negotiated protocol
 `2026-07-28` against the SDK's own server with nothing in this repository
@@ -4937,7 +4937,7 @@ That leaves a short list of things the SDK cannot decide, and those are what
 
 * **Authority.** A server is a persisted `mcp.server` artifact, globally
   visible and admin-owned. Ownership is read from the artifact row, never from
-  a field inside `schema` — a payload claiming `owner_user_id: <an admin>` is
+  a field inside `schema` - a payload claiming `owner_user_id: <an admin>` is
   a string somebody typed. Same rule `privileged: true` already lives under.
 * **Classification.** `egress` or `local_read`, from the artifact and nowhere
   else. Not from the server's own annotations: `readOnlyHint` is metadata
@@ -4946,7 +4946,7 @@ That leaves a short list of things the SDK cannot decide, and those are what
 * **Network policy.** Discovery and dispatch both run inside the same
   `tool_network_guard` the rest of the tool loop runs in. Measured before
   relying on it: the guard patches `socket.socket.connect` globally, so it
-  catches the SDK's transport without the SDK knowing it exists — including
+  catches the SDK's transport without the SDK knowing it exists - including
   the host a 307 redirect leads to, which is the case a URL allowlist checked
   at call time would miss.
 * **Naming.** Remote names are projected into `mcp__<server>__<tool>`, so a
@@ -4958,7 +4958,7 @@ That leaves a short list of things the SDK cannot decide, and those are what
 
 ### The defect that would have made the whole tranche a no-op
 
-`RemoteTool.spec()` emitted the flat Responses form —
+`RemoteTool.spec()` emitted the flat Responses form -
 `{"type": "function", "name": ..., "parameters": ...}`. Every backend in this
 repository reads the nested chat-completions form instead:
 `StubBackend.generate_with_tools` selects on `tool["function"]["name"]`,
@@ -4973,7 +4973,7 @@ and nothing at all from this one. Every other test in the file passed with the
 defect in place, because they all called `mcp_client.call` directly.
 
 The three reds that now cover it hand the spec to the two real readers rather
-than asserting its shape — a shape assertion encodes the same belief that
+than asserting its shape - a shape assertion encodes the same belief that
 produced the module, so it would have agreed with the bug.
 
 ### Two things the reds caught in the writing
@@ -4981,7 +4981,7 @@ produced the module, so it would have agreed with the bug.
 `neutralize_markers` before `scan_for_injection` was one call too many, and
 the wrong order besides: `wrap_untrusted` already neutralizes on the way out,
 so the early call only meant the scanner read text whose markers had already
-been mangled — a control marker could mask the pattern underneath it. Scanning
+been mangled - a control marker could mask the pattern underneath it. Scanning
 raw and neutralizing at the envelope is both shorter and strictly stronger.
 
 The policy guard was on discovery but not on `call`. Those are two separate
@@ -5003,7 +5003,7 @@ is weaker than proving the remote server never heard from us at all.
 `servers_for_turn` asks for `visibility="global"`. Reverting that to the
 unscoped default survives every test, and the probe says why: unscoped listing
 widens to private and shared rows only for the identity it is given, and this
-call site gives it none. Measured — `unscoped=True/False/False` against
+call site gives it none. Measured - `unscoped=True/False/False` against
 `global-only=True/False/False` for global/shared/private rows, and
 `with-tenant=True/True/False` once a tenant is passed. So the two spellings
 return the same rows today and no test can separate them.
@@ -5019,7 +5019,7 @@ mechanisms apart.
 ### Deliberately out of scope
 
 stdio, which turns "connect to a server" into "spawn the executable this row
-names" — a different privilege question that deserves its own review, and the
+names" - a different privilege question that deserves its own review, and the
 reason the artifact schema's `url` is pinned to `^https?://` rather than left
 open. Also OAuth, resources, prompts and subscriptions. Discovery is per turn
 with no cache: a remote server's offering is neither persisted nor stable, so
@@ -5041,33 +5041,33 @@ guard removed from discovery; the same removed from `call`; the result cap
 removed; the scan skipped; the envelope skipped; findings not recorded; the
 taint check on an `egress` tool removed; one dead server failing the turn;
 registered egress tools ignored by `is_withdrawn`; and, against the artifact
-schema, the `url` pattern dropped — which lets `file:///etc/passwd` persist as
-a server — and the `taint_class` enum widened to any string, which turns an
+schema, the `url` pattern dropped - which lets `file:///etc/passwd` persist as
+a server - and the `taint_class` enum widened to any string, which turns an
 operator's `local-read` typo into a silent downgrade instead of a write error.
 
 Two survivors, both accounted for rather than chased:
 
 * `is_withdrawn` ignoring the taint check survives this file and is killed by
-  five tests elsewhere in the suite. The invariant it breaks — an untainted
-  turn withdraws nothing — belongs to `taint.py`'s own tests, which is where
+  five tests elsewhere in the suite. The invariant it breaks - an untainted
+  turn withdraws nothing - belongs to `taint.py`'s own tests, which is where
   it is. A per-file mutation run reporting it as a survivor is the same false
   signal as the earlier `purged = 0` case: the harness's scope, not a gap.
 * `visibility="global"` reverted to the unscoped default is equivalent, as
   above.
 
 Two survivors were real and are now killed. Raising `MAX_NAME_LENGTH` to 1000
-survived because the test asserted `len(n) <= mcp_client.MAX_NAME_LENGTH` —
+survived because the test asserted `len(n) <= mcp_client.MAX_NAME_LENGTH` -
 it read the module's own constant, so the mutation moved the goalposts and the
 test agreed. 64 is a provider's limit on a function name, not this module's
 preference, so the literal is now written out. And removing the URL guard
 survived because no row could reach it: `validate_artifact` requires `url` on
 create and on update. The witness writes the malformed row the only way it can
-exist, straight into the table, which is also the only way it *does* exist —
+exist, straight into the table, which is also the only way it *does* exist -
 a restore from an older dump, or an operator's UPDATE.
 
 ## The MCP wiring: what a name means is the parent's decision
 
-The client existed and reached no model. This is the seam — discovery during
+The client existed and reached no model. This is the seam - discovery during
 prompt assembly, the spec in the offered tools, dispatch by name, and
 withdrawal through the ordinary taint path. SPEC §21.4 is its normative home.
 
@@ -5077,7 +5077,7 @@ The agent loop is split across a pipe: the parent assembles the prompt and
 owns every effect, and a worker process runs the model-chosen control flow.
 The worker sends the name it chose; the parent decides what that name means.
 
-So the discovered map — model name to `RemoteTool` — is a field on
+So the discovered map - model name to `RemoteTool` - is a field on
 `InvocationContext`, which already says of itself "never crosses the pipe.
 Every field here is something the worker must not be able to choose." A
 `RemoteTool` carries a URL and a `taint_class`, and a worker that could send
@@ -5096,7 +5096,7 @@ Both were written by hand, both passed, and both proved nothing:
 * `test_a_name_the_turn_did_not_discover_is_not_dispatched` passed an **empty**
   map. A dispatch that matched on the `mcp__` prefix alone and fell back to
   whatever server was configured would answer "unknown tool" for the same
-  reason the correct one does — there is nothing to fall back to. The map is
+  reason the correct one does - there is nothing to fall back to. The map is
   now non-empty, with an assertion that it is.
 * `test_the_turn_is_told_what_the_envelope_means` ran with web enabled, which
   it is in this environment, so the untrusted-data instruction was in the
@@ -5107,13 +5107,13 @@ Both were written by hand, both passed, and both proved nothing:
 ### Two real gaps the same run found
 
 The batch path was covered and the other two hand-offs were not. Both are now
-witnessed, and neither is hypothetical — each mutation breaks the feature
+witnessed, and neither is hypothetical - each mutation breaks the feature
 completely on one of the two paths a turn can take:
 
 * The **broker** hand-off (`_tools_round` reading `self._ctx.mcp_tools`). The
   earlier reds called `_run_round_tools` directly, passing the map by hand,
   which proves the broker nothing. The witness drives `_tools_round`.
-* The **streaming** path, which builds its own `InvocationContext` inline — the
+* The **streaming** path, which builds its own `InvocationContext` inline - the
   chat window's path. Its test stops at `_serve_invocation` and inspects the
   context that would have reached the broker: spawning a worker and streaming
   an answer needs a live model, and neither is what the test is about.
@@ -5130,16 +5130,16 @@ where the first returns a hostile string and the second is refused.
 ### One thing added on the way past
 
 Discovery is skipped when the backend cannot call tools. The planner discards
-the whole tool list in that case, and unlike the native schemas — which are
-constants — discovering costs a round trip per configured server before being
+the whole tool list in that case, and unlike the native schemas - which are
+constants - discovering costs a round trip per configured server before being
 thrown away. Its witness proves it on the server's own records rather than on
 the returned map, so it cannot pass by connecting and then answering empty.
 
 ### A regression the lane caught and the grep did not
 
 Changing `_build_agent_context`'s return arity broke 15 tests in two files.
-Both were stale call sites, not defects — a three-value unpack and a stub
-missing the new keyword — but the way they were missed is worth recording: the
+Both were stale call sites, not defects - a three-value unpack and a stub
+missing the new keyword - but the way they were missed is worth recording: the
 grep that was supposed to find every caller was piped through `head -20`, and
 the second file's real call sat below the cut while its docstring mention sat
 above it. A truncated search is not a completeness check. Nothing about the
@@ -5168,7 +5168,7 @@ Two independent blockers, neither visible from where the earlier tests stood.
 
 `POST /v1/artifacts` requires `kind` to start with `f"{type}."`. The pair was
 type `mcp_server` with kind `mcp.server`, and `"mcp.server".startswith(
-"mcp_server.")` is false, so every create was a 400 — before authorization,
+"mcp_server.")` is false, so every create was a 400 - before authorization,
 before the schema, before anything.
 
 The earlier tests could not see it because they called
@@ -5179,7 +5179,7 @@ operator could ever send it. A store-level witness for a thing operators
 configure is a witness for the wrong layer.
 
 The pair is now type `mcp`, kind `mcp.server`, which is the convention the
-rest of the table already follows — `workflow`/`workflow.linear`,
+rest of the table already follows - `workflow`/`workflow.linear`,
 `adapter`/`adapter.lora`.
 
 ### Nothing created through the API was ever global
@@ -5192,7 +5192,7 @@ not touch visibility.
 
 `ArtifactRequest` now carries `visibility`, defaulting to `private` so every
 existing caller keeps exactly what it had. `shared` and `global` require the
-admin role — read off the authenticated token, never from the body, the same
+admin role - read off the authenticated token, never from the body, the same
 rule `tenant_id` lives under. That gate is not MCP-specific and should not be:
 a globally visible `tool` artifact enters the process-wide registry every turn
 resolves against, so this field is the difference between "my configuration"
@@ -5205,7 +5205,7 @@ through config ops, not here", and refuses PATCH and DELETE for them. That is
 a coherent stance and this tranche did not widen it. What it did was check
 that the stated path actually works on this artifact type rather than being a
 sentence in a docstring: propose, approve, apply a patch setting
-`enabled: false`, then ask `servers_for_turn` — measured, not read.
+`enabled: false`, then ask `servers_for_turn` - measured, not read.
 
 ### The console, and a defect it exposed in every other section
 
@@ -5216,7 +5216,7 @@ anything was published, and a `visibility: private` post would look identical.
 
 Writing it surfaced a defect older than this tranche. The console loaded its
 tables only in the "page opened with a live session" branch, so an interactive
-sign-in left every table — patches, settings, users, adapters — empty until
+sign-in left every table - patches, settings, users, adapters - empty until
 its own Refresh button was clicked. An operator cannot tell that from an
 installation with nothing in it. Both entry points now call one `loadConsole`,
 which also means they cannot drift into loading different things. The witness
@@ -5245,7 +5245,7 @@ those was the worst defect in the tranche.
 
 Both selectors chose the tool agent on `attachments or web_enabled`, and knew
 nothing about MCP. So the exact configuration an operator has after publishing
-one server — tool-capable backend, web off, nothing attached — took the
+one server - tool-capable backend, web off, nothing attached - took the
 plain-chat workflow and never discovered anything.
 
 This is the same shape as the finding the previous commit fixed, one layer up
@@ -5258,13 +5258,13 @@ and assert on the fixture server's own `listed` counter.
 One selector now, shared by both paths, and it reads persisted state only:
 `servers_for_turn` is a store read. Probing here would let an unreachable
 third party decide, per request and after a timeout, whether a turn can use
-its own attachments. That is a red of its own — the selector must return True
+its own attachments. That is a red of its own - the selector must return True
 without the fixture recording a listing.
 
 ### HIGH: discovery metadata reached the model before anything scanned it
 
 A result was capped, scanned and wrapped. A tool's `description` and
-`inputSchema` went straight into the model's tool contract — earlier than any
+`inputSchema` went straight into the model's tool contract - earlier than any
 call, therefore earlier than any scan. A server that never answered a single
 call could put "ignore previous instructions" in front of the model with the
 turn untainted and every native egress tool still callable. `inputSchema` was
@@ -5274,7 +5274,7 @@ channel.
 
 Metadata is now vetted at discovery: bounded in size, depth and count, scanned
 for injection patterns and envelope markers. A tool whose metadata fails is
-**dropped, not rewritten** — neutralizing a schema would change enum values
+**dropped, not rewritten** - neutralizing a schema would change enum values
 and property names, offering the model a contract the server does not
 implement. Rejection logs and does not taint: nothing hostile reached the
 model, and tainting would let any server disarm a turn by advertising a tool
@@ -5287,7 +5287,7 @@ attacker-supplied JSON is a `RecursionError` whose timing the sender picks.
 
 Writing the schema reds surfaced it. `mcp==2.0.0` puts the wire's `inputSchema`
 on a model field named `input_schema`, and this module read the wire spelling
-off the Python object. `getattr` returned `None` — no error, no warning — so
+off the Python object. `getattr` returned `None` - no error, no warning - so
 **every remote tool had been offered to the model with no parameters at all.**
 
 Nothing in the suite could see it: every test handed arguments to `call`
@@ -5307,7 +5307,7 @@ thread by some route; `_invoke_tool` awaited nothing around `_plan_invocation`
 and is the call site that stalled.
 
 So there is one red, for the path that reproduces, and `_plan_invocation` is
-offloaded — measured first that it already ran unbound, so a worker thread
+offloaded - measured first that it already ran unbound, so a worker thread
 changes nothing about leasing. The streaming offload stays as the right
 discipline for a synchronous network call in an `async def`, and is recorded
 in the code as having no witness rather than described as a fix.
@@ -5331,8 +5331,8 @@ source-neutral now.
 §12.3 said users CRUD private artifacts and admins view system artifacts and
 approve patches. It did not carry the general publishing authority the route
 now implements. Documented as the generic rule, with the two properties that
-make it coherent: publishing is a one-way door — a published artifact leaves
-artifact CRUD entirely and every later change goes through config ops — and
+make it coherent: publishing is a one-way door - a published artifact leaves
+artifact CRUD entirely and every later change goes through config ops - and
 the create side is direct because a proposal needs an artifact to name, so
 requiring review to create one has no first step. §21.4 gains the metadata
 rule and the event-loop rule.
@@ -5349,7 +5349,7 @@ clean tool dropped along with the hostile ones.
 
 Two of those took a corrected witness first. `depth_is_unchecked` survived
 because a 400-level schema serializes past the size cap, so the size check
-rejected it either way — the witness is now deep and small. And the streaming
+rejected it either way - the witness is now deep and small. And the streaming
 loop test was deleted rather than kept: it killed nothing, and a test that
 cannot fail is the thing this project removes.
 
@@ -5362,7 +5362,7 @@ through config ops. The physical lifecycle said the opposite.
 `delete_user` removed every row with that `owner_user_id` whatever its
 visibility, and the foreign key was `ON DELETE CASCADE` independently. So a
 same-tenant admin deleting the admin who had published a global MCP server
-deleted the server, its versions and its config-patch history — no review, no
+deleted the server, its versions and its config-patch history - no review, no
 record that it had ever existed.
 
 Not a security escape: it needs an admin and it fails closed. It is two rules
@@ -5372,21 +5372,21 @@ installation-wide configuration share a personnel account's lifetime.
 ### The model, and why this one
 
 Publishing detaches; it does not destroy. A private artifact still dies with
-its account — the erasure guarantee is narrowed, not weakened. A published one
+its account - the erasure guarantee is narrowed, not weakened. A published one
 keeps its row, its versions and its audit trail, and loses its owner.
 
 For an MCP server that means it goes **inert**, which is the honest outcome:
 the admin attestation is what made it a capability, and the admin is gone.
 `servers_for_turn` already skipped any artifact with no owner, so nothing new
-enforces this — it falls out of the rule that authority comes from a live
+enforces this - it falls out of the rule that authority comes from a live
 admin-owned row. It stays inert until an admin publishes it again.
 
 `SET NULL` rather than `RESTRICT` on the key: refusing to delete the account
 would let one published row block a personnel action indefinitely, which is a
 worse answer than an artifact that survives unattributed. The key cannot tell
 visibilities apart, so a raw `DELETE FROM app_user` leaves a *private* row
-detached rather than removed. That direction is deliberate — recoverable beats
-unrecoverable when the constraint is guessing — and `delete_user`, the only
+detached rather than removed. That direction is deliberate - recoverable beats
+unrecoverable when the constraint is guessing - and `delete_user`, the only
 supported path, still removes private rows itself.
 
 ### Two mechanisms, and the one this repository controls
@@ -5403,7 +5403,7 @@ the constraint in `sql/schema.sql` fails no test on an already-provisioned
 database: the migration is `IF confdeltype = 'c'`, so re-applying the file to a
 database that has already been corrected is a no-op, and the live constraint
 was measured at `n` throughout. Two tests on a scratch database cover the file
-itself — what a fresh install gets, and what an old one is migrated to. They
+itself - what a fresh install gets, and what an old one is migrated to. They
 are slow-marked, because each creates and drops a database and what they check
 is a migration rather than a request path.
 
@@ -5411,9 +5411,9 @@ is a migration rather than a request path.
 
 "`owner_user_id` null means global/shared" conflated two independent columns.
 Global MCP servers are deliberately global *and* admin-owned, because the
-ownership is the attestation. Null now has a precise meaning of its own — no
+ownership is the attestation. Null now has a precise meaning of its own - no
 account stands behind this row, either because the installation seeded it or
-because its owner was deleted — and that is exactly why an unattributed `tool`
+because its owner was deleted - and that is exactly why an unattributed `tool`
 can never be privileged and an unattributed `mcp` server is offered to nobody.
 The kind list gains `mcp.server`, and the type list gains `mcp`.
 
@@ -5422,8 +5422,8 @@ The kind list gains `mcp.server`, and the type list gains `mcp`.
 Asked while this was running, and answered by measuring rather than by
 reading the Makefile: xdist was wired into exactly one target,
 `test-fast-xdist`, and the slow-marked tests only ever ran inside the serial
-`make test`. Nothing about the per-worker isolation is marker-specific — each
-worker already gets its own Postgres, Redis database and filesystem root — so
+`make test`. Nothing about the per-worker isolation is marker-specific - each
+worker already gets its own Postgres, Redis database and filesystem root - so
 the slow set was running serially for no reason.
 
 Measured on a 4-core box: the 110 slow-marked tests take **5m37s** serially
@@ -5431,7 +5431,7 @@ and **1m43s** at `-n 4`, same result. The whole non-browser suite, 2,814
 tests, takes **3m37s**. Parallelism is worth more here than in the fast lane
 because what makes a test slow is usually waiting.
 
-`make test-xdist` is that lane — the fast one with nothing deselected. It
+`make test-xdist` is that lane - the fast one with nothing deselected. It
 replaces "the full serial suite as an occasional release gate" in CLAUDE.md,
 whose advice was built on a quarter-hour cost that no longer exists.
 
@@ -5451,19 +5451,19 @@ two spellings are redundant on purpose.
 ### Carry-over: `SET NULL` was the other wrong guess
 
 The correction above replaced a key that destroyed published configuration
-with one that preserved it — and broke the erasure guarantee in the direction
+with one that preserved it - and broke the erasure guarantee in the direction
 nobody was watching. `ON DELETE SET NULL` applies to every artifact, so a raw
 `DELETE FROM app_user` left a **private** artifact alive and unattributed,
 with its payload still under the shared filesystem root. §2.1 says an
 account's private artifacts go with it, and §2.3 claimed the key detached only
-"the rest" — which the key cannot do, because it cannot see visibility.
+"the rest" - which the key cannot do, because it cannot see visibility.
 
 Both guesses destroy something, so the key stops guessing. It is
 `ON DELETE RESTRICT` now, and the objection that a published row could block a
 personnel action does not survive contact with the code: `delete_user` deletes
 the private rows, detaches the published ones and only then removes the
 account, so by that statement nothing references it. Measured before changing
-anything — `delete_user` completes unchanged against a `RESTRICT` key.
+anything - `delete_user` completes unchanged against a `RESTRICT` key.
 
 What the restriction costs is a deletion that skipped all of that, and
 refusing it is the point. An operation that cannot say which artifacts should
@@ -5476,16 +5476,16 @@ reach both. The scratch-database test is parametrized over both starting
 states, and a mutation narrowing the condition back to the cascade is killed
 by the `SET NULL` case.
 
-`grep -rn "DELETE FROM app_user"` returns exactly one production call site —
-inside `delete_user` — so nothing else was relying on the key to clean up.
+`grep -rn "DELETE FROM app_user"` returns exactly one production call site -
+inside `delete_user` - so nothing else was relying on the key to clean up.
 
 ### Two carry-overs from the same review
 
 `make qa` and `make qa-unit` depended on the serial `test` target, so the lane
 described as the gate was not the one the gate ran. Both point at
 `test-xdist` now. CI was left alone deliberately: it runs the same selection
-serially on each supported Python version, which answers a different question —
-whether the suite passes on an interpreter this machine does not have — and I
+serially on each supported Python version, which answers a different question -
+whether the suite passes on an interpreter this machine does not have - and I
 cannot verify a CI change from here. The wording in CLAUDE.md and the Makefile
 says "local gate" rather than "the release gate" for that reason.
 
@@ -5498,7 +5498,7 @@ reads the table.
 
 ## The gates were reporting on rules nobody was reading
 
-Opening PR #178 started Actions for the first time on this branch — correctly,
+Opening PR #178 started Actions for the first time on this branch - correctly,
 since the workflow triggers only on `push` to `main`/`develop` and on
 `pull_request` targeting them, and a branch with no PR has neither event. What
 it started was not a clean run.
@@ -5506,7 +5506,7 @@ it started was not a clean run.
 ### lint: seven errors, none on main, none visible locally
 
 `make lint` passed `--ignore E402`, and ruff's `--ignore` does not add to the
-configured ignore list — it **replaces** it. `[tool.ruff.lint]` in
+configured ignore list - it **replaces** it. `[tool.ruff.lint]` in
 pyproject.toml already says `select = [E, F, W, I]` and `ignore = [E501]`, so
 the flag suppressed E402 locally and re-enabled E501, while CI's explicit
 `--select`/`--ignore` only restate the config. Five E402s and two unsorted
@@ -5519,7 +5519,7 @@ what CI uses. The tests line keeps its relaxation through `--extend-ignore`,
 which adds rather than replaces.
 
 The errors are fixed at the cause. The E402s were not deliberate late imports
-— `_password_hasher` had been inserted above `auth.py`'s import block, so the
+- `_password_hasher` had been inserted above `auth.py`'s import block, so the
 block moved back above it.
 
 ### security: red on main since 2025-11-30
@@ -5529,7 +5529,7 @@ step is byte-identical between main and this branch, so nothing here caused
 it; the gate has simply not been read in nine months.
 
 Fifteen findings at `-ll --skip B101`, twelve of them on main. `git blame`
-against `origin/main` identified the three this branch added — all B608, all
+against `origin/main` identified the three this branch added - all B608, all
 in `postgres.py`, all the same shape as seven that were already there.
 
 All fifteen were examined rather than suppressed on sight:
@@ -5538,10 +5538,10 @@ All fifteen were examined rather than suppressed on sight:
   (`"title = %s"`, `"visibility = 'private'"`) selected by an `is not None`
   check; no caller value reaches the f-string and every value is bound. False
   positives, suppressed per line with that reason.
-* **One B613, the only HIGH** — and the one worth fixing rather than
+* **One B613, the only HIGH** - and the one worth fixing rather than
   suppressing. `web.py` held raw bidi and zero-width characters inside
   `_INVISIBLE_RE`, the class it uses to strip exactly those characters from
-  fetched pages. Data, not a Trojan Source attack — but a character class
+  fetched pages. Data, not a Trojan Source attack - but a character class
   nobody can read in an editor or a diff is not reviewable, and a file
   containing raw bidi controls has the attack's shape whatever the intent. Now
   written as `\u` escapes with a comment per range. Proven equivalent by
@@ -5549,7 +5549,7 @@ All fifteen were examined rather than suppressed on sight:
   155 characters matched by both.
 * **One B314**, `ElementTree.fromstring` in the extractor, which already
   carried a comment explaining that stdlib ElementTree resolves no external
-  entities and that the size guard bounds amplification — and which runs in
+  entities and that the size guard bounds amplification - and which runs in
   the disposable extraction child anyway.
 * **One B102**, `exec` in the code interpreter, which is that module's entire
   purpose and already confined.
@@ -5563,10 +5563,10 @@ All fifteen were examined rather than suppressed on sight:
 
 The first pass appended `# nosec` to each reported line by line number. One of
 those lines opened a triple-quoted f-string, so the comment became part of the
-SQL — a broken `INSERT` that no test would have caught quickly, since bandit
+SQL - a broken `INSERT` that no test would have caught quickly, since bandit
 was satisfied and the statement still parsed. Found by asserting the real
 property instead of the proxy: walking every module's AST for a string literal
-containing `nosec` — none may exist. That query is the reason this is a
+containing `nosec` - none may exist. That query is the reason this is a
 paragraph rather than a defect on the branch.
 
 The statement is now concatenated rather than triple-quoted, so the
@@ -5580,12 +5580,12 @@ that loads the suite died before a single test:
     tests/conftest.py:20: from tests.harness import run_id, worker_id
     E   ModuleNotFoundError: No module named 'tests'
 
-Not a 3.12 problem, though that is the job that reported it — reproduced on
+Not a 3.12 problem, though that is the job that reported it - reproduced on
 3.11 locally in one command. `python -m pytest` puts the working directory on
 `sys.path`; bare `pytest` does not, and CI runs bare `pytest`. Every local run
 this whole branch used the first form, and CI uses the second, so a conftest
-importing `tests.harness` — which this branch introduced with the worker
-isolation — was never once exercised the way CI would exercise it.
+importing `tests.harness` - which this branch introduced with the worker
+isolation - was never once exercised the way CI would exercise it.
 
 `pythonpath = ["."]` in `[tool.pytest.ini_options]` makes both invocations the
 same invocation, which is the property that was missing rather than the path
@@ -5603,7 +5603,7 @@ Worth stating as a single lesson rather than three incidents. The lint gate
 ran different rules locally than in CI; the security gate had not been read in
 nine months; the test gate was invoked one way locally and another way in CI.
 In all three the local command and the blocking command were not the same
-command, and in all three the local one was the more permissive — so local
+command, and in all three the local one was the more permissive - so local
 green meant nothing and nobody could see that it meant nothing.
 
 The fix in each case was to delete the difference rather than to chase the
@@ -5617,7 +5617,7 @@ invocation work both ways.
 local command cannot pass while CI fails, which is the safe direction for a
 mismatch to point.
 
-Not fixed, and pre-existing: `make lint` also fails on `tests/` — 22 errors on
+Not fixed, and pre-existing: `make lint` also fails on `tests/` - 22 errors on
 main, 25 here. Unsorted imports, `l` as a variable name, and six repeated dict
 keys whose values are identical, so nothing is dropped. CI does not lint
 `tests/`.
@@ -5630,27 +5630,27 @@ died there, on every Python version:
     liminallm/service/auth.py:17: import httpx
     E   ModuleNotFoundError: No module named 'httpx'
 
-**`httpx` is imported at module scope by five files** — `auth`, `web`,
-`sandbox`, `voice`, `gemini_backend` — and appears in no dependency list. It
+**`httpx` is imported at module scope by five files** - `auth`, `web`,
+`sandbox`, `voice`, `gemini_backend` - and appears in no dependency list. It
 has only ever arrived because `openai` depended on it.
 
 The reason it stopped is not a resolution accident. Resolving the base set as
 CI does gives `openai==3.3.1`, and **openai 3.x moved from `httpx` to
 `httpx2`**. Locally the dev extra pins `openai>=2.8.1` and the lockfile holds
-2.8.1, which still uses `httpx` — so every local environment had it and no CI
+2.8.1, which still uses `httpx` - so every local environment had it and no CI
 environment did. Measured with `uv pip compile` on the exact base set, before
 and after: `httpx` absent, then `httpx==0.28.1` alongside `httpx2==2.12.0`.
 
 That is not a near miss. A direct import satisfied by somebody else's
 requirement holds only until their requirement changes, and when it broke the
-application did not degrade — it failed to import, so every test job died in
+application did not degrade - it failed to import, so every test job died in
 the conftest before collecting anything.
 
 `httpx>=0.27,<1` is declared now. A sweep of every third-party import in
 `liminallm/` found two more undeclared names, and neither is a defect:
 `numpy` is a function-local import beside `safetensors.numpy` in the
-checkpoint loader — added to the `train` extra, since the code imports it
-directly — and `tiktoken` sits inside a `try:` that falls back to a heuristic
+checkpoint loader - added to the `train` extra, since the code imports it
+directly - and `tiktoken` sits inside a `try:` that falls back to a heuristic
 count, which is what optional is supposed to look like.
 
 ### The guard
@@ -5660,7 +5660,7 @@ count, which is what optional is supposed to look like.
 to be a declared base dependency. The rule is about position, not identity: a
 module-scope import is a hard requirement, and a function-local one is this
 repository's idiom for a capability that can be absent. Two supporting tests
-keep it honest — one asserts the walk actually finds something, so a broken
+keep it honest - one asserts the walk actually finds something, so a broken
 parser cannot report a clean list forever, and one pins `numpy` and `tiktoken`
 as deliberately function-local, so moving either to module scope becomes a
 decision rather than an accident.
@@ -5671,7 +5671,7 @@ Mutation: removing the `httpx` line from `pyproject.toml` fails it.
 
 CI installs unpinned, so it gets `openai==3.3.1`; the Responses conformance
 suite was qualified against 2.8.1, and the dev extra's comment claims the
-lockfile records which snapshot was qualified — but CI does not use the
+lockfile records which snapshot was qualified - but CI does not use the
 lockfile. Checked rather than assumed: 3.3.1 still exports every type those
 tests import, so they will at least collect. Whether the shapes still validate
 is what the run will say. Recorded here because the claim in the dev extra is
@@ -5683,8 +5683,8 @@ Midway through this, the local suite began failing in `initdb` with
 `cannot create /dev/null: Permission denied`. `/dev/null` had been replaced by
 a regular 48-byte file instead of the character device, so anything dropping
 output as an unprivileged user failed. Restored with `mknod /dev/null c 1 3`.
-Worth writing down only because the symptom — Postgres refusing to initialise
-— points nowhere near the cause.
+Worth writing down only because the symptom - Postgres refusing to initialise
+- points nowhere near the cause.
 
 ## The guard against undeclared imports had two of its own
 
@@ -5701,13 +5701,13 @@ shape, both introduced by the commit that was supposed to close it.
 
 `tomllib` entered the standard library in 3.11. This project's floor is 3.10,
 where it is the `tomli` backport under a different name. So the test written to
-catch a dependency nobody declared was itself a dependency nobody declared —
+catch a dependency nobody declared was itself a dependency nobody declared -
 on the one interpreter that had to be checked and was not.
 
 The fix is the ordinary conditional import plus `tomli>=2.0; python_version <
 '3.11'` in the dev extra. Two things went with it. `packaging.requirements`
 came out in favour of a small regex over the distribution name, because
-`packaging` is *also* transitively supplied — pytest happens to depend on it —
+`packaging` is *also* transitively supplied - pytest happens to depend on it -
 and a test about undeclared dependencies should not rest on one. And two
 entries in the name map, `uvicorn[standard]` and `psycopg[binary]`, could never
 match: the regex strips the extra before the lookup, so both fell through to a
@@ -5726,12 +5726,12 @@ passed, and removing the fallback reproduces the collection error exactly.
     ================ 6 skipped, 2694 deselected, 2 errors ================
 
 Both modules already guard `jax` and `safetensors` with `importorskip`, and
-imported `numpy` plainly beside them — it is ubiquitous wherever `jax` is, and
+imported `numpy` plainly beside them - it is ubiquitous wherever `jax` is, and
 that is exactly the assumption that fails. `numpy` is in the `train` extra. No
 CI lane installs that extra; the **test** job gets `numpy` because its install
 line names `jax`, which brings it along. The **browser** job installs only base
 plus dev, so `numpy` is absent there, and a module-scope import in a test file
-is not a failing test — it is a collection error that aborts the run. 2694
+is not a failing test - it is a collection error that aborts the run. 2694
 tests it would have deselected never ran.
 
 The same defect as `httpx`, one directory over: a module-scope import satisfied
@@ -5743,7 +5743,7 @@ The first version of this check walked `liminallm/` only, which is why it could
 not see either of these. It now walks `tests/` as well, and the rule there is
 measured against the narrowest lane rather than against `[project]
 dependencies`: a test module may import at module scope only what **every** CI
-lane installs — base plus dev — and reaches anything outside that through
+lane installs - base plus dev - and reaches anything outside that through
 `pytest.importorskip`, which is a call this walk does not see and a skip rather
 than an error when the package is missing. Today `tests/` imports exactly four
 third-party names at module scope: `pytest`, `fastapi`, `httpx`, `pydantic`.
@@ -5758,8 +5758,8 @@ can go quietly empty.
 ### What this cost, and the shape it keeps taking
 
 Three commits to declare one dependency, and each one's fix introduced the
-next. The pattern is the one already named on this branch — the witness stands
-one layer below where the defect lives — with a second edge: **the local
+next. The pattern is the one already named on this branch - the witness stands
+one layer below where the defect lives - with a second edge: **the local
 environment is never the narrowest environment.** Every one of these passed
 locally, on an interpreter with the extras installed, and failed on the lane
 that had least. Where a check is about what is installed, the only meaningful
@@ -5773,7 +5773,7 @@ The `tests/` check asks whether a module-scope import is in base plus dev,
 which is what the browser lane installs. It read the requirement strings with a
 regex that takes the distribution name and stops, so **an environment marker
 was invisible to it**. `tomli>=2.0; python_version < '3.11'` is in the dev
-extra, so the set named `installed_everywhere` contained `tomli` — a package
+extra, so the set named `installed_everywhere` contained `tomli` - a package
 installed on 3.10 and on nothing else. The browser lane runs 3.11. A
 module-scope `import tomli` in `tests/` would have passed the guard and aborted
 that lane's collection anyway, which is the one failure the guard exists to
@@ -5806,7 +5806,7 @@ the conformance suite would at least collect, and that whether the shapes still
 validated was what the run would say.
 
 The run said no. `test (3.10)` on `1030758` failed after fourteen minutes, with
-the other two matrix jobs cancelled by fail-fast rather than failed — so CI
+the other two matrix jobs cancelled by fail-fast rather than failed - so CI
 could not tell whether the defect was version-specific, and the local
 3.11 lane had passed 2823 tests half an hour earlier.
 
@@ -5825,7 +5825,7 @@ stream union turned a wall of union errors into one line:
 **openai 3.x made `cache_write_tokens` a required field of
 `input_tokens_details`.** In 2.8.1 that object required only `cached_tokens`.
 The served usage block emitted only `cached_tokens`, so as of 3.x this server
-had stopped conforming to the dialect it claims to speak — in exactly the way
+had stopped conforming to the dialect it claims to speak - in exactly the way
 `_responses_usage`'s own docstring warns about: *"the details objects are
 always present (zeros when unknown) because typed SDKs require the fields."*
 The principle was written down and the field was not added when the SDK added
@@ -5844,7 +5844,7 @@ diffing required-field sets across every model under `openai.types.responses`
 in both SDKs.
 
 The first version of that diff walked only the package's top-level exports and
-reported five changed models — and did not include `InputTokensDetails`, which
+reported five changed models - and did not include `InputTokensDetails`, which
 lives in the `response_usage` submodule. It could not see the very field being
 fixed. Walking the submodules too raised the count from 218 models to 390 and
 made the diff worth trusting:
@@ -5865,7 +5865,7 @@ fix, for a checked reason rather than a hopeful one.
 
 ### The cap that was not added
 
-The obvious response — pin `openai` below 3 — is the wrong one, and the reason
+The obvious response - pin `openai` below 3 - is the wrong one, and the reason
 is worth keeping. The unpinned range is what surfaced a wire this server had
 genuinely stopped conforming to. A cap would have preserved a green suite over
 a payload no current SDK accepts. The comment in the dev extra now says that
@@ -5874,7 +5874,7 @@ CI.
 
 Mutation: removing `cache_write_tokens` reproduces exactly the five failures,
 and restoring it gives 42 passed. Both SDK versions pass with the fix in place
-— 42 on 3.3.1 under 3.10, and 42 on 2.8.1 under 3.11 — so following the newer
+- 42 on 3.3.1 under 3.10, and 42 on 2.8.1 under 3.11 - so following the newer
 type did not break the older one.
 
 ### The lesson, again, one level up
@@ -5884,7 +5884,7 @@ sharpest instance: **the local environment is never the narrowest environment,
 and it is never the newest one either.** The 3.10 job failed on a package
 version no machine here had. The browser lane failed on a package no lane
 except one installed. Where a check is about the environment, the only place
-worth running it is an environment that differs from this one — which is what
+worth running it is an environment that differs from this one - which is what
 building CI's exact interpreter and install lines locally finally did.
 
 ### And a third package no lane installs: Pillow
@@ -5898,7 +5898,7 @@ The same 3.10 run that surfaced the openai defect also failed three tests on
 
 Pillow is in the `ocr` extra. No CI lane installs that extra, and every local
 environment had it. Most PIL-using tests skip cleanly because they carry
-`@pytest.mark.skipif(not ocr_available())` — but those three are gated on
+`@pytest.mark.skipif(not ocr_available())` - but those three are gated on
 nothing, and correctly so: they are not OCR tests. They exercise the refusal
 paths, where an unreadable image must name the remedy and a decompression bomb
 must be refused before it allocates. So the three tests that most deserve to
@@ -5916,7 +5916,7 @@ but a developer's.
 ### The class is wider than the guard, and this is measured
 
 The guard checks module-scope imports, because those abort collection. These
-three were *function-local*, which fails one test rather than the run — a
+three were *function-local*, which fails one test rather than the run - a
 milder symptom of the identical cause. Extending the same question to every
 import at any depth in `tests/`, exempting names handed to
 `pytest.importorskip`, flags five more:
@@ -5927,7 +5927,7 @@ import at any depth in `tests/`, exempting names handed to
     tomli       tests/test_declared_dependencies.py
     yaml        tests/test_harness_runs_the_real_thing.py
 
-`tomli` is a false positive — it sits inside a `try:`, which is the deliberate
+`tomli` is a false positive - it sits inside a `try:`, which is the deliberate
 soft-dependency idiom, so a real check needs that exemption. The rest are the
 genuine article, and `starlette` is precisely the `httpx` shape one directory
 over: imported directly, declared nowhere, present only because `fastapi`
@@ -5944,7 +5944,7 @@ change into a commit that has to be about the red.
 CI's 3.10 and 3.11 jobs both failed, and for once the cause was neither the
 interpreter version nor the dependency set. A CI-matching environment passes
 2671 tests here in parallel, serially, and serially with coverage against a
-schema built by `migrate.sh` — four reproductions, four negatives. The answer
+schema built by `migrate.sh` - four reproductions, four negatives. The answer
 was only ever in the job log.
 
 Which was, itself, the first problem. The `test` job prints ~2700 verbose
@@ -5952,15 +5952,15 @@ lines and then dumps the entire Postgres service-container log, so the failure
 summary sits roughly 7000 lines from the end and the available tooling reads
 tails. `get_check_run`'s `output.text` is empty for Actions checks. The summary
 was finally reached by requesting a 4000-line tail, letting it overflow to a
-file, and grepping the file — which costs nothing and should have been the
+file, and grepping the file - which costs nothing and should have been the
 first move rather than the fifth.
 
 ### 51 failures, and 31 of them one line
 
     PermissionError: [Errno 13] Permission denied: '/proc/self/setgroups'
 
-That is the sandbox working. `interpreter.py` says it plainly — *"There is no
-unconfined fallback"* — so a kernel that refuses the namespace means
+That is the sandbox working. `interpreter.py` says it plainly - *"There is no
+unconfined fallback"* - so a kernel that refuses the namespace means
 model-written code does not run, and every test needing a working interpreter
 fails. Failing closed against a hostile host policy is the behaviour to keep,
 not to argue with.
@@ -5992,9 +5992,9 @@ So there were two defects, not one, and only the second is about CI.
 **`_linux_available()` was wrong on a mainstream distribution.** It now reads
 the AppArmor knob too. This matters off CI: `backend_name()` decides whether
 the interpreter is offered at all, and on a stock Noble host it was advertising
-a capability that fails on every call. The check is pessimistic — an AppArmor
+a capability that fails on every call. The check is pessimistic - an AppArmor
 profile carrying `userns create` lifts the restriction for the programs it
-covers — and pessimistic is the right direction, because a wrong `False`
+covers - and pessimistic is the right direction, because a wrong `False`
 withholds a working interpreter while a wrong `True` offers a broken one.
 
 **The three `/proc` writes now name their operation and errno**, the way
@@ -6011,9 +6011,9 @@ correct probe on a restricted runner converts 31 failing confinement tests into
 31 passing skips, and the lane reports success while the security boundary goes
 completely untested.
 
-So the runner enables the primitive explicitly — `sysctl -w
+So the runner enables the primitive explicitly - `sysctl -w
 kernel.apparmor_restrict_unprivileged_userns=0`, not `|| true`, so the lane
-fails at that step if it ever stops working — and the lane declares
+fails at that step if it ever stops working - and the lane declares
 `LIMINALLM_REQUIRE_CONFINEMENT=1`, which arms a test that fails loudly when no
 backend is available. It runs code inside the sandbox rather than reading a
 sysctl, because what needs proving is that the boundary engages, not that a
@@ -6029,8 +6029,8 @@ variable the same suite skips 18 tests quietly, which is correct on a laptop.
 
 Twenty of the 51 failures are unrelated and are the first look CI has ever had
 at them: `ripgrep` is absent on the runner so two settings tests error on
-`FileNotFoundError: 'rg'` — the undeclared-tool shape again, one level out from
-a Python package — two more fail starting a second Postgres inside a test, and
+`FileNotFoundError: 'rg'` - the undeclared-tool shape again, one level out from
+a Python package - two more fail starting a second Postgres inside a test, and
 seven workflow-retry tests report zero retries. Three of those four files
 predate this branch. CI has never reached them before, because until this week
 it never got past importing the application.
@@ -6043,7 +6043,7 @@ Reported by Cursor Bugbot against `f9f587a`, and correct. The probe step was
 
 under Actions' default `bash -e`. `unshare` failed, the shell aborted the step
 before the `echo`, and job-level `continue-on-error` does not keep *later steps*
-running — so the two steps that mattered most, the confinement sequence call by
+running - so the two steps that mattered most, the confinement sequence call by
 call and what `_linux_available()` concludes, never ran. They were skipped by
 exactly the failure mode the job existed to distinguish.
 
@@ -6060,8 +6060,8 @@ missing, instead of leaving a green run whose evidence was silently skipped.
 ## The other twenty failures were four things, and one of them was nothing
 
 With the confinement cause identified, the remaining CI failures were worth
-attributing rather than assuming. Breaking confinement locally — pointing the
-availability probe at a knob reading 1, which is the runner's setting —
+attributing rather than assuming. Breaking confinement locally - pointing the
+availability probe at a knob reading 1, which is the runner's setting -
 reproduces the CI run file by file:
 
     test_attachments          10 failed   (CI: 9)
@@ -6082,7 +6082,7 @@ one. The remaining five are three separate things.
 
 ### There was never a retry bug
 
-The seven `test_workflow_retry_timeout` failures all read `assert 0 == 3` — no
+The seven `test_workflow_retry_timeout` failures all read `assert 0 == 3` - no
 retries at all, apparently. The log says otherwise:
 
     tool_worker_spawned      pid 14308, attempt 0
@@ -6103,7 +6103,7 @@ and `_run_builtin_body` never got to run there: every attempt failed with
     "the tool worker could not establish the boundary it runs under, so it ran
      nothing: [Errno 13] Permission denied: '/proc/self/setgroups'"
 
-So the assertion was reporting a true fact — the tool body ran zero times —
+So the assertion was reporting a true fact - the tool body ran zero times -
 about a cause three layers below the test's subject. Reproduced by breaking
 confinement locally: the same four assertions fail, `assert 0 == 3`,
 `assert 0 == (3 + 1)`, `assert 0 == 1`, `assert 'error' == 'ok'`, in the same
@@ -6115,7 +6115,7 @@ order CI reported them. Nothing in the retry path needed changing, and
 `tests/test_settings_sources.py` shelled out to `rg` for two source sweeps.
 It is a binary no lane installs, so both tests raised `FileNotFoundError: 'rg'`
 on the runner and passed on every developer machine that happened to have it.
-The same shape as the undeclared `httpx`, `numpy` and `Pillow` before it —
+The same shape as the undeclared `httpx`, `numpy` and `Pillow` before it -
 this time not a Python package at all, which is why no dependency guard could
 have caught it.
 
@@ -6128,7 +6128,7 @@ matches against the whole formatted line.
 Verified by comparison rather than by re-running: the walk's output is
 byte-identical to ripgrep's on both patterns. One pattern legitimately matches
 nothing, which is exactly the shape that goes vacuous unnoticed, so both were
-mutation-tested — planting `os.getenv("SNEAKY_SETTING")` and
+mutation-tested - planting `os.getenv("SNEAKY_SETTING")` and
 `getattr(settings, "made_up_field", 42)` in a service module makes each test
 fail naming the planted line.
 
@@ -6147,13 +6147,13 @@ Debian and Ubuntu compile `unix_socket_directories` as `/var/run/postgresql`,
 owned by `postgres`. The harness runs as root locally and `su`s to that user,
 so it never noticed; a CI runner running the suite as an ordinary user cannot
 write there. The socket now goes in the data directory, which is the one place
-this cluster's own user is guaranteed to own — a scratch cluster should not be
+this cluster's own user is guaranteed to own - a scratch cluster should not be
 reaching outside its scratch directory anyway, and `createdb` and the tests
 connect over TCP regardless.
 
 The second half matters more than the first. `_run` sent both streams to
 `DEVNULL`, and `pg_ctl` only ever prints "could not start server. Examine the
-log output" — so the reason existed the whole time, in a file, and the harness
+log output" - so the reason existed the whole time, in a file, and the harness
 threw it away. It now raises with the command, the exit status, both streams
 and the tail of the server log. **That is the third instrumentation gap in two
 days with the same shape: the failure was legible and something discarded the
@@ -6163,13 +6163,13 @@ still fails, and the new message states the permission error outright.
 ### One failure left, and it is not reproduced
 
 `test_generation_lifecycle.py::test_a_source_rooted_above_the_file_still_serializes`
-is a real race — two threads, a gated `_commit_generation`, and an assertion
+is a real race - two threads, a gated `_commit_generation`, and an assertion
 that the walk did not commit over the newer generation. It does not reproduce
 here under any configuration tried: normally, with confinement broken, or
 pinned to one and to two CPUs, three runs each.
 
 Deliberately not "fixed". Its synchronisation includes a `time.sleep(1.0)`,
-which is the obvious thing to harden, but it is not the proximate cause —
+which is the obvious thing to harden, but it is not the proximate cause -
 CI failed the *later* assertion, so the gate it guards did hold. Editing a race
 test's synchronisation without being able to reproduce its failure is how a
 test starts passing vacuously, which is the defect this file spends most of its
@@ -6197,7 +6197,7 @@ The model answered without reading the page. The log said why:
 is the SSRF check on the URL, and the test opts out of it explicitly, saying so
 in a comment. The tool network allowlist is a separate socket-level guard,
 consulted when the connection is opened and built once from settings in the
-engine's constructor — so patching settings afterwards never reaches it. The
+engine's constructor - so patching settings afterwards never reaches it. The
 test never opted out of that one.
 
 It passed anyway, everywhere, for a reason worth writing down.
@@ -6231,14 +6231,14 @@ three competing CPU hogs at twice the wall clock. Six configurations, no
 failure.
 
 So it was not fixed. Its assertions could only ever report that the answer was
-wrong, and the question is *which commit landed last* — so the gate now records
+wrong, and the question is *which commit landed last* - so the gate now records
 each commit as it happens and the failure message carries the sequence.
 
 Two details of that instrumentation are worth keeping, because the first
 version of it was useless and the second nearly was. Labelling by
 `threading.current_thread().name` produced `asyncio_0` for both actors, since
 the test client runs each request on an executor thread rather than the thread
-that started it — evidence that distinguishes nothing. The label is read from
+that started it - evidence that distinguishes nothing. The label is read from
 the committed chunks instead, and says `neither` rather than guessing when it
 cannot tell. Verified by forcing the assertion: a passing run reads
 
@@ -6246,7 +6246,7 @@ cannot tell. Verified by forcing the assertion: a passing run reads
 
 The upload's commit is last, which is the correct outcome; a failure will show
 it is not, and by how much. Forcing that assertion also caught the check being
-applied to the wrong function — this file holds two tests with an identical
+applied to the wrong function - this file holds two tests with an identical
 block, and the first edit landed on the sibling, which is its own small lesson
 about verifying that a mutation went where it was aimed.
 
@@ -6258,8 +6258,8 @@ The browser lane failed once on `5eadf33` with
           psycopg.errors.DeadlockDetected: deadlock detected
 
 at fixture setup, failing a test that had not started. That commit touched only
-`ScratchPostgres` — which this lane never constructs, since it sets
-`TEST_DATABASE_URL` — and a settings test the lane deselects, so it was not the
+`ScratchPostgres` - which this lane never constructs, since it sets
+`TEST_DATABASE_URL` - and a settings test the lane deselects, so it was not the
 cause. First sighting, on a lane CI has only just become able to run.
 
 `_truncate_all`'s own docstring named the assumption it was breaking: *"this
@@ -6273,7 +6273,7 @@ Postgres kills one.
 Reproduced rather than reasoned about: a reader holding one table and reaching
 for a second, against a TRUNCATE holding the second and reaching for the first,
 deadlocks every time. Worth noting that the probe's *reader* lost while CI's
-*fixture* lost — either side can be chosen, so the fixture has to survive being
+*fixture* lost - either side can be chosen, so the fixture has to survive being
 it.
 
 **And the first fix did not work, which the measurement caught before it was
@@ -6281,13 +6281,13 @@ committed.** A plain retry against six continuously looping readers changed
 nothing: 51 of 60 truncates failed with and without it, identical numbers,
 because a retry lands in the same steady state and the attempts stop being
 independent. Identical numbers are what prompted checking whether the `except`
-branch was even reached — it was, and `DeadlockDetected` was the right class.
+branch was even reached - it was, and `DeadlockDetected` was the right class.
 The retry simply does not help there.
 
 It helps decisively against the contention this lane actually produces. With a
 single in-flight reader overlapping the wipe: **40 of 40 failed without the
 retry, 0 of 40 with it.** So the fix is kept, with both numbers written down,
-because the boundary is the useful part — if this lane ever holds a database
+because the boundary is the useful part - if this lane ever holds a database
 busy while wiping it, the right answer is to quiesce the server rather than
 raise the attempt count, and exhausting the attempts is how it will say so.
 
@@ -6295,7 +6295,7 @@ Two lessons, and the second is the one that nearly got away. A retry is not
 automatically a fix for a deadlock; whether it helps depends entirely on
 whether the contention is transient, and that is measurable in about a minute.
 And an instrument that reports the same number for both arms of an experiment
-is reporting that it measured nothing — which is the same shape as the
+is reporting that it measured nothing - which is the same shape as the
 tick-count heartbeat and the vacuous witnesses that this file already tracks,
 arriving this time in the verification of a fix rather than in the fix itself.
 
@@ -6308,7 +6308,7 @@ Fixing the socket directory moved `test_worker_isolation` from failing at
         returned non-zero exit status 3
 
 Exit 3 is psql saying `ON_ERROR_STOP` fired. Which statement failed is in
-stderr, and `apply_schema` sent stdout to `DEVNULL` and never captured stderr —
+stderr, and `apply_schema` sent stdout to `DEVNULL` and never captured stderr -
 so the answer was thrown away one line before it was needed. **That is the
 fifth instrumentation gap of the same shape in two days**, after `confine.py`'s
 `/proc` writes, `pg_ctl`'s log, the sandbox's `worker_unconfined`, and the
@@ -6326,7 +6326,7 @@ The likely cause of the exit 3 is `sql/schema.sql:236`, `CREATE EXTENSION
 vector`. The runner reaches pgvector through a *service container*, and a
 scratch cluster is built from the **host's** binaries, which are stock
 PostgreSQL. This development box happens to have `postgresql-16-pgvector`
-installed, so the control file is there and the schema applies — the fifth
+installed, so the control file is there and the schema applies - the fifth
 environment coincidence in the same list.
 
 So `ScratchPostgres.available` now asks whether the installation can supply the
@@ -6336,7 +6336,7 @@ naming the missing extension and saying that a pgvector service container does
 not help, because it is a different server. The three call sites report that
 reason instead of "needs initdb", which was true of none of them.
 
-This is a skip, and the earlier argument against skips still applies — so it is
+This is a skip, and the earlier argument against skips still applies - so it is
 worth being precise about why this one is not the same. The confinement tests
 would have skipped a *security boundary* on the lane meant to prove it. These
 cover the harness's own worker isolation on a scratch cluster, and the property
@@ -6349,8 +6349,8 @@ saying so beats an opaque exit code.
 Reported by Cursor Bugbot against `c2a037e`, and correct. Three call sites were
 updated to report `unavailable_reason`; `_external_or_skip` was a fourth, and it
 still skipped with a fixed `"needs initdb and redis-server"`. So a host with
-`initdb` and without pgvector — the exact case the availability check had just
-been extended to catch — was told the one explanation that could not apply to
+`initdb` and without pgvector - the exact case the availability check had just
+been extended to catch - was told the one explanation that could not apply to
 it.
 
 This repository's own rule covers it: *grep the class when you fix the
@@ -6385,7 +6385,7 @@ runner the walk reaches `report.md` first, the gate holds the contested file,
 and the race actually happens.
 
 So the test is a vacuous witness here, in the same shape this file has tracked
-all along — passing for a reason unrelated to what it claims, and only
+all along - passing for a reason unrelated to what it claims, and only
 accidentally, on the ordering `os.scandir` happens to give this filesystem.
 
 ### And when the race does happen, the product loses it
@@ -6397,7 +6397,7 @@ Three runs, three failures:
 
 The walk's *stale* generation lands last, at 1.38s, and the upload's commit
 never happens at all. Meanwhile the upload returned 200 and the new bytes are
-on disk — the assertion immediately above the failing one checks
+on disk - the assertion immediately above the failing one checks
 `(files_dir / "report.md").read_bytes() == second` and passes, and
 `waited_for_release` is true, so the upload did block on the walk as intended.
 
@@ -6412,8 +6412,8 @@ walk's commit lands last. Every step succeeds."*
 This is a product finding, not a CI one, and two things make it wrong to fold
 into this branch unasked. The subsystem is untouched by the MCP work this pull
 request is about. And the fix has two halves that must land together: the
-gate has to become deterministic — naming `report.md` rather than taking
-whatever comes first — or the test will go on passing here for the wrong
+gate has to become deterministic - naming `report.md` rather than taking
+whatever comes first - or the test will go on passing here for the wrong
 reason, and making it deterministic without fixing the serialization turns a
 locally-green test into a permanently red one.
 
@@ -6444,7 +6444,7 @@ and dumping the rows outright:
                     content='{"report.md":{"checksum":"c915c5b6...","contexts":[]}}')]
 
 One row, for `.checksums.json`, and **no row for `report.md` at all**. The
-walk's stale commit did land, and the upload's invalidation then removed it —
+walk's stale commit did land, and the upload's invalidation then removed it -
 which is the safe outcome and the opposite of what was claimed.
 
 So the real defect, stated correctly:
@@ -6455,7 +6455,7 @@ So the real defect, stated correctly:
   `bool(context_id) and ...` and an ordinary upload names no context.
 * `contexts = set(prior_contexts) if deduped else set()` then resets the
   manifest's association, so nothing records that the context ever covered the
-  file — visible in the row above as `"contexts":[]`.
+  file - visible in the row above as `"contexts":[]`.
 
 The net effect is **silent coverage loss**: a context stops covering a file it
 covered, a search that used to find it finds nothing, and no error is raised
@@ -6465,20 +6465,20 @@ still not something to leave unnamed.
 Worth keeping as its own lesson, because it is the same shape as everything
 else in this file arriving one level up. An assertion message is a claim
 written at the same time as the assertion, by the same person, about what a
-failure would mean — so it is not evidence about what the failure *is*. The
+failure would mean - so it is not evidence about what the failure *is*. The
 index had to be read.
 
 ## Closing the coverage loss: emptying is half a correction
 
-The finding above stops at the right diagnosis — a context stops covering a
-file it covered, silently — and this is what it took to close it.
+The finding above stops at the right diagnosis - a context stops covering a
+file it covered, silently - and this is what it took to close it.
 
 **One authority for coverage.** `context_source` is the record that a context
 covers a path. Not `knowledge_chunk`, which is the materialisation of that
 record: a stray row would otherwise promote itself into a relationship nobody
 created, and, worse in the other direction, coverage would evaporate whenever
 a cleanup removed the index. Not the upload manifest either, which holds only
-the contexts an upload named — a directory source never appears in it, which
+the contexts an upload named - a directory source never appears in it, which
 is exactly how the original defect stayed invisible. `contexts_covering_path`
 reads `context_source` and nothing else, scoped to the owner, and the ingest
 paths now record the relationship so the authority is complete.
@@ -6487,32 +6487,32 @@ paths now record the relationship so the authority is complete.
 The upload already emptied every covering context under its publication lock,
 and that half is right: a chunk claiming to be the file's contents is false
 the moment new bytes exist. What it could not do there is re-read and re-embed
-for a set of contexts the request never chose — genuinely unbounded work,
+for a set of contexts the request never chose - genuinely unbounded work,
 which is why the code declined to do it and left the file lost. So the upload
 now records an `ingest_job` per covering context instead. Between empty and
 refill the path is *absent* from those contexts: recoverable, and unlike a
 stale answer, honest.
 
 **The queue takes the same lock the upload takes.** `service.fs.path_lock`,
-on the same key, with the generation re-read inside it — because waiting for
+on the same key, with the generation re-read inside it - because waiting for
 a lock is exactly when a replacement is most likely to have happened. A worker
 that cannot get the lock stands aside without spending an attempt, since
 whoever holds it is publishing that name and will queue what its own bytes
 need. Two locks that merely resembled each other would serialise nothing, so
 that is what the witness checks: a worker holding the lock, an ordinary upload
 of the same path, and a 409. Given the worker a key of its own, the upload
-publishes straight over it — measured, 200 instead of 409.
+publishes straight over it - measured, 200 instead of 409.
 
 **What the queue must not do is forget.** Each job carries the checksum of the
 bytes that prompted it and declines if the file has moved on. Repeated
 replacements collapse onto one pending slot holding the newest, with the due
-time reset — it is new bytes, not a retry of the job it displaced. Retries are
+time reset - it is new bytes, not a retry of the job it displaced. Retries are
 scheduled rather than immediate, because a worker drains until the queue is
 empty and an unscheduled retry is re-claimed within a second of the first
 failure, covering none of the outages retries exist for. A claimed job carries
 a lease, so a process killed mid-job returns its work instead of stranding it:
 the claim must not become the thing that forgets the file. And a read error is
-not a deletion — `FileNotFoundError` finishes a job, every other `OSError`
+not a deletion - `FileNotFoundError` finishes a job, every other `OSError`
 leaves it owed.
 
 **Two tests here asserted the old behaviour and were revised, not deleted.**
@@ -6525,7 +6525,7 @@ still described, and what it says is the current generation.
 
 **A note on the witnesses, because three of them had to be rewritten.** Each
 passed against code that was broken, and the mutation is what said so. One
-asserted every waiter eventually succeeded — which they do, just slower. One
+asserted every waiter eventually succeeded - which they do, just slower. One
 asserted a file came back after a manual drain, proving the job was real work
 rather than that anything was scheduled to run it. One simulated a racing
 replacement by deleting the very rows that would have proved the defect. The
@@ -6537,7 +6537,7 @@ you nothing until you have seen it fail for the reason you intend.
 The invariant: **after `DELETE /v1/files/{path}` returns success, no
 retrievable state may describe the deleted bytes.**
 
-Chunks were already handled — `delete_chunks_under_path` runs under the
+Chunks were already handled - `delete_chunks_under_path` runs under the
 publication lock and covers a whole subtree. What was left is everything that
 would put them back or go on claiming them.
 
@@ -6554,8 +6554,8 @@ beside it. That mistake has its own witness, and the mutation confirms the
 witness catches it and nothing else does.
 
 **A re-read owed for a path that is gone is owed for nothing.** A queued job
-could not in fact refill a deleted path — it re-reads the file, finds nothing
-and supersedes itself — so cancelling is not what makes deletion correct. It is
+could not in fact refill a deleted path - it re-reads the file, finds nothing
+and supersedes itself - so cancelling is not what makes deletion correct. It is
 that the queue records "this context owes this path a re-read", and once the
 path is gone that record is false; leaving it to be discovered later means a
 worker claims it, reads a missing file and writes a failure, for work nobody
@@ -6565,7 +6565,7 @@ wants.
 merged in the previous tranche keyed its publication lock on the file's own
 parent directory. `namespace_key` deliberately keys a name's *first component*
 so that a recursive delete of `bundle` and a mutation of `bundle/inner.md` meet
-— that is the whole reason it exists. Keying on the parent produced a lock
+- that is the whole reason it exists. Keying on the parent produced a lock
 nothing else takes.
 
 Measured, before the fix: a delete of `bundle` returned 200 while a job was
@@ -6575,7 +6575,7 @@ retrievable came down to which of two unsynchronised writes landed second.
 
 The root-file case hid it, because at the top level `namespace_key(files_dir,
 "report.md")` and `namespace_key(files_dir/"", "report.md")` agree. Only the
-nested case separates them — a reminder that a serialization witness proves
+nested case separates them - a reminder that a serialization witness proves
 nothing about depths it does not exercise. `publication_key` now derives the
 key from an absolute path by locating the files directory rather than assuming
 a depth, and both sides go through it.
@@ -6593,15 +6593,15 @@ source rows or descendant jobs: its source names the tree itself, and its job
 runs to completion before the deletion proceeds. So narrowing either
 predicate from separator-bounded subtree match to exact match would have left
 `bundle/inner.md`'s own source row and its queued job behind while all five
-cases still passed. One tree with three records at three depths — an ancestor
+cases still passed. One tree with three records at three depths - an ancestor
 directory source, an exact-file source inside the tree, and a queued job for
-that file — closes it, and the two narrowings now die by that test alone.
+that file - closes it, and the two narrowings now die by that test alone.
 
 **`ingest_job` had stopped being a required table.** `_verify_required_schema`
 refuses to start against a database missing a table the application needs, and
 names `scripts/migrate.sh`. The queue table was on that list in the tranche
 that introduced it and was not on it after that tranche was merged into
-another branch — a conflict-resolution casualty, silent because nothing
+another branch - a conflict-resolution casualty, silent because nothing
 depended on the list itself.
 
 The consequence is the shape the list exists to prevent: an older database
@@ -6622,7 +6622,7 @@ the entry. The guard is cheap; noticing its absence was not.
 `users/*/files`. An extracted tree may contain exactly those names, so
 `bundle/users/fake/files/inner.md` matched the archive's copy first: a worker
 locked a namespace *inside* the tree while a delete of the tree locked the
-tree, and the race this tranche exists to close was open again — reachable by
+tree, and the race this tranche exists to close was open again - reachable by
 unpacking an archive that mirrors the layout. Measured, the delete returned
 200 mid-ingest and the job then failed on `FileNotFoundError`.
 
@@ -6637,7 +6637,7 @@ holding that lock is entitled to supersede it in that window. The worker then
 timed out and wrote `queued` over `superseded`, undoing a cancellation it
 never had the authority to touch.
 
-This does not by itself restore deleted chunks — the revived job finds the
+This does not by itself restore deleted chunks - the revived job finds the
 file missing and supersedes itself. It makes the deletion's cancellation
 guarantee false, and if the same name with the same bytes reappears before
 that job runs, it ingests into a context whose exact source row the deletion
@@ -6653,7 +6653,7 @@ ingest, and what it does when that ingest fails is the thing under test.
 
 **One test was changed rather than kept.** It reached "a job with a backoff"
 by requeueing a row that had never been claimed. That is no longer a state the
-system can produce, so it now claims the job first — the setup was arranging a
+system can produce, so it now claims the job first - the setup was arranging a
 shape rather than reproducing a history, and the predicate made the difference
 visible.
 
@@ -6661,7 +6661,7 @@ visible.
 
 Anchoring to `fs_root` fixed the lookalike-tree problem and introduced a
 narrower one. `safe_join` resolves the paths it hands back, so when
-`SHARED_FS_ROOT` is a symlink — an ordinary deployment shape — a stored
+`SHARED_FS_ROOT` is a symlink - an ordinary deployment shape - a stored
 `fs_path` carries the physical spelling while a route builds its key from the
 configured one. `relative_to` then fails, the queue falls back to keying on
 the path itself, and the two sides take different locks again.
@@ -6669,17 +6669,17 @@ the path itself, and the two sides take different locks again.
 The correction is smaller than it looks and the distinction is worth stating
 exactly, because the two directions are opposite errors:
 
-* resolve the **root** to *recognise* a target — required, or the physical
+* resolve the **root** to *recognise* a target - required, or the physical
   spelling is unrecognisable;
-* resolve the **target** to *choose* the key — wrong, and the reason the
+* resolve the **target** to *choose* the key - wrong, and the reason the
   original code avoided `resolve()` at all: the lock is on the persistent
   name, and a symlinked entry inside a tree would key outside its namespace;
-* build the returned key from the **logical** root — or recognition succeeds
+* build the returned key from the **logical** root - or recognition succeeds
   and the answer still disagrees with the route's.
 
 One witness covers both identity rules at once: a symlinked root, and inside
 it a tree containing `users/fake/files/`. The key has to come out as the
-logical root's `bundle` — not the archive's copy, and not the physical
+logical root's `bundle` - not the archive's copy, and not the physical
 spelling. Mutating away either half kills it.
 
 Three findings in this function now, each from the same family: it answers
@@ -6697,8 +6697,8 @@ the chunk for all four phrasings tried, and the lexical channel alone returned
 it. What went missing was one layer up.
 
 `_turn_needs_tools()` decides whether a turn takes the tool-agent workflow or
-the plain one. It is a question about *capability* — is there an attachment, a
-web tool, a published MCP server — and it was answered correctly. But the two
+the plain one. It is a question about *capability* - is there an attachment, a
+web tool, a published MCP server - and it was answered correctly. But the two
 workflows do not differ only in capability:
 
 * `llm.generic` validates `context_id`, retrieves for it, and injects the
@@ -6717,7 +6717,7 @@ needed searching.
 `_turn_needs_tools()` is true on every fresh installation and every turn takes
 the agent path. That is why this reproduced immediately. It is not the cause:
 an attachment or a published MCP server loses the same context on a deployment
-with web off. The witness is parameterized over two triggers for that reason —
+with web off. The witness is parameterized over two triggers for that reason -
 a fix that repaired only the web case would leave an operator with an MCP
 server still losing every selected context.
 
@@ -6727,7 +6727,7 @@ Narrowing the selector to `web_tools_enabled and provider != "none"` also
 turns the reds green, which is what makes it dangerous. `"none"` disables web
 *search*; `web_fetch` needs no provider and is offered whenever web tools are
 on. Measured on the unfixed code, the tool list for that configuration is
-exactly `['web_fetch']` — so that patch would restore grounding by removing
+exactly `['web_fetch']` - so that patch would restore grounding by removing
 the turn's only capability, and nothing would have said so.
 
 There is a witness whose whole job is to refuse it: with web enabled and no
@@ -6737,9 +6737,9 @@ under that patch and passes under the fix.
 ### Additive, not alternative
 
 The fix is at agent-context construction, not at routing. `context_id` reaches
-the planner, is authorized by `_validate_context_scope` — the same check
+the planner, is authorized by `_validate_context_scope` - the same check
 `llm.generic` uses, so the two paths cannot answer "may this user read this"
-differently — and its chunks go into the system block before the first model
+differently - and its chunks go into the system block before the first model
 call. The same snippets ride in the plan so the worker returns them, which is
 what makes the turn *report* the grounding it actually used.
 
@@ -6747,7 +6747,7 @@ what makes the turn *report* the grounding it actually used.
 That is not a new capability: `_run_file_search()` already resolved an
 explicit `context_id`, so the tool worked the whole time and was simply never
 offered. Iterative search is the additive half. It must not become the only
-half, which is what the model in the witness pins down — it makes no tool call
+half, which is what the model in the witness pins down - it makes no tool call
 on purpose, because a context the user selected must not depend on the model
 guessing it should go looking.
 
@@ -6760,13 +6760,13 @@ the two answers begin to differ.
 
 Three, each killed by a different witness:
 
-1. The planner stops propagating the explicit context — both selected-context
+1. The planner stops propagating the explicit context - both selected-context
    cases and the `file_search` offer die.
-2. Grounding is dropped from the prompt while `file_search` stays offered —
+2. Grounding is dropped from the prompt while `file_search` stays offered -
    only the selected-context cases die. This is the one worth having: it
    proves "the model could have searched" is not accepted as equivalent to
    being grounded.
-3. `web_fetch` is suppressed when the provider is `none` — the
+3. `web_fetch` is suppressed when the provider is `none` - the
    capability-preservation witness dies.
 
 Mutation 3 also takes the no-context control with it, for an honest reason:
@@ -6778,8 +6778,8 @@ broke instead of reporting that the model was never called.
 ### Measured on the running product
 
 The same live probe, against the shipped configuration and a real model, went
-from three misses to three hits. The control — the same question with no
-context selected — misses in both, which is what makes the hits mean anything.
+from three misses to three hits. The control - the same question with no
+context selected - misses in both, which is what makes the hits mean anything.
 
 ### Two seams the first pass left, both found by review
 
@@ -6793,7 +6793,7 @@ the same altitude mistake as the defect itself: a seam above the shared
 function, invisible from below.
 
 One `run_streaming` case now covers it, and two mutations confirm the
-separation — removing the streaming retrieval, or the two arguments it passes
+separation - removing the streaming retrieval, or the two arguments it passes
 down, kills that case alone and leaves every batch case green.
 
 **Grounding was exempt from the prompt budget.** `_apply_prompt_budget` drops
@@ -6813,12 +6813,12 @@ agent (as first written):  grounding cannot be dropped
 Tool routing may add capabilities. It does not promote retrieved knowledge
 above the ordinary budget rules. Grounding is now passed as context and
 appended only after budgeting, so it is pruned before history like everything
-else — and `_build_agent_context` returns the surviving subset rather than the
+else - and `_build_agent_context` returns the surviving subset rather than the
 retrieved one.
 
 That return value is the point of the signature change. `context_snippets` is
 a claim about what the model was shown, so reporting the pre-pruning
-retrieval would name chunks that never reached it — the same class of untruth
+retrieval would name chunks that never reached it - the same class of untruth
 as reporting a context that was never injected, one stage later. The
 four-tuple was worth keeping while it cost only sixteen unpackings; it was not
 worth keeping at the price of recomputing the surviving set or parsing it back
@@ -6829,15 +6829,15 @@ before budgeting kills both budget cases, and reporting the retrieval instead
 of the survivors kills the reporting case alone.
 
 Seven mutations now, all applied and all killed. Two earlier attempts did not
-apply at all — a stale anchor, and a cooked string that turned a literal
-backslash-n into a newline — and a mutation that does not apply measures
+apply at all - a stale anchor, and a cooked string that turned a literal
+backslash-n into a newline - and a mutation that does not apply measures
 nothing, so the driver now reports an unmatched anchor as loudly as a
 survivor rather than printing a reassuring "skipped".
 
 ## Insights described adapters that belonged to nobody in particular
 
 Found while qualifying the learning loop against a running instance. Feedback
-was recorded, a per-user adapter was created, a training job was opened — and
+was recorded, a per-user adapter was created, a training job was opened - and
 `GET /v1/preferences/insights` reported `adapters: []`. The adapter existed:
 the same run had just asserted one row in `artifact`.
 
@@ -6874,7 +6874,7 @@ with no adapters yet.
 > would never find an existing adapter (creating a duplicate each call).
 
 The shape was understood and repaired at that call site. `summarize_preferences`
-is the sibling that was not searched for at the time — the "grep the class when
+is the sibling that was not searched for at the time - the "grep the class when
 you fix the instance" case, arriving from the other end some months later.
 
 ### Two arguments, not one
@@ -6889,7 +6889,7 @@ The invariant is therefore about agreement, not about one missing row:
 **preference insights describe the adapters visible to the same user whose
 preferences they summarize.**
 
-Five adapters around one subject pin it — their own private row, a neighbour's
+Five adapters around one subject pin it - their own private row, a neighbour's
 private row, a row their tenant shares, a row another tenant shares, and a
 global one. The two negatives matter as much as the positives: "the list is
 non-empty" would pass against a listing that returned every adapter on the
@@ -6897,13 +6897,13 @@ instance, which is the one outcome worse than showing none.
 
 `summarize_preferences(None)` keeps the meaning it already had. The signature
 allows it, nothing in the product passes it, and with no identity to scope by
-the store's answer is the public set — so that is pinned rather than changed.
+the store's answer is the public set - so that is pinned rather than changed.
 
 ### Mutations
 
 Two, each killed by exactly one witness: dropping `owner_user_id` kills the
 subject's-own-adapter case and nothing else; dropping `tenant_id` kills the
-tenant-shared case and nothing else. That separation is the point — it is what
+tenant-shared case and nothing else. That separation is the point - it is what
 distinguishes this fix from the one-argument version of it.
 
 ### On how it was found
@@ -6922,7 +6922,7 @@ does a caller with no user even have?
 
 `clustering.promote_clusters` lists adapters to build the set of clusters that
 already have one, so it does not create a second. That listing is unscoped, so
-it sees only global adapters — meaning a cluster whose adapter is private or
+it sees only global adapters - meaning a cluster whose adapter is private or
 tenant-shared reads as unbound, and the sweep can bind it again. It runs as an
 instance-level sweep with no principal, so the fix is a decision about what a
 cross-tenant sweep is entitled to see, not an argument to add.
@@ -6949,7 +6949,7 @@ reads
 {" ferrothorn. txt":{" checksum":" 527c75bd8631…"," contexts":[]}}
 ```
 
-— the user's own filenames and their checksums, sitting in the corpus where a
+- the user's own filenames and their checksums, sitting in the corpus where a
 retrieval can answer out of it. Nobody uploaded that document.
 
 ### The rule already existed, in one place
@@ -6960,8 +6960,8 @@ dots, so a user can never own such a name. Listings omit them; download and
 delete treat them as absent.
 
 Ingestion never learned it. The default extension list includes `.json`, so a
-directory source rooted at `files/` — the obvious source to add, being
-everything the user has uploaded — walked straight into the manifest.
+directory source rooted at `files/` - the obvious source to add, being
+everything the user has uploaded - walked straight into the manifest.
 
 Worth noting where the rule was: spelled twice inside `routes.py` alone, once
 inline in the listing and once as `_is_hidden_relpath`, and a third time
@@ -6973,7 +6973,7 @@ defect is made of.
 The obvious patch is `if file_path.name == ".checksums.json": continue`, and
 it fixes the sighting rather than the class. `bundle/.internal/secret.md` is
 internal for exactly the same reason and would stay indexed. The rule the
-Files API applies — and now the only rule — is about **any component** of the
+Files API applies - and now the only rule - is about **any component** of the
 relative path.
 
 Two witnesses exist to hold the fix at the right altitude:
@@ -6995,7 +6995,7 @@ manifest, and it is still not a document.
 
 The walk stops after `max_files` documents, and a tree full of bookkeeping
 must not exhaust that budget before reaching anything a user wrote. It does
-not — but the reason is narrower than where the check sits. `files_processed`
+not - but the reason is narrower than where the check sits. `files_processed`
 is incremented only after a successful ingest, so a path that `continue`s
 before that leaves the budget untouched no matter where the test for it
 appears. What makes the property hold is that internal entries are refused at
@@ -7004,7 +7004,7 @@ all.
 That distinction is recorded because it was nearly mis-stated as a claim about
 ordering. The check is early because it is cheap and reads well there, not
 because a behaviour depends on it, and the witness for the budget says
-plainly that it pins a property rather than reproducing a failure — it passes
+plainly that it pins a property rather than reproducing a failure - it passes
 against the unfixed code whenever the walk happens to yield a real document
 first.
 
@@ -7016,14 +7016,14 @@ dropping the single-file branch's check.
 
 A fifth was attempted and abandoned rather than counted. It would have moved
 the check to after the budget test, which no single-site edit can express and
-which — per the paragraph above — changes no behaviour to observe.
+which - per the paragraph above - changes no behaviour to observe.
 
 A sixth attempt measured nothing at all: the replacement ended in an escaped
 quote and produced an unterminated string, so pytest never ran and the driver
 reported it as a survivor. It now treats a run with no summary line as a
 broken build rather than as evidence, and reads stderr as well as stdout.
 That is the third time in this project a mutation has failed to measure what
-it claimed — twice by breaking the build, once by not applying — and each
+it claimed - twice by breaking the build, once by not applying - and each
 time it looked exactly like a result.
 
 ### Review found two more seams, and they are the same shape as the first
@@ -7034,7 +7034,7 @@ standing pattern in this area rather than a coincidence.
 **The source was classified by its basename.** `ingest_path` asked
 `is_internal_path(path.name)`, which is the whole question only when the name
 is the whole path. `bundle/.internal/secret.md` has an ordinary basename and
-an internal position, so naming it outright as a context source indexed it —
+an internal position, so naming it outright as a context source indexed it -
 while the identical file, reached by walking `files/`, was refused. One file,
 two answers, and the earlier direct-source witness could not see the
 difference because `.checksums.json` is hidden in its basename too.
@@ -7048,7 +7048,7 @@ The fix classifies the source against the base it was authorized within.
 sits between: the absolute path must not be scanned, because whether a
 deployment lives under `/srv/.storage` is its own spelling and would refuse an
 entire installation; and the basename alone is not enough, for the reason
-above. Both production callers already pass a base — the archive extractor
+above. Both production callers already pass a base - the archive extractor
 its destination's `files/`, the context-source route the shared root.
 
 **The durable queue never asked at all.** Re-indexing calls
@@ -7056,7 +7056,7 @@ its destination's `files/`, the context-source route the shared root.
 to it. That is the worse of the two: the queue is the machinery a replacement
 actually runs through, so an internal path reaching `ingest_job` would be
 chunked on a schedule, long after whoever created it stopped watching. It also
-contradicted the SPEC line this tranche adds — refused *by any route*.
+contradicted the SPEC line this tranche adds - refused *by any route*.
 
 The job is closed `superseded` with the reason recorded, not failed: nothing
 is owed now or later, and a failure would be retried five times to reach the
@@ -7065,8 +7065,8 @@ same conclusion.
 **One of these reds was vacuous when first written.** The queue case enqueued
 a placeholder generation, so the job was declined as stale before ingestion
 was ever attempted, and "no chunks were written" passed for a reason that had
-nothing to do with the path. The detail column said so — `on-disk generation
-2faf4dced1fb` — which is exactly what that column was added for. It now
+nothing to do with the path. The detail column said so - `on-disk generation
+2faf4dced1fb` - which is exactly what that column was added for. It now
 enqueues the generation the bytes actually have, and the unfixed queue indexes
 the internal file.
 
@@ -7082,7 +7082,7 @@ a reference that names nothing, rather than what the schema says about it.
 Three ways the executor quietly ran a different graph from the published one:
 
 ```
-entrypoint names nowhere   ran `next(iter(node_map))` — whatever came first
+entrypoint names nowhere   ran `next(iter(node_map))` - whatever came first
 next names nowhere         `if not node: continue`, continuation vanished
 two nodes share an id      the node_map dict comprehension kept the last
 ```
@@ -7097,7 +7097,7 @@ left one node silently replacing the other. All three are accepted at
 The validator says a workflow executes the graph it declares. The graph here
 is valid; what was wrong is which edge execution chose.
 
-`on_error` replaces `next` when a tool call fails — except on the
+`on_error` replaces `next` when a tool call fails - except on the
 circuit-breaker path, which built its own error result, read `next`, and
 returned before reaching the swap. Measured on a graph declaring
 `tool -> normal` with `on_error: recover`, breaker forced open:
@@ -7118,7 +7118,7 @@ and then wrote "taken instead of `next` when a tool call fails" as though it
 were universal. Which is what a comment is worth as evidence.
 
 **A second witness came from a mutation, not from review.** Removing
-`on_error` from the chooser entirely killed only the circuit-open witness —
+`on_error` from the chooser entirely killed only the circuit-open witness -
 so the primary path, a tool that simply fails, was resting on the breaker
 case to notice. It has its own witness now, and the two mutations separate:
 restoring the early-return copy kills one, removing the rule kills both.
@@ -7127,7 +7127,7 @@ restoring the early-return copy kills one, removing the rule kills both.
 
 `run_streaming` is a separate graph execution path, with the same entrypoint
 fallback and the same `if not node: continue`, and it never asked the new
-rule. So the row this tranche exists to protect — pre-existing or imported —
+rule. So the row this tranche exists to protect - pre-existing or imported -
 failed closed in blocking chat and still ran a different graph in streaming
 chat. The engine witnesses only drove `run()`, so nothing said so.
 
@@ -7139,8 +7139,8 @@ not merely that an error appears somewhere in the stream.
 ### And its own copy of the tool-node control plane
 
 Refusing the invalid graph was only the graph-shaped half. `run_streaming`
-streams three tools — `llm.generic`, `llm.generic_chat_v1`, `agent.files_v1`
-— without calling `_execute_node_with_retry`, so *neither* decision the
+streams three tools - `llm.generic`, `llm.generic_chat_v1`, `agent.files_v1`
+- without calling `_execute_node_with_retry`, so *neither* decision the
 blocking path makes around a tool call happened there:
 
 ```
@@ -7160,7 +7160,7 @@ backend raises early     no node traced at all; the turn ended on an error
 ```
 
 The same graph on the blocking path takes `recover` in both cases. So the two
-execution paths disagreed about what the same published graph means — and the
+execution paths disagreed about what the same published graph means - and the
 breaker, whose entire job is to stop calling a failing tool, did not apply to
 the one tool every ordinary chat turn uses.
 
@@ -7175,7 +7175,7 @@ One deliberate asymmetry, with its own control. A streamed failure whose node
 declares *no* `on_error` still ends the stream as it always did, rather than
 being handed to the chooser: the chooser answers `next` when no error edge
 exists, so routing every failure through it would send a failed node down the
-success path — the same defect one file over. The witness is a mutation that
+success path - the same defect one file over. The witness is a mutation that
 removes the guard.
 
 ### The handoff had a boundary the first fix walked straight past
@@ -7183,7 +7183,7 @@ removes the guard.
 Its own test said recovery after partial output was a separate question this
 tranche did not answer. The implementation answered it by accident: tokens are
 yielded as they arrive, so a node that streamed some output and *then* failed
-still took `on_error`. Measured — the client received both answers:
+still took `on_error`. Measured - the client received both answers:
 
 ```
 failed node emitted   "PARTIAL "
@@ -7244,7 +7244,7 @@ reported zero problems:
 
 The first is the sharpest: publish `end -> side`, validation confirms the
 edge, execution stops at `end` and `side` never runs. A resolved edge that
-never executes is the same silent divergence as a dangling one — the operator
+never executes is the same silent divergence as a dangling one - the operator
 reads the graph and the runtime reads something smaller.
 
 `_NODE_EDGES` is a per-node-type table now, and the field set it checks
@@ -7255,7 +7255,7 @@ The node type itself is that shape one level up. SPEC §9 names four and writes
 them as an enum; the kind schema said `{"type": "string"}`, and
 `_execute_node` runs anything it does not recognise as a `tool_call`. A node
 typed `"swich"` was therefore admitted with 201 and then traced
-`{"node": "x", "status": "ok"}` — it invoked the model. Both altitudes now
+`{"node": "x", "status": "ok"}` - it invoked the model. Both altitudes now
 name the four: the kind schema as an enum, and `graph_problems` semantically,
 because the schema does not reach a row that predates it.
 
@@ -7264,7 +7264,7 @@ with it. Requiring the key is admission's job; agreeing with execution is this
 altitude's, and being stricter than the runtime would be a different bug.
 
 **The rule found four existing test fixtures declaring node types this engine
-has never executed** — eleven uses of `llm_call` and four of `respond`, across
+has never executed** - eleven uses of `llm_call` and four of `respond`, across
 storage, chat, admin and tool-authority tests. None of them execute the graph,
 so nothing had ever noticed. They were corrected to
 `{"type": "tool_call", "tool": "llm.generic"}` rather than the rule being
@@ -7298,8 +7298,8 @@ runtime          fan -> choose -> join;  `side` never ran
 same shape covers a `tool_call` child's `next` and `on_error`, and a nested
 parallel's own children and `after`.
 
-The narrow reading is the one SPEC §9 supports — "fan-out to multiple nodes,
-then join" — so `parallel.next` names children that run once and `after` owns
+The narrow reading is the one SPEC §9 supports - "fan-out to multiple nodes,
+then join" - so `parallel.next` names children that run once and `after` owns
 the continuation. Making `parallel` a recursive subgraph executor is a
 specification decision, not a bug fix, so validation refuses the graphs that
 would need one instead of inventing the semantics. The check derives from the
@@ -7312,14 +7312,14 @@ the parallel itself declared `after: "join"`. The fixture therefore looked like
 it exercised a child's `next` when `after` was producing that continuation on
 its own and the two child edges contributed nothing. A positive control that
 passes for a reason other than the one it claims is a witness at the wrong
-altitude — the same failure mode as three vacuous witnesses earlier in this
+altitude - the same failure mode as three vacuous witnesses earlier in this
 campaign, in a fixture rather than a test.
 
 **One witness pins the premise rather than the rule.** The reason to refuse
 these graphs is that the executor discards a child's successors, so a test
 runs the refused graph with the graph check disabled and asserts `side` never
 executes. If `parallel` ever becomes recursive, that test fails and says the
-rule above needs revisiting — rather than the rule quietly outliving its
+rule above needs revisiting - rather than the rule quietly outliving its
 justification.
 
 **And `end` slipped through the first version of the rule**, because that rule
@@ -7327,11 +7327,11 @@ asked what edges a child declares and `end` declares none. Its meaning is its
 status, not an edge: on the ordinary path `status == "end"` stops the
 workflow, and `_execute_parallel_nodes` reads only `"error"` out of a child's
 status, so an `end` child is an ordinary success the parent walks past.
-Measured — `graph_problems` returned `[]` and the run traced
+Measured - `graph_problems` returned `[]` and the run traced
 `['fan', 'side']`. The node named `end` ended nothing.
 
 So the rule states the whole thing positively now: a parallel child is a leaf
-`tool_call`. That is what SPEC §9.1 describes — `parallel` is "fan-out to
+`tool_call`. That is what SPEC §9.1 describes - `parallel` is "fan-out to
 multiple nodes, then join", and `end` "produces the final response", which
 belongs on the `after` continuation where the ordinary loop can see it. The
 two halves separate under mutation: admitting `end` kills only the `end`
@@ -7373,7 +7373,7 @@ told apart by which one happened rather than by whether `pending` is empty.
 
 `visited` was incremented only in the driving loop. A parallel child runs
 inside `_execute_parallel_nodes`, which touches neither `visited` nor
-`visited_nodes` — and which builds every child task before awaiting one
+`visited_nodes` - and which builds every child task before awaiting one
 `asyncio.gather`. The graph rules permit any number of leaf `tool_call`
 children and nothing caps fan-out, so the loop sees two visits and the run
 does hundreds. Measured, with the tool call stubbed so the count was the only
@@ -7386,7 +7386,7 @@ variable:
 
 The second is the sharper one and the reason this is an availability finding
 rather than a bookkeeping one. Three nodes, a budget of sixteen, one repeated
-child id, and a hundred and fifty concurrent worker invocations — each entry
+child id, and a hundred and fifty concurrent worker invocations - each entry
 in `parallel.next` is an execution, whatever it is named.
 
 `ExecutionBudget` is one object per run, held by the driving loop and by the
@@ -7398,7 +7398,7 @@ over-budget batch never begins any of it, rather than being cut off partway
 through.
 
 A fan-out constant like `maxItems: 16` would not have repaired the claim that
-`max_steps` bounds node executions — it would have replaced one unchecked
+`max_steps` bounds node executions - it would have replaced one unchecked
 number with another. Charging the children is what makes the rest of the run
 bounded too, and that half has its own witness: a fan-out of forty that fits,
 followed by a chain that only exceeds the budget once the children are
@@ -7407,7 +7407,7 @@ counted.
 **The reservation replaced an inference, and that is a simplification.** The
 loop used to conclude after the fact that leftover pending work meant the
 step budget had run out. Now every execution is reserved where it happens, so
-the reason is recorded at the refusal and there is nothing to infer — the
+the reason is recorded at the refusal and there is nothing to infer - the
 `reached_end` bookkeeping that the earlier finding required is gone with it,
 and so is the mutation that probed it.
 
@@ -7415,7 +7415,7 @@ and so is the mutation that probed it.
 
 The control for that narrow distinction fanned out and then ended with
 `pending` already empty, so it never exercised "ended while siblings are
-queued" at all — the mutation that removes the distinction survived, which is
+queued" at all - the mutation that removes the distinction survived, which is
 the only reason it came to light. It uses a list `next` now, and asserts the
 trace, so the premise is checked rather than assumed.
 
@@ -7424,14 +7424,14 @@ visit guard. Measured rather than reasoned about afterwards: with
 `max_steps = min(100, 2n + 10)` and `max_visits = max(2, ceil(max_steps/n))`,
 a two-node cycle reaches its eighth visit at step 15 and the step budget has
 already stopped it at 14. Three nodes puts the visit guard at step 13 of 16.
-Asserting *which* budget ran out is what said so — without that, both
+Asserting *which* budget ran out is what said so - without that, both
 witnesses would have measured one mechanism twice while looking like coverage
 of two.
 
 ### An id that cannot name a node
 
 `node_map` is keyed by id and drops falsy keys, so a node declared with an
-empty id disappears — the same silent removal a duplicate causes, and it was
+empty id disappears - the same silent removal a duplicate causes, and it was
 being skipped rather than reported. `id` now carries `minLength: 1` in the
 kind schema *and* is reported semantically, because the schema does not reach
 a row that predates it.
@@ -7455,7 +7455,7 @@ The executor consumes **five** node-reference fields:
 
 Writing the validator from the kind schema is the obvious move and would have
 covered three of five while looking complete. `after` and `on_error` are not
-in that schema at all — nothing else in the system knows they exist — and
+in that schema at all - nothing else in the system knows they exist - and
 `on_error` is the one that matters most, because it is the transition a
 workflow takes precisely when it can least afford to stop silently.
 
@@ -7471,13 +7471,13 @@ code it adds is dead, not that the tests are weak.
 
 Sixteen anchors went stale across this tranche's seven passes and the driver
 said so each time rather than reporting a survivor. That guard has now caught
-something in every pass of this campaign — including two on the last pass,
+something in every pass of this campaign - including two on the last pass,
 where a rename would otherwise have quietly retired the budget-fallthrough
 mutations. The driver now takes mutation names on the command line, so a
 retarget is re-measured in seconds instead of by re-running the whole set.
 
-Several rules earned a **complementary pair** — one mutation that loses the
-rule and one that applies it too widely — because losing a rule and
+Several rules earned a **complementary pair** - one mutation that loses the
+rule and one that applies it too widely - because losing a rule and
 over-applying it are both wrong, and only one of them fails loudly. The
 parallel-child rule extended to the `after` target kills the control that says
 the rule is about the context and not the node. Marking every streamed node as
@@ -7514,7 +7514,7 @@ the mutation removing each kills only its own witnesses.
 ### A mutation retired rather than left surviving
 
 Re-adding the engine's old "replace a dangling entrypoint with the first
-node" fallback survived — because it cannot fire once the check above it has
+node" fallback survived - because it cannot fire once the check above it has
 refused such an entrypoint. A mutation that changes no behaviour says the code
 it adds is dead, not that the tests are weak, so it was retired with that
 reasoning recorded instead of being counted as a survivor.
@@ -7522,7 +7522,7 @@ reasoning recorded instead of being counted as a survivor.
 ### A control that was measuring the harness
 
 One witness asserted that the workflows this system synthesises for itself
-still *run*. They do not, under the mock engine those tests use — its default
+still *run*. They do not, under the mock engine those tests use - its default
 node returns an error, and it did so with the change stashed too. The property
 that belongs here is that the built-in graphs are not *refused*, and a second
 witness checks them against the rule directly, with no harness in the way.
@@ -7531,7 +7531,7 @@ witness checks them against the rule directly, with no harness in the way.
 
 Found by driving ConfigOps against §10 on a running instance. A published
 workflow was patched, the API returned 200, the patch was marked `applied`, a
-new `artifact_version` was written — and the configuration the chat path
+new `artifact_version` was written - and the configuration the chat path
 actually consumes did not change. Stored schema said `OMEGA`; serving said
 `ALPHA`, and still did six seconds later.
 
@@ -7550,7 +7550,7 @@ after   {"spare": "keep", "schema": {"spare": "CHANGED"}}
 
 The value the operator meant to change is untouched, a junk key is added, and
 the audit trail says the change was applied. Kind-schema validation cannot
-catch it — an extra top-level key is valid for the workflow kind — so nothing
+catch it - an extra top-level key is valid for the workflow kind - so nothing
 downstream objected either.
 
 ### The rule, and why `remove` belongs in it
@@ -7565,7 +7565,7 @@ was treated as nothing to do, which makes a removal that addressed the wrong
 path indistinguishable from one that did its job. Same silent success, same
 class.
 
-RFC 6902 already says all of this — §4.1 for `add`'s array bound, §4.2 for
+RFC 6902 already says all of this - §4.1 for `add`'s array bound, §4.2 for
 `remove`, §4.3 for `replace`. What the module had was a single creating walk
 shared by verbs with different requirements.
 
@@ -7600,7 +7600,7 @@ shapes, reachable by different mechanisms:
 
 The first is the proper-prefix case the RFC names outright: `/a` is a
 perfectly good parent right up until `/a` is the value being taken. The
-second has no prefix relationship at all — `/xs/3` is a legal append target
+second has no prefix relationship at all - `/xs/3` is a legal append target
 on three elements and out of range on the two that remain. Both raised, and
 both destroyed a value while raising.
 
@@ -7627,7 +7627,7 @@ test    /xs/1024          fine
 copy/move from /xs/1024   fine
 ```
 
-Position 1024 existed for four verbs and not for the two that write to it —
+Position 1024 existed for four verbs and not for the two that write to it -
 the same operation-dependent location semantics this tranche exists to
 remove, hiding inside the fix for it.
 
@@ -7637,21 +7637,21 @@ and `_ensure_list_capacity` are gone.
 
 **The first version of this section repeated that reason, and it is wrong.**
 Nothing in the current engine pads a list. Measured, with the length check
-deleted: `/xs/999999999` on `[1, 2]` produces `[1, 2, 3]` — one `append`, in
+deleted: `/xs/999999999` on `[1, 2]` produces `[1, 2, 3]` - one `append`, in
 0.0001s at 11MB. So what the length check defends is the *address*, not the
 heap: `/xs/999999999` must not silently mean `/xs/2`. That is the same
 wrong-location failure as everything else here, which is the better reason
 anyway, but it is not the reason I wrote first.
 
 The claim came from the deleted constant's own comment. Carrying a comment
-forward is not verification — the comment and the code it described were both
+forward is not verification - the comment and the code it described were both
 written from the same intent, and the padding implementation it described had
 already gone. Running it took one command.
 
 Two tests pinned the old wording (`tests/test_json_patch.py`,
 `tests/test_config_ops.py`). Both were updated rather than worked around: the
 memory-exhaustion concern they were written for is still exactly right, and
-still enforced — the complaint is just "out of range" now.
+still enforced - the complaint is just "out of range" now.
 
 **I missed the second one on the first sweep.** The grep was correct; it ended
 in `head -20` and the match was on line 21. Truncating a search for the *class*
@@ -7674,7 +7674,7 @@ a/b     is not a pointer     accepted as /a/b
 ```
 
 The escape pair is the worst, because both spellings can be real keys in the
-same document. So the operation does not fail — it succeeds against a valid
+same document. So the operation does not fail - it succeeds against a valid
 location nobody named. Through ConfigOps that is 200, status `applied`, a new
 `artifact_version`, and the key the operator wrote still holding its old
 value. The same consequence as the `/schema/foo` defect that opened this
@@ -7682,7 +7682,7 @@ tranche, reached through the pointer rather than through the path root.
 
 `_segments_or_raise` is now an RFC 6901 tokenizer: leading `/` required, empty
 reference tokens preserved, `~1` then `~0` decoded in that order, and a `~`
-that escapes nothing refused. The order is not cosmetic — decoding `~0` first
+that escapes nothing refused. The order is not cosmetic - decoding `~0` first
 turns `~01` into `~1` and then into `/`, a third key again.
 
 Error details render through `_pointer`, which re-escapes, so a key containing
@@ -7690,7 +7690,7 @@ Error details render through `_pointer`, which re-escapes, so a key containing
 
 **A root-path claim was inverted, in the code and in a test that agreed with
 it.** RFC 6901 §5: `""` is the whole document; `/` is the member keyed `""`.
-The engine had it backwards — `/` was refused as "the document root" while
+The engine had it backwards - `/` was refused as "the document root" while
 `""` was ignored in silence. `""` is now refused explicitly and `/` is an
 ordinary location. `test_a_root_path_is_a_bad_request` asserted the inverted
 rule in its docstring; it is rewritten, and a positive witness for `/` sits
@@ -7701,7 +7701,7 @@ not the same as naming the whole document, and conflating them through
 `op.get("path", "")` is how the whole-document pointer came to be ignored.
 
 While fixing that, `move`/`copy` with no `from` turned out to default the same
-way and report "addresses the whole document" — a true sentence about an
+way and report "addresses the whole document" - a true sentence about an
 operand the caller never wrote. It now says which operand is missing.
 
 ### An operation was trusted to carry its own operands
@@ -7717,12 +7717,12 @@ required:
 {}                               skipped in silence
 ```
 
-The first does not no-op — it destroys the value on behalf of an operand
+The first does not no-op - it destroys the value on behalf of an operand
 nobody supplied. The silent skips are worse than they look through the
 private-artifact PATCH route: the route carries on into
 `update_private_artifact`, so a patch made entirely of skipped operations
 returned 200 and wrote a new version. Measured on the red: version 1 to 2,
-schema unchanged. An audit entry asserting a change that did not happen —
+schema unchanged. An audit entry asserting a change that did not happen -
 the same consequence this tranche opened with.
 
 The rule lives in `validate_op`, and the artifact request model calls it
@@ -7744,8 +7744,8 @@ comment is what made the behaviour look deliberate for as long as it did.
 **A third instance, found by grepping the class rather than the instance.** An
 empty operation list is well-formed JSON and still names no change, and both
 callers accepted it and wrote a version: the route guarded the engine behind
-`if ops:` and went straight to the store — measured, `{"patch": []}` returned
-200 and took the artifact from version 1 to 2 — while ConfigOps looped zero
+`if ops:` and went straight to the store - measured, `{"patch": []}` returned
+200 and took the artifact from version 1 to 2 - while ConfigOps looped zero
 times and marked the patch applied. `validate_ops` refuses it, and the route's
 guard is gone so no patch reaches the store without meeting a rule.
 
@@ -7763,7 +7763,7 @@ path=42   path=null   path=["/a"]   path={"a":1}   from=42
 A 500 for a plainly bad request, and reachable over the wire: both API models
 take `List[dict]`, which admits any JSON value in any member.
 
-Refused rather than coerced. `str(42)` is `"42"` — a pointer that is not the
+Refused rather than coerced. `str(42)` is `"42"` - a pointer that is not the
 one anybody wrote, which is the whole failure this module exists to stop.
 
 ### `test` compared Python objects, not JSON values
@@ -7781,7 +7781,7 @@ so this does not merely misreport. Against `{"enabled": true, "spare":
  {"op":"replace","path":"/spare","value":"CHANGED"}]
 ```
 
-returned 200, set `spare` to `CHANGED`, and wrote version 2 — a mutation
+returned 200, set `spare` to `CHANGED`, and wrote version 2 - a mutation
 applied on a precondition that was never met.
 
 `json_equal` is the rule: booleans equal only booleans, numbers compare
@@ -7791,7 +7791,7 @@ one value and there is a control saying so.
 
 The two mutations are complements. Restoring Python `==` kills all seven
 inequality witnesses and both route witnesses; removing only the container
-recursion — a scalar-only fix — kills exactly the array, object and nested
+recursion - a scalar-only fix - kills exactly the array, object and nested
 three. That is what says those three are measuring the recursion rather than
 repeating the scalar case.
 
@@ -7809,8 +7809,8 @@ larger set, so several distinct spellings named one position:
 
 The last is the only case in this tranche that was a 500 rather than a wrong
 write: `isdigit()` admitted it and `int()` then raised through an
-unhandled path. The negative branch had the same pair — `"-²".lstrip("-")`
-`.isdigit()` was true and `int("-²")` was not — so both forms are matched
+unhandled path. The negative branch had the same pair - `"-²".lstrip("-")`
+`.isdigit()` was true and `int("-²")` was not - so both forms are matched
 strictly now.
 
 Through the route the rest is worse than a refusal would be:
@@ -7827,7 +7827,7 @@ mean "whatever this process read a moment ago".
 
 `ConfigOpsService.apply_patch` read the artifact and computed the new document
 *before* calling the store. The store then locked the artifact row `FOR
-UPDATE` — and validated and wrote the document it had been handed. The lock
+UPDATE` - and validated and wrote the document it had been handed. The lock
 serialized the write without covering the read behind it:
 
 ```
@@ -7850,8 +7850,8 @@ The patch row is locked and its status re-read there for the same reason. The
 `approved` guard, so two callers could both see `approved`, queue on the
 artifact lock, and each write a version for one patch.
 
-The description carried the identical staleness — `COALESCE(%s, description)`
-with a value read before the lock reverts a concurrent description change —
+The description carried the identical staleness - `COALESCE(%s, description)`
+with a value read before the lock reverts a concurrent description change -
 and its only caller was passing back what it had just read, so both the
 argument and the column update are gone.
 
@@ -7862,14 +7862,14 @@ lifecycle, so it passed against code with the race in it. The replacement
 drives a real concurrent edit through the ordinary artifact mutation path
 between the service's read and the store's transaction, and a second one
 witnesses two overlapping applies of the same approved patch. Each is killed
-by exactly one mutation — evaluation moved back outside the lock, and the
-patch row left unlocked — so they are measuring the two halves separately.
+by exactly one mutation - evaluation moved back outside the lock, and the
+patch row left unlocked - so they are measuring the two halves separately.
 
 Choosing the seam took one failed attempt worth recording: the first version
 made the concurrent edit from inside the patch computation, which after the
 fix runs *under* the artifact lock, so the edit waited on a lock its own call
 held and the suite hung. The seam has to be where no lock is held, which is
-before the store transaction opens — and that is version-agnostic, because
+before the store transaction opens - and that is version-agnostic, because
 the unfixed service has already computed its result by then.
 
 ### Apply and delete took the two rows in opposite orders
@@ -7891,7 +7891,7 @@ id, so a private artifact can carry an approved patch while its owner deletes
 it, and account erasure meets the same relationship. Measured:
 `{'apply': 'DeadlockDetected', 'delete': 'ok'}`.
 
-Postgres broke the cycle by aborting a transaction, so nothing was corrupted —
+Postgres broke the cycle by aborting a transaction, so nothing was corrupted -
 which is why this was a MEDIUM and not a HIGH. But a deadlock victim is not
 the same as two operations having one intentional order, and every other
 writer here already takes the artifact first. `apply_config_patch` now does
@@ -7905,9 +7905,9 @@ patch-first kills the deadlock witness alone, and both exactly-once witnesses
 survive it, which is what says so.
 
 **The witness is deterministic by construction rather than by timing.** The
-delete is held after it has taken the artifact lock and before the cascade —
+delete is held after it has taken the artifact lock and before the cascade -
 using the `_artifact_from_row` call that already sits between them, so no test
-hook was added to production code — and the apply is released only once
+hook was added to production code - and the apply is released only once
 `pg_stat_activity` shows a backend genuinely waiting on a lock. A sleep would
 have made the red probabilistic, and a probabilistic red is not a witness.
 
@@ -7921,7 +7921,7 @@ the tree quietly wrong.
 ### The same stale write in every other artifact caller
 
 Fixing ConfigOps closed the race for one writer. It did not close the class,
-and I did not look — a reviewer did. `update_artifact` had the identical
+and I did not look - a reviewer did. `update_artifact` had the identical
 shape: `FOR UPDATE`, then validate and write the `schema` argument rather
 than a transformation of the row it had just locked. Six callers passed a
 precomputed document.
@@ -7944,19 +7944,19 @@ callable, applied to the schema read under the lock. The private PATCH route
 builds there instead of before, which also moved the kind-prefix check inside
 the transaction, so a refusal writes nothing. `description` stopped being
 replayed: the route passes `None` when the request did not ask for one, which
-the store already reads as "leave it alone" — writing back the value you read
+the store already reads as "leave it alone" - writing back the value you read
 reverts a concurrent change to it, the same staleness one column over.
 
 **Training's promotion was the worst of them.** `dict(adapter.schema)` came
 from a snapshot taken before the training run, so the window is minutes, not
-microseconds — long enough for a ConfigOps patch to be proposed, approved,
+microseconds - long enough for a ConfigOps patch to be proposed, approved,
 applied, audited, and then erased when promotion finally took the lock. All
 five training call sites are builders now, each changing only the fields it
 owns.
 
 **My first promotion witness was vacuous, and the mutation caught it.** It
 applied the concurrent patch at the first `update_artifact` for that adapter
-— which is the pre-training vocab-size write. Training refreshes its snapshot
+- which is the pre-training vocab-size write. Training refreshes its snapshot
 afterwards, so by promotion time the document already contained the patch and
 the witness passed against the defect. The mutation that rebuilds from
 `adapter.schema` survived, which is the only reason I noticed. The seam is now
@@ -7968,7 +7968,7 @@ the lock.
 Found by Bugbot on the pull request, confirmed by execution, and the only
 defect in this tranche that the tranche itself caused.
 
-Two producers write a single key under `/meta` — `config_ops._fallback_patch`
+Two producers write a single key under `/meta` - `config_ops._fallback_patch`
 and the adapter auto-prune proposer in `training.py`. A freshly created
 artifact has no `meta` in its schema, and traversal no longer invents one, so
 both emitted a patch that stored `pending`, approved cleanly, and then failed
@@ -7981,7 +7981,7 @@ the artifact already, so both can emit ops that fit it.
 **The first repair was wrong, and the same reviewer caught it.** It inspected
 the artifact and prepended `add /meta {}` when `meta` was missing, so a
 proposal against a bare artifact would apply. ConfigOps stores a patch and
-applies it later, and `add` on a member that is already present replaces it —
+applies it later, and `add` on a member that is already present replaces it -
 so anything that put a `meta` there in between (another pending patch, a
 direct edit, the second producer on the same artifact) was silently wiped.
 Measured: a patch proposed against a bare artifact, applied after
@@ -8000,22 +8000,22 @@ a trade, and the leaf op wins it everywhere except one case:
 
 So `meta_ops` emits one leaf op and never the parent. What that gives up is
 the bare-artifact case, which is now a visible dead end instead of silent
-damage — the better half of the trade, and the same one this project made
+damage - the better half of the trade, and the same one this project made
 when it refused to repair RAG by making a configured `web_fetch` unreachable.
 
 Closing the dead end properly is larger than the engine and belongs to the
 ConfigOps tranche. Two candidates: version-gate a stored patch so one written
-against a different document is refused rather than misapplied — which
-generalizes past `meta` to *any* stale patch — or move these bookkeeping
+against a different document is refused rather than misapplied - which
+generalizes past `meta` to *any* stale patch - or move these bookkeeping
 annotations to the `artifact.meta` column that already exists, instead of
 writing them into the schema document that gets kind-validated and served.
 
 **The pruning producer changed twice with no witness either time.** Both
 rounds tested `meta_ops` directly and the ConfigOps fallback; the periodic
 worker test uses a fake training service, so it proves scheduling and not
-patch construction. `recommend_adapter_pruning()` is now driven for real — a
+patch construction. `recommend_adapter_pruning()` is now driven for real - a
 genuinely prune-eligible adapter with a `meta` sibling, through propose,
-approve and apply — and a mutation that re-adds the parent create at that call
+approve and apply - and a mutation that re-adds the parent create at that call
 site alone kills it and nothing else. The thresholds come from the service
 rather than being copied, so the fixture cannot drift away from eligibility.
 
@@ -8023,7 +8023,7 @@ Worth recording as process rather than only defect. Two points. This is the
 second time in this campaign that a correct engine-level refusal exposed a
 caller depending on the incorrect behaviour, and grepping for the *shape*
 found the second producer when the report named only the first. And the first
-repair passed its own witnesses, its mutations, and the full lane — what it
+repair passed its own witnesses, its mutations, and the full lane - what it
 did not have was a witness for the gap between proposing and applying, which
 is the seam a reviewer found by asking when the ops are evaluated rather than
 what they say. The same question asked once more, of the lifecycle rather than
@@ -8049,7 +8049,7 @@ add /xs/-2  on [1, 2]  ->  [9, 1, 2]
 ```
 
 `list.insert(-1, v)` writes before the last element, so a negative final
-segment does not fail on the write path — it lands somewhere the caller never
+segment does not fail on the write path - it lands somewhere the caller never
 named, which is this tranche's defect class exactly. `replace` was already
 covered, because requiring an existing target reads the index first; `add` has
 no target to require, so it is the one verb where the index itself must be
@@ -8071,13 +8071,13 @@ Twenty-three, of which twenty-one are killed and two survive by design (see
 below). Four cover the write-location rule:
 `replace` back to a creating traversal; a missing `remove` target back to a
 no-op; traversal manufacturing parents again; an array index past the end
-appending instead of failing. One covers the consumer — ConfigOps swallowing
-the refusal and applying anyway — and kills exactly one witness.
+appending instead of failing. One covers the consumer - ConfigOps swallowing
+the refusal and applying anyway - and kills exactly one witness.
 
 Two more cover the array bound, and they are complements rather than
 duplicates. Restoring the constant ceiling (M7) kills the two large-index
 witnesses and leaves the huge-gap one alive, because a gap stays refused under
-a ceiling — for the wrong reason. Deleting the length check (M4) does the
+a ceiling - for the wrong reason. Deleting the length check (M4) does the
 reverse. Neither check can stand in for the other, and the mutations say so
 rather than the comments.
 
@@ -8085,7 +8085,7 @@ One is the mutation that survived first: serving a negative write index from
 the end. Its witness is in the section above.
 
 Six cover the pointer, one rewrite each, and each kills only its own
-witnesses — which is what says the witnesses separate the four ways the old
+witnesses - which is what says the witnesses separate the four ways the old
 tokenizer changed an address rather than testing one of them four times:
 
 | mutation | kills |
@@ -8099,8 +8099,8 @@ tokenizer changed an address rather than testing one of them four times:
 
 **Two mutations silently measured nothing on the first run of this pass.** M7
 and M8 anchored on the `not_a_number=` argument that the diagnostic fix had
-just deleted, so neither applied. They reported it — the driver treats an
-unmatched anchor as loud, which is why that guard exists — and the repaired
+just deleted, so neither applied. They reported it - the driver treats an
+unmatched anchor as loud, which is why that guard exists - and the repaired
 anchors needed disambiguating too, because removing the argument left
 `_require_target` and `_set_at` sharing one call line. It happened a second
 time later in the tranche, when `validate_op` replaced the code another
@@ -8116,8 +8116,8 @@ sufficient, so removing either alone changes no observable behaviour:
 | mutation | result |
 |---|---|
 | the rule itself deleted | kills both empty-patch witnesses |
-| the model's call site removed | **survives** — the engine catches |
-| the route's `if ops:` guard restored | **survives** — the model catches |
+| the model's call site removed | **survives** - the engine catches |
+| the route's `if ops:` guard restored | **survives** - the model catches |
 | both call sites removed, rule intact | kills the route witness, and only that |
 
 The two survivors are the signature of the layering rather than unmeasured
@@ -8141,7 +8141,7 @@ creating traversal (M3) kills the self-descendant witness alone.
 ### An error message got better, and two tests said so
 
 `/xs/-1` reached the write path as "negative list index" and the read path as
-"patch source path not found" — one mistake with two descriptions, the vaguer
+"patch source path not found" - one mistake with two descriptions, the vaguer
 one pointing at a missing element rather than the index the author wrote.
 Both sides now say the same thing, and the three tests that pinned the old
 wording were updated rather than worked around.
@@ -8152,7 +8152,7 @@ Both found during the graph tranche, both deliberately left out of it.
 
 **A refused fan-out leaves its parent out of the trace.** When
 `_execute_parallel_nodes` refuses a batch for budget, the `parallel` node
-itself has already executed — it is what produced the child list — but the
+itself has already executed - it is what produced the child list - but the
 caller sees `budget_exhausted` and breaks before appending that parent to
 `workflow_trace`. The failure the caller reports is honest, and the run
 correctly fails closed, so this is a ledger completeness question rather than
@@ -8164,7 +8164,7 @@ complete execution ledger, which no tranche has done yet.
 manufacture an ordinary runtime failure, because tool names are not
 reference-validated. Once they are, that graph will be refused before it
 executes and the witness becomes invalid by design. The replacement is a real
-resolvable tool forced to return an error — not a weakened reference rule.
+resolvable tool forced to return an error - not a weakened reference rule.
 Recorded here rather than fixed early, because the witness is measuring the
 right thing today and the change belongs with the rule that invalidates it.
 
@@ -8177,7 +8177,7 @@ The streaming path now *reads* the circuit breaker before a streamed LLM call.
 It still never *writes* to it: `record_tool_failure` and `record_tool_success`
 are called only from `_execute_node`, so a tool that fails on every streamed
 turn never accumulates failures and the breaker never opens for it. In a
-deployment where chat streams — which is the ordinary case — the preflight can
+deployment where chat streams - which is the ordinary case - the preflight can
 only ever fire on a breaker some other path opened.
 
 Kept out of the graph tranche on purpose. Its invariant is SPEC §18's failure
@@ -8206,13 +8206,13 @@ routes.upload_file
 
 So a fire-and-forget idempotency write outlived the session that owned the
 pool. It passes alone (31s), passes 3/3 as a file under `-n 4`, and the full
-lane was green on the next run. It has no reach into the patch engine — the
+lane was green on the next run. It has no reach into the patch engine - the
 file never mentions `json_patch`, and the module's only call site in
 `routes.py` is the artifact PATCH route, not the upload route in the trace.
 
 The second sighting carried a fuller trace, and it widens the shape rather
-than confirming it. The pool closes underneath a *live request* —
-`POST /v1/files/upload` — and two different call sites reach for a connection
+than confirming it. The pool closes underneath a *live request* -
+`POST /v1/files/upload` - and two different call sites reach for a connection
 after that:
 
 ```
@@ -8226,7 +8226,7 @@ routes.upload_file
 So this is not only a fire-and-forget write outliving its session: request
 work itself is still running when the pool goes. The test passes in isolation
 and logs the unhandled exception, which is why it can fail the lane without
-failing the assertion — an important detail for whoever picks this up, because
+failing the assertion - an important detail for whoever picks this up, because
 grepping for the failing assertion will not find it.
 
 Worth a look on its own terms: the shape is a request outliving the pool it
@@ -8242,14 +8242,14 @@ The first sweep ran every case against one artifact and reported seven
 failures. One case removed `/schema/nodes`; every later path was then missing,
 so the atomicity and current-schema results described damage rather than
 behaviour. Re-run on fresh artifacts, kind-schema validation and atomicity
-were **correct** — a patch producing an invalid artifact returns 400, the
+were **correct** - a patch producing an invalid artifact returns 400, the
 patch stays `approved`, no version is written, and a multi-op patch whose
 later operation fails changes nothing.
 
 A second self-inflicted error was a substring check. `"OMEGA" in
 json.dumps(schema)` passed while the real node still said `ALPHA`, because the
 text was sitting in the junk `schema` key the defect had just created. The
-check that would have caught it immediately — comparing the specific field —
+check that would have caught it immediately - comparing the specific field -
 is the one the rewritten witnesses use.
 
 Two rules earned here, both cheap: give every case its own fixture when a
@@ -8264,7 +8264,7 @@ claim at the time was that streaming specialises token production and nothing
 above it. That claim was too strong. SPEC §9.2 makes retries, backoff, the
 per-node timeout and output-schema validation properties of a *node*, and
 §18.3 fixes their numbers; the streamable branch had none of them, because it
-never called `_execute_node_with_retry` — the branch directly below it did.
+never called `_execute_node_with_retry` - the branch directly below it did.
 
 Measured on one aliased tool that resolves to `llm.generic` and therefore
 streams, so the same node ran both ways:
@@ -8278,7 +8278,7 @@ output_schema      status error   tokens emitted, no error at all
 
 ### The timeout could not be enforced at all, and why
 
-`_stream_llm_node` iterated `llm.generate_stream` — a synchronous iterator —
+`_stream_llm_node` iterated `llm.generate_stream` - a synchronous iterator -
 directly on the event loop. Two defects in one line: the model ran on the
 loop, so every other request the worker was serving waited on this one's
 tokens; and nothing was watching the clock, so `timeout_ms` described nothing.
@@ -8311,8 +8311,8 @@ entry: after this change there is no such mutation to write.
 
 A streamed producer registers on the `Invocation` as a `Producer`, so a revoke
 reaches worker processes and in-process producers through the same call, and
-`terminate` counts both. The existing retry precondition — attempt *n+1* may
-not start while attempt *n* is alive — then covers streams with no second
+`terminate` counts both. The existing retry precondition - attempt *n+1* may
+not start while attempt *n* is alive - then covers streams with no second
 mechanism.
 
 The first draft also stopped the pump in `_pumped`'s own `finally`. Both
@@ -8322,7 +8322,7 @@ one stop is the shape this tranche exists to remove, so the local one went.
 
 `close` drops producers from the *wait* only, never from the stop. A producer
 blocked inside a read owns no process and no scratch path, and holding the
-caller for it would defeat the timeout that stopped it — the node correctly
+caller for it would defeat the timeout that stopped it - the node correctly
 failed at 201ms and the turn still took 1.53s until this was separated.
 
 ### Retry stops at the first token
@@ -8348,7 +8348,7 @@ purpose: "the producer stops between events" is met by any generator.
 `LocalJaxLoRABackend` declares itself out. It runs the whole forward pass
 inside `generate` before its first yield, so there is no point between events
 at which a stop could be honoured, and no way to interrupt a JAX call from
-another thread — no scheduling makes `timeout_ms` enforceable against it.
+another thread - no scheduling makes `timeout_ms` enforceable against it.
 Streamed nodes on such a backend fall back to the ordinary executor, which
 runs the body in a worker process that a kill does end, and the answer reaches
 the client in the final `message_done`. Later than a stream, under the
@@ -8359,7 +8359,7 @@ contract SPEC §9.2 requires.
 `MockLLM` was a hand-written stand-in with a single `generate` on it. It
 answered every capability question by not having the attribute, so seven
 tests could not see one the engine had started asking about. It is now
-`LLMService` over `StubBackend` — the rule from §V that a double is built from
+`LLMService` over `StubBackend` - the rule from §V that a double is built from
 the real object, earned again.
 
 The stop witness was vacuous on its first writing. Its producer yielded 50
@@ -8411,7 +8411,7 @@ identically.
 Review of the previous entry's green found two HIGHs and one MEDIUM. All
 three were real; each was reproduced before the fix. The shape of the first
 two is worth recording because both were *unprovable claims defaulting to
-true* — the exact opposite of how this codebase treats authority.
+true* - the exact opposite of how this codebase treats authority.
 
 ### `stream_is_cancellable` claimed an ability the shipped backends lack
 
@@ -8421,7 +8421,7 @@ any generator stops between events. The shipped network backends block
 under a 30s client timeout, native Gemini in `iter_lines()` under a 60s
 one. A stop flag is read between events, so a `timeout_ms: 200` stopped
 the waiter at 200ms while the provider request ran on for up to the
-provider's own timeout — precisely the waiter-versus-work distinction the
+provider's own timeout - precisely the waiter-versus-work distinction the
 refactor claimed to have closed.
 
 Measured before choosing the fix, with a local provider that stalls
@@ -8441,8 +8441,8 @@ reachable through both SDKs (`response.extensions["network_stream"]
 .get_extra_info("socket")`), verified by execution against a stall server
 on both.
 
-So the capability now fails closed — undeclared means no, and the node runs
-on the ordinary executor with its answer in the final `message_done` — and
+So the capability now fails closed - undeclared means no, and the node runs
+on the ordinary executor with its answer in the final `message_done` - and
 a declaration is backed by a real interrupt: `StreamAbortHandle` carries
 the in-flight response's socket, `CancellableStream.abort()` shuts it down,
 and `StreamPump.stop()` aborts the read in flight rather than only the next
@@ -8457,7 +8457,7 @@ The fallback rationale was also overclaimed. "The ordinary executor runs
 the body in a worker a kill really does end" is false for host tools:
 `llm.generic` runs in the parent's serve thread, and killing the worker
 does not interrupt a blocked parent-side generation. What is actually
-promised — and now witnessed — is that the deadline binds: the node fails
+promised - and now witnessed - is that the deadline binds: the node fails
 at `timeout_ms`, the late body runs on as bounded authorityless work, its
 answer is not delivered, and a retry is refused until the previous attempt
 is confirmed dead.
@@ -8466,27 +8466,27 @@ is confirmed dead.
 
 `begin_attempt`/`end_attempt` never ran on the streamed path. The worker
 spawn opens the lease for blocking attempts; streaming spawned no worker
-and opened nothing. Producer liveness looked like the lease — the
-peak-concurrency witness proved attempt two never overlaps attempt one —
+and opened nothing. Producer liveness looked like the lease - the
+peak-concurrency witness proved attempt two never overlaps attempt one -
 but liveness answers "is it running beside me", not "may it run at all".
 
 The concrete bad state, reproduced: after a pre-token failure the driver
 calls `revoke("retry")`; `Invocation.revoke` finds `_current is None`,
 reads that as "nothing has started", and deliberately cancels the whole
 execution so a pre-spawn revoke cannot be forgotten. The streamed retry
-then called the provider anyway — two calls with `invocation.cancelled`
+then called the provider anyway - two calls with `invocation.cancelled`
 true during the second, and three after an explicit cancel, because
 nothing on the path asked.
 
 The driver now opens a lease per attempt for attempt kinds that carry none
-of their own (`NodeAttempt.needs_lease` — streamed yes, blocking no), ends
+of their own (`NodeAttempt.needs_lease` - streamed yes, blocking no), ends
 it on every way out, and treats `LeaseRevoked` from `begin_attempt` as the
 cancellation it is. A cancelled execution gets no further provider calls,
 and `revoke("retry")` is attempt-scoped again.
 
 ### Streaming validated a different object than blocking
 
-Blocking validates the tool's own result — `{content, usage,
+Blocking validates the tool's own result - `{content, usage,
 context_snippets}` for `llm.generic`. Streaming validated a reconstruction
 with a `status` key the tool never produced, so a strict schema
 (`additionalProperties: false`) written for the real output passed
@@ -8494,7 +8494,7 @@ blocking and failed streaming. Reproduced with one schema and one output.
 
 `tool_postflight` is now extracted from `_invoke_tool` and both paths feed
 it the raw tool-result shape; the node's `status` is added after
-validation. The streamed node also reports its grounding now — its
+validation. The streamed node also reports its grounding now - its
 `message_done` previously came straight from the backend, which never saw
 the retrieval, so the streamed turn's `context_snippets` were empty where
 the blocking turn's were not.
@@ -8518,12 +8518,12 @@ were the previous round's fixes stopping one step short of their own rule.
 ### The interrupt existed only after response headers
 
 `supports_stream_cancel = True` promised an interruptible stream, and the
-socket-shutdown interrupt delivered that — from the moment
+socket-shutdown interrupt delivered that - from the moment
 `attach_response` had a socket. Before headers arrived there was nothing
 armed: a provider that accepts the connection and stalls silent leaves the
 producer blocked *entering* the stream, `abort()` records a flag and
-interrupts nothing, and `close()` — which deliberately did not wait for
-producers — forgot it. Reproduced with a server that accepts TCP and never
+interrupts nothing, and `close()` - which deliberately did not wait for
+producers - forgot it. Reproduced with a server that accepts TCP and never
 sends a byte: the workflow returned its 400ms timeout with the producer
 alive on both network backends. The same waiter-versus-work defect as the
 round before, moved earlier in the HTTP lifecycle.
@@ -8531,7 +8531,7 @@ round before, moved earlier in the HTTP lifecycle.
 Two measurements fixed it:
 
 * httpx forwards a per-request `trace` extension to httpcore, and the
-  `connect_tcp.complete` event carries the network stream — so the socket
+  `connect_tcp.complete` event carries the network stream - so the socket
   is in hand before the request is written, and `shutdown(SHUT_RDWR)`
   wakes a headers-wait immediately. Gemini passes the trace on its stream
   call; the OpenAI SDK builds requests internally, so its client is now an
@@ -8539,14 +8539,14 @@ Two measurements fixed it:
   requests force `Connection: close`, because a pooled connection skips
   the connect event and would reopen the gap.
 * The SDK retries transport errors: killing one blocked request started a
-  fresh one blocked in the same place (measured — the first probe's
+  fresh one blocked in the same place (measured - the first probe's
   shutdown freed nothing because retry two was already waiting). An
   aborted handle now refuses the next send with an exception the SDK does
   not retry, and each retry's connect re-attaches into the aborted handle
   and dies on arrival.
 
 What remains unarmed is DNS and the TCP connect itself, bounded by the
-client's connect timeout — a strictly smaller residue than the read
+client's connect timeout - a strictly smaller residue than the read
 timeout this closes, and one with no provider operation yet on the other
 end.
 
@@ -8555,14 +8555,14 @@ end.
 The backend flag says cancellation is possible in principle;
 `CancellableStream.armed` says this stream actually holds the interrupt.
 A network response whose socket cannot be reached is now refused before
-any token — silently arming nothing while advertised cancellable was the
+any token - silently arming nothing while advertised cancellable was the
 finding. No response object at all (in-memory doubles, the no-client
 fallback) still streams: nothing there can block on a socket. The gate
 sits after Gemini's 400-degrade handling; an error response never streams
 and must stay readable for the thinking-config retry, which the first
 placement of the gate broke and a mock-wire test caught.
 
-`terminate(producers=False)` — the terminal teardown — now waits for
+`terminate(producers=False)` - the terminal teardown - now waits for
 producers whose cancellation is proven: their death after a stop is
 prompt, and the workflow must not report a timeout while that provider
 operation runs on. Unproven producers stay excluded from the wait exactly
@@ -8576,22 +8576,22 @@ than the wire format.
 ### The handler names its result's fields
 
 The streamed attempt rebuilt the "raw tool result" from the fields it knew
-about — which were exactly `llm.generic`'s. `agent.files_v1` streams too,
+about - which were exactly `llm.generic`'s. `agent.files_v1` streams too,
 and its blocking result carries `artifacts` and `injection_findings`; the
 reconstruction dropped both before validation, so one result and one
 strict schema got two verdicts. Reproduced with the worker's real six-key
 shape.
 
 The streaming implementations now emit the completed result as a
-`tool_result` event — the llm node with its three keys, the agent node
-with the worker loop's six, on the partial-answer path included — and
+`tool_result` event - the llm node with its three keys, the agent node
+with the worker loop's six, on the partial-answer path included - and
 `StreamedNodeAttempt` consumes it and fails closed if it is missing,
 rather than reconstructing. Every newly streamable handler now names its
 own fields once, where it builds them.
 
 `tool_postflight` became the transformation boundary it was named as:
-streaming applies it to every completed result — sanitizing included,
-which it previously skipped entirely when no schema was declared — and
+streaming applies it to every completed result - sanitizing included,
+which it previously skipped entirely when no schema was declared - and
 what proceeds downstream is the sanitized object it returns, on both
 paths.
 
@@ -8599,7 +8599,7 @@ paths.
 
 Found while writing the pre-headers witness. `context_window` is resolved
 lazily by probing the provider, and the prompt-budget path triggers it on
-the event loop — against the stalled provider the *turn* blocked for the
+the event loop - against the stalled provider the *turn* blocked for the
 client's full read timeout (measured 60.15s Gemini, 5.07s OpenAI-SDK)
 before the node even started. Pre-existing, unrelated to the streaming
 seams, and its own fix: the probe belongs off the loop with a budget
@@ -8611,19 +8611,19 @@ it out of their measurement.
 Three needed intervention, and each earned its keep:
 
 * The chat-branch arm-or-refuse mutation first **broke the build instead of
-  measuring** — its anchor's first match was a *prefix* of the responses
+  measuring** - its anchor's first match was a *prefix* of the responses
   branch's block, whose `return True` lost its `return`. Re-anchored, it
   then **survived**: no witness exercised a socketless response through the
   SDK chat branch, because the SDK witnesses run over real sockets or fakes
   with no response object. It now has one, and dies to it.
-* The "attempt reconstructs the result" mutation was **dead code** — with
+* The "attempt reconstructs the result" mutation was **dead code** - with
   both handlers always emitting `tool_result`, a reconstruction fallback is
   unreachable and no test can see it. Retired, replaced by the two
   measurable sides of the seam: each handler's emission removed separately,
   killed by the canonical witness and by six streaming controls.
 * The send-refusal mutation **survived its first run** because the
   attach-kills-new-connections path makes the refusal redundant for
-  eventual teardown — the abort still wins, just after the SDK's whole
+  eventual teardown - the abort still wins, just after the SDK's whole
   retry budget. What the refusal actually buys is that an aborted client
   opens no further connection at all; the witness now asserts exactly that
   (a counting server sees zero accepts after an abort), deterministically.
@@ -8646,7 +8646,7 @@ governs whether the connection is retained *after* the request, not
 whether an already-idle pooled connection satisfies it.
 
 Measured on httpx 0.28.1 (in the supported range): warm a client with one
-request, send the next with `Connection: close` — the server sees it on
+request, send the next with `Connection: close` - the server sees it on
 the same socket. No connect event fires, the handle never arms, and the
 whole chain built on `armed` follows it down: `abort()` interrupts
 nothing, `cancellation_proven` is false, the terminal teardown excludes
@@ -8657,36 +8657,36 @@ reintroduced by the fix's own transport assumption.
 Production-reachable, not contrived: Gemini's context-window probe GETs
 through the same `_http()` client streaming used, so the first turn's
 budget computation warmed exactly the pool the stream then drew from. The
-cold-pool witnesses had pinned `_context_window` — which is precisely the
-request that warms that pool — so the arming premise was true in the
+cold-pool witnesses had pinned `_context_window` - which is precisely the
+request that warms that pool - so the arming premise was true in the
 tests artificially.
 
 The primitive that holds, probe-proven before building on it:
 `httpx.Limits(max_keepalive_connections=0)`. A pool that retains nothing
 has nothing idle to reuse, so every request connects fresh and the trace
-fires — `[1, 2]` connections in the probe where `Connection: close` gave
+fires - `[1, 2]` connections in the probe where `Connection: close` gave
 `[1, 1]`.
 
 The green:
 
-* `ArmingClient` forces zero keep-alive in its constructor — the class is
+* `ArmingClient` forces zero keep-alive in its constructor - the class is
   the no-reuse guarantee. The `Connection: close` injection is removed
   rather than kept as a second mechanism, for the reason mutation keeps
   teaching: two authorities for one property make both unmeasurable.
 * The OpenAI-compatible backend splits its SDK client: blocking calls
   keep the pooled client and its connection reuse; streams go through a
   second SDK client over `ArmingClient`. A dedicated client alone would
-  not have been enough — the first stream's completed connection would
+  not have been enough - the first stream's completed connection would
   idle in that pool and disarm the second stream the same way.
-* Gemini streams through `_http_stream()` — same transport injection,
-  zero keep-alive — while `_http()` keeps pooling for generate and the
+* Gemini streams through `_http_stream()` - same transport injection,
+  zero keep-alive - while `_http()` keeps pooling for generate and the
   probe.
 
 Witness structure, because the reviewer's framing was exactly right about
 what the previous witnesses proved: the cold-pool witnesses show what
 happens when the arming premise holds; the new ones witness the premise.
 End to end, the real window probe runs unpinned, warms the pool, and the
-streaming POST stalls on the same socket — the producer must be dead when
+streaming POST stalls on the same socket - the producer must be dead when
 the 400ms timeout returns. At the client, a handle-bound SDK request and
 a second gemini stream-client request must each open a fresh connection
 against a deliberately warmed server. Four no-reuse mutations pair with
@@ -8704,13 +8704,13 @@ reproduced as failing tests before the fix.
 
 **A finished stream is finished.** `bounded` checked the clock before
 asking the iterator, so the pull that would have ended a completed stream
-— the one after its final event — raised `TimeoutError` where
+- the one after its final event - raised `TimeoutError` where
 `StopAsyncIteration` was waiting. The driver then treated an answer the
 client had already received as a node timeout, and an empty completion
 (no token events) looked unemitted and was retried: a second answer after
 a delivered one. Two changes, each with its own witness and mutation:
 
-* `bounded` grants a 1ms terminal grace when the deadline has passed —
+* `bounded` grants a 1ms terminal grace when the deadline has passed -
   `StopAsyncIteration` ends cleanly; an event arriving inside the grace
   is dropped and the timeout raised, so a hot producer cannot ride the
   grace past the deadline one event at a time (witnessed against a
@@ -8718,8 +8718,8 @@ a delivered one. Two changes, each with its own witness and mutation:
 * The driver's `result()` wait keeps its `wait_for` only while budget
   remains. A streamed attempt's outcome is already computed once its
   events end; `wait_for(…, 0)` refuses a coroutine that only returns a
-  field. A blocking attempt's `events()` is empty, so its `result()` —
-  which runs the body — always sees effectively the whole budget, and the
+  field. A blocking attempt's `events()` is empty, so its `result()` -
+  which runs the body - always sees effectively the whole budget, and the
   unbounded branch is unreachable for it.
 
 SPEC's "a node past its timeout fails" is untouched: a node whose final
@@ -8733,7 +8733,7 @@ requires `message` on a node that omits it passed blocking and was
 refused on the streamed path. The same two lines now run before the
 streaming preflight, and the rule is stated normatively in SPEC's
 workflow-engine contracts: the fallback applies before validation and
-identically on both transports — validation judges the inputs the node
+identically on both transports - validation judges the inputs the node
 executes with.
 
 The tranche now stands at 39 mutations, 39 killed.
@@ -8742,7 +8742,7 @@ The tranche now stands at 39 mutations, 39 killed.
 
 Review finding on `4d389f0`, a HIGH the previous fix introduced. The
 exhausted-budget branch collected `result()` unbounded for *every*
-attempt type. For a streamed attempt that is correct — its outcome is
+attempt type. For a streamed attempt that is correct - its outcome is
 already computed once its events end, and `wait_for(…, 0)` would refuse a
 coroutine that only returns a field. For a blocking attempt it is where
 the body *starts*: empty events, terminal grace, spent budget, and a tool
@@ -8750,24 +8750,24 @@ body beginning after its deadline with no bound at all. `timeout_ms: 0`
 is admissible today (the artifact validator says nothing about node
 timing fields) and makes the route deterministic; the reviewer also
 reproduced it with microseconds of remaining budget, so admission hygiene
-alone cannot close it — ordinary scheduling can spend the last fraction
+alone cannot close it - ordinary scheduling can spend the last fraction
 of a positive budget between the event phase and `result()`.
 
 The fix makes the streamed exception's premise explicit on the attempt
-itself: `result_ready_after_events` — true for a streamed attempt, false
+itself: `result_ready_after_events` - true for a streamed attempt, false
 for a blocking one, declared beside `needs_lease`. Only an
 already-materialized result may be collected after the clock crosses
 zero; an unstarted body raises the timeout the driver already handles.
 
 Two witnesses, both failing first: `timeout_ms: 0` end to end on the
 blocking path (the body's start is recorded; it must never run), and the
-same property at the driver with the node dict handed straight in — so a
+same property at the driver with the node dict handed straight in - so a
 future `minimum: 1` at admission cannot make the witness pass while the
 driver stays wrong. One mutation (the branch generalized again) dies to
 both.
 
-One asymmetry accepted and named: the branch's streamed half — collecting
-a ready result with the budget exactly spent — has no deterministic
+One asymmetry accepted and named: the branch's streamed half - collecting
+a ready result with the budget exactly spent - has no deterministic
 witness, because forcing events to end inside the terminal grace requires
 landing in a millisecond window. The blocking half carries the mutations;
 the streamed half is the two-line collection of a stored field.
@@ -8775,7 +8775,7 @@ the streamed half is the two-line collection of a stored field.
 ### The admission-proof control was itself vacuous, and for the campaign's oldest reason
 
 Review caught it before merge: the driver-level witness's `BlockingShaped`
-fake omitted `result_ready_after_events` — the very field the branch under
+fake omitted `result_ready_after_events` - the very field the branch under
 test reads. The driver raised `AttributeError` inside the `elif`, the
 generic handler recorded a failed attempt, and `assert not started` passed
 because the fake crashed, not because the refusal ran. The §V rule, again:
@@ -8791,7 +8791,7 @@ The first parallel CI run on the speedup PR failed one test on 3.10:
 the identity-tokens erasure witness scans its whole Redis database for
 `reset:*` and asserts empty, and it saw a neighbouring worker's token.
 Not a flake and not the witness's fault: CI never set `TEST_REDIS_URL`,
-so the per-worker Redis leasing the 2I.1 work built never engaged there —
+so the per-worker Redis leasing the 2I.1 work built never engaged there -
 every worker fell back to the settings default, which is the same host
 and database 0 as the service container. Serially that sharing was
 invisible; under `-n 4` it is four workers in one database.
@@ -8800,8 +8800,8 @@ Diagnosed by execution, not the server log: the Postgres container dump
 that ends the job log is full of duplicate-key and FK errors that are
 deliberate test behaviour (the migration-guard witnesses run
 `migrate.sh` against corrupted rows on purpose), and reading it as
-cross-worker bleed was wrong twice before the pytest summary — one line,
-2,100 lines deep — named the actual test. Local reproductions of the CI
+cross-worker bleed was wrong twice before the pytest summary - one line,
+2,100 lines deep - named the actual test. Local reproductions of the CI
 shape (shared server, prepared clones, xdist, both Pythons, confinement
 required) were green because this machine has `redis-server`, so every
 worker got a scratch instance CI cannot start.
@@ -8812,7 +8812,7 @@ Verified in the binary-less CI shape that the harness's own isolation
 tests skip (they stand up scratch services CI has no binaries for), and
 that the erasure witness passes under leasing.
 
-Recorded, not fixed — a harness-tranche residual: running the suite with
+Recorded, not fixed - a harness-tranche residual: running the suite with
 `TEST_REDIS_URL` set on a machine that also has the service binaries
 (neither lane's configuration) fails eight `test_worker_isolation.py`
 tests, an interaction between the outer run's own lease state and the
@@ -8829,7 +8829,7 @@ The tranche's rule, sharpened by review before any code moved:
     increments; tool-level success clears. Transport and retry path do not
     change the ledger. A call refused before invocation records nothing.
 
-Characterized by execution first — real engine, real Postgres, real Redis,
+Characterized by execution first - real engine, real Postgres, real Redis,
 one attempt per row unless stated:
 
     scenario                         recorded      the rule says
@@ -8838,8 +8838,8 @@ one attempt per row unless stated:
     blocking exception x3 attempts   3             3
     tool-spec timeout                1 failure     1 failure
     node-deadline timeout            nothing       1 failure (ruling below)
-    output_schema refusal            1 failure     success — tool answered
-    input-validation refusal         1 failure     nothing — never started
+    output_schema refusal            1 failure     success - tool answered
+    input-validation refusal         1 failure     nothing - never started
     unresolved reference             1 failure     nothing
     plan-phase crash                 1 failure     nothing
     caller revocation                1 failure     nothing (ruling below)
@@ -8854,33 +8854,33 @@ Alice's failing private `foo` opened the breaker for Bob's healthy private
 checked or recorded at all.
 
 The consolidation gives the ledger one writer. Attempts carry a
-`BreakerObservation` — `started` and `outcome`, explicitly not derived from
-the node result — filled at the raw tool boundary: `_invoke_tool` sets it
+`BreakerObservation` - `started` and `outcome`, explicitly not derived from
+the node result - filled at the raw tool boundary: `_invoke_tool` sets it
 for blocking (before the postflight), `StreamedNodeAttempt._drain` sets it
 for streaming (at the `tool_result` event, before `finalize`). The shared
 attempt driver writes the ledger exactly once per attempt in its
-per-attempt `finally`, keyed by the resolved identity — the persisted
-artifact's id, or the builtin name when nothing is persisted behind it —
+per-attempt `finally`, keyed by the resolved identity - the persisted
+artifact's id, or the builtin name when nothing is persisted behind it -
 which the seeded default tools make an artifact id even for `llm.generic`.
 The breaker *check* moved before the invocation opens
 (`_execute_node_with_retry`, mirroring the streaming preflight), so a
 refusal is now truly pre-invocation: it opens nothing, records nothing, and
 no longer burns the node's retries and backoff on calls the breaker was
-always going to refuse — with `on_error` it takes that edge immediately,
+always going to refuse - with `on_error` it takes that edge immediately,
 without one the turn fails immediately.
 
 Two boundary rulings, stated in SPEC §18.3 rather than slipped in:
 
 * An attempt that starts and is then cut off at the node's own deadline
   records a failure. Without it a backend hung past every node budget never
-  records an outcome — the breaker could not open for exactly the hang it
+  records an outcome - the breaker could not open for exactly the hang it
   exists to stop. `started` marks the serve, so the same deadline spent in
   plan assembly still records nothing.
-* An attempt abandoned by its caller — cancel, revoked lease — records
+* An attempt abandoned by its caller - cancel, revoked lease - records
   nothing. Charging revocations meant a user's cancel habit could open
   their tenant's breaker with the tool never once at fault.
 
-Witnesses: `tests/test_tool_breaker_accounting.py`, nineteen tests — twelve
+Witnesses: `tests/test_tool_breaker_accounting.py`, nineteen tests - twelve
 were red on the previous code, each failing on its own assertion; the
 seven controls pin what already held. Exact-count witnesses sum the
 identity key and the spelling key, so a write regressed to the spelling is
@@ -8912,13 +8912,13 @@ verified byte-for-byte between runs:
 The survivor is an equivalent mutant, not a coverage hole. A circuit-open
 refusal exists only while the open key exists, and `record_tool_failure`'s
 atomic script begins by returning `already open` without incrementing when
-it does — so a failure recorded at that refusal site writes nothing the
+it does - so a failure recorded at that refusal site writes nothing the
 ledger can show. The property is enforced twice, engine and cache; the
 mutant disables the engine half and the cache half holds. It stops being
 equivalent only in the window where the open key expires between the check
 and the write, which no test can stage deterministically.
 
-Recorded, not fixed — two residuals for the reviewer:
+Recorded, not fixed - two residuals for the reviewer:
 
 * The direct-invocation path (`invoke_tool`, serving
   `POST /v1/tools/{id}/invoke`) neither consults nor writes the breaker,
@@ -8940,7 +8940,7 @@ Recorded, not fixed — two residuals for the reviewer:
 ## Review found the breaker bound to the node, not the attempt
 
 Four findings on the first breaker commit, three of them merge blockers,
-none visible to its own nineteen witnesses — each is now a red turned
+none visible to its own nineteen witnesses - each is now a red turned
 green:
 
 1. A breaker tripped by attempt one did not stop attempt two. The check
@@ -8950,11 +8950,11 @@ green:
    `max_retries: 2` ran three times where the rule allows one. Both
    transports.
 2. The same hoist froze the descriptor at node entry, and every retry ran
-   the captured spec. That regressed tranche 2's frozen rule — current
+   the captured spec. That regressed tranche 2's frozen rule - current
    canonical state is consulted at execution, and a process-local capture
    cannot create authority: a tool retired by its own first attempt was
    executed again by the second.
-3. The streamed `started` mark sat at the drain's first pull — before the
+3. The streamed `started` mark sat at the drain's first pull - before the
    streaming bodies plan. Retrieval and budget assembly (plain LLM) and
    grounding plus agent-context assembly (`agent.files_v1`) all ran after
    the mark, so a node deadline spent in streamed planning was recorded
@@ -8963,20 +8963,20 @@ green:
 4. The commit knowingly shipped SPEC broader than the code: "every
    invocation whose serve begins records exactly one outcome" beside an
    ISSUES residual admitting the direct endpoint records nothing. The
-   review declined the pairing — a normative rule the implementation
+   review declined the pairing - a normative rule the implementation
    contradicts on purpose is a false rule.
 
 One correction resolves the first two: attempts are prepared immediately
 before they start, inside the driver's loop. `_resolve_attempt_authority`
 resolves the descriptor fresh, derives the breaker identity, and checks
-the breaker — per attempt, one helper for both transports — and a refusal
+the breaker - per attempt, one helper for both transports - and a refusal
 comes back as the attempt itself: terminal, routed through the same
 refused-result chooser, retrying nothing. The identity moved onto the
 observation, because with per-attempt resolution two attempts of one node
 can legitimately run under two different rows. For the third, the
 observation now travels into the streaming bodies and `started` is marked
-at the real serve boundaries — the provider pump for the plain LLM node,
-the worker serve for the agent — with two new hang witnesses pinning that
+at the real serve boundaries - the provider pump for the plain LLM node,
+the worker serve for the agent - with two new hang witnesses pinning that
 a provider or serve that starts and stalls past the node deadline records
 the failure the mark exists to catch. For the fourth, the direct endpoint
 now checks the breaker before starting and records through the same
@@ -8990,7 +8990,7 @@ the real cache and assert the refusal made no recording call at all,
 which kills that mutant deterministically instead of excusing it.
 
 The mutation set was rebuilt for the new structure and grew to
-twenty-five, all killed — the round-one survivor included:
+twenty-five, all killed - the round-one survivor included:
 
     mutation                                        outcome
     drop streamed failure accounting                killed
@@ -9020,8 +9020,8 @@ twenty-five, all killed — the round-one survivor included:
     resolution cached across attempts               killed
 
 The witnesses for findings one and two need no synthetic mutants: they
-were written red against the exact structure under indictment — the
-committed hoist — and turned green only when the preparation moved into
+were written red against the exact structure under indictment - the
+committed hoist - and turned green only when the preparation moved into
 the attempt loop, which is the direct sensitivity proof a string mutation
 would only imitate.
 
@@ -9036,19 +9036,19 @@ is a red turned green.
    transport; every retry then re-resolved a fresh descriptor and inherited
    that first verdict. An ordinary user's non-privileged private spec could
    fail, be retired, and the retry fall through to an admin-owned
-   *privileged* spec of the same name — and run it, because the clean
+   *privileged* spec of the same name - and run it, because the clean
    preflight travelled while the spec did not. An authority bypass, not
    staleness. Preparation is now complete: resolution, the admission
    preflight against the attempt's own inputs, then the breaker check, one
    helper for both transports, and the outer streaming preflight is gone.
    The witness runs exactly the bypass; its complement proves a
    substituted spec's `input_schema` refuses the retry. `tool_preflight`
-   still also runs inside `_invoke_tool` — the authority witnesses pin the
+   still also runs inside `_invoke_tool` - the authority witnesses pin the
    invocation boundary as its own backstop, and one function called twice
    is not two copies.
 2. Preparation could spend the deadline and the tool started anyway. The
    driver computed the node budget, awaited preparation unbounded, and
-   only then started the clock — so a breaker check that stalled half a
+   only then started the clock - so a breaker check that stalled half a
    second handed the body a fresh budget past the node's own deadline, the
    same class as tranche 2's blocking-work-after-budget, one seam earlier.
    The absolute deadline is now fixed before preparation, preparation is
@@ -9059,10 +9059,10 @@ is a red turned green.
 3. The agent could turn a real post-start failure into breaker success.
    `agent.files_v1` deliberately salvages: a final stream that dies after
    a token keeps the partial answer and emits a well-formed `tool_result`,
-   which the attempt read as a raw success — five provider deaths became a
+   which the attempt read as a raw success - five provider deaths became a
    clean bill of health because the UI kept the fragments. The agent's
    catch now marks the observation failed (revoked leases excluded: caller
-   abandonment still records nothing) and the observation is sticky — a
+   abandonment still records nothing) and the observation is sticky - a
    later partial or fallback `tool_result` cannot rewrite a failure. The
    witness seeds four failures, salvages a partial, asserts the partial
    still reaches the client *and* the breaker is open.
@@ -9073,12 +9073,12 @@ preparation spends the attempt's deadline; recovery is not tool health.
 One ordering note made deliberately rather than silently: the workflow
 transports refuse invalid input before consulting the breaker, while the
 direct endpoint checks the breaker first and preflights inside the
-invocation — the transports now agree with each other, which is what the
+invocation - the transports now agree with each other, which is what the
 review asked; aligning the direct endpoint's order is a one-line follow-up
 if wanted.
 
-Five witnesses were added — the bypass, its validation complement, the
-deadline, the salvage, and a direct input refusal — bringing the file to
+Five witnesses were added - the bypass, its validation complement, the
+deadline, the salvage, and a direct input refusal - bringing the file to
 thirty-four, and the mutation set grew to twenty-nine, all killed:
 
     new mutation                                    outcome
@@ -9087,7 +9087,7 @@ thirty-four, and the mutation set grew to twenty-nine, all killed:
     agent caught failure left unmarked              killed
     observation stickiness dropped                  killed
 
-The preflight-drop mutant is killed by the retry-shaped witnesses alone —
+The preflight-drop mutant is killed by the retry-shaped witnesses alone -
 the single-attempt validation witness survives it through the
 `_invoke_tool` backstop, which is exactly the layering: the backstop
 guards the invocation, the preparation guards the attempt, and only the
@@ -9101,30 +9101,30 @@ green.
 
 1. A timeout before the worker opened its `Attempt` cancelled the whole
    logical execution. `Invocation.revoke` with no current attempt fails
-   closed by cancelling everything — right for a revoke racing the first
+   closed by cancelling everything - right for a revoke racing the first
    spawn, wrong for a node timeout whose retry policy still owes the node
    its retry. A stalled breaker check on attempt one, or blocking plan
    assembly running past the deadline, both revoked pre-spawn: the retry
    then died on `begin_attempt` (streamed) or was refused at its own spawn
    (blocking). The driver now establishes attempt-scoped authority before
-   any cancelable work — `begin_attempt` precedes preparation for every
-   attempt — so its timeout always revokes the attempt, never the
+   any cancelable work - `begin_attempt` precedes preparation for every
+   attempt - so its timeout always revokes the attempt, never the
    execution. The worker spawn *adopts* the driver's attempt instead of
    beginning its own (`Invocation.adopt_attempt`), refusing one the
    timeout already revoked, which keeps the pre-spawn revoke fence; a
-   driverless caller — direct invocation — still begins its own. Once
+   driverless caller - direct invocation - still begins its own. Once
    adopted, the parent-side serve loop keeps sole ownership of `finished`,
    so a retry still waits for the abandoned serve to actually return; the
    driver ends only attempts nothing adopted. Three witnesses: a stalled
-   breaker check, its streamed sibling, and stalled plan assembly — each
+   breaker check, its streamed sibling, and stalled plan assembly - each
    with a fast second attempt that must succeed.
 2. Streaming still had one free, synchronous resolver: the dispatch call
    that chose streamed-versus-blocking ran before any node deadline
-   existed, so a stalled lookup granted the provider a fresh clock — the
+   existed, so a stalled lookup granted the provider a fresh clock - the
    class the previous round closed, surviving in the one lookup that round
    did not move. The dispatch resolver is gone: every `tool_call` node
    enters the shared attempt driver, and the *preparation* decides the
-   transport from the same per-attempt resolution the admission uses — a
+   transport from the same per-attempt resolution the admission uses - a
    non-streamable spec, or a backend that cannot be stopped, gets a
    blocking attempt under the same driver, deadline and ledger, and the
    streaming loop applies the blocking bookkeeping to outcomes that
@@ -9137,14 +9137,14 @@ green.
    `_pumped()` as if the stream had completed: the agent fell out of its
    loop, emitted a well-formed partial `tool_result`, and the caller's own
    cancel recorded a breaker success over four seeded failures. The pump
-   now knows why it ended — `interrupted` is a stop that cut the producer
-   short of its natural end — and `_pumped` emits `cancel_ack` for an
+   now knows why it ended - `interrupted` is a stop that cut the producer
+   short of its natural end - and `_pumped` emits `cancel_ack` for an
    interrupted stream, which the agent's existing cancel branch turns into
    an unrecorded, unanswered exit. The witness cancels mid-read and holds
    the count at four, with a spy proving no success was ever recorded.
 4. The direct endpoint's admission order now matches the transports
-   instead of being recorded as a follow-up: `_admit_descriptor` — the
-   preflight, then the breaker — is the second half of attempt preparation
+   instead of being recorded as a follow-up: `_admit_descriptor` - the
+   preflight, then the breaker - is the second half of attempt preparation
    and the whole of direct admission, which skips only the resolution it
    does not need. With both grounds to refuse, every seam answers
    validation, not circuit-open; the witness holds an open breaker against
@@ -9166,13 +9166,13 @@ One prior mutant needed a new witness rather than a shrug: with admission
 now refusing at every seam, the `_invoke_tool` backstop's refusal branch
 became unreachable from the workflow and direct paths, and the mutant
 that makes it record survived as dead code. The backstop exists precisely
-for a caller that skips admission, so it earned a seam-level probe — the
+for a caller that skips admission, so it earned a seam-level probe - the
 refusal returns, the observation stays empty, and the recorder writes
-nothing — which kills that mutant deterministically.
+nothing - which kills that mutant deterministically.
 
 One load-sensitivity observation, same class as the pool-arming witness
 recorded earlier: one loaded full-lane run failed
-`test_a_replacement_cannot_be_undone_by_a_write_already_in_flight` — a
+`test_a_replacement_cannot_be_undone_by_a_write_already_in_flight` - a
 file-replacement race witness over code this tranche never touched, last
 changed before this branch existed. Green five times serially (a 31-second
 concurrency witness each run) and green on the confirming full lane;
@@ -9187,50 +9187,50 @@ first round had recorded as a residual. Every one is a red turned green.
 
 1. `adopt_attempt()` adopted whatever attempt happened to be current.
    Attempt A's serve, queued in a thread pool, could wake after the node
-   timed out, A was revoked and ended, and retry B had begun — and join
+   timed out, A was revoked and ended, and retry B had begun - and join
    B: A's stale plan executing under B's fresh authority, potentially
    beside B's own worker. Ambient authority by arrival time, the exact
    class tranche 2 removed from resolution. Adoption is now by exact
    attempt identity: the driver stamps its lease onto the per-attempt
    observation, the serve hands that token to the spawn, and
    `adopt_attempt(expected)` refuses anything that is not the live
-   current attempt — the staged race runs the tool body once, not twice.
+   current attempt - the staged race runs the tool body once, not twice.
    Two smaller doors in the same seam closed with it. Adoption, worker
    start and child registration are now one step under the execution's
    lock, so a revoke lands before the worker exists (the adoption
    refuses) or after it is registered (the sweep finds it), never in
-   between — witnessed with a held fake process proving a revoke cannot
+   between - witnessed with a held fake process proving a revoke cannot
    complete inside the spawn window. And ownership transfers only after
    registration: a `process.start()` that raises leaves the attempt
    unadopted for the driver to end, so a one-line OSError is an ordinary
-   retryable failure — measured at thirty seconds of `tool_worker_unreaped`
+   retryable failure - measured at thirty seconds of `tool_worker_unreaped`
    before, under two seconds after.
 2. A cancel landing during streamed preparation still started the
    provider: preparation returned normally onto a revoked attempt, and
    the pump was built and running before anything consulted the cancel.
-   The producer now starts the way a worker does — under the invocation
+   The producer now starts the way a worker does - under the invocation
    lock, exact attempt verified live, started and registered atomically,
    `cancel_ack` when the gate refuses. The witness blocks preparation in
    the breaker check, cancels, and requires zero provider calls and an
    empty ledger.
 3. `started` still meant "the serve was scheduled": blocking marked it
-   before `to_thread` ever ran the serve, so a saturated pool — or the
-   adoption refusal above — charged the tool for a worker that never
+   before `to_thread` ever ran the serve, so a saturated pool - or the
+   adoption refusal above - charged the tool for a worker that never
    existed. The mark moved to the atomic start point on every path: after
    the spawn registers the worker, inside the producer gate for streams.
    And `_record_breaker_outcome` now refuses to write for an unstarted
-   attempt outright — the normative boundary as a backstop rather than a
+   attempt outright - the normative boundary as a backstop rather than a
    convention every caller must remember.
 4. A stream that ended cleanly without a completed result still recorded
-   nothing — the first round's residual, now cheap to close because the
+   nothing - the first round's residual, now cheap to close because the
    pump distinguishes interruption from natural completion: the caller's
    stop stays silent, and a clean provider EOF with no answer is a
    started serve that failed. Five clean truncations open the breaker.
 
 Seven reds staged the races the forty-seven prior witnesses never
-staged — the late adoption, the exact-token contract, the spawn-failure
+staged - the late adoption, the exact-token contract, the spawn-failure
 strand, the revoke window, the cancel during preparation, the pre-spawn
-deadline, the clean truncation — plus a cancel discovered between events
+deadline, the clean truncation - plus a cancel discovered between events
 and a drain-seam probe, bringing the file to fifty. The mutation set is
 thirty-nine, all killed; the six new mutants:
 
@@ -9245,11 +9245,11 @@ thirty-nine, all killed; the six new mutants:
 Two witnesses had gone insensitive under this round's own layering and
 were sharpened rather than excused. The revocation witness's serve double
 never marked `started`, so the new recorder gate masked the very write it
-polices — it now marks `started` the way the real serve does, standing
+polices - it now marks `started` the way the real serve does, standing
 for a worker that spawned and was then revoked. And the interruption
-carve-out in the drain turned out to be unreachable end-to-end — every
+carve-out in the drain turned out to be unreachable end-to-end - every
 running path stops iterating at the forwarded `cancel_ack`, so the
-no-answer tail never runs post-acknowledgment — which made the
+no-answer tail never runs post-acknowledgment - which made the
 interruption-records-failure mutant survive twice; it is now killed by a
 seam probe of the attempt's own contract, the same resolution the
 invocation backstop got a round earlier: defense-in-depth stays, and it
@@ -9265,11 +9265,11 @@ that refreshed itself. Three reds, three greens.
 
 1. A worker could start, register, and be killed while the breaker still
    said `started=False`. The spawn's locked block adopted, started and
-   registered the worker — but the mark lived in `_serve_invocation`,
+   registered the worker - but the mark lived in `_serve_invocation`,
    after `spawn()` returned, and between the two sits the READY
    handshake: up to fifteen seconds waiting for the child to prove its
    process group. A node deadline expiring in that window killed a
-   registered, running worker and recorded nothing — exactly the
+   registered, running worker and recorded nothing - exactly the
    unhealthy-tool shape the ledger exists to count, and the same
    "marked one seam late" class as round five's scheduling mark, one
    seam later. `spawn()` now takes a no-throw `on_started` callback and
@@ -9280,7 +9280,7 @@ that refreshed itself. Three reds, three greens.
    exactly one failure.
 2. A stale serve waking after the invocation closed could still create
    filesystem state. The scratch was allocated in the spawn call
-   expression — evaluated before the adoption validated anything — so
+   expression - evaluated before the adoption validated anything - so
    the refusal arrived after `mkdtemp` and `add_path`, and the close
    that would have removed the path had already run; a second close is
    an idempotent no-op, so the orphan survived. The scratch argument is
@@ -9293,8 +9293,8 @@ that refreshed itself. Three reds, three greens.
    failure, which makes the real rule "a chain of failures with no gap
    longer than the window": one failure every fifty seconds tripped a
    breaker whose sixty-second window never held five. The counter is
-   now a timestamped set — prune entries older than the window, add,
-   count — and the read side counts the same score range, so the count
+   now a timestamped set - prune entries older than the window, add,
+   count - and the read side counts the same score range, so the count
    is the failures inside one window ending now. The red sets threshold
    three over a one-second window and drips failures 600 milliseconds
    apart across 1.2 seconds: under the TTL refresh the third drip
@@ -9312,12 +9312,12 @@ mutants:
 
 Two prior mutants were re-anchored rather than retired: the
 serve-boundary mark block they deleted no longer exists, so both now
-delete the `on_started` invocation inside the spawn block — the same
-semantic hole, at the seam it moved to — and the ownership-before-start
+delete the `on_started` invocation inside the spawn block - the same
+semantic hole, at the seam it moved to - and the ownership-before-start
 mutant re-anchored around the scratch and process construction the lock
 now encloses. Collateral: two invocation-lease witnesses called
 `spawn()` with the old scratch-path string and now pass a factory, and
-the SPEC bullet gained the words the code finally earned — the window
+the SPEC bullet gained the words the code finally earned - the window
 is rolling, the scratch is allocated inside the locked step, and
 `started` is marked at registration itself, not when the spawn call
 returns.
@@ -9326,13 +9326,13 @@ returns.
 
 Round six fixed three real defects, and review then found that two of its
 fixes had each introduced a smaller one, plus a third the rolling window
-had carried in from the start. All three are distributed-systems faults —
-a lock, a key type, and a clock — and all three are a red turned green.
+had carried in from the start. All three are distributed-systems faults -
+a lock, a key type, and a clock - and all three are a red turned green.
 
 1. Moving the scratch allocation inside `invocation.lock` let a stalled
    `mkdtemp` hold a revoke hostage. Round six put the scratch factory
    behind the exact-attempt gate to stop a stale serve leaving a
-   directory behind — correct — but the gate is the invocation lock, and
+   directory behind - correct - but the gate is the invocation lock, and
    the node deadline revokes through that same lock. `_worker_scratch`
    does real filesystem work, `mkdir` and `mkdtemp`; a slow one now ran
    while the lock was held, so a 300-millisecond node deadline could take
@@ -9344,7 +9344,7 @@ a lock, a key type, and a clock — and all three are a red turned green.
    attempt, transfers ownership of the directory, and starts and
    registers the worker as one step. A spawn refused at the revalidation
    deletes the directory it made, so a stale serve still leaves nothing
-   behind — the round-six property, kept, without the lock over the I/O.
+   behind - the round-six property, kept, without the lock over the I/O.
    The red blocks the allocation for two seconds under the deadline and
    requires the revoke to return in well under one, with no worker
    started and nothing left on disk.
@@ -9354,11 +9354,11 @@ a lock, a key type, and a clock — and all three are a red turned green.
    written with `INCR`. Round six made the same key a sorted set, read
    with `ZCOUNT` and `ZADD`. Any tool with one to four recent failures
    has a live string at that key when the new version rolls out, and the
-   first `ZCOUNT` against it raises `WRONGTYPE` — which the breaker
+   first `ZCOUNT` against it raises `WRONGTYPE` - which the breaker
    preflight does not mask, so every call for that tool errors. Worse
    mid-rollout: old replicas keep issuing `INCR` while new ones issue
    `ZADD`, so whichever type exists breaks the other version. The fix
-   versions the key — the sorted set lives at `:failures:v2`, the legacy
+   versions the key - the sorted set lives at `:failures:v2`, the legacy
    counter is left to expire on its own TTL, and the shared `:open` key,
    a plain string on both versions, stays put. The red writes the legacy
    string and requires neither the check nor the record path to raise.
@@ -9369,7 +9369,7 @@ a lock, a key type, and a clock — and all three are a red turned green.
    changes what the breaker counts. A replica whose clock runs slow
    scores a failure in the past, and the next normally-clocked replica
    prunes everything older than its own now-minus-window before counting
-   — dropping that failure early, so two failures inside one real minute
+   - dropping that failure early, so two failures inside one real minute
    never trip a two-in-a-minute breaker. The fix gives the ledger its own
    clock: the timestamp and the cutoff both come from Redis's `TIME`,
    read inside the atomic script, so every replica reads the same window.
@@ -9377,7 +9377,7 @@ a lock, a key type, and a clock — and all three are a red turned green.
    seconds slow, then one through a normal replica moments later, and
    requires the two to trip a threshold-two breaker; against a
    process-local clock the first is pruned early and they never combine.
-   (The mirror direction — a fast replica scoring in the future — is
+   (The mirror direction - a fast replica scoring in the future - is
    masked by the set's own window-length TTL, which evicts the future
    entry by real time before it can outlast the window, so the
    early-prune direction is the one a witness can pin.)
@@ -9393,8 +9393,8 @@ forty-five, all killed; the four new mutants:
 
 One round-six mutant was retired rather than retargeted: it asserted that
 allocating the scratch before the adoption gate was a defect, and this
-round makes that ordering deliberate — allocation is before the gate now,
-with cleanup as the safety — so the mutant described correct code and was
+round makes that ordering deliberate - allocation is before the gate now,
+with cleanup as the safety - so the mutant described correct code and was
 replaced by the two that police the new structure. The ownership-transfer
 mutant was re-anchored around the path registration the lock now encloses.
 Collateral: the round-six stale-serve witness asserted the scratch was
@@ -9428,7 +9428,7 @@ old key and two on the new, and neither ledger ever reaches five.
 
 The old code cannot be taught otherwise. It is already deployed; it writes
 and reads `:failures` and will never know `:failures:v2` exists. So new
-code cannot retrofit a shared ledger across the two versions — a new
+code cannot retrofit a shared ledger across the two versions - a new
 replica reading the legacy count could not clear it on the old replica's
 behalf, and the old replica's failures never enter the new window. Two
 representations that run at once are two ledgers, and no amount of new-side
@@ -9440,7 +9440,7 @@ a change to its storage representation is a coordinated reset, not a
 rolling deploy: the old replicas are drained before the new ones serve, the
 previous history is abandoned to its TTL, and the breaker starts empty on
 the new representation. Losing at most one window of failure history at
-that boundary is the correct trade — Redis is already defined as ephemeral
+that boundary is the correct trade - Redis is already defined as ephemeral
 state, and one empty minute is cheaper than two contradictory ledgers. The
 version is still worth keeping: it makes the boundary crash-safe, so a
 straggling old replica cannot corrupt the new type. What it is not is a
@@ -9449,17 +9449,17 @@ it was. SPEC §18.3 now says the representation change is a coordinated
 reset, states why the two ledgers cannot be unified while both run, and
 records that the ephemeral loss at the boundary is acceptable.
 
-This round closes a false claim, not a code defect: the steady-state code —
-every replica on `:failures:v2` — was already correct, and the fault was in
+This round closes a false claim, not a code defect: the steady-state code -
+every replica on `:failures:v2` - was already correct, and the fault was in
 what the specification promised about the rollout. So there is no
 behavioural red here, and manufacturing one would mean testing the
 mixed-version coexistence the contract forbids, which would legitimise the
 very thing being ruled out. The witness instead pins the contract's code
 half: the new ledger owns `:failures:v2` alone, counts only its own
-entries, and on success clears only its own key — the legacy counter is
+entries, and on success clears only its own key - the legacy counter is
 never read into a decision or cleared, but abandoned to its TTL. A mutant
-that makes success clear the legacy key too — a half-migration that would
-rebuild the partition — is killed by it. The two other choices review named
+that makes success clear the legacy key too - a half-migration that would
+rebuild the partition - is killed by it. The two other choices review named
 were both declined for cause: engineering live coexistence is impossible
 against frozen old code, and a staged two-release compatibility migration
 is heavy machinery for sixty seconds of throwaway counts.
@@ -9481,7 +9481,7 @@ failures to the legacy `:failures` counter, each refreshing its sixty-second
 TTL. The fleet drains and cuts over to `:failures:v2`, which starts empty. A
 tool succeeds; the new code clears `:failures:v2` and, by the round-eight
 contract, deliberately never touches the legacy key. Ten seconds later the
-deploy is rolled back — drain v2, start the old image again — well inside
+deploy is rolled back - drain v2, start the old image again - well inside
 the legacy key's TTL. The old code reads its still-live `:failures` = 4, the
 next failure makes five, and the breaker opens on a count a success was
 supposed to have cleared. The coordinated contract was followed to the
@@ -9490,19 +9490,19 @@ representation returned.
 
 So the reset has to retire the superseded history, not trust its TTL. The
 transition now purges the old representation's failure-history namespace
-outright — a small checked-in command, `scripts/reset_breaker_history.py`,
+outright - a small checked-in command, `scripts/reset_breaker_history.py`,
 run once per transition in whichever direction it goes. It deletes only
 `circuit:*:<representation>` keys: the glob ends at the representation's
 suffix, so purging `failures` cannot touch `failures:v2` and neither can
 touch the shared `:open` cooldown. That last point is deliberate and was the
 round's second, smaller finding: round eight said the breaker "starts
 empty", which read as contradicting the `:open` key the code keeps shared
-across representations. It does not — an already-open breaker keeps its
+across representations. It does not - an already-open breaker keeps its
 cooldown across a representation change, because a change of storage shape
 does not make a proven-unhealthy tool healthy. The failure *history* starts
 empty; the open *cooldown* survives. SPEC §18.3 now says both, and the
-operational procedure — drain, purge the superseded namespace, start, never
-overlap, `:open` survives, rollback in reverse — lives in
+operational procedure - drain, purge the superseded namespace, start, never
+overlap, `:open` survives, rollback in reverse - lives in
 `docs/DEPLOYMENT.md`, where an operator will find it, rather than only in the
 specification and this journal.
 
@@ -9511,7 +9511,7 @@ code: seed the legacy counter to four, run the reset, simulate a rollback
 with an old-style increment, and require the result to be one, not five.
 Under "abandon to TTL" the increment resurrects the count to five; under the
 purge it starts fresh at one. The witness also pins the two boundaries the
-purge must respect — the shared `:open` cooldown and any other
+purge must respect - the shared `:open` cooldown and any other
 representation's history both survive it. The mutation set is forty-eight,
 all killed; the three new mutants:
 
@@ -9538,12 +9538,12 @@ The purge took a raw key suffix and dropped it straight into a glob:
 `argparse` choice list, but the storage primitive did not, and a
 destructive primitive that trusts its argument is fail-open. `suffix="*"`
 expands to `circuit:*:*`, which deletes the legacy history, the v2 history,
-and the shared `:open` cooldown together — the exact key the SPEC and the
+and the shared `:open` cooldown together - the exact key the SPEC and the
 runbook promise survives a reset. The round-nine mutant proved the normal
 glob must stay narrow; it did not prove the input could not widen it. The
 primitive now takes a named representation, not a suffix: `legacy` or `v2`,
 validated against a map `RedisCache` owns, and anything else is refused
-before a glob is built. The map is the single source of truth — the current
+before a glob is built. The map is the single source of truth - the current
 representation's own suffix is read from it, and the operator command draws
 its `argparse` choices from it rather than keeping a second copy. The red
 seeds all three keys, asks the purge for a wildcard and four other invalid
@@ -9551,13 +9551,13 @@ names, and requires each to raise with every key left intact.
 
 The second finding was a test telling the opposite of the specification.
 `test_the_new_ledger_abandons_the_legacy_key` still said the legacy counter
-was "abandoned to its own TTL" and required it to survive v2 traffic — the
+was "abandoned to its own TTL" and required it to survive v2 traffic - the
 round-eight cutover reading, which round nine replaced with an explicit
 purge. The underlying code property is still worth pinning: the steady-state
 v2 path must never opportunistically read a stray legacy counter into its
 window or clear one on success, because half-migrating the two rebuilds the
-partition the design forbids. So the test was not deleted but reframed —
-`test_v2_never_half_migrates_a_stray_legacy_key` — as representation
+partition the design forbids. So the test was not deleted but reframed -
+`test_v2_never_half_migrates_a_stray_legacy_key` - as representation
 isolation, defense-in-depth on the code, explicitly not the cutover
 procedure. The cutover is pinned by the round-nine purge-and-rollback test,
 and the reframed test now points at it rather than contradicting it.
@@ -9565,7 +9565,7 @@ and the reframed test now points at it rather than contradicting it.
 The non-blocking cleanup: the operator command was booting the whole
 inference runtime and silently forcing `TEST_MODE=true` to do it. `TEST_MODE`
 is a testing-behaviour flag, and it gates exactly the Redis-absent fallback
-a purge command must never take — with it set, a command run against a
+a purge command must never take - with it set, a command run against a
 downed Redis would find no cache and quietly do nothing instead of failing.
 The injection is gone; the command talks to the real Redis the fleet uses,
 and fails loudly if it is not there. The command still resolves that Redis
@@ -9578,8 +9578,8 @@ The mutation set is forty-nine, all killed; the new mutant:
     new mutation                                    outcome
     the purge accepts any representation as a suffix  killed
 
-with the round-nine purge mutants — a glob that matches every breaker key,
-a purge that counts but deletes nothing — re-run and still killed, and the
+with the round-nine purge mutants - a glob that matches every breaker key,
+a purge that counts but deletes nothing - re-run and still killed, and the
 unversioned-key mutant re-anchored onto the representation map the suffix is
 now read from.
 
@@ -9587,14 +9587,14 @@ now read from.
 
 The PR's own review bot (Cursor Bugbot) flagged a real interaction the tranche
 introduced. The attachment agent, when its serve fails with no tokens emitted,
-degrades to a plain LLM answer. Before it does, it revokes the invocation — the
+degrades to a plain LLM answer. Before it does, it revokes the invocation - the
 comment says why: the failed agent's worker must come down before a second
 answer is produced, so a capability racing the teardown is refused rather than
 started. That revoke was harmless until round five added the producer gate.
 
 The gate refuses to start a producer once the invocation is `revoked`. The
-degradation revoke sets exactly that flag, so the fallback's own producer —
-started through `_stream_llm_node` a few lines later — was refused, and the
+degradation revoke sets exactly that flag, so the fallback's own producer -
+started through `_stream_llm_node` a few lines later - was refused, and the
 turn ended with a `cancel_ack` instead of the plain answer. A caller who
 uploaded files, hit a failing agent, and never cancelled anything received a
 cancellation. The salvage path (an answer already part-streamed) was
@@ -9604,8 +9604,8 @@ gate; only the no-token fallback took the hit.
 The distinction the gate needed was already in the invocation: a caller who
 walks away calls `cancel`, which sets `cancelled`; the agent's degradation
 calls `revoke`, which marks the attempt revoked but leaves `cancelled` false.
-So the fix is one branch, not a new attempt: the degraded fallback — and only
-it — gates on `cancelled` rather than `revoked`. It starts on a revoked
+So the fix is one branch, not a new attempt: the degraded fallback - and only
+it - gates on `cancelled` rather than `revoked`. It starts on a revoked
 invocation, because that revoke was its own teardown, and still refuses a
 cancelled one, because that is the caller's stop. It carries no breaker
 observation, so nothing about the ledger changes; the agent's failure was
@@ -9613,9 +9613,9 @@ already recorded before the revoke. Every other producer still refuses a
 revoked attempt exactly as before.
 
 Two reds pin the two sides. A failed agent with no caller cancel must produce
-a plain `message_done`, not a `cancel_ack` — red on the shipped commit, where
+a plain `message_done`, not a `cancel_ack` - red on the shipped commit, where
 the fallback yielded only `cancel_ack`. And a caller who cancels mid-serve must
-still get a cancellation, never the fallback answer — so the fix cannot become
+still get a cancellation, never the fallback answer - so the fix cannot become
 "the fallback always starts". The breaker mutation set is fifty-one, all
 killed; the two new mutants:
 

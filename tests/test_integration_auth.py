@@ -301,7 +301,7 @@ class TestOneCredentialFromTwoTransports:
 
     SPEC §17.10 puts `refresh_token` and `session_id` in `HttpOnly` cookies so
     the page cannot hold a durable credential. That only works if the server
-    accepts the cookie on its own — a required body field would force the SPA
+    accepts the cookie on its own - a required body field would force the SPA
     to keep the copy the cookie exists to replace. The body form stays for
     clients with no cookie jar, which is most of them.
 
@@ -315,7 +315,7 @@ class TestOneCredentialFromTwoTransports:
 
         Chromium treats 127.0.0.1 as a trustworthy origin and sends them over
         plain http; httpx applies no such exception, so a client on
-        `http://testserver` silently holds the cookies and never sends them —
+        `http://testserver` silently holds the cookies and never sends them -
         which would make these pass or fail for a reason that has nothing to
         do with the server.
         """
@@ -338,7 +338,7 @@ class TestOneCredentialFromTwoTransports:
         """What the SPA's `jsonHeaders()` sends: the readable CSRF cookie.
 
         Once the session cookies actually reach the server, so does CSRF
-        enforcement — measured, a test that omitted this got 403 and would
+        enforcement - measured, a test that omitted this got 403 and would
         have read as a refusal for the reason it was checking.
         """
         return {"X-CSRF-Token": client.cookies.get("csrf_token") or ""}
@@ -378,7 +378,7 @@ class TestOneCredentialFromTwoTransports:
         """The body must not be able to override the cookie.
 
         A *nonsense* body token proves nothing here: it fails whether or not
-        the conflict is detected, because the token is invalid either way —
+        the conflict is detected, because the token is invalid either way -
         measured, that version passed with the check removed. The credential
         has to be valid and belong to somebody else, which is the case the
         refusal exists for: a caller who can write one transport speaking as

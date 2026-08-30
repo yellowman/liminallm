@@ -2,7 +2,7 @@
 
 A retry with the same Idempotency-Key gets the original response back, not a
 second upload or a second turn. The slot is claimed atomically, so concurrent
-retries cannot both start work — the loser gets a 409.
+retries cannot both start work - the loser gets a 409.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ async def store(
             # `mode="json"` because this record is JSON-encoded on the way to
             # the cache. A plain model_dump leaves datetimes as datetimes, so
             # every route whose response carries `created_at` answered 500 the
-            # moment a client sent the Idempotency-Key SPEC §18 invites — and
+            # moment a client sent the Idempotency-Key SPEC §18 invites - and
             # the same request without the header succeeded, which is why it
             # went unnoticed.
             "response": envelope.model_dump(mode="json"),
@@ -122,7 +122,7 @@ class IdempotencyGuard:
     it happens, so this guard can go on describing the request.
 
     The two answer different questions and neither replaces the other. Replay
-    across requests is the slot's job — it is in Redis, so it survives the
+    across requests is the slot's job - it is in Redis, so it survives the
     process and the replica (§22). The ledger here is in memory and lives for
     one request: what it buys is that each mutation is recorded at the moment
     it lands, in order, so a route that makes several of them can say which

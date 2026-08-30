@@ -86,7 +86,7 @@ class _UUIDAsText(Loader):
 
     Every id in the models is typed ``str``, and the ids flowing in from JWTs,
     URLs and JSON are strings. Left as ``uuid.UUID``, a column value compares
-    unequal to the very id it was looked up by and is not JSON serializable —
+    unequal to the very id it was looked up by and is not JSON serializable -
     both of which have shipped as bugs here. Convert once, at the boundary.
     """
 
@@ -107,7 +107,7 @@ def _is_uuid(value: Any) -> bool:
     """Every id in this schema is a UUID.
 
     A malformed id cannot match a row, but Postgres raises on it rather than
-    returning nothing — so callers get a 500 where they should get a miss.
+    returning nothing - so callers get a 500 where they should get a miss.
     Check here and let the lookup return None.
     """
     try:
@@ -413,7 +413,7 @@ class PostgresStore:
             # Where "this context owes this path a re-read" is recorded. Every
             # replacement writes to it and every worker poll reads it, so an
             # older database without it boots clean and then fails at request
-            # time on the first replacement — with the queue that would have
+            # time on the first replacement - with the queue that would have
             # repaired the index unreadable. It was required by the tranche
             # that introduced it and lost that status in a merge, which is
             # what this entry and its test exist to prevent recurring.
@@ -453,8 +453,8 @@ class PostgresStore:
                 )
 
             # Retrieval's lexical channel reads this generated column by
-            # name. The table list above cannot catch its absence — the table
-            # is old, the column is not — so an install that pulled new code
+            # name. The table list above cannot catch its absence - the table
+            # is old, the column is not - so an install that pulled new code
             # without re-running migrations booted clean and then answered
             # every grounded chat turn with a 500. Fail here instead, where
             # the message can name the fix.
@@ -573,7 +573,7 @@ class PostgresStore:
             # function is equally present and equally useless. tgtype bit 0 is
             # FOR EACH ROW and bit 3 is DELETE; of tgenabled's four states
             # only 'O' (origin) and 'A' (always) fire for application
-            # statements — 'R' is replica-only.
+            # statements - 'R' is replica-only.
             for table, trigger, consequence in (
                 (
                     "artifact",
@@ -1119,7 +1119,7 @@ class PostgresStore:
         none", because a terminal write has to be able to say the second.
         `None` used to mean the first for both, so a skipped attempt could
         say it never trained while keeping the loss and version an earlier
-        attempt on the same job had recorded — and the worker retries the
+        attempt on the same job had recorded - and the worker retries the
         same claimed `job_id`, so that pairing is reachable rather than
         theoretical.
         """
@@ -1640,7 +1640,7 @@ class PostgresStore:
         with self._connect() as conn:
             # First, and before any read: this is what the subordinate
             # collectors wait on. Holding the account row is not enough for
-            # them — a sweep of `users/<id>` holds no row and would otherwise
+            # them - a sweep of `users/<id>` holds no row and would otherwise
             # be free to decide "not being erased" and act on that decision
             # after this transaction commits. See `hold_user_lifetime`.
             self._lock_user_lifetime(conn, user_id)
@@ -1710,7 +1710,7 @@ class PostgresStore:
             # convenience index with its own TTL, and it is not the authority
             # on which sessions exist: it can expire, or be evicted, while an
             # `auth:session:<id>` key it should have named is still readable.
-            # Purging from it alone leaves exactly those sessions behind —
+            # Purging from it alone leaves exactly those sessions behind -
             # the ones whose index is already gone.
             session_rows = conn.execute(
                 "SELECT id FROM auth_session WHERE user_id = %s", (user_id,)
@@ -1764,7 +1764,7 @@ class PostgresStore:
             # 9. Delete the private artifacts, and detach the published ones.
             # This is the only place that knows the difference. The foreign
             # key is `ON DELETE RESTRICT` precisely because it cannot see
-            # visibility, so both of these have to happen here — and after
+            # visibility, so both of these have to happen here - and after
             # them nothing references the account, which is why a restrictive
             # key never blocks step 17.
             if artifact_ids:
@@ -2372,7 +2372,7 @@ class PostgresStore:
         The attachment list is one JSON value, so `SELECT ... FOR UPDATE` on
         the conversation row is what makes editing it safe: concurrent uploads
         each read-modify-write the same value otherwise. A file lock cannot
-        serve here — the state is in Postgres and §22 runs several replicas.
+        serve here - the state is in Postgres and §22 runs several replicas.
 
         Retirement of what this record displaces happens in the same
         transaction under the same lock, and only of what *this* record
@@ -2384,7 +2384,7 @@ class PostgresStore:
         which is what lets two names share identical bytes.
 
         `generation_prefix` additionally retires rows that can never become
-        authorized — anything in this context that is not an attachment
+        authorized - anything in this context that is not an attachment
         generation at all.
 
         Returns the resulting list, or None when the conversation is not this
@@ -2594,7 +2594,7 @@ class PostgresStore:
         self, conversation_id: str, seq: int, *, limit: int = 200
     ) -> List[Message]:
         """The messages preceding ``seq``, oldest-first, bounded to the newest
-        ``limit`` of them — the conversation as it stood when that turn was
+        ``limit`` of them - the conversation as it stood when that turn was
         written."""
         if not _is_uuid(conversation_id):
             return []
@@ -2729,8 +2729,8 @@ class PostgresStore:
                 predicate = "a.visibility = 'private' AND a.owner_user_id = %s"
                 params: List[Any] = [name, scope.owner_user_id]
             elif tier == "shared":
-                # `shared` is scoped through the owner's tenant — `artifact`
-                # has no tenant column — so an ownerless shared row reaches no
+                # `shared` is scoped through the owner's tenant - `artifact`
+                # has no tenant column - so an ownerless shared row reaches no
                 # tenant, exactly as listing already treats it.
                 if not scope.tenant_id:
                     continue
@@ -2820,7 +2820,7 @@ class PostgresStore:
 
         The scope is the artifact's, never the caller's. Asking "can the
         publisher resolve this?" admits a shared workflow calling the author's
-        private tool — valid for exactly one person, and known at publication
+        private tool - valid for exactly one person, and known at publication
         time not to work for the audience it declares.
         """
         scope = ToolResolutionScope(
@@ -2882,8 +2882,8 @@ class PostgresStore:
         # An explicit visibility filter needs the identity that scopes it.
         # Without one, the branches below dropped the scoping clause and
         # returned *every* user's private rows, or every tenant's shared ones.
-        # Unreachable from `/v1/artifacts` — `app_user.tenant_id` is NOT NULL
-        # and the route always passes the caller — but it is the same
+        # Unreachable from `/v1/artifacts` - `app_user.tenant_id` is NOT NULL
+        # and the route always passes the caller - but it is the same
         # fail-open default that `get_latest_workflow` shipped with, so it
         # narrows here rather than waiting for a caller to find it.
         if (visibility == "private" and not owner_user_id) or (
@@ -2964,7 +2964,7 @@ class PostgresStore:
 
     #: Namespace for the per-artifact lifetime lock. Creation writes the
     #: canonical payload directory before it publishes the row, and orphan
-    #: discovery reads exactly those directories — so without a shared lock a
+    #: discovery reads exactly those directories - so without a shared lock a
     #: scan in that window records a retirement for an artifact that is about
     #: to exist. It looks harmless while the artifact is live, because the
     #: sweep refuses to remove anything Postgres still knows about, but the
@@ -3110,7 +3110,7 @@ class PostgresStore:
             # The retirement row is written by an AFTER DELETE trigger on
             # `artifact`, in this same transaction. Doing it here instead made
             # enrolment a property of this one caller, and every other way an
-            # artifact can disappear — account deletion above all — left its
+            # artifact can disappear - account deletion above all - left its
             # payloads with nothing to collect them.
             conn.execute("DELETE FROM artifact WHERE id = %s", (artifact_id,))
         return artifact
@@ -3203,7 +3203,7 @@ class PostgresStore:
         across the one event the answer is about, and a sweep that straddles a
         deletion unlinks a blob inside the grace period the retirement
         promised. `delete_user` takes the same lock at the start of its
-        transaction, so only two histories remain — the sweep runs entirely
+        transaction, so only two histories remain - the sweep runs entirely
         against pre-deletion state, where the account's conversations still
         name the blob and it is kept, or the deletion commits first and the
         sweep sees the retirement and does nothing.
@@ -3262,8 +3262,8 @@ class PostgresStore:
         """Record a namespace no account claims, at first observation.
 
         Enrolment normally comes from the delete trigger, which knows when the
-        account went. This covers what predates the trigger — a namespace left
-        by a deletion that happened before any of this existed — and it starts
+        account went. This covers what predates the trigger - a namespace left
+        by a deletion that happened before any of this existed - and it starts
         the clock now rather than at an unknowable earlier moment, so nothing
         is removed on the sweep that first sees it.
         """
@@ -3295,7 +3295,7 @@ class PostgresStore:
         """Drop the queue entry once the namespace is gone.
 
         Only after both trees are, so a failed removal is retried next sweep
-        instead of being forgotten — and so the subordinate sweeps keep
+        instead of being forgotten - and so the subordinate sweeps keep
         skipping the user until there is nothing left of them to skip.
         """
         if not _is_uuid(user_id):
@@ -3436,7 +3436,7 @@ class PostgresStore:
         result derived from an older row. `apply_config_patch` had the same
         shape and the same race.
 
-        `description` keeps its own meaning — `None` is "leave it alone",
+        `description` keeps its own meaning - `None` is "leave it alone",
         which is not the same as "write back what I read". A caller that
         replays the description it read reverts a concurrent change to it.
         """
@@ -3662,7 +3662,7 @@ class PostgresStore:
 
         Returns the schema *and the namespace its tool references mean*. This
         used to return the schema alone, and the owner and visibility it had
-        already read were discarded — so execution had nothing left but the
+        already read were discarded - so execution had nothing left but the
         runner's identity to resolve references with, and a shared workflow
         ran whichever `foo` the runner happened to own.
         """
@@ -3679,7 +3679,7 @@ class PostgresStore:
                 self._deny_workflow(workflow_id, user_id, owner_id, visibility)
                 return None
         elif visibility == "shared":
-            # `shared` means within a tenant, and the tenant is the owner's —
+            # `shared` means within a tenant, and the tenant is the owner's -
             # `Artifact` has no tenant column, so the previous
             # `getattr(artifact, "tenant_id", None)` was always None and the
             # `None in (...)` acceptance served shared workflows across
@@ -3972,7 +3972,7 @@ class PostgresStore:
         keeps the JSON Patch semantics and this method keeps the transaction.
 
         It used to take an already-computed `new_schema`. The service read the
-        artifact, applied the patch, and passed the result here — so this lock
+        artifact, applied the patch, and passed the result here - so this lock
         serialized the write without covering the read behind it, and anything
         committed in between was overwritten by a document derived from an
         older row. Locking and then writing someone else's snapshot is not
@@ -3985,7 +3985,7 @@ class PostgresStore:
         """
 
         with self._connect() as conn, conn.transaction():
-            # Artifact first, then the patch — the order every other writer
+            # Artifact first, then the patch - the order every other writer
             # here uses. `delete_private_artifact` locks the artifact and then
             # deletes it, and `config_patch.artifact_id` is ON DELETE CASCADE,
             # so the delete reaches the patch rows through the artifact.
@@ -4032,7 +4032,7 @@ class PostgresStore:
             #
             # Judged against the row's own `type`, never against the incoming
             # schema's `kind`. Choosing the validator from the payload lets
-            # the payload choose which rules it is judged by — an adapter
+            # the payload choose which rules it is judged by - an adapter
             # rewritten as `kind: tool.spec` passed the tool schema while the
             # row stayed `type='adapter'`. `type` is immutable through every
             # mutation path, so an adapter row must remain a valid adapter.
@@ -4042,7 +4042,7 @@ class PostgresStore:
             validate_artifact(artifact_row["type"], new_schema)  # type: ignore[arg-type]
             # Same door, third entrance. Without this an approved patch could
             # swap a published workflow onto a tool its audience cannot reach,
-            # write a version, and mark itself `applied` — an audit record
+            # write a version, and mark itself `applied` - an audit record
             # asserting a configuration the runtime then refuses.
             self._check_tool_references(
                 conn, artifact_row["type"], new_schema,
@@ -4219,7 +4219,7 @@ class PostgresStore:
         propagates to keys the admin never overrode.
 
         Filtered to the settings the model still declares, and generically so:
-        a key this build has retired is not an operator's choice — counting it
+        a key this build has retired is not an operator's choice - counting it
         as one refused the first-boot seed on databases whose only history was
         an older build, and echoed the deleted name from the admin API
         forever. Any future setting deletion becomes inert here for free.
@@ -4355,7 +4355,7 @@ class PostgresStore:
         with `list_contexts` answered a different one: whether those ids are
         near the top of a listing. That listing pages at 100 rows in SQL, so
         a context the request had already validated by direct lookup dropped
-        out of retrieval once the account had a hundred newer ones — the turn
+        out of retrieval once the account had a hundred newer ones - the turn
         succeeded and the model was given no grounding.
 
         Implicit conversation indexes are excluded here as everywhere else:
@@ -4580,7 +4580,7 @@ class PostgresStore:
         route helper checks them too, and that is not the same thing: a
         helper guards the callers that use it, while the predicate here
         guards the row. `conversation_id IS NULL` is what keeps a chat's
-        implicit index out — its lifetime belongs to the conversation
+        implicit index out - its lifetime belongs to the conversation
         (SPEC §19.5), so it is not part of the collection this edits.
 
         Only supplied fields are written, so a rename does not blank the
@@ -4771,7 +4771,7 @@ class PostgresStore:
         which describes exactly one generation.
 
         Delete and insert in one transaction, so a reader never sees the path
-        with no chunks at all — an interrupted refresh that emptied a path
+        with no chunks at all - an interrupted refresh that emptied a path
         would be a worse answer than a stale one.
         """
         deleted_generation: List[int] = []
@@ -4825,8 +4825,8 @@ class PostgresStore:
     def referenced_attachment_checksums(self, owner_user_id: str) -> set[str]:
         """Every attachment generation this user's conversations still name.
 
-        The marks for the generation store's sweep. They already exist —
-        each attachment record names its generation — so a reference count
+        The marks for the generation store's sweep. They already exist -
+        each attachment record names its generation - so a reference count
         would be a second record of the same fact, to be kept correct across
         every way a conversation is created, edited and deleted.
 
@@ -4917,7 +4917,7 @@ class PostgresStore:
         materialization of that statement and is not consulted here, however
         tempting it is: a chunk left behind by a bug would otherwise be read
         as evidence of coverage, and the next replacement would faithfully
-        re-ingest into a context nobody added — derived state promoting itself
+        re-ingest into a context nobody added - derived state promoting itself
         into authority. The converse matters as much. A context still covers
         its source when the chunks are gone, so coverage cannot evaporate
         because a cleanup removed the index.
@@ -4926,8 +4926,8 @@ class PostgresStore:
         context an upload happened to name, so a directory source never
         appears in it and an upload naming none erases what was there.
 
-        Scoped to the owner here, in one place — `knowledge_context` is
-        owned by a user on this schema — so that no caller can re-index a
+        Scoped to the owner here, in one place - `knowledge_context` is
+        owned by a user on this schema - so that no caller can re-index a
         replacement into somebody else's context by naming a path.
 
         The prefix test runs in Python rather than SQL because a filesystem
@@ -4944,7 +4944,7 @@ class PostgresStore:
                 # same reason `invalidate_path_in_other_contexts` excludes
                 # them: §19.5 scopes an attachment to the chat that received
                 # it, so one chat's upload must neither empty nor re-fill
-                # another chat's index. The two have to agree — a context this
+                # another chat's index. The two have to agree - a context this
                 # returned but that one skipped would be queued for a re-index
                 # of chunks nobody invalidated.
                 "WHERE kc.owner_user_id = %s AND kc.conversation_id IS NULL",
@@ -4971,7 +4971,7 @@ class PostgresStore:
         Collapses onto the pending slot for that (context, path): a file
         replaced five times before the queue drains needs one re-read of its
         final bytes, not five of which four describe bytes already gone. The
-        newest generation wins the slot, which is the whole point — an older
+        newest generation wins the slot, which is the whole point - an older
         one must never be what eventually gets indexed.
 
         A job already running is not disturbed. It carries an older generation,
@@ -5003,8 +5003,8 @@ class PostgresStore:
     def claim_ingest_jobs(self, limit: int = 16) -> List[Dict[str, Any]]:
         """Take up to `limit` queued jobs, marking them running.
 
-        `SKIP LOCKED` so two drains — the one a request starts and the one the
-        background worker runs — take different jobs rather than one waiting on
+        `SKIP LOCKED` so two drains - the one a request starts and the one the
+        background worker runs - take different jobs rather than one waiting on
         the other or, worse, both indexing the same path.
         """
         with self._connect() as conn:
@@ -5049,7 +5049,7 @@ class PostgresStore:
 
         Claiming marks a job `running`, and only `queued` jobs are ever
         claimed. A process that dies after claiming one would therefore strand
-        it forever — and because the replacement already dropped that path's
+        it forever - and because the replacement already dropped that path's
         chunks, the file would stay missing from that context until somebody
         happened to replace it again. That is the permanent forgetting this
         queue exists to prevent, reintroduced by the claim itself.
@@ -5108,7 +5108,7 @@ class PostgresStore:
         job. Claiming incremented `attempts`, so this gives it back. A worker's
         pass drains until the queue is empty and would otherwise re-claim a
         contended job many times a second, spending the whole budget while the
-        holder is still embedding — abandoning a re-index that never once ran.
+        holder is still embedding - abandoning a re-index that never once ran.
 
         `updated_at` moves, which puts the job behind its peers in the claim
         order rather than straight back at the front of the same pass.
@@ -5149,7 +5149,7 @@ class PostgresStore:
 
         The pending slot for a (context, path) holds one job. If a replacement
         landed while this one was running, that newer job is already in the
-        slot and holds the newer generation, so this one must not go back in —
+        slot and holds the newer generation, so this one must not go back in -
         and the unique index is what says so, rather than a re-read that could
         race. `attempts` was incremented when the job was claimed, so one that
         keeps failing counts up instead of retrying forever.
@@ -5211,7 +5211,7 @@ class PostgresStore:
         Contexts with a ``conversation_id`` are conversations' implicit
         indexes and are left alone. §19.5 scopes an attachment to the chat
         that received it, so another chat's upload of the same filename must
-        not reach into one — removing its chunks would be one chat changing
+        not reach into one - removing its chunks would be one chat changing
         another chat's state as much as replacing them would.
         """
         with self._connect() as conn:
@@ -5231,7 +5231,7 @@ class PostgresStore:
         """Drop the source rows that name `fs_path` or something inside it.
 
         A `context_source` row is a claim about a name. Deleting the thing it
-        names makes the claim false, so the row goes — and for a tree, so do
+        names makes the claim false, so the row goes - and for a tree, so do
         the rows naming anything within it.
 
         **Ancestors stay**, and this is the whole difficulty. A row on
@@ -5263,7 +5263,7 @@ class PostgresStore:
 
         A job carries the checksum of the bytes that prompted it and declines
         when the file has moved on, so a queued one cannot in fact refill a
-        deleted path — it re-reads, finds nothing, and supersedes itself. This
+        deleted path - it re-reads, finds nothing, and supersedes itself. This
         is not relying on that. The queue is where "this context owes this
         path a re-read" is recorded, and once the path is gone the record is
         simply false; leaving it to be discovered later means a worker claims
@@ -5290,7 +5290,7 @@ class PostgresStore:
         """Drop everything this user's contexts say about `fs_path` or its tree.
 
         A chunk's ``fs_path`` claims to be the contents of that path, and the
-        claim is about the path's current bytes — nothing in the row records
+        claim is about the path's current bytes - nothing in the row records
         which generation it came from. So when the path stops existing the
         claim has to stop with it, or a deleted file stays retrievable through
         any conversation grounded in a context that indexed it.
@@ -5325,7 +5325,7 @@ class PostgresStore:
     ) -> int:
         """Persist a chunk's segment vectors, replacing any it already had.
 
-        The replace covers re-indexing one chunk — a backfill, a repair. It is
+        The replace covers re-indexing one chunk - a backfill, a repair. It is
         not what makes re-ingestion idempotent: ``add_chunks`` still inserts
         fresh rows with new ids, so a caller that appends leaves two
         generations of both chunks and segments. What a named path does
@@ -5369,8 +5369,8 @@ class PostgresStore:
         """Chunks with a segment near this query vector, nearest first.
 
         Candidate generation only. A chunk qualifies on its best segment, not
-        on its average — which is the whole reason the segments are stored
-        separately — and the exact MaxSim score is computed by the caller over
+        on its average - which is the whole reason the segments are stored
+        separately - and the exact MaxSim score is computed by the caller over
         every segment of the chunks this returns.
 
         SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
@@ -5653,7 +5653,7 @@ class PostgresStore:
 
     # Both chunk searches read the same rows through the same access rules;
     # only the ORDER BY differs. Kept in one place so a filter added to one
-    # channel cannot go missing from the other — and the missing filter that
+    # channel cannot go missing from the other - and the missing filter that
     # matters here is the user isolation one.
     _CHUNK_SELECT = """
                 SELECT kc.id, kc.context_id, kc.fs_path, kc.content, kc.embedding, kc.chunk_index, kc.created_at, kc.meta
@@ -5681,7 +5681,7 @@ class PostgresStore:
         candidate selection: discarding unauthorized rows from the result
         keeps them out of the prompt but not out of the ranking, so enough of
         them take every slot and the authorized file falls outside the cut.
-        Over-fetching is not an answer — any fixed over-fetch is consumed by
+        Over-fetching is not an answer - any fixed over-fetch is consumed by
         enough rows.
         """
         where_clauses: list[str] = ["kc.context_id = ANY(%s)"]
@@ -5773,7 +5773,7 @@ class PostgresStore:
         identifiers, error codes and numbers findable when it is not.
 
         Terms are OR'd, not AND'd: one absent rare word must not empty the
-        pool. ``ts_rank`` only has to be a decent recall filter here — the
+        pool. ``ts_rank`` only has to be a decent recall filter here - the
         real ranking is BM25 over the returned pool.
 
         SECURITY: user_id is required to enforce data isolation per SPEC §12.2.

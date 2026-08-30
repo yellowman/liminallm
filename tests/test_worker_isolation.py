@@ -3,14 +3,14 @@
 The suite wipes its database before every test. That is what makes tests
 independent of each other, and it is only true while one process owns the
 database. Point four workers at one, and `TRUNCATE every table` stops being
-isolation and becomes every test deleting every other test's rows — not
+isolation and becomes every test deleting every other test's rows - not
 flakiness, a guarantee inverted.
 
 Most of the isolation is free, and measured rather than assumed: under xdist
 each worker is its own process, so the module-level temp root, the scratch
 Postgres and the scratch Redis are already per-worker. What is not free is the
-case where the services are supplied from outside — `TEST_DATABASE_URL`,
-`TEST_REDIS_URL` — because then every worker is handed the same one.
+case where the services are supplied from outside - `TEST_DATABASE_URL`,
+`TEST_REDIS_URL` - because then every worker is handed the same one.
 
 These tests run pytest inside pytest, against services stood up for the
 occasion. Asserting that the derivation *functions* return different strings
@@ -32,8 +32,8 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 
 #: Set by the outer test when it runs this file inside a nested pytest. The
-#: probe below is not a test of the product — it is a worker reporting what it
-#: was given — so it does nothing in an ordinary run.
+#: probe below is not a test of the product - it is a worker reporting what it
+#: was given - so it does nothing in an ordinary run.
 _PROBE_OUT = os.environ.get("LIMINALLM_HARNESS_PROBE")
 
 
@@ -44,7 +44,7 @@ def test_probe_records_what_this_worker_was_given():
     The reporting is half of it. The other half is the fixed identifiers:
     every worker registers the *same* email address and writes the *same*
     cache key. The address is unique-constrained, so on a shared database
-    the second worker to arrive fails — this succeeding in every worker is
+    the second worker to arrive fails - this succeeding in every worker is
     end-to-end evidence of isolation, rather than evidence that some
     derived strings differed.
     """
@@ -94,7 +94,7 @@ def test_probe_holds_redis_state_while_another_run_flushes():
 
     The waiting is the test. Another pytest invocation starts while this one
     is paused and empties what it believes is its own database before every
-    test — so if the two runs were handed the same number, this comes back to
+    test - so if the two runs were handed the same number, this comes back to
     nothing.
     """
     import time as time_
@@ -136,7 +136,7 @@ def test_probe_gives_its_lease_away():
 
     Standing in for the schedule where a lease expires and another run takes
     the number: the outcome is the same, and this one can be forced. The next
-    test's reset is what has to refuse — this one does nothing destructive
+    test's reset is what has to refuse - this one does nothing destructive
     itself.
     """
     import redis as redis_
@@ -206,7 +206,7 @@ class _External:
         """Which of the two is missing, and why.
 
         A fixed "needs initdb" was wrong for every host that has initdb and
-        lacks pgvector — the case this availability check was extended to
+        lacks pgvector - the case this availability check was extended to
         catch, reported with the one explanation that could not apply to it.
         """
         if not self.pg.available:
@@ -224,7 +224,7 @@ class _External:
         self.url = self.pg.start()
         # `TEST_REDIS_URL` is documented as "point at an existing service".
         # Nothing says that service's database must be 0, and using a numbered
-        # one for tests is ordinary — so the fixture can name one.
+        # one for tests is ordinary - so the fixture can name one.
         host = self.redis.start().rsplit("/", 1)[0]
         # Both spellings redis-py accepts. The query form is the one where the
         # path lies about which database the URL reaches.
@@ -253,7 +253,7 @@ class _External:
     def env(self, *, probe_out=None, hold_out=None, prepared=True, extra=None):
         """The environment a nested run gets.
 
-        `LIMINALLM_TEST_RUN` is dropped so each invocation mints its own — two
+        `LIMINALLM_TEST_RUN` is dropped so each invocation mints its own - two
         runs sharing one would derive the same Postgres database name.
         `PYTEST_XDIST_WORKER` is dropped because an inherited one is a claim
         to belong to a run this process is not part of; conftest reads the
@@ -350,7 +350,7 @@ def _data_keys(keys) -> list[str]:
 
     The lease ledger lives in database 0, which is also the caller's database
     when they named that one, so its bookkeeping shows up in a listing there.
-    Those keys carry a TTL — `assert_control_keys_expire` checks it — so they
+    Those keys carry a TTL - `assert_control_keys_expire` checks it - so they
     are not data the run left behind. They are also not the sentinel.
     """
     from tests.harness import REDIS_BASE_PREFIX, REDIS_LEASE_PREFIX
@@ -551,7 +551,7 @@ class TestAWorkerOwnsItsResources:
             )
 
     def test_the_base_database_is_left_exactly_as_it_was(self, tmp_path):
-        """It is truncated before every test — but not this one."""
+        """It is truncated before every test - but not this one."""
         with _external_or_skip() as ext:
             done = ext.run_pytest(
                 "-n", "2", "--dist", "each", PROBE,
@@ -586,14 +586,14 @@ class TestAWorkerOwnsItsResources:
 
         Offering `1..15` regardless of which one the URL named meant a caller
         who pointed the harness at `redis://host/1` had that exact database
-        leased to the first worker — and then flushed before every test,
+        leased to the first worker - and then flushed before every test,
         because the lease said it was owned.
 
         Both spellings, because redis-py accepts two and they disagree: the
         path, and a `db=` query argument that outranks it. Asserted here on
         the list rather than only through a run, because a run with one worker
         is handed the first free number and that is 1 whichever way the
-        exclusion was computed — the end-to-end red cannot see this half.
+        exclusion was computed - the end-to-end red cannot see this half.
         """
         from tests.harness import lease_candidates, redis_database_index
 
@@ -641,7 +641,7 @@ class TestAWorkerOwnsItsResources:
         `redis://host:6379/0?db=7` connects to database seven. A base
         exclusion that reads only the path protects database zero, leases
         seven to the first worker, and flushes the caller's data before every
-        test — the same defect as the path case, through the other spelling
+        test - the same defect as the path case, through the other spelling
         redis-py accepts.
         """
         with _external_or_skip(redis_db=7, db_in_query=True) as ext:
@@ -670,7 +670,7 @@ class TestAWorkerOwnsItsResources:
         """The same defect on the other service, found by looking for it.
 
         libpq takes connection keywords from a URL's query string, and
-        `dbname` there outranks the path — measured, the same way redis-py's
+        `dbname` there outranks the path - measured, the same way redis-py's
         `db=` was. So `postgresql://host:5432/?dbname=liminallm` names no
         database in its path and connects to `liminallm`, and a worker URL
         built by replacing the path keeps the argument that outranks it:
@@ -820,7 +820,7 @@ class TestAWorkerOwnsItsResources:
             )
 
             # The serial run has finished, but its reservation outlives it by
-            # the TTL — which is the point. Another run starting now must not
+            # the TTL - which is the point. Another run starting now must not
             # be handed database 4.
             ledger = redis.Redis.from_url(
                 ext.redis_url.rsplit("/", 1)[0] + "/0", decode_responses=True
@@ -878,13 +878,13 @@ class TestAWorkerOwnsItsResources:
             try:
                 assert ledger.get(f"{REDIS_BASE_PREFIX}:4") is not None, (
                     "the reservation expired while the run was still using "
-                    "the database — it is written once and never refreshed"
+                    "the database - it is written once and never refreshed"
                 )
             finally:
                 ledger.close()
 
     def test_two_base_databases_on_one_server_do_not_lease_the_same_number(self):
-        """One server, one ledger — whatever database each caller was given.
+        """One server, one ledger - whatever database each caller was given.
 
         A ledger kept in each caller's own database cannot see the other's
         claims, so two runs configured with different base databases hand out
@@ -994,7 +994,7 @@ class TestAWorkerOwnsItsResources:
         CI runs `scripts/migrate.sh` and then sets the flag so conftest cannot
         quietly repair a deploy command that does nothing. A worker that built
         its own schema instead of cloning would restore exactly the hole the
-        flag was added to close — every worker rebuilding from `schema.sql`,
+        flag was added to close - every worker rebuilding from `schema.sql`,
         and the suite green over a `migrate.sh` that never ran.
 
         The sentinel table is not in `schema.sql`. Only a clone has it.
@@ -1009,7 +1009,7 @@ class TestAWorkerOwnsItsResources:
             assert reports and all(r["inherited_sentinel_table"] for r in reports), (
                 "a worker's database does not have the prepared database's "
                 "sentinel, so it was built from schema.sql rather than cloned "
-                "— and TEST_SCHEMA_PREPARED no longer means anything"
+                "- and TEST_SCHEMA_PREPARED no longer means anything"
             )
 
     def test_serial_runs_are_untouched(self, tmp_path):
@@ -1033,7 +1033,7 @@ class TestAWorkerOwnsItsResources:
         """Collect the suite twice and compare, name for name.
 
         xdist requires every worker to collect an identical set, and each
-        worker collects independently — so a test whose id is not a function of
+        worker collects independently - so a test whose id is not a function of
         the source refuses to run in parallel at all. Found that way: a
         parametrization built two of its cases with `uuid.uuid4()` at
         collection time, and four workers produced four different suites.
@@ -1066,8 +1066,8 @@ class TestAWorkerOwnsItsResources:
         """Ownership across runs, not only across the workers of one run.
 
         The Postgres name carries a run id exactly so two invocations cannot
-        both take `gw0`. The Redis number could not carry one — there are
-        fifteen numbers, not an alphabet — and deriving it from the worker id
+        both take `gw0`. The Redis number could not carry one - there are
+        fifteen numbers, not an alphabet - and deriving it from the worker id
         alone made every invocation pick the same one, while each flushed it
         before every test believing it owned it. Two runs at once is one
         terminal and one editor.

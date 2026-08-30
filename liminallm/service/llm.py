@@ -57,13 +57,13 @@ class LLMService:
         The single materialization point. It canonicalizes the adapter set
         (gate first, §5.0.1) and places `prompt_instructions` exactly once,
         into a copy of the caller's list, choosing the representation from
-        (mode, backend) — weights on a local backend, prompt on an API one.
+        (mode, backend) - weights on a local backend, prompt on an API one.
 
         Every path into a backend goes through here, which is the whole
         point. When only `generate`/`generate_stream` materialized, the API
         backends materialized too "to be safe", so those two paths sent the
         instructions twice while `generate_with_tools` and `stream_messages`
-        — which never passed through the service's message builder — sent
+        - which never passed through the service's message builder - sent
         them once. Removing the backend copy alone would have taken the
         latter pair to zero; giving the service one primitive that every
         entry point uses is what makes one copy true everywhere.
@@ -137,7 +137,7 @@ class LLMService:
 
         Fail closed: a backend that says nothing cannot stream. The first
         version defaulted to True on the theory that any generator stops
-        between events — but the shipped network backends block *inside* an
+        between events - but the shipped network backends block *inside* an
         event, in a synchronous read bounded only by the provider client's
         own 30–60s timeout, and a stop flag is not read until that read
         returns. A `timeout_ms: 200` was honoured for the waiter while the
@@ -147,7 +147,7 @@ class LLMService:
         `supports_stream_cancel = True` therefore asserts the full contract:
         the backend's stream carries an `abort()` that interrupts a read in
         flight (`CancellableStream`), or it never blocks at all (the stub).
-        A backend without the declaration does not stream — the node runs on
+        A backend without the declaration does not stream - the node runs on
         the ordinary executor, whose deadline the driver enforces, and its
         answer reaches the client in the final `message_done`.
         """
@@ -202,9 +202,9 @@ class LLMService:
         """The model that will actually answer, not the one configured.
 
         An adapter server overrides the base model, and both live on the
-        backend rather than here. Anything deciding by model identity — the
+        backend rather than here. Anything deciding by model identity - the
         tokenizer, the context window, whether a listwise rerank is a
-        reasonable ask — has to resolve the pair the same way, so it resolves
+        reasonable ask - has to resolve the pair the same way, so it resolves
         it here once. Read off ``self`` it silently returned nothing, and the
         caller fell back to the configured base model without noticing.
         """
@@ -258,8 +258,8 @@ class LLMService:
         """One vision call: read an image with the configured model.
 
         Capability is probed, never assumed from backend type: a backend that
-        implements its own ``transcribe_image`` (a local multimodal model —
-        PaliGemma/LLaVA class — would) is used directly; otherwise any
+        implements its own ``transcribe_image`` (a local multimodal model -
+        PaliGemma/LLaVA class - would) is used directly; otherwise any
         OpenAI-compatible client gets the standard content-parts message.
         Backends with neither raise NotImplementedError so callers can refuse
         cleanly instead of hallucinating a transcription. (Today's local JAX
@@ -325,7 +325,7 @@ class LLMService:
             return list(messages)
         if self._backend_applies_lora_weights:
             # SPEC §5.1: the local decoder gets ONE representation, the same
-            # one training wrote — marker AND placement, since token order is
+            # one training wrote - marker AND placement, since token order is
             # part of the input for a raw decoder.
             return local_format.place_context(
                 [dict(msg) for msg in messages], context_snippets
@@ -350,7 +350,7 @@ class LLMService:
         """The effective adapter set, built once for every path (§5.0.1).
 
         Gate first, mechanism second: `g == 0` means the adapter is absent
-        from the request, so it is dropped here — before prompt injection,
+        from the request, so it is dropped here - before prompt injection,
         weight loading, remote passthrough, KV hashing or accounting can see
         it. This is the only funnel into a backend (generate, generate_stream,
         chat and complete all pass through it), which is what keeps those
@@ -380,7 +380,7 @@ class LLMService:
             # Compared as the value, not as `str()` of it. `get_adapter_mode`
             # returns the raw string when the artifact states one and an
             # `AdapterMode` member when it infers, and `str(AdapterMode.HYBRID)`
-            # is "AdapterMode.HYBRID" — which matches nothing, so every adapter
+            # is "AdapterMode.HYBRID" - which matches nothing, so every adapter
             # that did not state a mode was silently skipped here. That is the
             # documented default for legacy adapters, and it went unnoticed
             # because the API backends were injecting the prompt themselves;
@@ -391,7 +391,7 @@ class LLMService:
                 continue
             if mode == AdapterMode.HYBRID and self._backend_applies_lora_weights:
                 # SPEC §5.0.1: for a hybrid adapter the prompt is the
-                # *portable fallback* — it carries the behaviour on API
+                # *portable fallback* - it carries the behaviour on API
                 # backends, while a local backend applies the trained
                 # weights. Injecting both meant a graduated skill served its
                 # weights AND the instructions they were distilled from, so

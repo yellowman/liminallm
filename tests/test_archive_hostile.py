@@ -48,7 +48,7 @@ def _zip(path: Path, members: list[tuple[str, bytes]], *, mode: int | None = Non
 
     `compress_type` is set on each entry rather than on the `ZipFile`: passing
     a `ZipInfo` to `writestr` takes the compression from the *info*, which
-    defaults to STORED — so the archive would be as large as its contents and a
+    defaults to STORED - so the archive would be as large as its contents and a
     compression-ratio fixture would silently test nothing.
     """
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -236,7 +236,7 @@ class TestBudgetsAreEnforcedOnBytesRead:
         past a 1 MiB floor, so the cap was not a cap for small archives.
 
         The floor's stated reason was that "an empty-file tar is mostly header"
-        and so expands past the ratio — which is backwards. Measured: an
+        and so expands past the ratio - which is backwards. Measured: an
         empty-file tar is 10240 bytes on disk and expands to 0.
         """
         root, _outside = area
@@ -354,7 +354,7 @@ class TestTheDestinationIsAllOrNothing:
 
     def test_a_policy_skip_is_not_all_or_nothing(self, area, tmp_path):
         """A disallowed extension is a per-entry policy skip, and the rest of
-        the archive still arrives — that distinction is the module's own."""
+        the archive still arrives - that distinction is the module's own."""
         root, _outside = area
         src = _zip(
             tmp_path / "mixed.zip",

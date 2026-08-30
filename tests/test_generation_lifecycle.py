@@ -3,7 +3,7 @@
 That claim has a lifetime. It is true from the moment the bytes at P are
 indexed until the moment P holds different bytes, or holds nothing at all.
 Nothing in the schema records which generation of P a chunk came from, so
-the claim is about P *now* — and the index has no way to say "this is a
+the claim is about P *now* - and the index has no way to say "this is a
 snapshot" instead.
 
 Everything here follows from that one reading. A path that is deleted must
@@ -89,7 +89,7 @@ class TestDeletingAFileStopsItBeingDescribed:
 
     Deletion removed the bytes, the manifest entry and nothing else. The
     chunks stayed, so a grounded conversation still answered with the
-    contents of a file the user had deleted — the deletion the user asked
+    contents of a file the user had deleted - the deletion the user asked
     for did not happen, it only became invisible in the file listing.
     """
 
@@ -101,7 +101,7 @@ class TestDeletingAFileStopsItBeingDescribed:
 
         # The same bytes into two contexts. The second upload dedupes on
         # checksum and still ingests, because the context is new to the
-        # manifest entry — so one pathname is described by two contexts,
+        # manifest entry - so one pathname is described by two contexts,
         # which is what makes a single-context cleanup wrong.
         for context_id in (first, second):
             resp = _upload(client, headers, "evidence.md", secret, context_id)
@@ -380,7 +380,7 @@ class TestTheManifestIsARecordNotANote:
         assert not armed["on"], "the manifest write never happened"
 
         # The retry repairs it. The same key, because the request failed and
-        # a failed slot is reclaimable — this is the client doing what a 5xx
+        # a failed slot is reclaimable - this is the client doing what a 5xx
         # tells it to do.
         resp = client.post(
             "/v1/files/upload",
@@ -685,7 +685,7 @@ class TestAReplacedPathLeavesNoOlderGenerationBehind:
         #
         # This asserted the path was gone from the first context, which was
         # the behaviour before the re-index queue existed. Emptying is only
-        # half a correction — the first context still holds this file as a
+        # half a correction - the first context still holds this file as a
         # source, and a context that covers a path but describes nothing has
         # lost the file rather than been corrected. The upload empties it and
         # queues the re-read; what is left afterwards is the current bytes.
@@ -736,7 +736,7 @@ class TestAReplacedPathLeavesNoOlderGenerationBehind:
         """A conversation's implicit context is not a path-following source.
 
         §19.5 scopes an attachment to the chat that received it, so another
-        chat's later upload of the same filename must not reach into it —
+        chat's later upload of the same filename must not reach into it -
         not by replacing its chunks, and not by removing them either. The
         attachment's own staleness is the separate, recorded problem; what
         this holds is that the invalidation sweep does not become the way
@@ -787,7 +787,7 @@ class TestAnAttachmentNeverResolvesToOtherBytes:
     by every consumer: the inline reader, the interpreter's workdir, and the
     note importer. Another conversation uploading that filename replaces the
     global path, so one chat's attachment started resolving to another
-    chat's bytes — and §19.5 scopes an attachment to the chat that received
+    chat's bytes - and §19.5 scopes an attachment to the chat that received
     it. Deleting the file and later creating the name again is the same
     thing with a gap in the middle: the old record silently rebinds to bytes
     that were never attached to anything.
@@ -846,7 +846,7 @@ class TestAnAttachmentNeverResolvesToOtherBytes:
         """The record chooses the path, so the record is not trusted.
 
         `generation_path` builds `<store>/<first two>/<checksum>` and the
-        consumers reopen whatever comes back — the inline reader reads it, the
+        consumers reopen whatever comes back - the inline reader reads it, the
         interpreter stages it. A record is a stored jsonb value, so a
         corrupted or hand-edited `checksum` chooses that path. Measured with
         the validation removed: `../../../../../../etc/passwd` resolves to
@@ -857,7 +857,7 @@ class TestAnAttachmentNeverResolvesToOtherBytes:
         for.
 
         Uppercase is refused too. The store writes lowercase digests, so an
-        uppercase spelling is not a second name for the same object — it is a
+        uppercase spelling is not a second name for the same object - it is a
         name for a path that does not exist, and accepting it would make
         `resolve_attachment` answer differently from `store_generation`.
         """
@@ -1072,8 +1072,8 @@ class TestARejectedRequestDoesNotMutateAnything:
     def test_a_failed_ingestion_leaves_a_generation_that_can_be_retried(self, client):
         """The other half: the context is real and the ingestion fails.
 
-        Unlinking the destination does not restore what it replaced — the
-        previous bytes are already gone — so it leaves the pathname absent
+        Unlinking the destination does not restore what it replaced - the
+        previous bytes are already gone - so it leaves the pathname absent
         while the manifest and the chunks still describe them. The new bytes
         are the only generation that exists by then, so they are what is
         kept, recorded, and left for the retry to finish.
@@ -1134,7 +1134,7 @@ class TestARejectedRequestDoesNotMutateAnything:
 class TestDedupeIsConfirmedByTheDiskNotTheRecord:
     """A manifest entry nominates a dedupe hit; the file confirms it.
 
-    The manifest can outlive the bytes it describes — a publication that
+    The manifest can outlive the bytes it describes - a publication that
     failed after writing them leaves exactly that. When the record alone
     decides, re-uploading the bytes it names skips the write and reports
     success over a file holding something else entirely, which is the false
@@ -1193,7 +1193,7 @@ class TestTheIndexIsItsOwnReverseIndex:
     The invalidation swept `prior_contexts` out of `.checksums.json`, which
     only ever records the contexts an *upload* named. A context that acquired
     the path through `POST /contexts/{id}/sources` is not in it, and never
-    becomes so — the source route ingests and takes the namespace lock, and
+    becomes so - the source route ingests and takes the namespace lock, and
     writes nothing to the manifest. So the sweep walked past it, entirely
     sequentially, with no failure anywhere.
 
@@ -1250,7 +1250,7 @@ class TestTheIndexIsItsOwnReverseIndex:
 
         One lock for the whole source works while the source *is* the file.
         A source rooted at `files/` locks `files/`, an upload of
-        `files/report.md` locks `report.md`, and the two never meet — so the
+        `files/report.md` locks `report.md`, and the two never meet - so the
         walk reads one generation while the upload publishes the next, and
         the walk's commit lands last. Every step succeeds.
         """
@@ -1274,9 +1274,9 @@ class TestTheIndexIsItsOwnReverseIndex:
         # below can only report that the answer was wrong. This records the
         # order so a failure says what happened instead of what did not.
         # It has failed twice on a CI runner and reproduces on no local
-        # configuration tried — ordinary, with confinement broken, pinned to
+        # configuration tried - ordinary, with confinement broken, pinned to
         # one and to two CPUs, without a proxy, and pinned under contention at
-        # twice the wall clock — so the next occurrence is the only source of
+        # twice the wall clock - so the next occurrence is the only source of
         # evidence left.
         commits: list[tuple[str, float]] = []
         origin = time.monotonic()
@@ -1289,7 +1289,7 @@ class TestTheIndexIsItsOwnReverseIndex:
             # Which actor is committing, read from the chunks themselves. The
             # thread name says `asyncio_0` for both, because the test client
             # runs each request on an executor thread rather than on the
-            # thread that started it — so a label taken from the thread would
+            # thread that started it - so a label taken from the thread would
             # be evidence that distinguishes nothing.
             chunks = kwargs.get("chunks")
             if chunks is None and len(args) >= 3:
@@ -1310,7 +1310,7 @@ class TestTheIndexIsItsOwnReverseIndex:
             # covered, or report.md committed empty, and those are different
             # bugs. The first recorded failure read
             # [('walk', 1.2324), ('neither', 1.4468)] against a passing
-            # [('neither', 1.1999), ('upload', 1.4146)] — so the upload's
+            # [('neither', 1.1999), ('upload', 1.4146)] - so the upload's
             # marked commit was missing entirely, and which file the unmarked
             # one belonged to is the next thing worth knowing.
             commits.append(
@@ -1359,7 +1359,7 @@ class TestTheIndexIsItsOwnReverseIndex:
         indexed = _text(runtime, context_id)
         assert "THE GENERATION THE UPLOAD WROTE" in indexed, (
             "the walk committed over the newer generation's chunks. Commits "
-            f"landed as {commits} — (which generation, file, chunks, seconds "
+            f"landed as {commits} - (which generation, file, chunks, seconds "
             "since the gate was armed). The upload's commit must be last; "
             "when this passes it reads [..., ('upload', 'report.md', _, _)]"
         )
@@ -1375,7 +1375,7 @@ class TestTheIndexIsItsOwnReverseIndex:
         exists so one unreadable PDF does not abandon a whole tree. A
         `PathLockTimeout` entering the guard was swallowed the same way, so a
         source that never got its lock returned 201 with zero chunks and left
-        its source record behind — while the route's own 409 handler, which
+        its source record behind - while the route's own 409 handler, which
         removes that record, could not be reached.
         """
         from liminallm.service.fs import PathLockTimeout
@@ -1455,7 +1455,7 @@ class TestAnAttachmentIsAnImmutableGeneration:
     *path*; the inline reader then reopened it to read the text, and
     `resolved_names` threw the object away entirely and returned a basename
     for `prepare_workdir` to reopen later. So a replacement landing between
-    the check and the use was served exactly as before — the check noticed a
+    the check and the use was served exactly as before - the check noticed a
     replacement that had already happened, and nothing about one that had
     not happened yet.
 
@@ -1939,7 +1939,7 @@ def _pdf_bytes(line: str, pad: int = 0) -> bytes:
 
     The content stream is Flate-compressed on purpose. An uncompressed one
     is mostly ASCII, so the marker survives a generic byte decode and a test
-    built on it passes whether or not the format was recognised — measured,
+    built on it passes whether or not the format was recognised - measured,
     that is exactly what the first version of this did.
     """
     raw = f"BT /F1 24 Tf 72 700 Td ({line}) Tj ET".encode()
@@ -1984,7 +1984,7 @@ class TestAGenerationKeepsItsFormat:
     the generic byte decode, and was refused as binary. The upload reported
     success with nothing indexed.
 
-    The extension does not go into the key — the key is the identity of the
+    The extension does not go into the key - the key is the identity of the
     bytes and nothing else. The format travels beside it, as what the
     conversation calls the file.
     """
@@ -2186,7 +2186,7 @@ class TestAConversationsIndexIsNotAUserManagedContext:
 
     The invalidation sweep skips auto contexts because they hold attachment
     generations, which are immutable and scoped to one chat. That reasoning
-    only holds if nothing else can put a path-following source into one —
+    only holds if nothing else can put a path-following source into one -
     and `POST /contexts/{id}/sources` checked ownership and nothing else.
     The id is not even hidden: a searchable attachment upload returns it.
 
@@ -2334,7 +2334,7 @@ class TestAnExtractedTreeIsInvisibleUntilItIsComplete:
     The destination directory exists under its real name from the first
     member onward, so a download of a member still being written returns a
     truncated file with a content-length taken from the descriptor at open
-    time — the client gets a short file and no reason to doubt it. This is
+    time - the client gets a short file and no reason to doubt it. This is
     the same harm the staged upload and the linked artifact removed, one
     level up, and it takes the same answer: fill something nobody can see,
     then make it visible in one step.
@@ -2463,7 +2463,7 @@ class TestAnExtractedTreeIsInvisibleUntilItIsComplete:
     def test_stale_staging_is_reclaimed_but_a_live_one_is_left(self, tmp_path):
         """A staging tree outlives its extraction only if the process died.
 
-        Nothing reads these directories, so age is the only signal there is —
+        Nothing reads these directories, so age is the only signal there is -
         and the only one needed, since a finished extraction removes its own.
         """
         from liminallm.app import _sweep_archive_staging
@@ -2491,7 +2491,7 @@ class TestAnAutoContextIsNotATransferableCapability:
     `meta.auto` was made load-bearing on the write side: the sweep skips
     these contexts, retrieval from them is filtered, and a source cannot be
     added to one. The read side still accepted one as an ordinary knowledge
-    context when a caller named it — and the id is not secret, because a
+    context when a caller named it - and the id is not secret, because a
     searchable attachment upload returned it.
 
     So a second chat could name the first chat's index and read it, with the
@@ -2626,7 +2626,7 @@ class TestTwoAttachmentsDoNotRetireEachOther:
 
     Two filenames take different filesystem locks, so their uploads run
     alongside each other. Each ingests, then records, then prunes the
-    conversation's index to what its own snapshot of the records named — and
+    conversation's index to what its own snapshot of the records named - and
     the first one's snapshot does not name the second one. Measured, the
     conversation ended with both records, both objects, and only one of them
     indexed, with both uploads returning 200. No serialization of two
@@ -2634,7 +2634,7 @@ class TestTwoAttachmentsDoNotRetireEachOther:
 
     The transaction that displaces a record is also the one that retires what
     it displaced, and it retires only that. A generation whose record has not
-    been written yet is not "unauthorized" — it is unfinished, and the
+    been written yet is not "unauthorized" - it is unfinished, and the
     difference is the whole bug.
     """
 
@@ -2726,7 +2726,7 @@ class TestOneObjectCanHoldTwoInterpretations:
 
     The store is keyed by digest, which is right: the bytes are the bytes.
     But the index was keyed by the *object*, and `replace_chunks_for_path`
-    replaces by path — so attaching identical bytes under two names that
+    replaces by path - so attaching identical bytes under two names that
     parse differently made the second interpretation replace the first. A
     `.pdf` read as a document and the same bytes read as `.md` are two
     readings of one object, and the `.md` reading is a refusal, so its empty
@@ -2805,7 +2805,7 @@ class TestOneObjectCanHoldTwoInterpretations:
         Two names holding identical bytes cost one copy and, when they parse
         the same way, one reading: same digest and same suffix, so both
         records authorize `attachment-generation:<X>:.md`. Replacing one of
-        them displaces a record naming that reading — and retiring it on that
+        them displaces a record naming that reading - and retiring it on that
         basis alone would take the reading the *other* record still
         authorizes.
 
@@ -2897,7 +2897,7 @@ class TestAuthorizationReachesCandidateSelection:
     of the prompt, which is the disclosure question and it is answered. It
     does not keep them out of the *ranking*: if enough of them outrank the
     current attachment, the top-k is spent on rows that are then discarded
-    and the conversation is told nothing matched — while the file it holds
+    and the conversation is told nothing matched - while the file it holds
     sits just outside the cut.
 
     The predicate has to reach candidate selection, before each channel's
@@ -3120,8 +3120,8 @@ class TestOneConversationHasOneImplicitContext:
             b"# one\nTHE ATTACHED TEXT\n" * 800,
         ).status_code == 200
 
-        # Claiming the conversation in JSON alone is accepted by the index —
-        # it is not the key — and changes nothing about which context the
+        # Claiming the conversation in JSON alone is accepted by the index -
+        # it is not the key - and changes nothing about which context the
         # conversation resolves to.
         real = runtime.store.get_conversation_attachment_context(
             user_id, conversation_id
@@ -3177,8 +3177,8 @@ class TestOneConversationHasOneImplicitContext:
 
         An account upgrading from before the unique index may already hold
         two indexes for one conversation, and adding the index would simply
-        fail against them. The losers' chunks move to the oldest row — the
-        one any earlier lookup would have returned — because deleting a
+        fail against them. The losers' chunks move to the oldest row - the
+        one any earlier lookup would have returned - because deleting a
         loser outright takes chunks the winner does not have.
         """
         import os
@@ -3265,7 +3265,7 @@ class TestOneConversationHasOneImplicitContext:
         )
         # Moving is not enough. `_commit_generation` builds on one fs_path
         # being one complete current generation, and the merge bypasses
-        # `replace_chunks_for_path` — so a generation both contexts held
+        # `replace_chunks_for_path` - so a generation both contexts held
         # arrives twice, and the copies spend candidate slots that belong to
         # other attachments.
         duplicated = [
@@ -3363,8 +3363,8 @@ class TestAuthorizationIsNeverAPage:
     `_validate_context_scope` builds its owned set from
     `list_contexts(owner_user_id=...)`, which defaults to one 100-row page and
     really does `LIMIT` it in SQL. So a context the API has already accepted
-    by direct id lookup — the request is running, the conversation records it
-    — silently drops out of retrieval once the account has a hundred newer
+    by direct id lookup - the request is running, the conversation records it
+    - silently drops out of retrieval once the account has a hundred newer
     contexts. The turn succeeds and the model is simply given no grounding.
 
     An authorization decision is a question about one identity. It should
@@ -3486,7 +3486,7 @@ class TestALoadBearingIndexIsVerifiedAtStartup:
     These checks got much smaller when the relationship stopped being a JSON
     expression. Verifying a unique index over `meta ->> 'conversation_id'`
     took three rounds, because "unique, two keys, owner first, mentions the
-    right words" is satisfied by indexes that enforce nothing — an extra key
+    right words" is satisfied by indexes that enforce nothing - an extra key
     of `id`, the row id folded into the second key, a predicate of
     `id IS NULL`. A single key on a foreign-key column admits none of them:
     there is no expression to substitute and no room for an extra key.
@@ -3553,15 +3553,15 @@ class TestALoadBearingIndexIsVerifiedAtStartup:
     def test_a_predicate_that_excludes_every_implicit_context_is_refused(
         self, client
     ):
-        """Unique, one key, right column — and constraining nothing.
+        """Unique, one key, right column - and constraining nothing.
 
         `WHERE conversation_id IS NULL` is the impostor a key check alone
         cannot see. Every implicit context has a non-NULL conversation_id, so
         the index covers none of them, and PostgreSQL permits arbitrarily many
         NULLs in a unique index anyway. The schema therefore declares no
-        predicate at all — a plain unique index on a nullable column already
+        predicate at all - a plain unique index on a nullable column already
         allows any number of ordinary contexts while admitting one row per
-        conversation — and startup requires that there be none.
+        conversation - and startup requires that there be none.
         """
         import os
 
@@ -3594,7 +3594,7 @@ class TestALoadBearingIndexIsVerifiedAtStartup:
 
         A cascading, single-column foreign key from `conversation_id` into
         `conversation` satisfies every other clause here while pointing at
-        the wrong column — so the cascade fires on changes to something that
+        the wrong column - so the cascade fires on changes to something that
         is not the conversation's identity, and the lifetime it appears to
         establish is with a different value entirely.
         """

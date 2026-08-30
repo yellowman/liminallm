@@ -88,7 +88,7 @@ class ConfigOpsService:
 
         The schema update, the historical version and the patch's status are
         one transaction in the store, and the store validates the result
-        before writing any of them — so there is no partial state to report
+        before writing any of them - so there is no partial state to report
         and no invalid schema to persist. A failure here changed nothing.
         """
         patch = self.store.get_config_patch(patch_id)
@@ -107,7 +107,7 @@ class ConfigOpsService:
             )
 
         # The patch is applied inside the store's transaction, against the
-        # schema the store reads under the artifact lock — not against the
+        # schema the store reads under the artifact lock - not against the
         # `artifact` above. That read answers the request; it is not what the
         # write is derived from, because anything committed between the two
         # would otherwise be overwritten by a document built from the older

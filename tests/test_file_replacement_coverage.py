@@ -5,18 +5,18 @@ ordinary upload endpoint, which is what a user does and which names no context.
 Three things must hold afterwards, and they are one invariant seen from three
 sides:
 
-* the old text is never retrievable again — a context that answers out of bytes
+* the old text is never retrievable again - a context that answers out of bytes
   the file no longer holds is answering out of something that does not exist;
-* the new text becomes retrievable — the file did not silently leave the
+* the new text becomes retrievable - the file did not silently leave the
   corpus;
-* the context still covers the file — coverage is a property of the
+* the context still covers the file - coverage is a property of the
   context/source relationship, and replacing bytes is not a statement about it.
 
 The first and second hold at different times, on purpose. Dropping the old
 chunks is cheap and happens during the request; re-reading and re-embedding the
 file for every context that covers it is not bounded by anything the request
 chose, so it happens out of band. In between, the path is *absent* from those
-contexts. These tests therefore wait for the refresh rather than reading once —
+contexts. These tests therefore wait for the refresh rather than reading once -
 but the wait is not a blind sleep: the old generation is checked for at every
 observation, so an implementation that briefly reinstates it fails here even
 though the end state looks right.
@@ -26,7 +26,7 @@ step goes through the HTTP API, with no threads, no gate, and no reach into the
 engine. Concurrency was never needed to expose this. An earlier attempt at the
 same invariant used two threads and a gated commit, and it hid the defect on
 any machine where a directory listing happened to come back in a convenient
-order — the test passed for a reason unrelated to its subject. This one fails
+order - the test passed for a reason unrelated to its subject. This one fails
 everywhere the invariant is broken.
 
 Reads go to the store because the served surface has no chunk listing. That is
@@ -129,7 +129,7 @@ def _state(runtime, context_id: str, name: str) -> str:
     facts with separate causes, and asserting them one after another reports
     only the first. A replacement that indexed without invalidating and one
     that did nothing at all both fail the same assertion, and they are
-    different bugs — so every message carries both.
+    different bugs - so every message carries both.
     """
     indexed = _text_for(runtime, context_id, name)
     return (
@@ -153,7 +153,7 @@ def _wait_for_refresh(runtime, context_id: str, name: str) -> str:
 
     Absent is a legal intermediate state; wrong is not. The old generation is
     checked for at every observation, not only at the end, so an implementation
-    that puts the stale chunks back — briefly, or by racing its own queue —
+    that puts the stale chunks back - briefly, or by racing its own queue -
     fails here rather than passing on its final state.
     """
     deadline = time.monotonic() + REFRESH_TIMEOUT_SECONDS
@@ -231,7 +231,7 @@ class TestReplacingBytesKeepsCoverage:
         """The same invariant, against coverage acquired by naming a context.
 
         The second upload names nothing. Absence of a `context_id` is not a
-        statement that the file now belongs to no context — it is the ordinary
+        statement that the file now belongs to no context - it is the ordinary
         way to replace a file's bytes.
         """
         runtime = get_runtime()
@@ -305,8 +305,8 @@ class TestTheWindowBetweenThem:
 
     The tests above wait for the refresh, so they see only the end state, and
     an implementation that re-indexed everything inside the request would
-    satisfy them. It would also spend an amount of work no caller chose — one
-    extract-and-embed per covering context — before answering an upload. So
+    satisfy them. It would also spend an amount of work no caller chose - one
+    extract-and-embed per covering context - before answering an upload. So
     the deferral is deliberate, and it has its own requirement: during the
     window the path is *absent* from those contexts, never stale, and the work
     is *recorded*, never dropped.
@@ -344,7 +344,7 @@ class TestTheWindowBetweenThem:
         )
         assert runtime.store.count_pending_ingest_jobs(path) == 1, (
             "nothing owes this context a re-read, so the file is not "
-            "temporarily absent — it is permanently gone"
+            "temporarily absent - it is permanently gone"
         )
         assert sources_before <= _sources(runtime, context_id), (
             "the context stopped covering the path while waiting to re-read it"
@@ -421,7 +421,7 @@ class TestTheWindowBetweenThem:
     def test_a_job_that_fails_goes_back_in_the_queue(self, client, monkeypatch):
         """A failed re-index is retried, because the alternative is losing it.
 
-        Failures here are transient far more often than not — the database
+        Failures here are transient far more often than not - the database
         blinked, the encoder was briefly unreachable. Abandoning the job on
         the first one would leave the path missing from that context until
         somebody happened to replace the file again, which is precisely the
@@ -490,7 +490,7 @@ class TestWhatCoversWhat:
 
     Read straight from the store, because the subject is the predicate itself
     rather than the endpoint's use of it. Every context here is real and owned
-    — created through the API — because owner scoping is one of the properties
+    - created through the API - because owner scoping is one of the properties
     under test and a stand-in with no owner could not express it.
 
     Getting this wrong is not a cosmetic error. Too narrow, and a replaced file
@@ -582,7 +582,7 @@ class TestWhatCoversWhat:
         `knowledge_context` is owned by one user, and a replacement must only
         ever refresh that user's own contexts. Left to the caller, this would
         be one forgotten argument away from letting an upload write into a
-        stranger's index — so the scope is applied here, in the query, not
+        stranger's index - so the scope is applied here, in the query, not
         by whoever calls it.
         """
         runtime = get_runtime()
@@ -592,7 +592,7 @@ class TestWhatCoversWhat:
 
         # A row saying another account's context covers this account's
         # directory. It is written to the store directly because the API
-        # refuses to create one — asserted at the end — and what is under
+        # refuses to create one - asserted at the end - and what is under
         # test here is what the query does if such a row exists anyway.
         intruder = _context(client, other_headers)
         runtime.store.add_context_source(
@@ -651,7 +651,7 @@ class TestTheQueueDoesNotLoseWork:
 
         A process killed after claiming would strand it there forever. Because
         the replacement has already dropped the chunks, that is not a delayed
-        re-index — it is a file permanently absent from a context that covers
+        re-index - it is a file permanently absent from a context that covers
         it, caused by the bookkeeping meant to prevent exactly that.
         """
         runtime, context_id, path, _drain = self._replaced_with_drain_suspended(
@@ -764,7 +764,7 @@ class TestTheQueueDoesNotLoseWork:
         """Standing aside is not the same as trying and failing.
 
         A worker's pass keeps draining until the queue is empty, so a job that
-        yields a held path is re-claimed straight away — many times over while
+        yields a held path is re-claimed straight away - many times over while
         the holder is still embedding. If each of those spends one of the
         job's attempts, the budget is gone in milliseconds and the job is
         abandoned, which leaves the path missing from a context that covers
@@ -801,7 +801,7 @@ class TestTheQueueDoesNotLoseWork:
         )
         # What a failure leaves behind, reached the way a failure reaches it:
         # a job is claimed, fails, and is put back with a delay. Requeueing is
-        # a `running -> queued` transition, so the claim is not decoration —
+        # a `running -> queued` transition, so the claim is not decoration -
         # pushing a never-claimed row's due time out would be arranging a
         # state the system does not produce.
         claimed = runtime.store.claim_ingest_jobs(1)
@@ -833,7 +833,7 @@ class TestTheProducerIsAlsoAWriter:
     `run_job` serialises workers against each other. It is not enough. The
     upload route deletes a path's chunks and queues new work without holding
     that lock, and `ingest_file` extracts the file into memory well before it
-    writes the chunks — so a replacement can land in between and have its
+    writes the chunks - so a replacement can land in between and have its
     invalidation undone by a write that was already in flight.
     """
 
@@ -845,7 +845,7 @@ class TestTheProducerIsAlsoAWriter:
         The worker is held after it has read the old bytes and before it
         writes them as chunks. The replacement happens in that gap, through
         the ordinary endpoint. Then the worker is released. Afterwards the old
-        generation must not be answerable — that is the whole promise.
+        generation must not be answerable - that is the whole promise.
         """
         import threading
 
@@ -914,7 +914,7 @@ class TestRetriesAreSpreadOverTime:
         """Five attempts in five seconds is not a retry policy.
 
         A failed job goes straight back to `queued`, and a worker's pass keeps
-        draining until the queue is empty — so a single pass can claim, fail
+        draining until the queue is empty - so a single pass can claim, fail
         and requeue the same job until its budget is gone. A thirty-second
         embedding outage would then permanently remove the file from the
         context, which is exactly what the retries are documented to prevent.
@@ -993,12 +993,12 @@ class TestRetriesAreSpreadOverTime:
 class TestHoldersDoNotStarveEachOther:
     """Holding one connection and needing a second is a deadlock in waiting.
 
-    These are not contending writers — each holds a *different* path and is
+    These are not contending writers - each holds a *different* path and is
     entitled to run. Keeping waiters off the pool did nothing for them: the
     lock connection is held for the whole critical section, and the delete and
     the ingest inside it each need another. Once holders can take every
     connection, each waits for a second one that only another holder can give
-    back, until the pool times out — and the upload's error path answers a
+    back, until the pool times out - and the upload's error path answers a
     timeout by deleting the file it just wrote.
     """
 
@@ -1009,7 +1009,7 @@ class TestOneLockForBothSides:
     This is the claim the whole design rests on once the database advisory
     lock is gone. Two locks that merely look alike would serialise nothing:
     the worker would re-index a path while an upload replaced its bytes, and
-    the losing write would outlive the winner's — which is the defect the lock
+    the losing write would outlive the winner's - which is the defect the lock
     exists to prevent, reached through the machinery built to fix it.
 
     So the test does not inspect either side's code. It makes a worker hold
@@ -1036,7 +1036,7 @@ class TestOneLockForBothSides:
 
         # The upload waits the ordinary amount for a lock; shortened here so a
         # refusal takes a moment rather than half a minute. Only the timeout
-        # changes — the lock, its key and its holder are the real ones.
+        # changes - the lock, its key and its holder are the real ones.
         import functools
 
         monkeypatch.setattr(
@@ -1085,7 +1085,7 @@ class TestAFailedIngestStillOwesTheReRead:
     A named context is left out of the enqueue loop because it is about to be
     ingested in the request. When that ingest fails, the request has written a
     `context_source` row saying the context covers the path and has emptied
-    what it said about it — a context covering a file it describes not at all,
+    what it said about it - a context covering a file it describes not at all,
     which is the coverage loss this whole queue exists to prevent, arriving
     through the one branch that does not use it.
     """
@@ -1121,7 +1121,7 @@ class TestAFailedIngestStillOwesTheReRead:
         )
         assert runtime.store.count_pending_ingest_jobs(path) >= 1, (
             "the context covers this path and says nothing about it, and "
-            "nothing is queued to fix that — the file is lost from a context "
+            "nothing is queued to fix that - the file is lost from a context "
             "that claims to hold it"
         )
 

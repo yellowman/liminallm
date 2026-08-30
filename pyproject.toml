@@ -18,7 +18,7 @@ dependencies = [
   "redis>=5.0",
   # Imported at module scope by auth, web, sandbox, voice and the Gemini
   # backend. It was never declared and arrived only because `openai` depends
-  # on it — a direct import satisfied by somebody else's dependency, which
+  # on it - a direct import satisfied by somebody else's dependency, which
   # holds until their dependency changes. CI installed a set without it and
   # the whole application failed to import.
   "httpx>=0.27,<1",
@@ -76,14 +76,14 @@ dev = [
   # Also in the `ocr` extra, where it is a runtime capability. Here because
   # three tests need it to build a fixture image, and those three are not OCR
   # tests: they gate on nothing, because what they exercise is the refusal
-  # path — an unreadable image naming the remedy, and a decompression bomb
+  # path - an unreadable image naming the remedy, and a decompression bomb
   # refused before it allocates. Declared rather than skipped so they run in
   # CI. They did not, and every lane there failed them, because the local
   # environment happened to have Pillow and no CI lane installs the extra.
   "Pillow>=10.0",
   # The arbiter for the served Responses wire (SPEC §16). Those tests hand
   # each payload to the SDK's generated types, which live under
-  # `openai.types.responses` and do not exist in the base floor above — so a
+  # `openai.types.responses` and do not exist in the base floor above - so a
   # minimum-version environment could not even collect them.
   #
   # Deliberately not raised at runtime: the API backend supports SDKs and
@@ -93,9 +93,9 @@ dev = [
   # Deliberately uncapped, too, and that is the interesting half. An earlier
   # note here said the lockfile recorded which schema snapshot was qualified,
   # which was not true of CI: CI installs unpinned and resolved 3.3.1 while
-  # every local environment held 2.8.1. It found a real defect — 3.x made
+  # every local environment held 2.8.1. It found a real defect - 3.x made
   # `input_tokens_details.cache_write_tokens` required and the served usage
-  # block omitted it — and that is the arrangement working, not failing. A cap
+  # block omitted it - and that is the arrangement working, not failing. A cap
   # would have hidden a wire this server had genuinely stopped conforming to.
   # The suite now passes against both 2.8.1 and 3.3.1, measured on each.
   "openai>=2.8.1",

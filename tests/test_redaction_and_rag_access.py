@@ -143,7 +143,7 @@ def _context(store, owner, *, visibility=None):
 
 
 def test_a_request_without_a_user_gets_nothing(rag, store):
-    """No user means no way to check ownership, so the answer is no contexts —
+    """No user means no way to check ownership, so the answer is no contexts -
     not "all of them"."""
     owner = _user(store)
     ctx = _context(store, owner)

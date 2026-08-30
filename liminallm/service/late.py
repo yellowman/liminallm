@@ -2,12 +2,12 @@
 
 A pooled chunk embedding has to answer for the whole chunk at once. Everything
 the chunk says is averaged into one point, and the ranking is then one inner
-product — which is precisely the object the dimension bound in SPEC §2.5
+product - which is precisely the object the dimension bound in SPEC §2.5
 applies to. A chunk that covers two subjects lands between them and is the
 best match for neither.
 
 Late interaction keeps the parts separate and defers the comparison to query
-time: the chunk is stored as several vectors, and the score is MaxSim — for
+time: the chunk is stored as several vectors, and the score is MaxSim - for
 each part of the query, the best-matching part of the chunk, summed. The score
 is no longer a single inner product, so the single-vector bound does not
 describe it. That is why multi-vector models are the one architecture in the
@@ -18,7 +18,7 @@ the same encoder as everything else, because that encoder is reached through
 an OpenAI-compatible ``/embeddings`` endpoint and such an endpoint returns one
 vector per input. It cannot return per-token vectors, so this is not ColBERT
 and must not be read as carrying ColBERT's published numbers. What it does
-carry is the mechanism — several vectors per document, MaxSim at query time —
+carry is the mechanism - several vectors per document, MaxSim at query time -
 at a coarser granularity, and roughly an order of magnitude less storage than
 per-token would cost. The seam is the encoder: a real late-interaction model
 can replace ``segment_text`` + the embed call without touching the storage,
@@ -41,9 +41,9 @@ _BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 # are hundreds of words long.
 MIN_SEGMENT_WORDS = 12
 
-# The query side needs its own floor. A real question is short — "Compare the
+# The query side needs its own floor. A real question is short - "Compare the
 # census with the grazing report. Which is newer?" has a three-word second
-# clause — so the chunk threshold folded every query back into one segment and
+# clause - so the chunk threshold folded every query back into one segment and
 # the multi-vector query side never ran at all.
 QUERY_MIN_SEGMENT_WORDS = 3
 
@@ -54,7 +54,7 @@ def segment_text(
     """Split a chunk into the parts that get their own vector.
 
     Short fragments merge forward, and the result is packed down to
-    ``max_segments`` by joining neighbours — never by dropping them, because a
+    ``max_segments`` by joining neighbours - never by dropping them, because a
     dropped segment is content that becomes unretrievable.
     """
     if max_segments < 1 or not (text or "").strip():
@@ -115,7 +115,7 @@ def maxsim(
     Normalized once per vector, then compared by dot product. Calling a
     general cosine per pair re-derived both norms, copied both vectors and
     rescanned them for NaN on every one of the (query x segment x candidate)
-    comparisons — at the shipped defaults that measured 0.44 s per retrieval
+    comparisons - at the shipped defaults that measured 0.44 s per retrieval
     and 2 s at the candidate cap, on a request thread, before the answering
     model was even called. The arithmetic is identical; the work is not.
     """
@@ -133,7 +133,7 @@ def maxsim(
         best = 0.0
         for doc in docs:
             if len(doc) != len(unit_query):
-                # Different encoders. Not a weak match — not a comparison.
+                # Different encoders. Not a weak match - not a comparison.
                 continue
             score = sum(map(operator.mul, unit_query, doc))
             if score > best:

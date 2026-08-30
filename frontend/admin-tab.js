@@ -3,7 +3,7 @@
  * storage objects, and config patches. (The standalone /admin page has its
  * own driver in admin.js; this file is the panel inside the chat app.)
  *
- * Definitions only — chat.js wires and invokes these at DOMContentLoaded.
+ * Definitions only - chat.js wires and invokes these at DOMContentLoaded.
  */
 
 // =============================================================================

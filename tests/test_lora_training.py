@@ -6,7 +6,7 @@ resulting weights fitted no model that exists. These tests pin the parts that
 make the ladder true instead of ceremonial.
 
 The strongest one is `test_training_teaches_the_target`. Everything else can
-pass while the adapter still learns nothing useful — loss curves go down for
+pass while the adapter still learns nothing useful - loss curves go down for
 all sorts of wrong reasons. Asking whether the trained target actually became
 more likely *in the model that will serve it* is the claim the README makes,
 so it is the claim under test.
@@ -26,8 +26,8 @@ pytest.importorskip("safetensors")
 
 from tests.test_local_transformer import _build_checkpoint  # noqa: E402
 
-# Every test in this module runs the real thing — training steps, a forward
-# pass, an eval gate — so it is measured in seconds rather than milliseconds.
+# Every test in this module runs the real thing - training steps, a forward
+# pass, an eval gate - so it is measured in seconds rather than milliseconds.
 # `make test-fast` skips these; `make test` and the pre-commit gate do not,
 # because what they exercise is not covered anywhere else.
 pytestmark = pytest.mark.slow
@@ -194,7 +194,7 @@ class TestTrainingRuns:
 
     def test_the_base_model_is_never_updated(self, tmp_path, checkpoint):
         """SPEC §5.1: 'only on adapters, never on the base model'. The base
-        params are closed over, not differentiated — so they must come out of
+        params are closed over, not differentiated - so they must come out of
         training bit-identical."""
         service = _service(tmp_path, str(checkpoint))
         config, params = service._base_checkpoint()
@@ -223,8 +223,8 @@ class TestTrainingRuns:
     ):
         """α is a hyperparameter, not a parameter.
 
-        It used to enter the optimizer tree — the L2 term alone gives it a
-        gradient — so Optax moved it while the evaluation still used the
+        It used to enter the optimizer tree - the L2 term alone gives it a
+        gradient - so Optax moved it while the evaluation still used the
         original value. The gate then passed under one α and serving got
         another.
         """

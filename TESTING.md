@@ -15,7 +15,7 @@ store and the same cache production runs. Nothing to set up:
 ```
 
 Both services are real on purpose. An in-memory store used to double the
-storage layer, so every storage feature was written twice and verified once —
+storage layer, so every storage feature was written twice and verified once -
 and the untested half was the one production ran. Running without Redis is the
 same problem one layer down: rate limits, idempotency, the session cache and
 the concurrency slots all take their fallback path, so a green suite says
@@ -47,7 +47,7 @@ TEST_MODE=true pytest tests/
 ```
 
 To reuse an existing database instead of starting one, point
-`TEST_DATABASE_URL` at it. It needs the `vector` extension available —
+`TEST_DATABASE_URL` at it. It needs the `vector` extension available -
 the schema declares a `VECTOR` column.
 
 ### Integration Tests with Docker
@@ -97,7 +97,7 @@ Regular test users are created dynamically during tests.
 | `EMBEDDING_VECTOR_DIM` | `1536` | Vector width; the suite pins `64` to match the hash encoder |
 
 To let the app fall back to an in-process cache when Redis is unavailable,
-enable the `allow_redis_fallback_dev` admin setting — it is stored in the
+enable the `allow_redis_fallback_dev` admin setting - it is stored in the
 database, not read from the environment.
 
 ### Test Database

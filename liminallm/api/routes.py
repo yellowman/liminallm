@@ -235,7 +235,7 @@ async def get_user_or_api_key(
     or any session auth.
 
     Only this dependency reads API keys. Native routes authenticate through
-    get_user, which cannot — so a leaked key can drive the agent surfaces and
+    get_user, which cannot - so a leaked key can drive the agent surfaces and
     nothing else, and in particular cannot mint or revoke keys.
     """
     runtime = get_runtime()
@@ -278,9 +278,9 @@ def _get_owned_context(
     """A context this caller may name, or an error.
 
     A conversation's implicit index is never one of them. Being one is
-    load-bearing — the stale-generation sweep skips these contexts, and
+    load-bearing - the stale-generation sweep skips these contexts, and
     retrieval from them is filtered to what the conversation's records still
-    name — and both of those key on the conversation, not on the context. So
+    name - and both of those key on the conversation, not on the context. So
     a caller that can *name* one gets an index nothing scopes: measured, a
     second chat read the first chat's attachment by naming its id, which
     §19.5 scopes to the chat that received it.
@@ -307,7 +307,7 @@ def _get_private_artifact(runtime, artifact_id: str, principal: AuthContext):
     through to another user's artifact and to ownerless system artifacts,
     which is right for viewing and wrong as a mutation rule. Used for PATCH,
     it made `/artifacts/{id}` a way to edit a global system workflow directly
-    — the change ConfigOps exists to review — as an accidental consequence of
+    - the change ConfigOps exists to review - as an accidental consequence of
     being an admin on an ordinary user route.
 
     SPEC §12.3 scopes user CRUD to *private* artifacts. Visibility is part of
@@ -481,7 +481,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
     ip_addr = request.client.host if request.client else None
     # Per CLAUDE.md the tenant is never taken from the request body. It is the
     # tenant serving the site this login arrived at, and it must match the one
-    # on the user's record — an account from another site cannot sign in here.
+    # on the user's record - an account from another site cannot sign in here.
     user, session, tokens = await runtime.auth.login(
         email=body.email,
         password=body.password,
@@ -825,7 +825,7 @@ async def admin_delete_user(
     #
     # By id. The address is the identifier this request exists to remove, and
     # writing it into the audit log copies it into a store with its own
-    # retention and its own readers — an erasure that ends by re-recording
+    # retention and its own readers - an erasure that ends by re-recording
     # what it erased. The id correlates the entry with everything else about
     # the account, which is what an audit trail is for.
     logger.info(
@@ -1095,7 +1095,7 @@ async def request_reset(body: PasswordResetRequest):
     if user:
         # No token when the account was erased between the lookup above and
         # the write. Nothing is sent, and the answer below is the same one an
-        # address that never existed gets — which is the point of that answer.
+        # address that never existed gets - which is the point of that answer.
         token = await runtime.auth.initiate_password_reset(user)
         if token:
             # Run blocking SMTP in thread to avoid blocking event loop
@@ -1342,7 +1342,7 @@ async def create_api_key(
 ):
     """Mint a bearer key for the served Responses API (SPEC §13.1).
 
-    Session-authenticated on purpose — get_user cannot read keys, so a key
+    Session-authenticated on purpose - get_user cannot read keys, so a key
     can never mint another and outlive its own revocation.
     """
     runtime = get_runtime()
@@ -1500,8 +1500,8 @@ async def chat(
 # ---------------------------------------------------------------------------
 #
 # The point of serving this shape: any client that speaks the Responses API
-# gets a weak model wrapped in this kernel's enrichment — hybrid RAG,
-# personas, skill adapters, routing, compaction — because a request here runs
+# gets a weak model wrapped in this kernel's enrichment - hybrid RAG,
+# personas, skill adapters, routing, compaction - because a request here runs
 # the SAME turn pipeline as /chat. Responses rather than chat/completions
 # because Responses is stateful by design: previous_response_id maps directly
 # onto conversations, which carry exactly the state a completions shim would
@@ -1552,7 +1552,7 @@ def _openai_error(
 def _responses_reject_unsupported(body: dict) -> None:
     """The v1 scope line, drawn where an SDK will read it.
 
-    Each rejection names why in terms of what this kernel already does —
+    Each rejection names why in terms of what this kernel already does -
     "unsupported" alone reads as "broken", and every one of these has a
     deliberate reason.
     """
@@ -1581,7 +1581,7 @@ def _responses_input_text(payload: Any) -> str:
     """The user text of a Responses ``input``, or a named rejection.
 
     A string passes through. A list accepts message items carrying user text
-    — role shorthand or typed parts — and refuses the rest by name: system
+    - role shorthand or typed parts - and refuses the rest by name: system
     and developer items would fight the personas that own the system prompt
     here, and function_call_output belongs to caller tools, which this
     surface does not take.
@@ -1630,7 +1630,7 @@ def _responses_input_text(payload: Any) -> str:
         role = item.get("role")
         if role in ("system", "developer"):
             raise _ResponsesReject(
-                f"{where}: system/developer items are not supported — the "
+                f"{where}: system/developer items are not supported - the "
                 "system prompt belongs to per-user personas and adapters here.",
                 param=where,
             )
@@ -1705,8 +1705,8 @@ def _responses_usage(usage: dict) -> dict:
     into the turn's usage precisely so a consumer can see them; dropping them
     here was the one gap in that chain. The details objects are always
     present (zeros when unknown) because typed SDKs require the fields, and
-    the total falls back to input+output for backends — the local tokenizer
-    path historically — that report the parts without the sum.
+    the total falls back to input+output for backends - the local tokenizer
+    path historically - that report the parts without the sum.
     """
     prompt = int(usage.get("prompt_tokens") or 0)
     completion = int(usage.get("completion_tokens") or 0)
@@ -1717,7 +1717,7 @@ def _responses_usage(usage: dict) -> dict:
     # client may compute visible output as output - reasoning and expect
     # input + output == total. Backends disagree about that: OpenAI counts
     # reasoning inside its output count, Gemini counts thoughts alongside
-    # candidates. Measured on our own fixture — prompt 10 + candidates 5 = 15
+    # candidates. Measured on our own fixture - prompt 10 + candidates 5 = 15
     # against a reported total of 22, which only reconciles once the 7 thought
     # tokens are added.
     #
@@ -1748,7 +1748,7 @@ def _responses_usage(usage: dict) -> dict:
     }
 
 
-#: Server-side tool runs served as the dialect's own output items — only the
+#: Server-side tool runs served as the dialect's own output items - only the
 #: types the dialect defines, so typed SDK parsers never meet an unknown
 #: discriminator. Everything else (note_search, history_search, run_python,
 #: web_fetch) appears in the liminallm extension's tool_trace instead of
@@ -1763,7 +1763,7 @@ def _web_search_action(query: Any) -> dict:
     """What a `web_search_call` says it did. Required by the dialect.
 
     The action distinguishes a search from opening a page or finding within
-    one, and the search variant requires the query — so an item that omitted
+    one, and the search variant requires the query - so an item that omitted
     it said a web search happened without saying what for, and failed the
     generated type outright. `run_web_search` is always a search, and the
     trace carries the query, so nothing is invented here.
@@ -1801,7 +1801,7 @@ def _responses_enrich_tool_items(items: list, tool_trace: list) -> None:
     """Fill streamed tool items from the trace, once the trace exists.
 
     A streamed item opens on a trace event that carries no arguments, so it
-    is emitted with the empty-when-unknown query — which is honest at that
+    is emitted with the empty-when-unknown query - which is honest at that
     moment and is what the dialect requires. By the time the turn finishes
     the arguments are known, and the finished response is where a caller
     reads what the run actually did, so it says so rather than staying empty
@@ -1874,7 +1874,7 @@ def _responses_payload(
         "metadata": metadata,
         "usage": usage,
         # Required by the dialect, and all three describe the caller-supplied
-        # tool surface — which this endpoint refuses by name, because it runs
+        # tool surface - which this endpoint refuses by name, because it runs
         # the kernel's own loop server-side. So: no caller tools were in
         # effect, none were available to choose between, and none were
         # emitted in parallel. What the server ran appears where §16 says it
@@ -2148,7 +2148,7 @@ async def _responses_stream(
         # The client went away; stop generating. Nothing more can be sent.
         cancel_event.set()
         raise
-    except Exception:  # noqa: BLE001 — a failed event beats a broken stream
+    except Exception:  # noqa: BLE001 - a failed event beats a broken stream
         logger.exception("responses_stream_failed", user_id=principal.user_id)
         yield ev(
             "response.failed",
@@ -2173,7 +2173,7 @@ async def create_response(
     """One enriched turn, in the Responses API shape.
 
     The body is read raw and validated by hand so both the success and the
-    error wire shapes are exactly OpenAI's — response_model wrapping, a typed
+    error wire shapes are exactly OpenAI's - response_model wrapping, a typed
     body parameter, and FastAPI's 422s would each break an SDK's parser in a
     different way.
     """
@@ -2232,7 +2232,7 @@ async def create_response(
 
         if body.get("stream") is True:
             # Everything that can refuse the request refuses it HERE, as a
-            # proper HTTP error — once the stream starts the status is spent.
+            # proper HTTP error - once the stream starts the status is spent.
             # Slots are taken in the route and handed to the generator, whose
             # finally releases them however the stream ends.
             held_slots: list[str] = []
@@ -2337,7 +2337,7 @@ async def create_response(
         # A provider or service failure mid-turn: without this, the app-wide
         # handler would answer in the Envelope and break the SDK parsing it.
         return _openai_error(exc.status_code, exc.message, code=exc.error_code)
-    except Exception:  # noqa: BLE001 — the wire-shape rule outranks the global handler
+    except Exception:  # noqa: BLE001 - the wire-shape rule outranks the global handler
         logger.exception("responses_turn_failed", user_id=user_id)
         return _openai_error(500, "internal server error", code="server_error")
 
@@ -2544,7 +2544,7 @@ async def notes_graph(principal: AuthContext = Depends(get_user)):
 async def list_sweep_reports(
     limit: int = 10, principal: AuthContext = Depends(get_user)
 ):
-    """Past sweep reports, newest first — replay without re-spending calls."""
+    """Past sweep reports, newest first - replay without re-spending calls."""
     runtime = get_runtime()
     await rate_limit(runtime, "read", principal.user_id)
     _require_notes_enabled(runtime)
@@ -2657,7 +2657,7 @@ async def search_notes(
                     **_note_payload(note, content=False),
                     # Position, not a score. What search_notes returns is a
                     # fused rank value that tops out near 0.016 and packs the
-                    # whole result set into a hair's breadth of itself — a
+                    # whole result set into a hair's breadth of itself - a
                     # number no client can render and none should try to.
                     "rank": position,
                     "excerpt": " ".join(note.content.split())[:300],
@@ -3295,7 +3295,7 @@ async def create_artifact(
         if not type_prefix:
             raise BadRequestError("type or kind is required")
         # Publishing is a privilege, and the role comes off the authenticated
-        # token — never from the body, which is the same rule `tenant_id`
+        # token - never from the body, which is the same rule `tenant_id`
         # lives under. A `shared` artifact is every account in the tenant's,
         # and a `global` one is the installation's: a globally visible `tool`
         # enters the registry every turn resolves against, and a globally
@@ -3358,7 +3358,7 @@ async def delete_artifact(
     The payloads are deliberately *not* removed here. A turn resolves an
     adapter from Postgres and only then touches disk, so unlinking inside this
     request lets a caller that legitimately acquired the artifact read a
-    filesystem where it no longer exists — a state no serial order of the two
+    filesystem where it no longer exists - a state no serial order of the two
     produces. `service/artifacts.sweep_artifact_payloads` collects them once
     they have been orphans for longer than any request may live, which also
     keeps an `rmtree` of a large checkpoint tree off an API worker and makes
@@ -3391,7 +3391,7 @@ async def patch_artifact(
 ):
     """Update an artifact via RFC 6902 JSON Patch or legacy schema update.
 
-    Paths address the artifact's schema document itself — `/entrypoint`, not
+    Paths address the artifact's schema document itself - `/entrypoint`, not
     `/schema/entrypoint`. See `ArtifactPatchRequest` for why the second
     spelling was wrong here and is now refused rather than misapplied.
 
@@ -3437,7 +3437,7 @@ async def patch_artifact(
 
     # None when the request did not ask for one, which the store reads as
     # "leave it alone". Passing back the description we read would revert a
-    # concurrent change to it — the same staleness as the schema, one column
+    # concurrent change to it - the same staleness as the schema, one column
     # over.
     new_description = normalized.get("description")
 
@@ -3641,7 +3641,7 @@ async def get_system_settings_schema(
         ):
             # A runtime fact, not schema: reranking is on, and this backend
             # cannot carry the verdict out-of-band, so it is parsed from
-            # reply text — the degraded transport. The one person who can fix
+            # reply text - the degraded transport. The one person who can fix
             # that is the admin reading this screen.
             entry["warning"] = (
                 "Active on a backend without tool calling: the verdict is "
@@ -3744,7 +3744,7 @@ async def update_system_settings(
         # Non-structural settings still have to reach THIS worker's
         # runtime.settings before the response returns. The polling watcher
         # exists for the *other* workers; leaning on it here made "the change
-        # is live" true only after an interval nobody promised the admin —
+        # is live" true only after an interval nobody promised the admin -
         # the reranker reads rag_rerank per retrieval, but per-retrieval
         # reads of a stale object are still stale.
         runtime.refresh_settings()
@@ -3799,7 +3799,7 @@ async def upload_file(
 ):
     """Upload a file, optionally attaching it to a conversation.
 
-    With `conversation_id` the file becomes usable in that chat immediately —
+    With `conversation_id` the file becomes usable in that chat immediately -
     small text files are injected into the prompt, larger documents are chunked
     into the conversation's implicit context for the model's file_search tool,
     and everything is readable from the code interpreter. No context needs to
@@ -3922,7 +3922,7 @@ async def upload_file(
             return existing, checksum_before, contexts
         # Archives are binary; they are stored but never text-ingested.
         # POST /files/{name}/extract expands them (with ingestion) instead.
-        # (Attaching an archive to a conversation is fine — it is handed to the
+        # (Attaching an archive to a conversation is fine - it is handed to the
         # code interpreter, never chunked, so context_id stays unset below.)
         if context_id and is_archive_filename(safe_filename):
             raise http_error(
@@ -3934,7 +3934,7 @@ async def upload_file(
 
         # Before anything durable happens. `_publish` used to reach this
         # check inside its ingestion step, which runs after the pathname has
-        # already been replaced — so a request refused for naming a context
+        # already been replaced - so a request refused for naming a context
         # that does not exist had overwritten the file first, and the failure
         # handler then unlinked it. Measured: the pathname was gone while the
         # manifest and the chunks still described the generation it used to
@@ -4023,9 +4023,9 @@ async def upload_file(
             """
             existing_checksums, prior_checksum, prior_contexts = _read_manifest()
             # The manifest nominates a dedupe hit; the disk confirms it. The
-            # record can outlive the bytes it describes — a publication that
+            # record can outlive the bytes it describes - a publication that
             # failed after writing them and was never retried leaves exactly
-            # that — and when the record alone decides, re-uploading the bytes
+            # that - and when the record alone decides, re-uploading the bytes
             # it names skips the write and reports success over a file holding
             # something else. That is the false dedupe hit 2E.1 removed,
             # reached this time by abandoning a failed request rather than by
@@ -4040,7 +4040,7 @@ async def upload_file(
 
             # A conversation attachment keeps its own copy of these bytes.
             # The chat was given *this* generation, and `/files/{name}` is a
-            # name every later upload of it also owns — so what the chat can
+            # name every later upload of it also owns - so what the chat can
             # read has to stop depending on that name. Stored before anything
             # names it, and unreferenced copies are reclaimed by the sweep.
             generation: Optional[FilePath] = None
@@ -4072,7 +4072,7 @@ async def upload_file(
                 # entry, so a concurrent duplicate request is rejected with 409
                 # while this write proceeds. The slot records that the request
                 # was entered; the guards here record which of its mutations
-                # actually landed — this upload writes bytes and then ingests
+                # actually landed - this upload writes bytes and then ingests
                 # them, and those are two facts, not one.
                 with idem.commit(
                     "files.write", {"path": safe_filename, "checksum": checksum}
@@ -4081,7 +4081,7 @@ async def upload_file(
                         # Staged beside the destination, then renamed onto it.
                         # `write_bytes` truncates the file in place, so a
                         # download that already opened it saw the old bytes
-                        # end mid-stream — measured, a reader got eight bytes
+                        # end mid-stream - measured, a reader got eight bytes
                         # and then EOF, which is neither generation. A rename
                         # replaces the *name*: an open descriptor keeps the
                         # inode it has, and the next open gets the new one.
@@ -4099,8 +4099,8 @@ async def upload_file(
 
                 # The bytes changed, so every context that described the
                 # previous ones is now describing a file that is gone. Upload
-                # already stops *recording* them — the manifest's context set
-                # starts empty for a new checksum — and left their chunks in
+                # already stops *recording* them - the manifest's context set
+                # starts empty for a new checksum - and left their chunks in
                 # place, which is the record forgetting them while the index
                 # does not. Measured, with no race at all: two uploads of one
                 # name into two contexts left the first context answering
@@ -4109,7 +4109,7 @@ async def upload_file(
                 # Asked of the database, not of `prior_contexts`. The manifest
                 # records only the contexts an upload named, and a context can
                 # acquire a path through `POST /contexts/{id}/sources` without
-                # ever appearing there — so a sweep driven by the manifest
+                # ever appearing there - so a sweep driven by the manifest
                 # walked straight past it. The chunks are what claim to be
                 # this path's contents, so they are the reverse index.
                 #
@@ -4122,7 +4122,7 @@ async def upload_file(
                 # But emptying alone answers only half of it. Replacing bytes
                 # changes the file's generation, not which contexts cover it,
                 # and a context that keeps its `context_source` row while its
-                # chunks are gone has not been corrected — it has lost the
+                # chunks are gone has not been corrected - it has lost the
                 # file. Re-ingesting for every covering context inside this
                 # lock is genuinely unbounded work the request never chose, so
                 # what happens here is the bounded half: empty now, record the
@@ -4151,7 +4151,7 @@ async def upload_file(
                 the directory: an upload of *another* name takes a different
                 file lock, runs alongside, and its read-modify-write is built
                 from a snapshot taken before this one landed. Measured, that
-                dropped the other upload's entry entirely — and a missing
+                dropped the other upload's entry entirely - and a missing
                 entry is a dedupe miss, so the next upload of that name
                 re-ingests a file that never changed.
 
@@ -4161,7 +4161,7 @@ async def upload_file(
 
                 Not best effort. The manifest is one of the three records
                 that have to describe one generation, and a swallowed failure
-                leaves it naming the previous checksum — recoverable only
+                leaves it naming the previous checksum - recoverable only
                 because the dedupe check now confirms against the disk.
                 """
                 with path_lock(runtime.settings.shared_fs_root, str(manifest_path)):
@@ -4208,7 +4208,7 @@ async def upload_file(
                             operation.result = chunks
                 except Exception:
                     # The new bytes stay. Unlinking them does not restore what
-                    # they replaced — those bytes are already gone — so it only
+                    # they replaced - those bytes are already gone - so it only
                     # removes the pathname while the manifest and the index go
                     # on describing a generation no file has. What exists by
                     # here is this generation, so it is what gets recorded,
@@ -4241,7 +4241,7 @@ async def upload_file(
                     #
                     # The worker's poll is what refills it: this request is
                     # about to abort, so nothing it scheduled will run.
-                    # Attachments are excluded exactly as above — no source
+                    # Attachments are excluded exactly as above - no source
                     # row was written for one, so nothing claims coverage.
                     if generation is None:
                         with contextlib.suppress(Exception):
@@ -4258,7 +4258,7 @@ async def upload_file(
                     contexts.add(context_id)
                 _persist(contexts)
             # Inside the lock, because the record says how large this file is
-            # and therefore how the conversation may use it — §19.5 makes
+            # and therefore how the conversation may use it - §19.5 makes
             # inline/searchable/analyzable part of that. Written after the
             # lock was released, the loser's classification could land last,
             # and `read_inline_contents` would then open the winner's bytes
@@ -4277,7 +4277,7 @@ async def upload_file(
                 # the object is created or reused until the record naming it
                 # is durable. `store_generation` adopts an existing object
                 # without touching its age, so an object old enough to be
-                # swept can be adopted — and the sweep then unlinked it
+                # swept can be adopted - and the sweep then unlinked it
                 # during the very attachment that was adopting it. Namespace
                 # lock first, generation lock second; the sweep takes only
                 # the second, so the two orders cannot meet.
@@ -4311,7 +4311,7 @@ async def upload_file(
             fs_path=safe_filename,
             # Not the implicit one. Nothing accepts a conversation's index as
             # a named context any more, so publishing its id buys a client
-            # nothing — `chunk_count` already says the file was indexed — and
+            # nothing - `chunk_count` already says the file was indexed - and
             # an identifier nobody needs is one more thing to keep refusing.
             context_id=None if implicit_context else context_id,
             chunk_count=chunk_count,
@@ -4369,7 +4369,7 @@ async def list_files(
 
     # List files with pagination, walking extracted-archive subdirectories.
     # Hidden components are internal bookkeeping (e.g. the .checksums.json
-    # upload manifest) — uploads and extraction strip leading dots, so users
+    # upload manifest) - uploads and extraction strip leading dots, so users
     # can never own a dotfile here.
     all_files = []
     try:
@@ -4378,7 +4378,7 @@ async def list_files(
             # observational: `is_file()` followed by `stat()` is two questions
             # about a name, and a delete landing between them raised
             # FileNotFoundError out of a route that only caught
-            # PermissionError. Nothing here needs a lock — it needs to accept
+            # PermissionError. Nothing here needs a lock - it needs to accept
             # that what it saw a moment ago may be gone.
             try:
                 info = f.stat()
@@ -4552,7 +4552,7 @@ async def download_file(
     # The header is *encoded*, never interpolated: a filename is
     # attacker-influenced the moment model-written code chose it, and
     # `filename="{path}"` let a name containing a quote close the string and
-    # add a second `filename=` parameter — a browser taking the last one saves
+    # add a second `filename=` parameter - a browser taking the last one saves
     # the file under a name and extension the injected page picked. This is
     # the same RFC 5987 rule `FileResponse` applies, kept when the body moved
     # to a descriptor; `tests/test_signed_download.py` is what holds it.
@@ -4626,7 +4626,7 @@ async def delete_file(
 
         A delete landing inside an upload's transaction left the file absent
         while the manifest and the index still described it, with both
-        requests returning 200 — a state no ordering of those two requests
+        requests returning 200 - a state no ordering of those two requests
         produces.
 
         And the manifest is one object for every name in the directory, so an
@@ -4634,7 +4634,7 @@ async def delete_file(
         concurrent upload of a *different* file, which is the false dedupe hit
         2E.1 removed, reintroduced from the other side.
 
-        Namespace lock first, manifest lock second — the same order upload
+        Namespace lock first, manifest lock second - the same order upload
         uses, so the two can never each hold what the other waits for.
 
         Inside the lock the order is bookkeeping first and the pathname last.
@@ -4642,7 +4642,7 @@ async def delete_file(
         halves can fail with the other already done, and the two ways of
         failing are not equally bad. Unlinking first and cleaning up
         afterwards leaves "the file is gone, its contents are still
-        retrievable, and the request failed" — the user is told the deletion
+        retrievable, and the request failed" - the user is told the deletion
         did not happen while the thing they wanted deleted is still readable
         through any grounded conversation. Doing the durable work first
         leaves "nothing was deleted and the request failed", which is a
@@ -4666,7 +4666,7 @@ async def delete_file(
             # A source row naming this path, or anything inside it, is a claim
             # about a name that is about to stop existing. A row naming an
             # *ancestor* is not: `files/` still covers that directory, and
-            # will cover the name again if it reappears — so containment is
+            # will cover the name again if it reappears - so containment is
             # the test rather than coverage, or one deleted child would
             # un-index every other file beside it.
             runtime.store.delete_context_sources_under_path(
@@ -4682,7 +4682,7 @@ async def delete_file(
                     # Not best effort. The manifest is one of the three
                     # records that have to describe one generation, and a
                     # swallowed failure here leaves it naming a file that is
-                    # about to stop existing — the next upload of that name
+                    # about to stop existing - the next upload of that name
                     # then dedupes against a checksum no file has.
                     manifest = json.loads(manifest_path.read_text())
                     if manifest.pop(filename, None) is not None:
@@ -4747,7 +4747,7 @@ async def extract_uploaded_archive(
         )
     # Before anything is published. The check used to sit after the
     # extraction, so a request refused for naming a context that does not
-    # exist had already written the whole tree — and the corrected retry then
+    # exist had already written the whole tree - and the corrected retry then
     # got 409, because the destination the refused request created was in the
     # way. Same ordering rule as the upload route: a parameter this will
     # refuse is knowable before any mutation.
@@ -4780,7 +4780,7 @@ async def extract_uploaded_archive(
         `bundle.tar.gz` are different requests for different archives whose
         only shared state is where they land, so two of them could both pass
         an exists-check taken in the API process and both write into one
-        tree — measured, `bundle/` ended up holding `zip.txt` and `tar.txt`
+        tree - measured, `bundle/` ended up holding `zip.txt` and `tar.txt`
         with both requests returning 200.
 
         Worse on the failure path: `extract_archive` removes the destination
@@ -4809,7 +4809,7 @@ async def extract_uploaded_archive(
             # the first member onward: measured, a member of an unfinished
             # tree was signable, and a download of it would have returned a
             # short file with a content-length that agreed. The unit that
-            # has to appear at once is the tree — a listing showing half a
+            # has to appear at once is the tree - a listing showing half a
             # bundle describes something that never existed.
             #
             # Staged outside the user's area rather than as a hidden sibling
@@ -4839,7 +4839,7 @@ async def extract_uploaded_archive(
             # Ingestion stays inside the lock. Releasing it here and indexing
             # afterwards leaves the tree deletable mid-traversal, and
             # `ingest_path` catches per-file errors and returns the partial
-            # count rather than failing — so the request reports success with
+            # count rather than failing - so the request reports success with
             # the folder gone and only the files read before the delete
             # indexed. "Extract with a context" is one operation; the
             # destination has to stay this operation's until it is finished
@@ -5222,7 +5222,7 @@ async def get_public_conversation(
 ):
     """Read a publicly shared conversation (unauthenticated).
 
-    Only role, content, and timestamps are exposed — message metadata,
+    Only role, content, and timestamps are exposed - message metadata,
     adapter traces, and owner identity stay private.
     """
     runtime = get_runtime()
@@ -5516,7 +5516,7 @@ async def add_context_source(
     # persisted visibility is `shared`/`global` covers it. This used to accept
     # anything underneath `shared_fs_root/shared` because it was underneath
     # that directory, and then check that the destination *context* belonged to
-    # the caller — which says who receives the content and never who was
+    # the caller - which says who receives the content and never who was
     # entitled to the source. See service/fs.authorize_path.
     try:
         validated_path = authorize_path(
@@ -5564,7 +5564,7 @@ async def add_context_source(
 
             Reading and committing are two moments. Upload, extraction and
             deletion all treat a pathname as one critical section, and this
-            route took part in none of it — so its commit could land after a
+            route took part in none of it - so its commit could land after a
             newer generation had already replaced the bytes, the manifest
             entry and the chunks. Measured: the disk and the manifest
             described the upload while the index described what the source
@@ -5575,7 +5575,7 @@ async def add_context_source(
             source rooted at `files/` takes a key nothing else takes, while
             an upload of `files/report.md` takes that name's key, so a single
             source-wide lock let the same interleaving straight through one
-            level up — measured again, with the source being the directory
+            level up - measured again, with the source being the directory
             rather than the file.
 
             Only for a path inside the caller's own files. That is where the
@@ -5639,8 +5639,8 @@ async def add_context_source(
 
         # Recording the source and reading it are two moments, and the owner
         # may retire the context in between. The database already refuses the
-        # work — chunks reference the context, the source row went with it by
-        # cascade — but `ingest_path` treats a failed file as a warning and
+        # work - chunks reference the context, the source row went with it by
+        # cascade - but `ingest_path` treats a failed file as a warning and
         # carries on, which is right for one unreadable file in a tree and
         # wrong for the whole context being gone. Without this the request
         # reported 201 and returned a source record that no longer existed.
@@ -5739,7 +5739,7 @@ async def websocket_chat(ws: WebSocket):
     """Handle WebSocket chat connections for streaming responses."""
     runtime = get_runtime()
     client_host = ws.client.host if ws.client else "unknown"
-    # The declared policy, not a second lookup with its own hardcoded default —
+    # The declared policy, not a second lookup with its own hardcoded default -
     # that copy ignored the admin's setting whenever it was left unset.
     try:
         await rate_limit(runtime, "websocket:connect", client_host)

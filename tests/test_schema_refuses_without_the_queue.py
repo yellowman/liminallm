@@ -2,14 +2,14 @@
 
 `ingest_job` is where "this context owes this path a re-read" is recorded.
 Every replacement writes to it and every worker poll reads it, so a database
-without it is not a degraded deployment — it is one where the first file
+without it is not a degraded deployment - it is one where the first file
 replacement raises at request time and the queue that would have repaired the
 index cannot be read at all.
 
 `_verify_required_schema` exists to turn that into a refusal at startup, with
 the command that fixes it. This is the witness that `ingest_job` is on its
 list, because it was on that list in the tranche that introduced the table and
-did not survive being merged into another branch — a conflict resolution can
+did not survive being merged into another branch - a conflict resolution can
 silently un-require a table, and nothing else would have noticed.
 """
 

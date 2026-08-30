@@ -92,7 +92,7 @@ def test_pgvector_retrieval_finds_the_keyword_match_without_an_encoder(store):
 
     Before hybrid retrieval this path was ORDER BY embedding <-> query and
     nothing else, so the ranking of a user's own files was decided by hash
-    distance — the SPEC's own definition of noise.
+    distance - the SPEC's own definition of noise.
     """
     user, ctx, near = _hybrid_fixture(store)
     rag = RAGService(
@@ -179,7 +179,7 @@ def test_a_retrieval_channel_with_no_user_refuses_rather_than_widens(store, abse
     """Both chunk channels refuse an absent principal rather than widening.
 
     `user_id` is keyword-only and annotated as required, so an absent one can
-    only arrive from a caller that bypassed the annotation — which is the case
+    only arrive from a caller that bypassed the annotation - which is the case
     the check exists for. The failure mode is not an error: `_chunk_scope`
     builds a WHERE clause with no owner term, so the query runs and returns
     every user's chunks in the named contexts.
@@ -300,7 +300,7 @@ def test_a_chunk_the_store_matched_is_never_dropped_by_the_rescore(store):
     \\w+ keeps it whole. So SQL matched the chunk on "user id" and the
     re-score gave it 0.0. With the hash encoder lexical is the only live
     channel, so the whole turn came back empty for a question the corpus
-    answers — the common shape for the source files ingest_path defaults to.
+    answers - the common shape for the source files ingest_path defaults to.
     """
     user = store.create_user(email=f"tk_{uuid.uuid4().hex[:8]}@example.com")
     ctx = store.upsert_context(user.id, f"tk-{uuid.uuid4().hex[:6]}", "fixture")
@@ -327,7 +327,7 @@ def test_bm25_orders_the_lexical_pool_not_arrival_order(store):
 
     Pinned at the fusion seam with a pool whose arrival order disagrees with
     its BM25 order, because a mutation that fused the pool as it arrived
-    passed every retrieval test — the two scorers agree too often on small
+    passed every retrieval test - the two scorers agree too often on small
     fixtures for an end-to-end red to catch the difference deterministically.
     """
     rag = RAGService(store)

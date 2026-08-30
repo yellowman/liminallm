@@ -1,6 +1,6 @@
 """The admin console builds itself from the settings schema.
 
-It used to mirror the field list by hand — every setting written out twice in
+It used to mirror the field list by hand - every setting written out twice in
 JavaScript plus a block of markup. Thirty settings had no control at all, and
 smtp_password was still being posted after it became environment-only, which
 made every save fail with a 400. These pin the schema the console renders from
@@ -66,7 +66,7 @@ class TestSchema:
     def test_nothing_falls_into_the_unlabelled_bucket(self):
         """"Other" is a safety net so a new setting still appears, not a
         destination. Eighteen ended up there once and nobody noticed, because
-        the console rendered them — just at the bottom, under no heading."""
+        the console rendered them - just at the bottom, under no heading."""
         stranded = [
             entry["name"]
             for entry in managed_settings_schema()
@@ -88,7 +88,7 @@ class TestSchema:
         """Rotating an SMTP password should not require restarting the app.
 
         They are managed settings like any other, so the console can set them
-        — but they are marked secret, and a secret is never read back out.
+        - but they are marked secret, and a secret is never read back out.
         """
         by_name = {entry["name"]: entry for entry in managed_settings_schema()}
         for name in ("smtp_password", "jwt_secret", "web_search_api_key",
@@ -188,7 +188,7 @@ class TestSaveValidation:
         assert current["data"]["model_path"] == "keep-me"
 
     def test_an_env_only_setting_cannot_be_written(self, client, admin_headers):
-        """extract_reader_plugins imports Python modules — the console must
+        """extract_reader_plugins imports Python modules - the console must
         not be a path to running code."""
         resp = client.put(
             "/v1/admin/settings",
@@ -303,7 +303,7 @@ class TestSecretHandling:
         self, client, admin_headers, store
     ):
         """The console cannot show the current value, so it cannot round-trip
-        one either — a blank field means 'not retyped', not 'erase it'."""
+        one either - a blank field means 'not retyped', not 'erase it'."""
         client.put(
             "/v1/admin/settings",
             headers=admin_headers,

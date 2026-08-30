@@ -53,7 +53,7 @@ async def release(runtime, kind: str, user_id: str) -> None:
 
 @contextlib.asynccontextmanager
 async def slots(runtime, user_id: str, *kinds: str) -> AsyncIterator[None]:
-    """Hold several slots for a block, releasing everything actually taken —
+    """Hold several slots for a block, releasing everything actually taken -
     including when a later acquire is what fails."""
     taken: list[str] = []
     try:

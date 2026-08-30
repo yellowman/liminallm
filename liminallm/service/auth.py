@@ -34,7 +34,7 @@ def _password_hasher() -> PasswordHasher:
     The library defaults spend 64 MiB and about 65 ms per hash, and that cost
     is the entire point: it is what makes a stolen hash expensive to attack.
 
-    The test suite creates thousands of accounts and buys nothing with it —
+    The test suite creates thousands of accounts and buys nothing with it -
     measured at 11.5% of the suite's wall clock. So TEST_MODE, and only
     TEST_MODE, lowers the parameters. There is deliberately no setting of its
     own: a knob that weakens password hashing is one an operator can turn by
@@ -55,7 +55,7 @@ def _password_hasher() -> PasswordHasher:
     return PasswordHasher(type=Type.ID)
 
 # Bearer keys for the served Responses API. The prefix makes a key
-# recognizable in a paste or a log scrub, and — having no dots — impossible
+# recognizable in a paste or a log scrub, and - having no dots - impossible
 # to confuse with a JWT.
 API_KEY_PREFIX = "sk-liminal-"
 
@@ -84,7 +84,7 @@ OAUTH_PROVIDERS = {
 logger = get_logger(__name__)
 
 # TOTP parameters. These are the Key Uri Format defaults, and they are what an
-# authenticator app assumes when the otpauth:// URI omits them — which is why
+# authenticator app assumes when the otpauth:// URI omits them - which is why
 # the server has to agree with them rather than pick its own. It verified
 # HMAC-SHA-256 while every app computed HMAC-SHA-1, so enrolment could never
 # complete: the user scanned the QR, typed a correct code, and was told it was
@@ -418,7 +418,7 @@ class AuthService:
 
         This is the trust boundary of the whole OAuth flow: whatever payload
         comes back here becomes an account. There is deliberately no cache and
-        no injection point in front of the provider round trip — tests stub
+        no injection point in front of the provider round trip - tests stub
         this method, nothing pre-registers codes.
         """
         if provider not in OAUTH_PROVIDERS:
@@ -628,7 +628,7 @@ class AuthService:
             # is globally unique, so a lookup finds the account whatever site
             # the flow started at; without this, signing in with Google at
             # globex minted acme's tokens. The password path has always
-            # refused this — the two ways in must agree.
+            # refused this - the two ways in must agree.
             self.logger.warning(
                 "oauth_tenant_mismatch",
                 provider=provider,
@@ -702,7 +702,7 @@ class AuthService:
         Individual chat deletion already retires its cached summary. Bulk
         erasure went straight to the store and skipped it, so an erased
         account's recent messages stayed readable under `chat:summary:<id>`
-        for the rest of the TTL — an hour, by default.
+        for the rest of the TTL - an hour, by default.
         """
         erasure = self.store.delete_user(user_id)
         if erasure is None:
@@ -734,14 +734,14 @@ class AuthService:
 
         Both halves of a tenanted request must agree (service/tenancy.py).
         One method rather than one copy per entry point: the next change to
-        this rule — an audit line, a role carve-out — must not be able to
+        this rule - an audit line, a role carve-out - must not be able to
         land in three places and miss the fourth, because the one it misses
         is an authorization hole.
 
         ``None`` means the caller resolved no site and is not making a
         tenanted decision: logout revokes your own session and needs no
         opinion about where you belong. A hint that arrived *blank* is a
-        different thing — that caller tried to resolve a site and failed,
+        different thing - that caller tried to resolve a site and failed,
         which is the case least safe to wave through.
         """
         if site_tenant is None:
@@ -1101,7 +1101,7 @@ class AuthService:
         )
 
     def mint_api_key(self, user_id: str, *, name: str) -> Tuple["ApiKey", str]:
-        """Create a key and return (record, plaintext) — the one plaintext sighting.
+        """Create a key and return (record, plaintext) - the one plaintext sighting.
 
         The stored form is a SHA-256; a random 256-bit key needs no slow hash,
         that cost model belongs to low-entropy passwords.
@@ -1124,7 +1124,7 @@ class AuthService:
         Keys skip the session and MFA machinery on purpose: minting one
         already required a fully authenticated session, and the key is its
         own credential class with its own revocation (the tombstone). The
-        tenant check is NOT skipped — a key must not cross sites any more
+        tenant check is NOT skipped - a key must not cross sites any more
         than a token may.
         """
         token = self._extract_bearer(authorization)
@@ -1177,7 +1177,7 @@ class AuthService:
         self.store.set_user_mfa_secret(user_id, secret, enabled=False)
         # Spell out algorithm/digits/period rather than relying on the Key Uri
         # Format's defaults. They are the defaults, but writing them down is
-        # what makes a mismatch with _verify_totp visible instead of silent —
+        # what makes a mismatch with _verify_totp visible instead of silent -
         # the server verified SHA-256 against apps computing SHA-1, so nobody
         # could complete enrolment and nothing said why.
         uri = (
@@ -1267,7 +1267,7 @@ class AuthService:
         email address is a reassignable name: delete the account that asked
         for a reset, register the same address, and a token that named the
         address would resolve to the new account and change its password.
-        Nothing in the flow looks unusual — the attacker holds a token their
+        Nothing in the flow looks unusual - the attacker holds a token their
         own account was legitimately issued. Ids are never reused, so binding
         to one makes the token expire with the account rather than follow the
         address to whoever holds it next.
@@ -1277,7 +1277,7 @@ class AuthService:
         here, so an erasure can commit and purge in that gap and this would
         put a fresh token naming the erased account back afterwards. The
         caller sends no email and answers exactly as it does for an address
-        that never existed — which is what it already does, and why the
+        that never existed - which is what it already does, and why the
         distinction is invisible from outside.
         """
         # Use raw bytes for proper entropy (not string representation)
@@ -1308,7 +1308,7 @@ class AuthService:
 
         In that order. Reading the token and deleting it after the password
         was written left it valid for the length of the reset, so two requests
-        holding it both resolved a subject and both wrote — the password
+        holding it both resolved a subject and both wrote - the password
         ending up as whichever arrived last. Consumed first, the second
         request finds nothing.
 

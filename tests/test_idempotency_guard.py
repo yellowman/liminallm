@@ -15,7 +15,7 @@ from liminallm.service.runtime import get_runtime
 @pytest.mark.asyncio
 async def test_a_failed_request_may_be_retried():
     """The failure is recorded so the retry is not deadlocked behind an
-    "in progress" record that never resolves — but it must not replay."""
+    "in progress" record that never resolves - but it must not replay."""
     runtime = get_runtime()
     runtime._local_idempotency.clear()
     user_id, key = "user-test", "idem-failure"

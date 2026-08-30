@@ -2,7 +2,7 @@
 
 The containment property under test is structural, not policy: get_user never
 reads keys, so a leaked key can drive /v1/responses and /v1/mcp and nothing
-else — it cannot list conversations, cannot mint another key, cannot revoke
+else - it cannot list conversations, cannot mint another key, cannot revoke
 anything.
 """
 

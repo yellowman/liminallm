@@ -1,14 +1,14 @@
 """A user can retire a knowledge context they own, and only that.
 
 SPEC §12.3 gives users CRUD over their contexts. The API had create, list,
-chunks and source add/list — no direct read, no edit, no delete.
+chunks and source add/list - no direct read, no edit, no delete.
 
 Two boundaries make this more than adding three routes. A conversation's
 implicit attachment index is a `knowledge_context` too, and it must not be
 reachable here: it belongs to the chat's lifetime (SPEC §19.5), not the
-user's context collection. And a context is referenced from two directions —
+user's context collection. And a context is referenced from two directions -
 `context_source` and `knowledge_chunk` hang off it, while `conversation`
-points at it through `active_context_id` — so deleting one is only correct
+points at it through `active_context_id` - so deleting one is only correct
 while both of those relationships are what the schema claims they are.
 """
 
@@ -324,7 +324,7 @@ class TestTheBindingIsVerifiedAtStartup:
     """`ON DELETE SET NULL` is what makes context deletion safe.
 
     The schema creates that foreign key conditionally, and the condition is a
-    name lookup in `information_schema.table_constraints` — which lists every
+    name lookup in `information_schema.table_constraints` - which lists every
     constraint type. A constraint of the same name that is not a foreign key
     satisfies the guard, the FK is never created, and deleting a context then
     leaves conversations pointing at a row that is gone.
@@ -368,7 +368,7 @@ class TestTheBindingIsVerifiedAtStartup:
         Refusing to start is only useful if `scripts/migrate.sh` then fixes
         it. A guard that asks information_schema for the *name* finds the
         CHECK constraint, concludes its work is done, and leaves the database
-        in exactly the state startup refuses — so the operator is told to run
+        in exactly the state startup refuses - so the operator is told to run
         a command that changes nothing.
         """
         import os
@@ -409,7 +409,7 @@ class TestTheBindingIsVerifiedAtStartup:
     def test_a_binding_that_cascades_instead_of_nulling_is_refused(self, client):
         """`ON DELETE CASCADE` here would delete the user's conversations.
 
-        Same column, same tables, still a foreign key — and retiring a
+        Same column, same tables, still a foreign key - and retiring a
         context would take every chat bound to it.
         """
         import os

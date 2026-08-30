@@ -58,7 +58,7 @@ def test_mapped_host_gets_its_tenant():
 
 def test_unmapped_host_is_refused_once_a_mapping_exists():
     """Serving the default tenant here would mean any DNS name pointed at the
-    box gets that tenant's login page — the spoofing this module prevents."""
+    box gets that tenant's login page - the spoofing this module prevents."""
     s = _settings(tenant_domains={"acme.example.com": "acme"})
     with pytest.raises(NotFoundError):
         tenancy.tenant_for_host("evil.example.com", s)
@@ -99,7 +99,7 @@ def test_both_halves_must_agree():
 def test_a_blank_on_either_side_is_a_mismatch_not_a_pass():
     """Skipping the comparison when a value is missing is how it goes missing.
 
-    The caller with nothing to compare is the one that resolved no site — the
+    The caller with nothing to compare is the one that resolved no site - the
     case least safe to wave through.
     """
     assert not tenancy.user_belongs_to_site("acme", "")
@@ -180,7 +180,7 @@ def test_no_route_reads_a_tenant_header():
 
 
 def test_signup_lands_in_the_tenant_serving_the_host(client):
-    """The default install has no mapping, so this is default_tenant_id — but
+    """The default install has no mapping, so this is default_tenant_id - but
     it arrives via tenancy, not via a hardcoded None."""
     email = f"t_{uuid.uuid4().hex[:8]}@example.com"
     resp = client.post(
@@ -274,7 +274,7 @@ def test_a_bare_host_cannot_reach_the_default_tenant(client, two_sites):
 
     localhost and the test client's own testserver used to resolve to the
     default tenant, so a caller who could reach the service directly picked
-    that tenant — and with signup open, registered an account on it.
+    that tenant - and with signup open, registered an account on it.
     """
     for host in ("localhost", "testserver", "127.0.0.1"):
         resp = client.post(
@@ -351,7 +351,7 @@ def test_oauth_cannot_sign_an_account_in_at_another_tenants_site(client, two_sit
 
     Email is globally unique, so the lookup finds the account whatever site
     the flow began at. Without the check, starting Google at globex minted
-    acme's tokens — while the password path refused the same thing.
+    acme's tokens - while the password path refused the same thing.
     """
     from liminallm.service.runtime import get_runtime
 
@@ -381,7 +381,7 @@ def test_login_uses_the_same_rule_as_every_other_entry_point():
     assert matches(None, user, "acme") is True
     assert matches(None, user, "globex") is False
     assert matches(None, user, "") is False
-    # None is not "unresolved", it is "not a tenanted decision" — logout
+    # None is not "unresolved", it is "not a tenanted decision" - logout
     # revoking your own session needs no opinion about where you belong.
     assert matches(None, user, None) is True
 
@@ -389,7 +389,7 @@ def test_login_uses_the_same_rule_as_every_other_entry_point():
 def test_the_default_tenant_cannot_be_cleared():
     """Blank-is-mismatch turned an empty default into an unrecoverable lockout.
 
-    Every user's tenant_id would be blank too, so every request 401s —
+    Every user's tenant_id would be blank too, so every request 401s -
     including the admin call that would put the value back.
     """
     from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, validate_managed_settings
@@ -410,7 +410,7 @@ def test_an_ipv6_host_can_be_mapped_and_then_matched():
     from liminallm.config import Settings
 
     # The real model, because the normalization under test is the config
-    # validator's — a SimpleNamespace would skip the very code being checked.
+    # validator's - a SimpleNamespace would skip the very code being checked.
     s = Settings(default_tenant_id="public", tenant_domains={"::1": "v6"})
 
     assert s.tenant_domains == {"[::1]": "v6"}, "settings and requests must agree"

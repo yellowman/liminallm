@@ -69,7 +69,7 @@ const updateDraftIndicator = () => {
 //
 // The refresh token and the session id are deliberately absent (SPEC §17.10).
 // The server sets both as HttpOnly cookies the page cannot read, so a copy
-// here would be a durable credential any script on the page could take —
+// here would be a durable credential any script on the page could take -
 // removing the protection the cookie exists to provide, and outliving the
 // short-lived access token it was meant to replace.
 const persistedKeys = ['accessToken', 'tenantId', 'role', 'userId', 'conversationId'];
@@ -560,7 +560,7 @@ const setConversation = (id) => {
 };
 
 // =============================================================================
-// Turn navigator — a rail of tick marks on the right, one per turn. At rest it
+// Turn navigator - a rail of tick marks on the right, one per turn. At rest it
 // is just the ticks; hovering or focusing it expands into a list of the
 // model-written turn descriptions, and picking one jumps to that turn.
 // =============================================================================
@@ -619,7 +619,7 @@ const refreshTurnLabels = async () => {
       'Failed to refresh labels'
     );
     // Messages appended live during a send have no data-id (only
-    // history-rendered ones do), so fall back to positional matching — but
+    // history-rendered ones do), so fall back to positional matching - but
     // align from the END, not the start: the API returns the newest page of
     // messages, so when either side is truncated the two lists share their
     // tail, not their head. Aligning from the start pinned label N onto turn 0.
@@ -669,7 +669,7 @@ const initTurnRail = () => {
 };
 
 // =============================================================================
-// Composer attachments — drop a file in the composer and it is usable in this
+// Composer attachments - drop a file in the composer and it is usable in this
 // chat immediately. No context to create or select: the server classifies the
 // file and the model reaches it inline, via file_search, or via run_python.
 // =============================================================================
@@ -766,7 +766,7 @@ const attachFileToConversation = async (file) => {
       : attachment?.searchable
         ? `indexed for search (${envelope.data?.chunk_count || 0} chunks)`
         : 'available to the code interpreter';
-    showStatus(`Attached ${file.name} — ${how}. Ask about it.`);
+    showStatus(`Attached ${file.name} - ${how}. Ask about it.`);
     fetchConversations();
   } catch (err) {
     showStatus(err.message, true);
@@ -814,7 +814,7 @@ const updateShareButton = () => {
   btn.disabled = !state.conversationId;
   btn.textContent = state.conversationPublic ? 'Make Private' : 'Share It';
   btn.title = state.conversationPublic
-    ? 'This conversation is public — click to make it private again'
+    ? 'This conversation is public - click to make it private again'
     : 'Publish this conversation to a public read-only page';
   btn.classList.toggle('shared', Boolean(state.conversationPublic));
 };
@@ -1345,7 +1345,7 @@ const sendMessage = async (event) => {
                 messageDoneReceived = true;
                 messageDoneData = { ...messageDoneData, ...(msg.data || {}) };
                 // Attachment answers come from a tool-calling node, which
-                // returns the whole reply at once rather than as tokens — so
+                // returns the whole reply at once rather than as tokens - so
                 // create the message here if no token ever arrived.
                 if (!streamingMsg && messageDoneData.content) {
                   hideTypingIndicator();
@@ -1366,7 +1366,7 @@ const sendMessage = async (event) => {
                   if (injections.length) {
                     streamingMsg.warn(
                       `A fetched page attempted a prompt injection (${injections.join(', ')}). ` +
-                      'It was redacted — treat this answer with extra care.'
+                      'It was redacted - treat this answer with extra care.'
                     );
                   }
                 }
@@ -1459,7 +1459,7 @@ const sendMessage = async (event) => {
         context_id: payload.context_id,
         conversation_id: payload.conversation_id,
         // The server rejects dual auth on the socket (fresh_session_required),
-        // so send exactly one method — prefer the bearer token.
+        // so send exactly one method - prefer the bearer token.
         access_token: state.accessToken || undefined,
         stream: true,
       }));
@@ -2583,8 +2583,8 @@ const fetchMfaStatus = async () => {
     }
 
     // Show/hide appropriate buttons, unless a flow already owns one. Each
-    // section hides its own entry point while it is open — startMfaSetup
-    // hides Enable, showMfaDisable hides Disable — so re-deriving these
+    // section hides its own entry point while it is open - startMfaSetup
+    // hides Enable, showMfaDisable hides Disable - so re-deriving these
     // from `enabled` would put a second entry point on screen beside a
     // live interaction, and let a second request start while the first
     // secret and code are still displayed. The status text above is
@@ -2849,7 +2849,7 @@ const createApiKey = async (event) => {
     if (plainEl) plainEl.textContent = envelope.data?.api_key || '';
     $('api-key-plaintext')?.classList.remove('hidden');
     if (nameInput) nameInput.value = '';
-    setApiKeyStatus('Key created — copy it before leaving this page');
+    setApiKeyStatus('Key created - copy it before leaving this page');
     await loadApiKeys();
   } catch (err) {
     setApiKeyStatus(err.message || 'Failed to create API key', true);

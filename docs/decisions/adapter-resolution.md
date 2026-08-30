@@ -19,18 +19,18 @@ direction too: it looked for `latest/vNNNN`, so a correctly promoted
 adapter became unservable merely because the convenience pointer existed
 beside its versions. Resolution therefore starts at the adapter root
 (`adapters/<id>`), and the `latest` pointer takes no part in authoritative
-resolution — it is refreshed on promotion, best-effort, for humans and
+resolution - it is refreshed on promotion, best-effort, for humans and
 tooling.
 
 Re-raising on a failed pointer write aborted a run *after* the version was
 bumped, which left the gate decision unrecorded and let the worker retry
-against weights that were already authoritative — which is why the pointer
+against weights that were already authoritative - which is why the pointer
 write is best-effort.
 
 ## ownership by layout alone was not ownership
 
-An explicit `fs_dir` may say *where* an adapter's directory lives — a
-per-user root, another mount — never *whose* it is. Validating only that it
+An explicit `fs_dir` may say *where* an adapter's directory lives - a
+per-user root, another mount - never *whose* it is. Validating only that it
 sat under `fs_root` proved nothing, since every adapter's directory does,
 and an artifact naming `adapters/B` had B's weights served as A's version 1.
 
@@ -38,7 +38,7 @@ Layout is therefore checked (the directory containing a `params.json` is
 named for its owner) *and* provenance: training records `adapter_id` and
 `version` inside each version's `metadata.json`, and a recorded id or
 version that disagrees refuses. Provenance catches the case layout cannot
-see — a directory renamed to A holding B's run. It is verified when
+see - a directory renamed to A holding B's run. It is verified when
 present rather than required, so a hand-written version fails on
 disagreement rather than on absence.
 
@@ -46,7 +46,7 @@ disagreement rather than on absence.
 
 A lane existed for artifacts without `current_version`: a direct
 `params.json` path, a `latest` pointer, a directory scan. Every hole this
-section closes had reopened inside it — `latest` aimed elsewhere served
+section closes had reopened inside it - `latest` aimed elsewhere served
 another adapter's weights, a bare `vNNNN` served what a gate-rejected run
 leaves behind, and a versionless *hybrid* took weights from its direct file
 while the service, reading metadata alone, injected the prompt fallback:
@@ -56,8 +56,8 @@ and deleting it is what made the resolver agree with the data model.
 
 ## the version decision comes before the filesystem is touched
 
-Path resolution is not inert — it validates ownership and containment and
-refuses on either — so an adapter that authorizes no weights must be
+Path resolution is not inert - it validates ownership and containment and
+refuses on either - so an adapter that authorizes no weights must be
 answered from its metadata alone. Resolving first turned an unpromoted
 hybrid whose `fs_dir` was stale or out of root into a failed request, when
 the correct answer was the prompt fallback and nothing was ever going to
@@ -66,9 +66,9 @@ read that path.
 ## composition: the two obvious alternatives both shipped, both wrong
 
 Gate-weighting `A` and `B` separately and dividing by the total weight
-computes `(gA)/g = A` for a lone adapter — the router's gate cancels
+computes `(gA)/g = A` for a lone adapter - the router's gate cancels
 itself, so 0.2 and 1.0 behave identically. For two adapters it forms
-`B̄Ā`, whose expansion contains `B₁A₂` and `B₂A₁` — products of one
+`B̄Ā`, whose expansion contains `B₁A₂` and `B₂A₁` - products of one
 adapter's up-projection with another's down-projection that appear in no
 term of the sum. Rank concatenation (`A*` stacked on the rank axis, `B*`
 carrying `gαB` per adapter) reproduces the sum exactly, needs no padding
@@ -80,8 +80,8 @@ being normalized back into existence.
 Composition carries only A/B pairs forward, so a foreign key never reaches
 a validator that runs afterwards. And concatenation *adds ranks up*: two
 adapters that each disagree with themselves (A of rank 2 with B of rank 1,
-and A of rank 1 with B of rank 2) compose into a pair whose totals agree —
-3 and 3 — while every row pairs with the wrong column. A `scale` is a
+and A of rank 1 with B of rank 2) compose into a pair whose totals agree -
+3 and 3 - while every row pairs with the wrong column. A `scale` is a
 scalar attached to a hooked weight, so a projection named only by a
 `scale` has no matrices and is refused: such an adapter is non-empty on
 the way in and contributes nothing on the way out, which is how one
@@ -96,7 +96,7 @@ through its recognized half while the rest went to a log line. That is why
 
 `_select_adapters` attaches each gate weight to the activated adapter dict;
 the backend reads it there and nowhere else. Returning gates alongside the
-adapters for tracing only — which is what used to happen — meant
+adapters for tracing only - which is what used to happen - meant
 composition ran every adapter at 1.0 no matter what the policy decided,
 and the §5.2 equation was exactly right about a number it never received.
 
@@ -119,7 +119,7 @@ path components, so which spelling a deployment happened to store
 determined whether an adapter could be trained at all. One implementation
 (`transformer.same_base_model`) now answers at both ends of the ladder;
 identity is the final path component, case-insensitive, and nothing looser
-— family similarity (`-chat`, `-base`, version suffixes) is expressly not
+- family similarity (`-chat`, `-base`, version suffixes) is expressly not
 sufficient, because those are different frozen weights and therefore
 different models.
 
@@ -128,11 +128,11 @@ different models.
 - The prompt for an event is bounded by the target message's sequence
   number resolved by id (`seq < target_seq`), never by its position in a
   fetch window: searching for the target inside the window silently
-  disabled the bound for any event older than the window — exactly the
+  disabled the bound for any event older than the window - exactly the
   event most likely to have later turns after it.
 - Truncation reserves the target span first. Slicing the head of
   `prompt + target` could drop the whole supervised span, leaving an
-  all-zero loss mask — an example reporting loss zero, which reads as one
+  all-zero loss mask - an example reporting loss zero, which reads as one
   the model already answers perfectly.
 - The holdout number is cross-entropy only, without the training
   objective's L2 term: `B` starts at zero and can only grow, so charging
@@ -145,5 +145,5 @@ different models.
 - The TOTP-style tokenizer rules (train against the checkpoint's own
   tokenizer, refuse out-of-vocabulary ids rather than clip) exist because
   gradients through the right weights teach nothing transferable if the
-  text reached them through an invented token space — and the holdout,
+  text reached them through an invented token space - and the holdout,
   tokenized the same wrong way, would agree that it worked.

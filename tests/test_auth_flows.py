@@ -1,6 +1,6 @@
 """Every way in other than email and password: OAuth, MFA, reset, verification.
 
-Against the real service, store and Redis — the MFA lockout and the reset
+Against the real service, store and Redis - the MFA lockout and the reset
 tokens are atomic cache operations, and the fallback beside them is a
 different implementation.
 """
@@ -80,8 +80,8 @@ _HASHES = {"SHA1": hashlib.sha1, "SHA256": hashlib.sha256, "SHA512": hashlib.sha
 def enrolment(uri: str) -> dict:
     """What an authenticator app reads out of the QR code.
 
-    Anything the URI omits takes the Key Uri Format default — SHA1, 6 digits,
-    30 seconds — because that is what the app will assume.
+    Anything the URI omits takes the Key Uri Format default - SHA1, 6 digits,
+    30 seconds - because that is what the app will assume.
     """
     from urllib.parse import parse_qs, urlparse
 
@@ -99,7 +99,7 @@ async def test_an_authenticator_apps_code_is_accepted(auth, user):
     """The server must verify whatever its own QR code promises.
 
     It promised nothing and verified HMAC-SHA-256, so every app computed
-    HMAC-SHA-1 — the Key Uri Format default — and enrolment could never
+    HMAC-SHA-1 - the Key Uri Format default - and enrolment could never
     complete. The user scanned the code, typed a correct number, and was told
     it was wrong, with nothing logged to say why.
     """
@@ -277,7 +277,7 @@ def oauth_configured():
 
 
 def _stub_exchange(auth, payloads):
-    """Stub the provider round trip — the seam tests are meant to use.
+    """Stub the provider round trip - the seam tests are meant to use.
 
     `_exchange_oauth_code` is the trust boundary; production has no way to
     pre-register a payload, so the stub lives here and consumes each code

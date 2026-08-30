@@ -1,11 +1,11 @@
 """The frontend's testable core, driven from the Python suite.
 
-The markdown renderer is the XSS boundary for every assistant message — its
+The markdown renderer is the XSS boundary for every assistant message - its
 real tests live in tests/frontend/*.test.mjs and run under node; this file
 makes the Python suite run them, so a frontend regression fails CI the same
 way a backend one does. The share-page test pins the script manifest: the
 page used to load chat.js without common.js, and renderMarkdown's very first
-call (escapeHtml) was a ReferenceError — no shared conversation could render
+call (escapeHtml) was a ReferenceError - no shared conversation could render
 an assistant message.
 """
 
@@ -58,11 +58,11 @@ def test_each_page_loads_its_dependencies_in_order():
     }.items():
         scripts = _scripts_of(page)
         positions = [scripts.index(s) for s in required]
-        assert positions == sorted(positions), f"{page} loads {scripts} — wrong order"
+        assert positions == sorted(positions), f"{page} loads {scripts} - wrong order"
 
 
 def test_the_share_page_does_not_ship_the_whole_app():
-    """share.html once pulled in all of chat.js for one function — and still
+    """share.html once pulled in all of chat.js for one function - and still
     broke, because chat.js's renderer needs common.js, which the page never
     loaded. The share page carries exactly what it uses."""
     scripts = _scripts_of("share.html")
@@ -72,7 +72,7 @@ def test_the_share_page_does_not_ship_the_whole_app():
 
 def test_share_js_uses_nothing_beyond_its_declared_dependencies():
     """Whatever share.js references must be defined in common.js, markdown.js,
-    or itself — the page loads nothing else."""
+    or itself - the page loads nothing else."""
     provided = set()
     for f in ("common.js", "markdown.js"):
         provided.update(re.findall(r"^const (\w+)", (ROOT / "frontend" / f).read_text(), re.M))
@@ -103,7 +103,7 @@ def test_the_chat_page_scripts_parse_as_one_scope(tmp_path):
 
 
 def test_extracted_modules_define_but_never_execute():
-    """The split is safe because the moved files only define — wiring stays in
+    """The split is safe because the moved files only define - wiring stays in
     chat.js's DOMContentLoaded path. A top-level call added to an extracted
     module would run before chat.js's helpers exist."""
     import re as _re

@@ -2,7 +2,7 @@
 
 The API tests prove the route. This proves the page: that the form exists,
 that what it sends is the shape the route accepts, and that a server published
-by clicking the button is one a turn can then use. Those are separable — a
+by clicking the button is one a turn can then use. Those are separable - a
 console that posts `visibility: private`, or the wrong `type`, passes every
 API test in the suite and silently publishes nothing.
 
@@ -92,7 +92,7 @@ class TestAnAdminPublishesAServerFromTheConsole:
 
         Checked against `servers_for_turn` rather than against the table the
         page redraws, because the page rendering a row it just typed is not
-        evidence that anything was published — a private artifact would look
+        evidence that anything was published - a private artifact would look
         identical in that table and reach no turn at all.
         """
         from liminallm.service import mcp_client
@@ -172,7 +172,7 @@ class TestTheConsoleCannotBeAWayAround:
     def test_a_non_admin_never_reaches_the_console(self, page, server):
         """The form is admin-only because publishing is.
 
-        The route refuses either way — this is about not showing an operator
+        The route refuses either way - this is about not showing an operator
         a control that cannot work, and about the gate being the role rather
         than the markup.
         """
@@ -204,7 +204,7 @@ class TestTheTableSaysWhatTheResolverWouldSay:
         `servers_for_turn` skips any artifact with no owner, because the admin
         attestation is what made it a capability. The table computed its state
         from `schema.enabled` alone, so a server whose publisher was deleted
-        read as "enabled" while being offered to nobody — the one reading an
+        read as "enabled" while being offered to nobody - the one reading an
         operator would act on, and the opposite of the truth.
         """
         import httpx

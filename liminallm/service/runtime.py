@@ -50,8 +50,8 @@ MODEL_AFFECTING_SETTINGS: Tuple[str, ...] = tuple(sorted(_MODEL_AFFECTING))
 
 
 #: Query keys that carry a password. Both drivers read connection keywords
-#: from the query string — `?password=` for redis-py and libpq alike, plus
-#: libpq's `sslpassword` — so a mask that rewrites only the userinfo
+#: from the query string - `?password=` for redis-py and libpq alike, plus
+#: libpq's `sslpassword` - so a mask that rewrites only the userinfo
 #: publishes the same secret through the other spelling.
 _PASSWORD_QUERY_KEYS = frozenset({"password", "sslpassword"})
 
@@ -120,7 +120,7 @@ def _mask_url_password(url: Optional[str]) -> Optional[str]:
 #: spent proving the same schema over and over against the same database.
 #:
 #: The store is the one thing in the runtime with no per-test state to
-#: isolate — it holds a pool and a fs_root — so sharing one across the session
+#: isolate - it holds a pool and a fs_root - so sharing one across the session
 #: costs nothing that the reset was buying. Tests that need a store built from
 #: scratch, such as the startup-verification reds, construct `PostgresStore`
 #: directly and are unaffected.
@@ -228,7 +228,7 @@ class Runtime:
         # LISTEN/NOTIFY, and a single-process deployment gets local semantics.
         db_url = self.settings.database_url
         # The cache object is the signal that Redis really exists here (the
-        # setting has a localhost default even on redis-less deployments) —
+        # setting has a localhost default even on redis-less deployments) -
         # but an explicit backend=redis is the operator's word over that
         # heuristic, e.g. when Redis was briefly down at boot.
         bus_backend = self.settings.cluster_bus_backend
@@ -348,7 +348,7 @@ class Runtime:
         make a declarative deploy (compose, k8s) unable to configure anything
         without a human opening the admin UI. This is the one seam: a JSON
         object of managed settings, written to the database only when no admin
-        has saved anything yet. It is a seed, not an override — once a value is
+        has saved anything yet. It is a seed, not an override - once a value is
         in the database it is authoritative, so a stale container env cannot
         quietly revert what an operator changed.
         """
@@ -387,7 +387,7 @@ class Runtime:
 
         It used to be generated into a file under shared_fs_root, which no
         longer works: that path is itself a database setting now. Storing the
-        key alongside it also fixes a quieter problem — every replica that
+        key alongside it also fixes a quieter problem - every replica that
         could not read the file generated its own, so tokens issued by one
         worker were rejected by the next.
         """
@@ -406,7 +406,7 @@ class Runtime:
         """(Re)build the services that capture credentials at construction.
 
         Both take their configuration as constructor arguments, so handing them
-        a new settings object is not enough — rotating an SMTP password would
+        a new settings object is not enough - rotating an SMTP password would
         update self.settings and change nothing about the mail that gets sent.
         Neither opens a connection when constructed, so rebuilding is cheap and
         a rotation applies to the next message rather than the next restart.
@@ -442,7 +442,7 @@ class Runtime:
             get_settings(), self._system_settings_overrides()
         )
         # Services built earlier hold a reference to the old object. They only
-        # read attributes off it, so handing them the new one is enough — and
+        # read attributes off it, so handing them the new one is enough - and
         # without this an admin's change would not reach a running auth or
         # email service until the process restarted.
         for service in ("auth", "workflow", "training"):
@@ -491,7 +491,7 @@ class Runtime:
         # Real embeddings when the backend has an OpenAI-compatible client
         # (its /embeddings endpoint serves OpenAI, Gemini-compat, and
         # self-hosted alike). Without one, the deterministic hash keeps the
-        # kernel self-contained — and is_semantic=False tells every consumer
+        # kernel self-contained - and is_semantic=False tells every consumer
         # that cosine over those vectors is noise, so rankings stay BM25-only.
         embed_client = getattr(self.llm.backend, "client", None)
         if embed_client is not None and hasattr(embed_client, "embeddings"):
@@ -685,7 +685,7 @@ class Runtime:
 
         # A runtime closes what it built. Under test the store is shared
         # across the session, and the app's lifespan shutdown runs whenever a
-        # test exercises it — which closed the pool every later test needed.
+        # test exercises it - which closed the pool every later test needed.
         if getattr(self, "store", None) and self.store is not _shared_store:
             with contextlib.suppress(Exception):
                 await self.store.close()
@@ -733,7 +733,7 @@ def reset_runtime_for_tests() -> Runtime:
                 pass
 
         # Close the store's connection pool too. Replacing the runtime without
-        # this leaks a pool per reset — invisible while the store was in-memory,
+        # this leaks a pool per reset - invisible while the store was in-memory,
         # and it exhausts Postgres connections the moment it is not.
         # Not the shared one: it outlives every reset by design, and closing
         # its pool here would make the next test pay to rebuild it.
@@ -856,7 +856,7 @@ async def _acquire_idempotency_slot(
     #
     # The whole claim is inside the guard, not a question asked before it. An
     # answer released before the write is a check-then-act across the
-    # deletion — the erasure commits and purges in the gap, and the claim
+    # deletion - the erasure commits and purges in the gap, and the claim
     # lands afterwards under a key the purge has already been past.
     with runtime.store.hold_live_user(user_id) as live:
         if not live:

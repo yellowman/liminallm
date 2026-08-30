@@ -131,7 +131,7 @@ class TestRemoveRequiresAnExistingTarget:
 
         Driven through `apply_op`, which edits in place. `apply_ops` copies
         first, so asserting on the caller's document there proves only that
-        `copy.deepcopy` works — the risk lives on the mutating entry point.
+        `copy.deepcopy` works - the risk lives on the mutating entry point.
         """
         doc = {"keep": 1}
         with pytest.raises(BadRequestError):
@@ -186,7 +186,7 @@ class TestArrayBoundsFollowTheSpec:
         """The bound is the list's own length, not a constant.
 
         A fixed ceiling made position 1024 addressable by `remove`, `test` and
-        both source reads while `replace` and `add` refused it — the same
+        both source reads while `replace` and `add` refused it - the same
         location existing for one verb and not another, which is the
         inconsistency this file exists to remove.
         """
@@ -202,7 +202,7 @@ class TestArrayBoundsFollowTheSpec:
     def test_a_negative_write_index_is_not_counted_from_the_end(self):
         """`list.insert(-1, v)` writes before the last element, silently.
 
-        So a negative final segment does not fail loudly on the write path —
+        So a negative final segment does not fail loudly on the write path -
         it lands somewhere the caller did not name: `add /xs/-1` on [1, 2]
         produces [1, 9, 2], and `/xs/-2` produces [9, 1, 2]. `replace` is
         already covered, because requiring an existing target reads the index
@@ -220,7 +220,7 @@ class TestArrayBoundsFollowTheSpec:
         """`/xs/999999999` must not quietly become `/xs/2`.
 
         Nothing here pads a list, so deleting the length check does not
-        allocate a billion entries — measured, it falls through to one
+        allocate a billion entries - measured, it falls through to one
         `append` and lands at index 2. That is the failure: an address the
         caller never named, reported as success. Same rule as `/xs/5`.
         """
@@ -241,7 +241,7 @@ class TestAPointerNamesTheKeyItSpells:
     def test_an_escaped_slash_addresses_the_key_it_spells(self):
         """`~1` is a `/`, so `/a~1b` names one key called `a/b`.
 
-        Undecoded it names a *different, also-valid* key spelled `a~1b` — so
+        Undecoded it names a *different, also-valid* key spelled `a~1b` - so
         a document holding both gets the wrong one written and the right one
         left alone, with nothing raised.
         """
@@ -265,7 +265,7 @@ class TestAPointerNamesTheKeyItSpells:
         assert doc == {"~1": "X", "/": "WRONG", "~01": "ALSO WRONG"}
 
     def test_an_empty_reference_token_is_a_real_key(self):
-        """`/a//b` is three tokens — `a`, ``, `b` — not two.
+        """`/a//b` is three tokens - `a`, ``, `b` - not two.
 
         Dropping the empty one addressed `a.b`, a sibling of the key named.
         """
@@ -310,7 +310,7 @@ class TestAPointerNamesTheKeyItSpells:
 
     def test_the_whole_document_pointer_is_refused_not_ignored(self):
         """`""` is the whole document (§5). Every verb here edits a member of
-        a container, so there is nothing to serve — but it is refused out
+        a container, so there is nothing to serve - but it is refused out
         loud. It used to return quietly, which reports success."""
         doc = {"k": 1}
         with pytest.raises(BadRequestError):
@@ -321,7 +321,7 @@ class TestAPointerNamesTheKeyItSpells:
         """Found while fixing the pointer, same class as the pointer.
 
         A missing `from` used to default to "", go through the tokenizer, and
-        come back as "addresses the whole document" — a true sentence about
+        come back as "addresses the whole document" - a true sentence about
         an operand the caller never wrote. It is now one entry in the operand
         table rather than a special case here.
         """
@@ -345,14 +345,14 @@ class TestAnOperationCarriesItsOperands:
     Treating an absent member as a default is the same defect one level up
     from a mis-parsed pointer: the engine acts on an operand nobody supplied.
     A half-formed op used to be skipped in silence, which through the artifact
-    route still wrote a new version — an audit entry for a patch that did
+    route still wrote a new version - an audit entry for a patch that did
     nothing.
     """
 
     def test_a_replace_without_a_value_does_not_write_none(self):
         """The sharpest of these: it does not no-op, it destroys.
 
-        `{"op": "replace", "path": "/k"}` produced `{"k": None}` — the value
+        `{"op": "replace", "path": "/k"}` produced `{"k": None}` - the value
         overwritten on behalf of an operand the caller never wrote.
         """
         doc = {"k": "ORIGINAL"}
@@ -405,9 +405,9 @@ class TestAnOperationCarriesItsOperands:
 
         An empty list is well-formed JSON and still names no change. Both
         callers accepted it and wrote a version anyway: the artifact route
-        guarded `apply_ops` behind `if ops:` and went straight to the store —
+        guarded `apply_ops` behind `if ops:` and went straight to the store -
         measured, `{"patch": []}` returned 200 and took the artifact from
-        version 1 to 2 — and ConfigOps looped zero times and marked the patch
+        version 1 to 2 - and ConfigOps looped zero times and marked the patch
         applied.
         """
         with pytest.raises(BadRequestError, match="no operation"):
@@ -425,7 +425,7 @@ class TestAnOperationCarriesItsOperands:
         """Presence was required, type was not.
 
         `_segments_or_raise` reaches straight for `path.startswith("/")`, so a
-        non-string pointer left as an uncaught AttributeError — a 500 for what
+        non-string pointer left as an uncaught AttributeError - a 500 for what
         is plainly a bad request. Both API models accept nested arbitrary
         dicts, so this arrives over the wire.
         """
@@ -453,7 +453,7 @@ class TestArrayIndexGrammar:
     leading zeros.
 
     `str.isdigit()` is a far larger set, so several distinct pointer spellings
-    named one position — the normalization this whole file exists to stop.
+    named one position - the normalization this whole file exists to stop.
     """
 
     def test_a_leading_zero_is_not_the_same_index(self):
@@ -480,7 +480,7 @@ class TestArrayIndexGrammar:
     @pytest.mark.parametrize("token", ["²", "-²"], ids=["sup2", "neg-sup2"])
     def test_a_digit_int_cannot_read_is_a_bad_request_not_a_crash(self, token):
         """`"²".isdigit()` is True and `int("²")` raises. The pair let a
-        malformed pointer leave as an uncaught ValueError instead of a 400 —
+        malformed pointer leave as an uncaught ValueError instead of a 400 -
         the one case here that was a 500 rather than a wrong write.
         """
         with pytest.raises(BadRequestError):
@@ -506,7 +506,7 @@ class TestTestComparesJsonValues:
     recursively through lists and dicts. JSON has no such rule: booleans and
     numbers are different value classes. `test` exists to guard the
     operations after it, so an equality that is too generous does not just
-    misreport — it lets a mutation through on a precondition that was never
+    misreport - it lets a mutation through on a precondition that was never
     actually met.
     """
 
@@ -605,7 +605,7 @@ class TestMoveAndCopyDestinationsFollowAdd:
         """The positive control the two above could otherwise break.
 
         Moving inside a list is exactly the case where the destination must
-        be judged after the removal rather than before it — index 2 is the
+        be judged after the removal rather than before it - index 2 is the
         end of the shortened list, not of the original.
         """
         assert json_patch.apply_ops(
@@ -703,7 +703,7 @@ class TestConfigOpsInheritsIt:
         """The consequence that made this worth finding.
 
         Before: HTTP 200, status `applied`, a new artifact_version, and the
-        configuration serving consumes unchanged — an audit trail asserting a
+        configuration serving consumes unchanged - an audit trail asserting a
         change that did not happen.
         """
         artifact = _published(client, admin_headers)
@@ -734,8 +734,8 @@ class TestConfigOpsInheritsIt:
         """The pointer form of the defect that started this tranche.
 
         `/a~1b` names the key `a/b`. Undecoded it names `a~1b`, which is a
-        real and different key. So this patch succeeds — 200, `applied`, a new
-        artifact_version — while changing a key the operator did not name and
+        real and different key. So this patch succeeds - 200, `applied`, a new
+        artifact_version - while changing a key the operator did not name and
         leaving the one they did name alone. Same audit trail asserting a
         change that did not happen, reached through the pointer instead of
         through the path root.
@@ -792,7 +792,7 @@ class TestThePatchProducersEmitApplicablePatches:
     patch and the adapter auto-prune proposer. A freshly created artifact has
     no `meta` in its schema, and traversal no longer invents one, so both now
     emit a patch that stores `pending`, approves cleanly, and then fails on
-    apply — a dead end this branch introduced.
+    apply - a dead end this branch introduced.
 
     Prepending an unconditional `add /meta` is not the fix: `add` on a member
     that is already there replaces it, so that trades a refused patch for a
@@ -914,7 +914,7 @@ class TestThePatchProducersEmitApplicablePatches:
         self, client, admin_headers
     ):
         """Through the real producer, with the model failing so the fallback
-        is what gets stored — and applied against an artifact that has a
+        is what gets stored - and applied against an artifact that has a
         `meta`, which is the case the fallback can actually serve."""
         artifact = _published(client, admin_headers, extra={"meta": {"keep": "ME"}})
         runtime = get_runtime()
@@ -951,7 +951,7 @@ class TestApplyIsOneReadModifyWrite:
     "Current" is the load-bearing word. The service read the artifact and
     computed the new document before entering the store transaction, and the
     store then locked the artifact row and wrote that already-computed
-    document — so the lock serialized the write without covering the read it
+    document - so the lock serialized the write without covering the read it
     came from. Anything committed in between was overwritten.
 
     The earlier staleness witness in this file asks the right question at the
@@ -974,8 +974,8 @@ class TestApplyIsOneReadModifyWrite:
 
         A concurrent edit lands after ConfigOps has read the artifact and
         computed its result, and before the row is written. Either outcome is
-        correct — apply against the newly locked schema and keep both changes,
-        or refuse as stale and change nothing — but the edit must not vanish.
+        correct - apply against the newly locked schema and keep both changes,
+        or refuse as stale and change nothing - but the edit must not vanish.
         """
         artifact = _private(client, admin_headers, extra={"meta": {"keep": "ME"}})
         patch_id = self._proposed(client, admin_headers, artifact, [
@@ -991,7 +991,7 @@ class TestApplyIsOneReadModifyWrite:
             # the fix moves that computation under the artifact lock, an edit
             # attempted from inside it waits on a lock this very call holds.
             # This runs before the transaction opens, so it commits through
-            # the ordinary mutation path exactly as another replica would —
+            # the ordinary mutation path exactly as another replica would -
             # and it is the same seam either way, because the unfixed service
             # has already computed its result by the time it gets here.
             edit = client.patch(f"/v1/artifacts/{artifact}", headers=admin_headers,
@@ -1026,7 +1026,7 @@ class TestApplyIsOneReadModifyWrite:
         Fixing ConfigOps closed the race for one writer. The ordinary private
         PATCH route still reads the artifact, computes the whole new schema,
         and hands it to a store method that locks the row and writes the
-        document it was given — so with the two writers interleaved the other
+        document it was given - so with the two writers interleaved the other
         way round, it is the *applied* ConfigOps patch that disappears:
 
             private PATCH reads schema N, computes N + D
@@ -1089,7 +1089,7 @@ class TestApplyIsOneReadModifyWrite:
         its owner deletes it. Account erasure meets the same relationship.
 
         Postgres resolves it by aborting one transaction, so nothing is
-        corrupted — but "the loser gets a DeadlockDetected" is not the same as
+        corrupted - but "the loser gets a DeadlockDetected" is not the same as
         two operations having an intentional order, which is the discipline
         every other writer here follows.
 
@@ -1170,8 +1170,8 @@ class TestApplyIsOneReadModifyWrite:
         """The long-lived snapshot, at the real call site.
 
         `train_from_preferences` reads the adapter, runs a training job, and
-        promotes. Promotion used to rebuild from `dict(adapter.schema)` — the
-        document read before the run — so anything committed during it was
+        promotes. Promotion used to rebuild from `dict(adapter.schema)` - the
+        document read before the run - so anything committed during it was
         erased when promotion finally took the lock. That window is minutes,
         not the microseconds the API routes race over.
         """
@@ -1195,8 +1195,8 @@ class TestApplyIsOneReadModifyWrite:
             """Stands in for the job, and applies the patch while it runs.
 
             The seam is here rather than on the first `update_artifact`,
-            because training writes to the adapter *before* the run — vocab
-            size, base model — and refreshes its snapshot afterwards. A patch
+            because training writes to the adapter *before* the run - vocab
+            size, base model - and refreshes its snapshot afterwards. A patch
             applied at one of those would already be in the document promotion
             rebuilds from, and the witness would pass against the defect.
             This is the real window: committed during the run, after the last
@@ -1246,7 +1246,7 @@ class TestApplyIsOneReadModifyWrite:
 
         The status check ran outside the transaction and the status write had
         no `approved` guard, so both callers could observe `approved` and each
-        write a version for one patch. The sequential test never sees it —
+        write a version for one patch. The sequential test never sees it -
         the first apply has already committed by the time the second reads.
 
         Determinism comes from the patch computation, which the fix runs
@@ -1329,7 +1329,7 @@ class TestArtifactPatchInheritsIt:
         self, client, admin_headers
     ):
         """`if ops:` skipped the engine entirely, so an empty patch never met
-        a rule — it went straight to the store and got a version."""
+        a rule - it went straight to the store and got a version."""
         artifact = _private(client, admin_headers)
         before, before_versions = _schema(artifact), _versions(artifact)
 
@@ -1435,7 +1435,7 @@ class TestArtifactPatchInheritsIt:
 
         `/nodes/01/tool` is not a JSON Pointer array index. It used to
         normalize to 1 and rewrite the second node's tool, then return 200 and
-        write a version — an operator's typo becoming a silent edit to a
+        write a version - an operator's typo becoming a silent edit to a
         different node than the one they named.
         """
         artifact = _private(client, admin_headers, extra=TWO_TOOLS)

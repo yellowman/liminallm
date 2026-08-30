@@ -318,7 +318,7 @@ class UserErasure:
     deletion is about to make unreachable. A cached conversation summary
     outlives its chat by up to an hour, and after the account is gone there is
     no longer any way to ask which conversations it had. So the deletion says
-    what it took, and the caller purges the copies on a best-effort basis —
+    what it took, and the caller purges the copies on a best-effort basis -
     afterwards, so a Redis outage cannot roll back an erasure.
 
     Every field is read from Postgres inside the deleting transaction, never

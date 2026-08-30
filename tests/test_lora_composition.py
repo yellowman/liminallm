@@ -1,8 +1,8 @@
-"""Adapter composition and tokenizer fidelity — SPEC §5.2 and §5.4.
+"""Adapter composition and tokenizer fidelity - SPEC §5.2 and §5.4.
 
 Every test here covers a case the earlier suite could not distinguish. The
 old composition averaged A and B and divided by the total gate weight, which
-is *correct* for exactly one input — a single adapter at weight 1.0 — and
+is *correct* for exactly one input - a single adapter at weight 1.0 - and
 that was the only input anything tested. So:
 
 * gates other than 1.0, where the old code cancelled the gate entirely;
@@ -30,8 +30,8 @@ pytest.importorskip("safetensors")
 from liminallm.service.model_backend import LocalJaxLoRABackend  # noqa: E402
 from tests.test_local_transformer import _build_checkpoint  # noqa: E402
 
-# Every test in this module runs the real thing — training steps, a forward
-# pass, an eval gate — so it is measured in seconds rather than milliseconds.
+# Every test in this module runs the real thing - training steps, a forward
+# pass, an eval gate - so it is measured in seconds rather than milliseconds.
 # `make test-fast` skips these; `make test` and the pre-commit gate do not,
 # because what they exercise is not covered anywhere else.
 pytestmark = pytest.mark.slow
@@ -41,7 +41,7 @@ BASE = ""
 """The serving base identity these fixtures' adapters declare.
 
 SPEC §5.1 ties LoRA weights to one frozen base, so serving refuses an adapter
-that does not declare the base it is being applied to — a fixture without one
+that does not declare the base it is being applied to - a fixture without one
 describes an adapter the artifact schema could not store either.
 """
 
@@ -49,7 +49,7 @@ describes an adapter the artifact schema could not store either.
 @pytest.fixture(scope="module", autouse=True)
 def checkpoint(tmp_path_factory):
     """autouse so BASE is set before any test in the module reads it, whatever
-    order they run in — an unset BASE would refuse weights for the wrong
+    order they run in - an unset BASE would refuse weights for the wrong
     reason."""
     global BASE
     directory = _build_checkpoint(tmp_path_factory.mktemp("compose_model"))
@@ -64,7 +64,7 @@ def config(checkpoint):
 
 @pytest.fixture(scope="module")
 def checkpoint_without_tokenizer(tmp_path_factory):
-    """Weights present, tokenizer absent — a misconfigured deployment."""
+    """Weights present, tokenizer absent - a misconfigured deployment."""
     directory = _build_checkpoint(tmp_path_factory.mktemp("no_tokenizer"))
     for name in ("tokenizer.json", "tokenizer_config.json"):
         (directory / name).unlink()
@@ -91,7 +91,7 @@ def _effective_delta(blended, key="layers.0.attn_q"):
 
     SPEC §5.2 is an equation about weights, and weights compose exactly.
     Asserting on logits instead would be asserting that the whole network is
-    linear in the adapter delta — it is not, because the delta passes through
+    linear in the adapter delta - it is not, because the delta passes through
     a softmax and a SwiGLU, so logit changes are only proportional to first
     order. Testing ΔW tests the actual claim, exactly.
     """
@@ -193,7 +193,7 @@ class TestTwoAdaptersCompose:
         """The composed delta must equal the sum of the individual deltas.
 
         Averaging A and B produces B̄Ā, whose expansion contains B₁A₂ and
-        B₂A₁ — one adapter's up-projection against another's down-projection.
+        B₂A₁ - one adapter's up-projection against another's down-projection.
         No term of the SPEC sum has that shape.
         """
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
@@ -213,7 +213,7 @@ class TestTwoAdaptersCompose:
             backend._blend_adapter_weights([first, second], user_id="u")
         )
 
-        # ΔW_together == g₁α₁B₁A₁ + g₂α₂B₂A₂, exactly — no cross terms.
+        # ΔW_together == g₁α₁B₁A₁ + g₂α₂B₂A₂, exactly - no cross terms.
         assert float(jnp.max(jnp.abs(together - (alone_first + alone_second)))) < 1e-6
         # And the composition is not the degenerate "one of them wins".
         assert float(jnp.max(jnp.abs(together - alone_first))) > 1e-6
@@ -273,7 +273,7 @@ class TestTokenizerFidelity:
         self, tmp_path, checkpoint_without_tokenizer
     ):
         """Gradients through the right weights still teach the wrong token
-        space, and the holdout — tokenized the same wrong way — agrees."""
+        space, and the holdout - tokenized the same wrong way - agrees."""
         from liminallm.service.training import TrainingService
 
         checkpoint = checkpoint_without_tokenizer
@@ -304,7 +304,7 @@ class TestTokenizerFidelity:
         ("input_ids", "labels"),
         [
             ([[1, 99_999]], [[99_999, 3]]),  # above the vocabulary
-            ([[1, -1]], [[-1, 3]]),  # below it — and negative indexing does
+            ([[1, -1]], [[-1, 3]]),  # below it - and negative indexing does
             ([[1, 2]], [[-5, 3]]),  # not crash, it reads from the far end
         ],
     )
@@ -314,7 +314,7 @@ class TestTokenizerFidelity:
         """A mismatch is refused, not clipped into a token nobody wrote.
 
         Both ends of [0, vocab_size): a negative id is as far outside the
-        vocabulary as an oversized one, and it is the quieter of the two —
+        vocabulary as an oversized one, and it is the quieter of the two -
         array indexing resolves it against the end of the embedding table
         instead of failing.
         """
@@ -355,7 +355,7 @@ class TestSftSequenceConstruction:
         """The *newest* turn must survive, not the oldest.
 
         The tokenizer was previously asked to truncate first, and tokenizers
-        truncate from the right — so a long prompt was already reduced to its
+        truncate from the right - so a long prompt was already reduced to its
         oldest tokens before the deliberate "keep the tail" slice ran, which
         could then only pick among tokens that had lost the recent context.
         This tokenizer does not truncate at all, so the code under test has to
@@ -382,7 +382,7 @@ class TestSftSequenceConstruction:
 
     def test_an_empty_target_is_dropped_not_invented(self, tmp_path):
         """`or [0]` turned a missing correction into supervision teaching the
-        model to emit token 0 — with positive mask weight, so no later
+        model to emit token 0 - with positive mask weight, so no later
         zero-mask check could catch it."""
 
         class WordTokenizer:
@@ -406,7 +406,7 @@ class TestSftSequenceConstruction:
         assert len(batch["input_ids"]) == 1  # only one usable example
         # The shape describes the rows actually emitted. It used to report the
         # source slice, so a consumer preallocating from it would size for
-        # examples that were dropped — and this assertion used to pin that.
+        # examples that were dropped - and this assertion used to pin that.
         assert batch["shape"]["batch"] == 1
 
     def test_a_long_prompt_never_erases_the_target(self, tmp_path):
@@ -435,7 +435,7 @@ class TestSftSequenceConstruction:
         """The whole path with no hand-written token ids anywhere.
 
         Every other training test starts from token lists, which cannot catch
-        a tokenizer that disagrees with the model — the batches would be
+        a tokenizer that disagrees with the model - the batches would be
         internally consistent and wrong. Here the text goes through the
         production tokenizer, the batches feed the real trainer, and the
         trained file is loaded by the serving backend.
@@ -469,7 +469,7 @@ class TestSftSequenceConstruction:
         # And serving consumes exactly this file, through gate composition.
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         # The directory carries the adapter's identity and the version its
-        # promotion authorized (§5.5) — a bare params.json authorizes nothing.
+        # promotion authorized (§5.5) - a bare params.json authorizes nothing.
         adapter_dir = tmp_path / "e2e" / "v0001"
         adapter_dir.mkdir(parents=True)
         (adapter_dir / "params.json").write_text(params_path.read_text())

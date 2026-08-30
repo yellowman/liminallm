@@ -2,7 +2,7 @@
 
 `cluster_everyone` is the pass the training worker schedules. It called
 `self.clusterer.cluster_user_preferences(...)`, but `SemanticClusterer` has no
-`clusterer` attribute — so every user and every tenant raised AttributeError
+`clusterer` attribute - so every user and every tenant raised AttributeError
 into the per-iteration `except Exception`, was logged as a warning, and the
 whole pass did nothing. Nothing failed loudly; the feature was simply absent.
 
@@ -91,7 +91,7 @@ async def test_the_global_pass_runs_once_per_tenant_not_once_overall(store):
 
 @pytest.mark.asyncio
 async def test_one_users_failure_does_not_stop_the_rest(store):
-    """The point of the per-iteration except — but it must be catching real
+    """The point of the per-iteration except - but it must be catching real
     clustering failures, not an AttributeError on every single user."""
     good = [_user(store, "public") for _ in range(3)]
     rec = _Recorder(store)

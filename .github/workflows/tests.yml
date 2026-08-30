@@ -73,7 +73,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install .[dev] || pip install .
           # pytest-xdist is in the dev extra, but this line is what runs when
-          # the `|| pip install .` fallback fired — and a missing plugin turns
+          # the `|| pip install .` fallback fired - and a missing plugin turns
           # `-n 4` into an unrecognized-argument crash, not a serial run.
           pip install pytest pytest-cov pytest-xdist jax jaxlib
 
@@ -115,8 +115,8 @@ jobs:
           TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/liminallm
           # The service Redis, named explicitly so the suite's per-worker
           # database leasing engages. Serially this never mattered: without
-          # it every worker falls back to the settings default — the same
-          # host and database 0 — and under `-n 4` the workers then share
+          # it every worker falls back to the settings default - the same
+          # host and database 0 - and under `-n 4` the workers then share
           # one Redis, so a test that scans its own database (the identity
           # tokens erasure witness scans `reset:*`) sees its neighbours'
           # keys. The runner has no local `redis-server`, so the scratch
@@ -134,13 +134,13 @@ jobs:
           LIMINALLM_REQUIRE_CONFINEMENT: "1"
         # `-m 'not browser'`: that lane needs a Chromium binary and has its
         # own job below. ALLOW_REDIS_FALLBACK_DEV is not set here because it
-        # reaches nothing — the setting is admin-managed with no environment
+        # reaches nothing - the setting is admin-managed with no environment
         # variable, and TEST_MODE above is what actually permits the fallback.
         #
         # `-n 4 --dist loadfile`, mirroring `make test-xdist`: the per-worker
         # Postgres database, Redis database and filesystem root that make the
         # suite safe in parallel are the suite's own, so CI gets the same
-        # parallelism the local lanes run — this selection took 16–33 minutes
+        # parallelism the local lanes run - this selection took 16–33 minutes
         # serially on these 4-vCPU runners against ~4–5 minutes locally at
         # `-n 4`. Coverage runs on 3.11 only, the one version that uploads
         # it; instrumenting the other two bought nothing and cost 20–40%.
@@ -175,8 +175,8 @@ jobs:
         run: bandit -r liminallm/ -ll --skip B101
 
   # The browser lane. Its own job because it needs a Chromium binary, and one
-  # Python version because what it checks — what the SPA persists where
-  # scripts can read it, and what the browser puts on the wire — does not vary
+  # Python version because what it checks - what the SPA persists where
+  # scripts can read it, and what the browser puts on the wire - does not vary
   # by interpreter. Previous defects at this seam were all invisible to
   # TestClient, which has no script context and no HttpOnly enforcement.
   browser:

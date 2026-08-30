@@ -1,7 +1,7 @@
 """One JSON Patch implementation, exercised through both of its callers.
 
 Config patches had the hardened traversal but no move/copy/test; artifact
-PATCH had the full verb set but swallowed every failure with ``pass`` — a
+PATCH had the full verb set but swallowed every failure with ``pass`` - a
 patch that did nothing reported success. These tests pin the union.
 """
 
@@ -63,7 +63,7 @@ def test_remove_refuses_a_missing_key():
 def test_remove_does_not_create_the_containers_it_removes_from():
     """Walking with the creating walker left the parents behind.
 
-    remove /a/b on {} used to return {"a": {}} — so every model-authored
+    remove /a/b on {} used to return {"a": {}} - so every model-authored
     patch that dropped an optional nested key quietly wrote an empty object
     into the config or artifact schema it was editing. Removing a missing
     target is now refused outright, and the refusal must still leave nothing
@@ -110,7 +110,7 @@ def test_the_original_document_is_never_mutated():
 
 
 # ---------------------------------------------------------------------------
-# The hardening — every silent ``pass`` in the old artifact path, now a 400
+# The hardening - every silent ``pass`` in the old artifact path, now a 400
 # ---------------------------------------------------------------------------
 
 
@@ -124,7 +124,7 @@ def test_the_original_document_is_never_mutated():
         ({"op": "add", "path": "/name/deep", "value": 1}, "non-container"),
         # Not "too large": there is no ceiling any more, only the list's
         # length. 9999 is refused for the same reason /xs/5 is on two
-        # elements — it names a position past the end.
+        # elements - it names a position past the end.
         ({"op": "add", "path": "/rules/9999", "value": 1}, "out of range"),
         ({"op": "add", "path": "/rules/-1/x", "value": 1}, "negative"),
         ({"op": "move", "path": "/b", "from": "/ghost"}, "source path not found"),
@@ -150,8 +150,8 @@ def test_a_half_formed_op_is_refused(op):
     """This used to assert the opposite, on a premise that was not true.
 
     Its reason was that "both callers validated shape upstream and relied on
-    this". `ArtifactPatchRequest` did not — it took `List[dict]` and checked
-    nothing — so the artifact route applied a no-op patch and wrote a version
+    this". `ArtifactPatchRequest` did not - it took `List[dict]` and checked
+    nothing - so the artifact route applied a no-op patch and wrote a version
     for it. SPEC promises JSON Patch, which does not include quietly
     discarding operations that are not JSON Patch.
     """
@@ -222,7 +222,7 @@ def test_the_route_refuses_a_malformed_patch_instead_of_pretending(
     client, auth_headers, owned_artifact
 ):
     """The old route implementation would have returned 200 with nothing
-    changed — the client had no way to know the patch was dropped."""
+    changed - the client had no way to know the patch was dropped."""
     resp = client.patch(
         f"/v1/artifacts/{owned_artifact['id']}",
         json={"patch": [{"op": "add", "path": "/rules/notanumber", "value": {}}]},
@@ -257,12 +257,12 @@ def test_a_failed_test_op_aborts_the_whole_patch(client, auth_headers, owned_art
 )
 def test_negative_indices_are_refused_on_the_read_path_too(op):
     """RFC 6902 array indices are non-negative. Python's list[-1] quietly
-    served `/rules/-1` to move/copy/test while the write path refused it —
+    served `/rules/-1` to move/copy/test while the write path refused it -
     found reviewing the commit that introduced this module.
 
     Both sides now name the same mistake the same way. This used to expect
     "source path not found", which is what the read path happened to say
-    while the write path said "negative list index" — one error with two
+    while the write path said "negative list index" - one error with two
     descriptions, and the vaguer one sent the reader looking for a missing
     element instead of at the index they wrote.
     """

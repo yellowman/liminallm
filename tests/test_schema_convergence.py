@@ -13,7 +13,7 @@ naming that column fails against a database that predates it. `CREATE INDEX IF
 NOT EXISTS` has the same shape of problem for a changed definition: the old
 index survives under the new name and the planner keeps using it.
 
-The test builds the old shape, applies the file, and asks what happened —
+The test builds the old shape, applies the file, and asks what happened -
 rather than reading it and reasoning, which is what let the gap through.
 """
 
@@ -103,7 +103,7 @@ def test_applying_the_schema_to_an_older_database_updates_its_shape(client):
         )
 
         # And again, because idempotent means it can be applied any number of
-        # times — the second run is the one that would fail on a bare ALTER.
+        # times - the second run is the one that would fail on a bare ALTER.
         second = _apply_schema(probe)
         assert second.returncode == 0, second.stderr
         assert _shape(probe) == (has_column, index)

@@ -19,7 +19,7 @@ const source = ['frontend/common.js', 'frontend/markdown.js']
 
 // escapeHtml escapes by writing textContent into a detached div and reading
 // innerHTML back. This stub reproduces exactly what a browser text node
-// escapes: & < > — and nothing else (quotes stay, as the comment in chat.js
+// escapes: & < > - and nothing else (quotes stay, as the comment in chat.js
 // relies on).
 const documentStub = {
   createElement: () => {

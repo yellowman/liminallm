@@ -2,7 +2,7 @@
 
 The Files API already draws this line and says so: any relative path with a
 component beginning `.` is bookkeeping, omitted from listings, and treated as
-absent by download and delete. `.checksums.json` — the upload manifest — is
+absent by download and delete. `.checksums.json` - the upload manifest - is
 the row that made the rule necessary.
 
 Ingestion never learned it. The default extension list includes `.json`, so a
@@ -112,8 +112,8 @@ class TestTheManifestIsNotADocument:
         """Asserted on content as well as path, because either would leak.
 
         A chunk recorded under some other path but carrying the manifest's
-        JSON is the same disclosure — the user's filenames and checksums in
-        a retrieval — so the bytes are checked, not only the name.
+        JSON is the same disclosure - the user's filenames and checksums in
+        a retrieval - so the bytes are checked, not only the name.
         """
         _headers, user_id, root = corpus
         context = fresh_context(user_id)
@@ -161,7 +161,7 @@ class TestInternalIsAboutComponentsNotBasenames:
 
 class TestInternalEntriesDoNotStarveTheBudget:
     def test_a_tree_full_of_bookkeeping_still_indexes_the_document(self, corpus):
-        """A property, not a reproduction — and worth stating either way.
+        """A property, not a reproduction - and worth stating either way.
 
         The walk stops after `max_files` documents. If internal entries
         counted against that, a directory carrying thousands of them would
@@ -200,8 +200,8 @@ class TestTheApiAndTheWalkerAgree:
     ):
         """One predicate, asked twice.
 
-        The listing and the walker answer the same question — is this path
-        the user's content, or the server's bookkeeping — so they must not
+        The listing and the walker answer the same question - is this path
+        the user's content, or the server's bookkeeping - so they must not
         answer it differently. Driven through both surfaces over one tree
         rather than by reading the two implementations.
         """
@@ -234,7 +234,7 @@ class TestASourceBeneathAHiddenDirectoryIsStillInternal:
     A source is classified by what it is called, and a path named outright
     arrives with its own basename in hand. `bundle/.internal/secret.md` has an
     ordinary basename and an internal position, so a check that asks only
-    `path.name` admits it — while the very same file, reached by walking
+    `path.name` admits it - while the very same file, reached by walking
     `files/`, is refused. One file, two answers.
 
     Reachable through the supported route: `POST /contexts/{id}/sources` calls
@@ -299,7 +299,7 @@ class TestTheDurableQueueAsksTheSameQuestion:
 
     Re-indexing calls `rag.ingest_file` directly. Every refusal added to the
     walk is therefore invisible here, and the queue is the durable machinery a
-    replacement actually runs through — so an internal path that reaches
+    replacement actually runs through - so an internal path that reaches
     `ingest_job` would be chunked on a schedule, long after whoever created it
     stopped watching.
 

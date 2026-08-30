@@ -141,7 +141,7 @@ class _FailsMidStreamBackend:
     """Streams a few tokens, then the provider drops the connection."""
 
     #: Declared, because the capability is now fail-closed and an undeclared
-    #: backend does not stream at all — which would bypass the mid-stream
+    #: backend does not stream at all - which would bypass the mid-stream
     #: boundary this test exists to witness. Honest for this double: it is an
     #: in-memory generator that never blocks, so a stop between events is a
     #: complete interrupt.

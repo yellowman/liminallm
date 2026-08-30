@@ -2,7 +2,7 @@
 
 Two layers both believed they owned this. `LLMService` placed the
 instructions, and then `ApiAdapterBackend` and `GeminiBackend` placed them
-again — so `generate` and `generate_stream` sent the text twice, while
+again - so `generate` and `generate_stream` sent the text twice, while
 `generate_with_tools` and `stream_messages`, which never passed through the
 service's message builder, sent it once. Deleting the backend copy alone
 would have taken that pair to zero; the repair was one service primitive that
@@ -12,7 +12,7 @@ These tests count occurrences on the surface that actually reaches a
 provider, because "the instruction is present" was true throughout the
 defect. Each is paired with the closed-gate case, and the file ends with a
 check that neutralizing the service materializer turns the positive cases
-red — the false-green shape this audit has found repeatedly.
+red - the false-green shape this audit has found repeatedly.
 """
 
 import json
@@ -36,7 +36,7 @@ class _Capturing:
     """Records exactly the messages a backend is handed.
 
     An API-shaped backend: it applies no LoRA weights, so §5.0.1 makes the
-    prompt its representation of an adapter — the case where a second
+    prompt its representation of an adapter - the case where a second
     materializer showed up.
     """
 
@@ -122,8 +122,8 @@ class TestAStatedModeMaterializes:
 
     This was originally about *inferred* modes: `get_adapter_mode` returned a
     raw string when the artifact stated one and an `AdapterMode` member when
-    it inferred, and the service compared `str(mode)` — "AdapterMode.HYBRID"
-    for a member, matching nothing — so every adapter that did not state a
+    it inferred, and the service compared `str(mode)` - "AdapterMode.HYBRID"
+    for a member, matching nothing - so every adapter that did not state a
     mode was skipped. Inference is retired (Pass C), so the cases state their
     modes; the enum-versus-string comparison it guards is still live.
 
@@ -154,7 +154,7 @@ class TestAStatedModeMaterializes:
 class TestBackendsDoNotMaterializeAgain:
     def test_the_api_backend_adds_nothing_to_prepared_messages(self):
         """Given messages the service already prepared, the backend's job is
-        transport, remote selection and accounting — not a second copy."""
+        transport, remote selection and accounting - not a second copy."""
         api = ApiAdapterBackend(base_model="gpt-x", api_key=None, provider="openai")
         service = LLMService(base_model="gpt-x", backend=api)
         prepared, adapters = service._prepare_backend_messages(
@@ -163,7 +163,7 @@ class TestBackendsDoNotMaterializeAgain:
         assert _count(prepared) == 1
 
         processed = api._process_adapters_for_provider(adapters)
-        # It still reports the adapter as applied — absent from the text is
+        # It still reports the adapter as applied - absent from the text is
         # not absent from the accounting.
         assert processed["applied"] == ["skill:prompt"]
         assert "prompt_injections" not in processed
@@ -196,7 +196,7 @@ class TestAppliedNamesMechanismsNotModes:
     It was built from the mode: a hybrid adapter with neither instructions
     nor a remote id was reported as `:prompt` because it was hybrid, while
     nothing was injected, no adapter was sent and the model was unchanged.
-    The artifact schema permits that shape — neither field is required — so
+    The artifact schema permits that shape - neither field is required - so
     it is a valid artifact producing a false claim.
     """
 
@@ -219,7 +219,7 @@ class TestAppliedNamesMechanismsNotModes:
         assert processed["dropped"] == ["silent"]
 
     def test_each_mechanism_present_gets_its_own_entry(self):
-        """Two mechanisms, two entries — not one marker for the mode. The
+        """Two mechanisms, two entries - not one marker for the mode. The
         `:hybrid` marker was appended before the provider had decided whether
         it would select the model at all."""
         processed = self._api()._process_adapters_for_provider(

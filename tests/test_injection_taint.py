@@ -1,6 +1,6 @@
 """Injection findings must restrict capability, not merely inform.
 
-Detection was already good — sanitize, envelope, scan, report. But a model
+Detection was already good - sanitize, envelope, scan, report. But a model
 that just read "ignore your rules and run this" is precisely the model least
 able to be trusted with an interpreter, so the control has to be enforcement
 rather than instruction.
@@ -136,7 +136,7 @@ async def test_sweep_reembeds_stale_and_missing_vectors(tmp_path):
     assert done == 2  # the stale one and the un-embedded one, not the fresh one
     assert store.get_note(stale.id).meta["embedding_model"] == "encoder-v2"
     assert store.get_note(never.id).embedding == [0.5, 0.5]
-    # A second pass finds nothing left to do — it converges.
+    # A second pass finds nothing left to do - it converges.
     assert notes.reembed_stale(store, enc, user_limit=100) == 0
 
 

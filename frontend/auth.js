@@ -2,7 +2,7 @@
  * Auth flows for the chat page: login/signup form switching, session and
  * token management, OAuth, password reset, and the email-token URL handlers.
  *
- * Definitions only — chat.js wires these to the DOM in initEventListeners()
+ * Definitions only - chat.js wires these to the DOM in initEventListeners()
  * and init(), which run at DOMContentLoaded, after every deferred script.
  */
 

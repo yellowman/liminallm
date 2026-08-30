@@ -3,7 +3,7 @@
 SPEC §9.2 makes retries, backoff, the per-node timeout and output validation
 properties of a *node*; §18.3 fixes their numbers. None of that is a property
 of how the node's answer is transported, so none of it belongs in a second
-copy beside the streaming path. It had one anyway — measured on one aliased
+copy beside the streaming path. It had one anyway - measured on one aliased
 tool that resolves to `llm.generic` and therefore streams:
 
     property           blocking      streaming
@@ -22,7 +22,7 @@ control back and the thread is still inside `next()`, still producing the
 answer the next attempt is about to replace. So `asyncio.to_thread(next, it)`
 cannot be the timeout mechanism. Termination here is a request the producer
 honours between events, plus a separate answer about whether it actually
-returned — and an attempt that will not confirm its death stops the retry
+returned - and an attempt that will not confirm its death stops the retry
 rather than running beside its replacement.
 """
 
@@ -54,7 +54,7 @@ class StreamPump:
 
     One thread owns the producer for its whole life. That is the difference
     from `asyncio.to_thread(next, iterator)`, which hands one item to one
-    pool thread and leaves nobody owning the iterator between items — cancel
+    pool thread and leaves nobody owning the iterator between items - cancel
     the await and the thread is abandoned inside `next()` with no way to reach
     it, and the pool loses a worker per cancelled stream.
 
@@ -77,11 +77,11 @@ class StreamPump:
         self._queue: asyncio.Queue = asyncio.Queue()
         self._stop = threading.Event()
         #: Set when the producer ran to its natural end. `_DONE` alone cannot
-        #: say why the stream ended — `stop()` injects the same sentinel — and
+        #: say why the stream ended - `stop()` injects the same sentinel - and
         #: a consumer that reads an interrupted stream as a finished one turns
         #: a cancellation into a completed answer.
         self._completed = False
-        #: The producer's iterator, kept so `stop` can reach its `abort` — a
+        #: The producer's iterator, kept so `stop` can reach its `abort` - a
         #: cancellable backend stream can interrupt a read in flight, and the
         #: stop flag alone is only read *between* events.
         self._iterator: Optional[Iterator[Dict[str, Any]]] = None
@@ -126,8 +126,8 @@ class StreamPump:
                 # exception, and a refusal to start all leave it unset.
                 self._completed = True
         except BaseException as exc:  # noqa: BLE001 - reported as an event
-            # After a stop this is the abort surfacing — the shutdown socket
-            # raises out of the read — not a result anyone may act on.
+            # After a stop this is the abort surfacing - the shutdown socket
+            # raises out of the read - not a result anyone may act on.
             if not self._stop.is_set():
                 self._emit(
                     {
@@ -163,7 +163,7 @@ class StreamPump:
         """Stop the producer, and release whoever is waiting on it.
 
         Three parts, in this order. The flag ends the thread at its next
-        iteration. The abort — when the backend's stream carries one —
+        iteration. The abort - when the backend's stream carries one -
         interrupts the read the thread is inside *right now*: the shipped
         network backends block in a synchronous read bounded only by the
         provider client's 30–60s timeout, and without the abort a
@@ -191,7 +191,7 @@ class StreamPump:
     def cancellation_proven(self) -> bool:
         """Whether this producer's death can be presumed prompt.
 
-        True once the stream's abort handle is armed — an interrupt is in
+        True once the stream's abort handle is armed - an interrupt is in
         hand, so a stop reaches a read in flight and the thread returns in
         moments. Terminal teardown waits for exactly these producers: a
         proven claim is cashed, not forgotten. Unarmed producers (plain
@@ -215,21 +215,21 @@ class BreakerObservation:
     """What one attempt learned about the tool's health (SPEC §18).
 
     Deliberately not derived from the attempt's node-level result: a node can
-    fail for reasons that say nothing about the tool — the consumer's
-    `output_schema`, an input refused before anything ran — and the ledger
+    fail for reasons that say nothing about the tool - the consumer's
+    `output_schema`, an input refused before anything ran - and the ledger
     must record what the *tool* did. `outcome` is set at the raw tool
     boundary; `started` marks that the tool's own work began, which is what
     lets a deadline that fired mid-serve count as a failure while one that
     fired during planning records nothing.
     """
 
-    #: The resolved breaker identity this attempt runs under — the persisted
+    #: The resolved breaker identity this attempt runs under - the persisted
     #: artifact's id, or the builtin name when nothing is persisted behind
     #: it. On the observation rather than beside it, because resolution is
     #: per attempt: two attempts of one node can resolve different rows, and
     #: each outcome belongs to the row that produced it.
     identity: Optional[str] = None
-    #: The driver's `Attempt` this observation belongs to — the exact token
+    #: The driver's `Attempt` this observation belongs to - the exact token
     #: a worker spawn or producer start must present to run under this
     #: attempt's authority. Typed loosely to keep this module free of the
     #: invocation machinery; ``None`` for driverless direct invocations.
@@ -239,7 +239,7 @@ class BreakerObservation:
     #: precede it.
     started: bool = False
     #: "success" | "failure", or None when the attempt proved nothing about
-    #: the tool — refused before it started, or abandoned by its caller.
+    #: the tool - refused before it started, or abandoned by its caller.
     outcome: Optional[str] = None
 
 
@@ -275,9 +275,9 @@ class NodeAttempt(Protocol):
     unreaped_error: str
 
     #: Whether `result()` is already computed once `events()` has ended.
-    #: True for a streamed attempt — its work happened while the events
+    #: True for a streamed attempt - its work happened while the events
     #: drained, and `result()` only returns the stored outcome. False for a
-    #: blocking attempt — its body *starts* inside `result()`. The driver
+    #: blocking attempt - its body *starts* inside `result()`. The driver
     #: may collect a ready result after the clock has crossed zero; it must
     #: never start un-begun work there.
     result_ready_after_events: bool
@@ -333,10 +333,10 @@ class StreamedNodeAttempt:
     streams exactly as it did before.
 
     The completed tool result arrives as its own `tool_result` event, emitted
-    by the streaming implementation and consumed here — never forwarded, and
+    by the streaming implementation and consumed here - never forwarded, and
     never reconstructed from the client-facing `message_done`. This class
     used to manufacture the raw result itself from the fields it knew about,
-    which was exactly `llm.generic`'s four — so `agent.files_v1`'s
+    which was exactly `llm.generic`'s four - so `agent.files_v1`'s
     `artifacts` and `injection_findings` vanished before validation, and a
     schema for the real result got a different verdict per transport. The
     handler that produced the result names its fields; a transport does not.
@@ -362,12 +362,12 @@ class StreamedNodeAttempt:
     ) -> None:
         self._stream = stream
         #: The postflight: `(sanitized, refusal)`. Always applied, exactly as
-        #: the blocking path applies it — sanitizing is not conditional on a
+        #: the blocking path applies it - sanitizing is not conditional on a
         #: schema, and what proceeds downstream is the sanitized object.
         self._finalize = finalize
         self._buffer = buffer
         #: Shared with the streaming body, which marks `started` at its own
-        #: serve boundary — the worker spawn or the provider pump, not this
+        #: serve boundary - the worker spawn or the provider pump, not this
         #: class's first pull: the body plans (retrieval, grounding, context
         #: assembly) before any tool work runs, and a deadline spent there
         #: must record nothing.
@@ -383,7 +383,7 @@ class StreamedNodeAttempt:
         finally:
             # Explicitly, because closing *this* generator does not close the
             # one it was iterating: the attempt still holds a reference, so the
-            # inner generator's cleanup — which stops the producer — would wait
+            # inner generator's cleanup - which stops the producer - would wait
             # for a collection instead of happening when the node ends.
             await self._stream.aclose()
 
@@ -397,7 +397,7 @@ class StreamedNodeAttempt:
         async for event in self._stream:
             kind = event.get("event")
             if kind == "cancel_ack":
-                # The pump was cut short of its natural end — the caller's
+                # The pump was cut short of its natural end - the caller's
                 # stop, not the stream finishing. Remembered so the no-answer
                 # tail below stays out of the ledger for it.
                 interrupted = True
@@ -417,7 +417,7 @@ class StreamedNodeAttempt:
                 # the client's contract is tokens and `message_done`.
                 raw = dict(event.get("data") or {})
                 # The breaker records what the *tool* did, so the observation
-                # is taken here — before the postflight, whose refusal is the
+                # is taken here - before the postflight, whose refusal is the
                 # consumer's schema speaking, not the tool (SPEC §18). A
                 # failure already observed is sticky: a body that salvages a
                 # partial answer after its provider died still emits a
@@ -441,7 +441,7 @@ class StreamedNodeAttempt:
         if done is None:
             # The producer stopped without an answer. A cancel is the
             # caller's own stop and records nothing; a stream that ended on
-            # its own mid-sentence — a clean provider EOF — is a serve that
+            # its own mid-sentence - a clean provider EOF - is a serve that
             # started and produced no completed result, which is a tool
             # failure: a backend that always dies mid-answer must still be
             # able to open the breaker (SPEC §18.3). The recorder's own
@@ -501,10 +501,10 @@ async def bounded(
                 # has already delivered its final event has nothing left to
                 # time out. This raised unconditionally, so the pull that
                 # would have ended a completed stream reported a node timeout
-                # instead — and an empty completion was then retried, a
+                # instead - and an empty completion was then retried, a
                 # second answer after one the client had received. One short
                 # grace distinguishes finished from late: `StopAsyncIteration`
-                # ends cleanly; an event, or nothing, is late — the event is
+                # ends cleanly; an event, or nothing, is late - the event is
                 # dropped, exactly as if the deadline had caught it earlier.
                 try:
                     await asyncio.wait_for(iterator.__anext__(), 0.001)

@@ -4,7 +4,7 @@ Tests run against the real thing, not a stand-in, for both. The reasoning is
 the same each time and the suite has been bitten by it twice:
 
 * the in-memory store doubled the storage layer, so every storage feature was
-  written twice and verified once — and the untested half was the one
+  written twice and verified once - and the untested half was the one
   production runs. Removing it surfaced three Postgres-only bugs, including
   preference recording that had never worked;
 * a synchronous Redis client existed for the tests alone. It drifted eight
@@ -16,7 +16,7 @@ cache and the concurrency slots actually run on; without it the fallbacks were
 exercised and the production path was not (24% covered).
 
 Set ``TEST_DATABASE_URL`` or ``TEST_REDIS_URL`` to point at existing services
-instead — CI with service containers, or a developer's local pair.
+instead - CI with service containers, or a developer's local pair.
 """
 
 from __future__ import annotations
@@ -41,8 +41,8 @@ _MAX_IDENTIFIER = 63
 def worker_id() -> str:
     """Which xdist worker this process is, or "" when there is no xdist.
 
-    Set by xdist in the worker's environment before conftest is imported —
-    measured, not assumed — so everything a worker must own can be derived at
+    Set by xdist in the worker's environment before conftest is imported -
+    measured, not assumed - so everything a worker must own can be derived at
     module scope.
     """
     return os.environ.get("PYTEST_XDIST_WORKER", "")
@@ -77,7 +77,7 @@ def worker_database_name(base: str, worker: str, run: str) -> str:
 #:
 #: Database 0, one ledger for the whole server, and never a candidate. It was
 #: briefly moved into whichever database `TEST_REDIS_URL` named, to keep every
-#: write inside the database the caller pointed at — but that fragments the
+#: write inside the database the caller pointed at - but that fragments the
 #: only thing a lease is for. Two runs given different base databases on one
 #: server then keep separate ledgers, cannot see each other's claims, and hand
 #: out the same number twice:
@@ -87,7 +87,7 @@ def worker_database_name(base: str, worker: str, run: str) -> str:
 #:                    both believe they own database 3
 #:
 #: Exclusivity across callers needs one place to record it. The cost is that
-#: the harness writes into database 0 even when told to use another — short
+#: the harness writes into database 0 even when told to use another - short
 #: lived keys under the two prefixes below, compare-deleted at teardown and
 #: expiring on their own. The database the caller named is still never leased
 #: and never flushed, which was the actual defect.
@@ -108,8 +108,8 @@ REDIS_LEASE_PREFIX = "liminallm:test:redis-db-lease"
 #: leaving a database alone.
 REDIS_BASE_PREFIX = "liminallm:test:redis-db-base"
 
-#: Long enough that no single test outruns it — the slowest is about a minute
-#: — and renewed before every test, so a run that dies stops renewing and its
+#: Long enough that no single test outruns it - the slowest is about a minute
+#: - and renewed before every test, so a run that dies stops renewing and its
 #: databases come back on their own.
 #:
 #: It is the renewal that makes 900 safe, not the number: the serial lane
@@ -123,7 +123,7 @@ def _lease_ttl() -> int:
     A value below one second is refused rather than clamped. `SET ... EX 0`
     is an error in Redis and a negative TTL deletes on write, so the run
     would fail somewhere inside the ledger with a message about the wrong
-    thing — while the mistake is right here, in a number somebody typed.
+    thing - while the mistake is right here, in a number somebody typed.
     """
     raw = os.environ.get("LIMINALLM_TEST_LEASE_TTL")
     if not raw:
@@ -223,7 +223,7 @@ def redis_url_for_database(base_url: str, index: int) -> str:
 
     The path is replaced *and* any `db=` argument dropped. Leaving it would
     win over the path, so the URL would name one database and connect to
-    another — which is the same defect one layer along.
+    another - which is the same defect one layer along.
     """
     parts = urlsplit(base_url)
     query = [
@@ -252,7 +252,7 @@ def lease_candidates(base_url: str) -> list[int]:
     the caller's, and a worker leasing it would flush it before every test,
     which is the base-preservation rule inverted rather than bent. Pointing
     the harness at `redis://host/1` is an ordinary thing to do. Never
-    database 0 either, which holds the ledger for the whole server — a
+    database 0 either, which holds the ledger for the whole server - a
     worker's `FLUSHDB` must not be able to erase the record of who owns what.
 
     Which database the URL *reaches*, not which one its path spells: see
@@ -271,7 +271,7 @@ def claim_redis_database(base_url: str, holder: str) -> tuple[str, int]:
 
     Deriving the number from the worker id alone looked sufficient and was
     not: it is a function of `gw0`, so every simultaneous pytest invocation
-    picks the same one — and each of them flushes it before every test,
+    picks the same one - and each of them flushes it before every test,
     believing it owns it. Two runs at once is not exotic; it is one terminal
     and one editor.
 
@@ -309,12 +309,12 @@ def reserve_base_database(base_url: str, *, ledger=None) -> bool:
     """Say, where every caller can see it, that this database is spoken for.
 
     Answers False when a worker of another run already holds a lease on that
-    database. The two transitions are symmetric — see `_RESERVE_IF_UNLEASED` —
+    database. The two transitions are symmetric - see `_RESERVE_IF_UNLEASED` -
     so whichever run gets there first keeps the database and the other is
     told, rather than both proceeding and one flushing the other.
 
     Refreshed rather than claimed: workers of one run all reserve the same
-    base, and none of them owns it alone. Nothing releases it — it expires,
+    base, and none of them owns it alone. Nothing releases it - it expires,
     which leaves a database alone for a while longer rather than handing it
     out early. Refreshing re-tests the lease key, so a reservation that lapsed
     and was leased away is not silently re-taken.
@@ -323,7 +323,7 @@ def reserve_base_database(base_url: str, *, ledger=None) -> bool:
     they answer differently: a claim that could not say which database it was
     given has silently dropped the protection it was about to rely on and
     should fail, while renewal reports False and its caller stops. A catch in
-    between could only hide the case the two do not share — a Redis that
+    between could only hide the case the two do not share - a Redis that
     permits `EVAL` and refuses `SET`, which is a permissions fault worth
     seeing rather than a database quietly left unprotected.
     """
@@ -361,7 +361,7 @@ def renew_redis_database(base_url: str, index: int, holder: str) -> bool:
     deletes: once a lease has expired the number may already belong to
     somebody else, and a read followed by an `EXPIRE` would extend their
     claim. The answer is returned rather than logged because the caller is
-    about to flush that database — a run that has lost its lease must stop,
+    about to flush that database - a run that has lost its lease must stop,
     not continue best-effort.
 
     A Redis that cannot be reached answers False for the same reason: unknown
@@ -410,7 +410,7 @@ def _free_port(env_override: str | None = None) -> int:
 
     A fixed override is the opposite of that, and under xdist it would send
     every worker's scratch service to one port. The second worker then fails
-    somewhere inside `pg_ctl`, which is a loud failure but not a legible one —
+    somewhere inside `pg_ctl`, which is a loud failure but not a legible one -
     so refuse here, where the reason can be stated.
     """
     if env_override and os.environ.get(env_override):
@@ -437,7 +437,7 @@ def _pg_bin() -> str | None:
 
 
 #: The extensions `sql/schema.sql` creates. `vector` is the one that travels
-#: separately — a stock PostgreSQL install does not have it, and the CI runner
+#: separately - a stock PostgreSQL install does not have it, and the CI runner
 #: reaches pgvector only through a service *container*, while a scratch cluster
 #: is built from the host's own binaries. Without this the shortfall surfaced
 #: as `psql` exiting 3 with its stderr discarded, which names nothing.
@@ -514,7 +514,7 @@ class ScratchPostgres:
         # this cluster's own user is guaranteed to own. Debian and Ubuntu
         # compile the default as /var/run/postgresql, owned by `postgres`,
         # which is writable when we are root and `su` to that user and is not
-        # writable by anybody else — so on a CI runner that runs the suite as
+        # writable by anybody else - so on a CI runner that runs the suite as
         # an ordinary user the postmaster died with "could not create lock
         # file /var/run/postgresql/.s.PGSQL.<port>.lock: Permission denied".
         # A scratch cluster should not reach outside its scratch directory in
@@ -548,7 +548,7 @@ class ScratchPostgres:
 
         Both streams used to go to DEVNULL, so a cluster that would not start
         surfaced as a bare `CalledProcessError` naming a command and no cause
-        — and `pg_ctl` itself only prints "could not start server", because
+        - and `pg_ctl` itself only prints "could not start server", because
         the reason is in the server log it was handed with `-l`. That cost a
         full CI round trip to discover a one-line permissions problem that the
         log had stated plainly the whole time.
@@ -615,7 +615,7 @@ _STORE_ROOT: str | None = None
 
 
 def get_test_store():
-    """The one store the suite talks to — the same class production runs.
+    """The one store the suite talks to - the same class production runs.
 
     Shared across tests so the suite holds a single connection pool instead of
     one per test; isolation comes from truncating between tests (see conftest),
@@ -632,7 +632,7 @@ def get_test_store():
         # filesystem authority, adapters, archive staging and the interpreter
         # resolved paths under another.
         #
-        # From the settings, which read SHARED_FS_ROOT — the throwaway root
+        # From the settings, which read SHARED_FS_ROOT - the throwaway root
         # conftest exports before any import.
         from liminallm.config import get_settings
         from liminallm.storage.postgres import PostgresStore
@@ -648,7 +648,7 @@ def reset_shared_store(store) -> None:
     `PostgresStore.__init__` seeds the default chat workflow and tool specs,
     and it used to run twice per test, so the per-test TRUNCATE was undone by
     the next construction. One store for the session means that construction
-    happens once — so the first TRUNCATE removed the defaults and every test
+    happens once - so the first TRUNCATE removed the defaults and every test
     after it ran in a boot state production never has, exercising fallbacks
     where the application runs on seeded rows.
 
@@ -678,7 +678,7 @@ def apply_schema(url: str, *, embedding_dim: int = 64) -> None:
 
     `ON_ERROR_STOP=1` makes psql exit 3 on the first failing statement, and
     stderr is where it says which one. That used to be discarded, so a schema
-    that would not apply arrived as `CalledProcessError ... exit status 3` —
+    that would not apply arrived as `CalledProcessError ... exit status 3` -
     a number, with the explanation thrown away one line earlier.
     """
     root = Path(__file__).resolve().parent.parent
@@ -701,7 +701,7 @@ def postgres_database_name(url: str) -> str:
 
     Asked of psycopg rather than read off the path, for the reason
     `redis_database_index` asks redis-py: libpq takes connection keywords from
-    the query string as well, and `dbname` there outranks the path. Measured —
+    the query string as well, and `dbname` there outranks the path. Measured -
 
         postgresql://host:5432/mydb?dbname=other  ->  libpq connects to other
 
@@ -719,7 +719,7 @@ def postgres_url_for_database(base_url: str, name: str) -> str:
     """`base_url`, pointed at a different database.
 
     The path is replaced *and* any `dbname` argument dropped, because leaving
-    it would outrank the path — the URL would name the worker's database and
+    it would outrank the path - the URL would name the worker's database and
     connect to the caller's, which every worker would then truncate before
     every test.
     """
@@ -749,7 +749,7 @@ def create_worker_database(base_url: str, worker: str, run: str, *, prepared: bo
     reason this is not one line:
 
     * `TEST_SCHEMA_PREPARED` means something outside this suite already built
-      the schema — CI runs `scripts/migrate.sh` and then sets it, precisely so
+      the schema - CI runs `scripts/migrate.sh` and then sets it, precisely so
       that conftest cannot quietly repair a deploy command that does nothing.
       A worker must therefore *clone* that database rather than build its own,
       or the invariant is lost the moment the suite runs in parallel: gut

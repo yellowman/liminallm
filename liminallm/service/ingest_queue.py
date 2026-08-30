@@ -5,7 +5,7 @@ halves are load-bearing, and they pull in opposite directions at the moment of
 replacement:
 
 * the old chunks describe bytes that no longer exist, so they must stop
-  answering searches immediately — an index quoting a file that has moved on
+  answering searches immediately - an index quoting a file that has moved on
   is worse than an index missing it;
 * the contexts that cover the path keep covering it, so each of them owes the
   file a re-read.
@@ -24,8 +24,8 @@ anything the job re-reads the file and compares, so a job queued for an older
 generation declines rather than reinstating it over a newer one.
 
 The publication lock is the same `service.fs.path_lock` the upload takes, on
-the same key. A worker that cannot get it is not failing — another publication
-of that name is in progress, and it will queue its own job — so the worker
+the same key. A worker that cannot get it is not failing - another publication
+of that name is in progress, and it will queue its own job - so the worker
 stands aside without spending an attempt.
 """
 
@@ -89,7 +89,7 @@ def generation_of(path: Path) -> Optional[str]:
     None means the file is not there. Every other read error is raised, and
     the caller retries: "the file was deleted" and "the disk was briefly
     unavailable" look identical to a bare `except OSError` and call for
-    opposite responses — one job is finished, the other is owed another go.
+    opposite responses - one job is finished, the other is owed another go.
     """
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -119,7 +119,7 @@ def run_job(
     """Re-index one path into one context. Returns the chunks written.
 
     None means the job was not attempted, because another publication of that
-    name holds the lock. That is not zero chunks written — a drain that
+    name holds the lock. That is not zero chunks written - a drain that
     treated the two alike would loop against a contended path until the job's
     budget ran out.
     """
@@ -127,7 +127,7 @@ def run_job(
     path = Path(str(job["fs_path"]))
 
     # This function is not a caller of `ingest_path`, so it inherits none of
-    # that walk's refusals — it calls `rag.ingest_file` directly. The queue is
+    # that walk's refusals - it calls `rag.ingest_file` directly. The queue is
     # the durable machinery a replacement actually runs through, so an
     # internal path reaching `ingest_job` would be chunked on a schedule, long
     # after whoever created it stopped watching.
@@ -135,7 +135,7 @@ def run_job(
     # Closed rather than failed: nothing is owed now or later, and a failure
     # would be re-attempted five times to reach the same conclusion. Measured
     # against `fs_root` for the same reason a source is measured against its
-    # base — the absolute path carries the deployment's own spelling.
+    # base - the absolute path carries the deployment's own spelling.
     if is_internal_under(fs_root, path):
         store.finish_ingest_job(
             job_id, "superseded", detail="internal path is not corpus"
@@ -201,7 +201,7 @@ def _reindex_under_lock(
     try:
         # One statement, not two. `ingest_file` commits through
         # `_commit_generation`, which replaces everything the context says
-        # about this path in a single transaction — so there is no moment
+        # about this path in a single transaction - so there is no moment
         # where the path has neither the old chunks nor the new.
         written = rag.ingest_file(context_id, fs_path, chunk_size=chunk_size)
     except Exception as exc:

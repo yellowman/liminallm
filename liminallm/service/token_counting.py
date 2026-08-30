@@ -8,11 +8,11 @@ different content: CJK and code undercount badly, ordinary prose overcounts.
 The fix deliberately avoids depending on a vendor tokenizer library:
 
 - **exact when we own the tokenizer.** local_gpu_lora already has the
-  checkpoint's HF tokenizer resident — exact, offline, free.
+  checkpoint's HF tokenizer resident - exact, offline, free.
 - **calibrated from ground truth otherwise.** every provider returns
   ``usage.prompt_tokens`` for the prompt we just sent. Feeding that back
   (``observe``) gives a per-model correction factor that converges on the
-  real tokenizer's behavior for the traffic this deployment actually sends —
+  real tokenizer's behavior for the traffic this deployment actually sends -
   and it works for Gemini, Claude, GLM, and anything else, none of which
   tiktoken can count anyway.
 - **tiktoken only if it is already installed and its data is local.** It is
@@ -75,7 +75,7 @@ def _tiktoken_encoding_name(model: str) -> Optional[str]:
 class TokenCounter:
     """Counts tokens for one model, resolving the best available method once.
 
-    ``method`` is "hf:<model>", "tiktoken:<encoding>", or "heuristic" —
+    ``method`` is "hf:<model>", "tiktoken:<encoding>", or "heuristic" -
     worth logging, since a deployment on the heuristic is one whose budget
     math is calibrated rather than exact.
     """
@@ -90,7 +90,7 @@ class TokenCounter:
         self._resolve(tokenizer)
 
     def _resolve(self, tokenizer: Any) -> None:
-        # A live tokenizer object (local checkpoint) is exact and offline —
+        # A live tokenizer object (local checkpoint) is exact and offline -
         # strictly better than any vendor library guess.
         if tokenizer is not None and callable(getattr(tokenizer, "encode", None)):
             try:

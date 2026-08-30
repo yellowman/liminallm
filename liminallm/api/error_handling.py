@@ -43,7 +43,7 @@ def _error_response(
 
     This is the one place an error leaves the process, so it is where the
     sanitizers belong. `message` is often `str(exc)` and `details` is often
-    machine-built — a regex from a blocklist, a resolved filesystem path, a
+    machine-built - a regex from a blocklist, a resolved filesystem path, a
     driver's exception text. Both get scrubbed here rather than at each of
     the several dozen raise sites, which is the only way it stays true.
     """

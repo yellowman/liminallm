@@ -1,7 +1,7 @@
 """SPEC §5.0.1: the gate activates first and modulates second.
 
 `g = clamp(g_router, 0, 1)`. `g == 0` means the adapter is absent from the
-request — from every mechanism, not just the one whose equation happens to
+request - from every mechanism, not just the one whose equation happens to
 name `g`. Before this rule was written down, three surfaces disagreed:
 composition dropped the zero-gated term, prompt injection never read the gate
 at all, and the KV signature hashed an adapter contributing nothing.
@@ -82,7 +82,7 @@ class TestTheGateIsClampedBeforeItIsRead:
 
     def test_the_effective_set_carries_the_canonical_magnitude(self):
         """Membership is half the answer. A consumer that reads the adapter's
-        weight must read the same number composition scales by — otherwise it
+        weight must read the same number composition scales by - otherwise it
         re-derives it, and re-derivation is what sent a provider 5.0 for an
         adapter already clamped to 1.0."""
         adapters = [
@@ -172,7 +172,7 @@ class TestRemotePassthroughAndAccounting:
     def test_a_closed_gate_is_absent_rather_than_dropped(self):
         """`dropped` records an adapter the backend could not honour. A
         zero-gated adapter was never asked for, so it belongs in neither
-        list — reporting it as applied would claim it affected the answer."""
+        list - reporting it as applied would claim it affected the answer."""
         processed = self._api()._process_adapters_for_provider(
             [{**PROMPT_ADAPTER, "weight": 0.0}]
         )
@@ -211,7 +211,7 @@ class TestRemotePassthroughAndAccounting:
         The formatter used to re-read the raw dict, so it sent 5.0 for an
         adapter the kernel clamps to 1.0, sent 1.0 for one whose gate lived in
         `schema.weight`, and raised on a weight the canonical rule reads as
-        1.0 — a malformed number became a failed request rather than a
+        1.0 - a malformed number became a failed request rather than a
         defaulted one.
         """
         adapter = {
@@ -243,7 +243,7 @@ class TestRemotePassthroughAndAccounting:
     def test_gemini_native_agrees(self):
         """Accounting only. This used to assert the backend returned the
         instruction text, which is the second-materializer contract §5.0.1
-        replaced — `_request_body` then prepended it on top of the copy
+        replaced - `_request_body` then prepended it on top of the copy
         LLMService had already placed."""
         from liminallm.service.gemini_backend import GeminiBackend
 
@@ -342,7 +342,7 @@ class TestTheEffectiveStackHashesTheSame:
         self, tmp_path, checkpoint
     ):
         """§5.3 keys cached KV by the effective stack. `[X @ 0]` and `[]` are
-        the same effective model, so they must be the same key — hashing the
+        the same effective model, so they must be the same key - hashing the
         zero-gated adapter cost a legitimate reuse on every turn where the
         router happened to close a gate."""
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
@@ -357,9 +357,9 @@ class TestTheEffectiveStackHashesTheSame:
 
     def test_the_key_names_the_mechanisms_that_ran(self, tmp_path, checkpoint):
         """§5.3 keys cached KV by the *effective* stack, and on this backend
-        the mechanism is weights. An adapter that applies none — nothing
+        the mechanism is weights. An adapter that applies none - nothing
         promoted, or a prompt rung whose text is already in the tokens the
-        key covers — describes the same local model as no adapter at all, so
+        key covers - describes the same local model as no adapter at all, so
         it must not key apart from it. Safe either way (a mismatch only costs
         a reuse), but one definition of "effective" is the point."""
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
@@ -391,7 +391,7 @@ class TestTheEffectiveStackHashesTheSame:
         only from the LoRA sum and the cache key.
 
         The backend applied no weights and hashed as the base model, then
-        returned `usage.adapter_id == "X"` — a turn that claimed an adapter
+        returned `usage.adapter_id == "X"` - a turn that claimed an adapter
         shaped an answer it had no part in. `generate()` canonicalizes the
         list at its own entry now, so this holds for a direct call and not
         only downstream of LLMService.
@@ -425,7 +425,7 @@ class TestTheEffectiveStackHashesTheSame:
         closed = backend.generate(messages, [{**adapter, "weight": 0.0}], user_id="u")
         assert closed["usage"].get("adapter_id") is None
 
-        # Control: the same adapter, open, is reported — so the absence above
+        # Control: the same adapter, open, is reported - so the absence above
         # is the gate and not a backend that never reports anything.
         open_ = backend.generate(messages, [{**adapter, "weight": 1.0}], user_id="u")
         assert open_["usage"].get("adapter_id") == "X"
@@ -437,7 +437,7 @@ class TestTheEffectiveStackHashesTheSame:
         so an absent adapter could still reconfigure tokenization.
 
         Both adapters here are promoted, because vocabulary is weight-specific
-        state and §5.5 only lets a promoted adapter carry weights — an
+        state and §5.5 only lets a promoted adapter carry weights - an
         unpromoted one applies no mechanism and so has no say either.
         """
         config = __import__(

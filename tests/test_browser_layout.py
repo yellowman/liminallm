@@ -4,8 +4,8 @@ The main navigation lives inside a fixed-height top bar, so it must never
 wrap: a second line has nowhere to go and overlaps the bar's own border. The
 conversation title shares a row with the thread controls on a desktop width,
 which is what stopped that row costing the chat column twice. Neither
-property is observable without a real layout engine — they are about wrapping
-and overflow, which only a browser computes — so they live in the browser
+property is observable without a real layout engine - they are about wrapping
+and overflow, which only a browser computes - so they live in the browser
 lane.
 
 A stale `flex-wrap: wrap` override survived the move into the top bar and

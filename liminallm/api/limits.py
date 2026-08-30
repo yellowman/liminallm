@@ -1,7 +1,7 @@
 """Named rate-limit policies.
 
 An endpoint names a policy instead of restating the settings lookup, the window
-and the key format — six lines that appeared fifty-seven times, and which an
+and the key format - six lines that appeared fifty-seven times, and which an
 endpoint therefore got written without. Naming them also makes "unlimited" a
 visible choice; seventeen routes were unlimited by omission.
 """
@@ -90,7 +90,7 @@ async def rate_limit(
     response: Optional[Response] = None,
     cost: int = 1,
 ) -> RateLimitInfo:
-    """Apply a named policy to a subject — usually principal.user_id, but an
+    """Apply a named policy to a subject - usually principal.user_id, but an
     email for signup and an address for anonymous flows."""
     limit_attr, window = RATE_POLICIES[policy]
     window_seconds = (
@@ -117,7 +117,7 @@ async def enforce(
 ) -> RateLimitInfo:
     """Consume ``cost`` against ``key``, raising 429 when the bucket is empty."""
     # limit <= 0 means "disabled/unlimited" per the admin-settings contract, and
-    # check_rate_limit() honors that. Do NOT clamp to 1 here — that would turn
+    # check_rate_limit() honors that. Do NOT clamp to 1 here - that would turn
     # an operator's "unlimited" into the strictest possible limit.
     if window_seconds <= 0:
         logger.warning(

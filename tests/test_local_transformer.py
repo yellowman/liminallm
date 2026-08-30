@@ -2,18 +2,18 @@
 
 The model here is small (2 layers, hidden 32, vocab 64) but it is not a
 stub: real safetensors on disk, real config.json, the same loader and the
-same forward pass production uses. That is the point — a hand-made stand-in
+same forward pass production uses. That is the point - a hand-made stand-in
 would encode what I believe the forward pass does, and the bugs worth
 catching live exactly in the gap between that belief and the arithmetic.
 
 What is pinned here, and why each one:
 
-* cached decode == full recompute — a KV cache that drifts degrades answers
+* cached decode == full recompute - a KV cache that drifts degrades answers
   silently, the longer the conversation the worse.
-* causality — a mask off by one makes the model see its own future.
-* LoRA at B=0 is the identity — that is how every adapter initializes, so a
+* causality - a mask off by one makes the model see its own future.
+* LoRA at B=0 is the identity - that is how every adapter initializes, so a
   fresh adapter changing logits means the adapter maths is wrong.
-* cold generation == warm generation — the prefix cache must be a speedup
+* cold generation == warm generation - the prefix cache must be a speedup
   and nothing else. If reuse changed a single token it would be a
   correctness bug wearing a performance costume.
 """
@@ -24,8 +24,8 @@ import pytest
 
 from liminallm.service import transformer
 
-# Every test in this module runs the real thing — training steps, a forward
-# pass, an eval gate — so it is measured in seconds rather than milliseconds.
+# Every test in this module runs the real thing - training steps, a forward
+# pass, an eval gate - so it is measured in seconds rather than milliseconds.
 # `make test-fast` skips these; `make test` and the pre-commit gate do not,
 # because what they exercise is not covered anywhere else.
 pytestmark = pytest.mark.slow
@@ -34,8 +34,8 @@ pytestmark = pytest.mark.slow
 # `numpy` guarded alongside `jax` rather than imported plainly above, for the
 # same reason the two below are: it is in the `train` extra, and the only CI
 # lane that installs it does so by naming `jax` on a `pip install` line.
-# Imported at module scope it took down the browser lane — whose install set
-# is the narrowest in CI — at collection, which deselects nothing because
+# Imported at module scope it took down the browser lane - whose install set
+# is the narrowest in CI - at collection, which deselects nothing because
 # collection never finishes. The same defect as the undeclared `httpx`: a
 # module-scope import satisfied by somebody else's requirement.
 np = pytest.importorskip("numpy")
@@ -277,7 +277,7 @@ class TestLoRA:
 
     def test_foreign_matrix_names_do_not_half_apply(self, loaded):
         """An adapter trained for another architecture must not partially
-        land — it reports nothing matched instead."""
+        land - it reports nothing matched instead."""
         config, _ = loaded
         assert (
             transformer.lora_by_layer(
@@ -305,7 +305,7 @@ class TestLocalBackendGeneration:
         assert usage["prompt_tokens"] > 0
         assert usage["completion_tokens"] == 6
         assert usage["total_tokens"] == usage["prompt_tokens"] + 6
-        # Nothing cached on the first turn — the number must be earned.
+        # Nothing cached on the first turn - the number must be earned.
         assert "cached_tokens" not in usage
 
     def test_continuation_reuses_the_prefix_and_reports_it(self, checkpoint):
@@ -348,7 +348,7 @@ class TestLocalBackendGeneration:
 
     def test_repeated_prompt_leaves_a_token_to_run(self, checkpoint):
         """A fully cached prompt still needs one token forward to produce
-        logits — otherwise there is nothing to sample from."""
+        logits - otherwise there is nothing to sample from."""
         backend = self._backend(checkpoint)
         messages = [{"role": "user", "content": "identical prompt"}]
         backend.generate(messages, [])

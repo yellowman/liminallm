@@ -14,8 +14,8 @@ Lee, ICLR 2026, *On the Theoretical Limitations of Embedding-Based
 Retrieval*).
 
 That is a floor, and a loose one. Optimizing the vectors directly against
-the test set — no language model, no generalization, the best case that can
-exist — the same work measures a *critical-n* per dimension: 10 documents at
+the test set - no language model, no generalization, the best case that can
+exist - the same work measures a *critical-n* per dimension: 10 documents at
 `d=4`, 99 at `d=18`, extrapolating to ~500k at 512, ~4m at 1024, ~250m at
 4096. Real encoders land far below their own floor: the 46-document probe
 below is solvable in 12 free dimensions, and real models at 64 dimensions
@@ -23,8 +23,8 @@ still cannot solve it.
 
 ## what that looks like in practice
 
-The paper's LIMIT probe is deliberately trivial — documents like "Jon likes
-quokkas and apples", queries like "who likes quokkas?" — and it breaks
+The paper's LIMIT probe is deliberately trivial - documents like "Jon likes
+quokkas and apples", queries like "who likes quokkas?" - and it breaks
 state-of-the-art embedders:
 
 | | recall@2, 46 docs | recall@2, 50k docs |
@@ -37,7 +37,7 @@ state-of-the-art embedders:
 Two results matter more than the ranking:
 
 - **It is not domain shift.** Fine-tuning on in-domain training data moves
-  recall@10 from ~0 to 2.8, while training on the test set solves it — the
+  recall@10 from ~0 to 2.8, while training on the test set solves it - the
   task is representationally hard, not unfamiliar.
 - **Lexical is not the answer either.** Rewriting the same corpus with
   synonyms drops BM25 by ~89% (97.8 → 10.6) while the dense models hold,
@@ -52,18 +52,18 @@ this failure, so "we use a good embedding model" is not a mitigation.
 ## why fusion is by rank, never by score
 
 - Cosine is bounded and BM25 is not, and BM25's magnitude depends on the
-  pool it was scored against — so any weighted sum needs a normalizer, and
+  pool it was scored against - so any weighted sum needs a normalizer, and
   every normalizer moves with the pool. The same chunk would score
   differently depending on what it was ranked beside.
 - Rank fusion expresses something a weighted sum cannot: a chunk **both**
   channels rank well beats one that only a single channel loves. Under a
   fixed-weight sum, a perfect cosine always beats a perfect BM25 and the
-  lexical channel can never win a head-to-head — which the table above says
+  lexical channel can never win a head-to-head - which the table above says
   is exactly backwards.
 - A channel ranks only what it matched. Zero is silence, not a weak opinion:
   an arbitrary order over non-matches would otherwise carry the channel's
   full weight. This is also why an un-embedded turn in conversation recall
-  is *absent* from the semantic channel rather than scored zero by it — the
+  is *absent* from the semantic channel rather than scored zero by it - the
   weighted-sum predecessor had to hold the zero against it.
 
 The weighted sums that preceded rank fusion disagreed with the rule and
@@ -73,30 +73,30 @@ precedence, and recall scored un-embedded turns as literal zeros.
 ## why the reranker exists, and why `auto` distrusts small models
 
 In the paper's own test, a long-context reranker solved all 1000 of the
-46-document queries where the best embedder stayed under 60 — it is the only
+46-document queries where the best embedder stayed under 60 - it is the only
 stage that escapes both ceilings and the only one that can answer "none of
 these". But that result is a frontier long-context model; this project's
 premise is small self-hosted models, the case the paper never tested, and
 the stage can *drop* context. So it is conditional (`rag_rerank = auto`),
 and `auto` asks for positive evidence of capability (curated family
-prefixes, declared parameter count ≥30B), with unknown as a no — a model
+prefixes, declared parameter count ≥30B), with unknown as a no - a model
 given the benefit of the doubt here can silently drop a user's grounding.
 
 The capability test matches small-variant names (`mini`, `nano`, `lite`) as
-whole name parts, never substrings — `mini` lives inside `gemini` — and a
+whole name parts, never substrings - `mini` lives inside `gemini` - and a
 size the name declares beats family membership in both directions, so
 `gemini-2.0-flash-8b` is refused on its stated size rather than admitted on
 its prefix.
 
 ## where this system is most exposed
 
-The paper's difficulty metric is qrel graph density — how often one document
+The paper's difficulty metric is qrel graph density - how often one document
 is relevant to many queries, and how much queries share documents. LIMIT
 scores 0.085 density / 28.5 average query strength against ≤0.026 / ≤0.6
 for NQ, HotpotQA, SciFact and FollowIR. The parts of this system at the
 hard end of that scale are the notes vault and the witness (SPEC §19),
 where the task *is* relating documents to each other and a hub note is
-relevant to many questions — not chat RAG over a handful of uploaded files,
+relevant to many questions - not chat RAG over a handful of uploaded files,
 which sits at the easy end.
 
 ## late interaction, measured caveats
@@ -120,7 +120,7 @@ Two measured implementation notes that shaped the SPEC's rules:
 
 - MaxSim normalizes once per vector and compares by dot product. A general
   cosine per pair re-derived both norms, copied both vectors and rescanned
-  them for NaN on every (query × segment × candidate) comparison — 0.44s
+  them for NaN on every (query × segment × candidate) comparison - 0.44s
   per retrieval at the shipped defaults and 2s at the candidate cap, on a
   request thread, before the answering model was called. Same arithmetic,
   6× less of it.

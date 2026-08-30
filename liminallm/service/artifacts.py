@@ -27,7 +27,7 @@ once and kept forever.
 
 The delay is measured from a durable record written in the same transaction
 as the deletion, not from anything on disk. A payload's own timestamps answer
-a different question — an adapter trained a week ago and deleted a moment ago
+a different question - an adapter trained a week ago and deleted a moment ago
 is a week old by that measure, and the first version of this sweep collected
 it immediately, putting the race straight back. "Retired at T" has to mean
 "the capability stopped existing at T".
@@ -38,7 +38,7 @@ clear the record once the bytes are gone.
 
 The sweep also enrols what nothing enrolled for it. A ledger only collects
 what something puts in it, and `create_artifact` writes its payload before
-publishing the row — so a failed publication leaves a directory no artifact
+publishing the row - so a failed publication leaves a directory no artifact
 ever named, with no deletion to trigger enrolment. Those are recorded at
 first observation rather than removed on sight, which keeps discovery without
 bringing back a clock that means the wrong thing.

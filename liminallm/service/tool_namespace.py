@@ -2,7 +2,7 @@
 
 Pure, and shared by both altitudes on purpose. Admission cannot instantiate a
 `WorkflowEngine` to ask what is executable, and the engine must not keep a
-second copy of the answer — two lists of "executable" is the failure this
+second copy of the answer - two lists of "executable" is the failure this
 tranche exists to remove, not one to introduce.
 
 The executable set really is split in two. Some tool bodies run in the worker
@@ -13,7 +13,7 @@ reference is executable if it reaches either.
 Resolution scope is the other half. A tool reference is resolved in the
 *workflow's* namespace, not the runner's: a published workflow that resolved
 `foo` differently for each caller would name a different capability for each
-of them. Measured before this existed — a global `foo` handled by
+of them. Measured before this existed - a global `foo` handled by
 `llm.generic` and Bob's private `foo` handled by `agent.code_v1` gave Bob a
 different body for the same shared workflow.
 """
@@ -43,7 +43,7 @@ HOST_TOOL_HANDLER_NAMES = frozenset({
 EXECUTABLE_HANDLER_NAMES = frozenset(tool_worker.BODY_NAMES) | HOST_TOOL_HANDLER_NAMES
 
 #: Handlers the streaming path can produce tokens for. Compared against the
-#: *resolved* handler, never against the reference spelling — comparing the
+#: *resolved* handler, never against the reference spelling - comparing the
 #: spelling let a tenant-shared override of the name `llm.generic` stream the
 #: model while the blocking path ran the override's real body, so the `stream`
 #: flag chose the capability.
@@ -88,7 +88,7 @@ class ToolResolutionScope:
 
 
 #: The namespace for workflows the system synthesises for itself. They are not
-#: artifacts, so they have no publisher and no tenant — the global namespace is
+#: artifacts, so they have no publisher and no tenant - the global namespace is
 #: the only one they can mean.
 SYSTEM_SCOPE = ToolResolutionScope(visibility="global")
 
@@ -118,7 +118,7 @@ def resolve_executable_handler(
 
     A persisted spec's `handler` is authoritative. `_resolve_worker_tool` used
     to check `tool_name in BODY_NAMES` *first*, so a spec named
-    `notes.search_v1` with handler `llm.generic` ran the notes body — the
+    `notes.search_v1` with handler `llm.generic` ran the notes body - the
     reference's spelling beat the row that was actually resolved, and
     admission had approved the other one.
 
@@ -138,7 +138,7 @@ class ToolDescriptor:
     `artifact_id`/`owner_user_id`/`owner_role` are read from the persisted
     artifact row. SPEC §18 makes `privileged:true` a property of an
     *admin-owned artifact*, so the authority cannot be read out of the spec
-    the caller supplied — a `privileged: true` key is only a claim until an
+    the caller supplied - a `privileged: true` key is only a claim until an
     admin-owned row is standing behind it.
 
     A seeded system tool is ownerless by design, so it resolves and is never

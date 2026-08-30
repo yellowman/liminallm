@@ -3,17 +3,17 @@
 Each of these passed review at the level of "the mechanism is right" and
 failed at the level of "the rule holds everywhere it is written":
 
-* §5.2 — a malformed adapter must not partially apply. Refusing the pairs
+* §5.2 - a malformed adapter must not partially apply. Refusing the pairs
   and dimensions still let a *foreign name* through, because assembly
   skipped what it did not recognize and applied the rest.
-* §5.0.1 — a hybrid adapter is weights on a local backend, prompt on an API
+* §5.0.1 - a hybrid adapter is weights on a local backend, prompt on an API
   one. Injecting both gave the model an input the eval gate never scored.
-* §5.4.2 — the prompt ends at the target's sequence. Searching a 200-message
+* §5.4.2 - the prompt ends at the target's sequence. Searching a 200-message
   window for the target silently disabled the bound whenever the target was
   older than the window.
-* §5.1 — one local representation. Serving still appended its own
+* §5.1 - one local representation. Serving still appended its own
   ``Context:`` marker inside the user turn.
-* §5.5 — version authority over path shape. A direct ``params.json`` path
+* §5.5 - version authority over path shape. A direct ``params.json`` path
   short-circuited the promotion check entirely.
 """
 
@@ -38,7 +38,7 @@ BASE = ""
 """The serving base identity these fixtures' adapters declare.
 
 SPEC §5.1 ties LoRA weights to one frozen base, so serving refuses an adapter
-that does not declare the base it is being applied to — a fixture without one
+that does not declare the base it is being applied to - a fixture without one
 describes an adapter the artifact schema could not store either.
 """
 
@@ -46,7 +46,7 @@ describes an adapter the artifact schema could not store either.
 @pytest.fixture(scope="module", autouse=True)
 def checkpoint(tmp_path_factory):
     """autouse so BASE is set before any test in the module reads it, whatever
-    order they run in — an unset BASE would refuse weights for the wrong
+    order they run in - an unset BASE would refuse weights for the wrong
     reason."""
     global BASE
     directory = _build_checkpoint(tmp_path_factory.mktemp("contract_model"))
@@ -252,7 +252,7 @@ class TestVersionAuthorityOverPathShape:
     ):
         """A bare params.json cannot demonstrate which version it is.
 
-        This test previously asserted the opposite for a positive version —
+        This test previously asserted the opposite for a positive version -
         it blessed a file being served as "version 1" on nothing but the
         artifact's say-so, which is the escape hatch §5.5's version authority
         exists to close. It then allowed a never-versioned artifact to use a

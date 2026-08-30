@@ -78,8 +78,8 @@ def _detokenize(tokens: List[str]) -> str:
 def _internal_source(path: Path, allowed_base) -> bool:
     """Whether a named ingestion source is bookkeeping rather than content.
 
-    Both production callers pass a base — the archive extractor its
-    destination's `files/`, the context-source route the shared root — so the
+    Both production callers pass a base - the archive extractor its
+    destination's `files/`, the context-source route the shared root - so the
     strong form is what actually runs. With no base there is no namespace to
     measure position against, and the basename is the most that can honestly
     be asked.
@@ -96,7 +96,7 @@ def _within_source(candidate: Path, root: Path) -> bool:
 
     The link test answers what a directory listing can see. The
     resolved-containment test catches a path reaching outside through a
-    component the listing did not name — `glob` does not descend into a
+    component the listing did not name - `glob` does not descend into a
     symlinked directory today, and that is a property of the Python version
     rather than of this code, so the test does not rely on it.
 
@@ -106,7 +106,7 @@ def _within_source(candidate: Path, root: Path) -> bool:
     other tests. `st_nlink` is the only signal available, and
     refusing a linked file matches what the archive extractor already does
     with hardlinked members. A legitimate file with a second link elsewhere is
-    skipped as a consequence, which is the safe direction here — the reader
+    skipped as a consequence, which is the safe direction here - the reader
     cannot tell the two apart, and the content is somebody's either way.
     """
     try:
@@ -126,7 +126,7 @@ class RAGService:
 
     Retrieval runs two channels and fuses them: dense for meaning, lexical for
     the exact word. Neither is sound alone. A single vector of dimension d
-    cannot express every top-k set of documents a query might ask for — that
+    cannot express every top-k set of documents a query might ask for - that
     ceiling is geometric, so no encoder or training set removes it, and a
     dense-only ranking has no second opinion when it hits one. Keywords fail
     the opposite way, on anything the user phrased differently.
@@ -153,7 +153,7 @@ class RAGService:
         self.embed = embed
         # One round trip per chunk instead of one per segment. Falls back to
         # the single encoder so a caller that supplies only ``embed`` still
-        # works — just slowly, which is the pre-existing behaviour.
+        # works - just slowly, which is the pre-existing behaviour.
         self.embed_many = embed_many or (
             lambda texts: [embed(text) for text in texts]
         )
@@ -166,7 +166,7 @@ class RAGService:
         # model does the reranking, or whether one does at all. The runtime's
         # reranker decides per call and reports a budget of zero when the
         # operator has it off, so nothing here has to be rebuilt to turn it
-        # on — and nothing here has to know that.
+        # on - and nothing here has to know that.
         self.rerank = rerank
         # Late interaction needs a real encoder for the same reason the dense
         # channel does: MaxSim over hash vectors is noise with extra steps.
@@ -175,7 +175,7 @@ class RAGService:
         # another name, so a caller that enabled the feature without naming a
         # segment count would index nothing at all and never be told.
         self.late_segments = max(2, late_segments)
-        # Set when segment indexing fails structurally — a missing table, a
+        # Set when segment indexing fails structurally - a missing table, a
         # width mismatch. Nothing clears it, because nothing that would fix
         # those leaves this object standing.
         self._segment_index_broken = False
@@ -379,8 +379,8 @@ class RAGService:
         # The encoder filter belongs to the vector channels and only to them:
         # it exists so a query vector is never compared against a chunk from a
         # different encoder. Keyword search compares no vectors, and gating it
-        # on encoder identity meant that changing embedding_model_id — a
-        # managed setting an admin can flip — made every stored chunk invisible
+        # on encoder identity meant that changing embedding_model_id - a
+        # managed setting an admin can flip - made every stored chunk invisible
         # to BM25 as well, so retrieval returned nothing at all for an exact
         # filename or error code until the whole corpus was re-ingested by
         # hand. There is no backfill job (SPEC §2.5), so "until" was forever.
@@ -505,8 +505,8 @@ class RAGService:
         scored exactly against *all* of their segments. Approximate search
         decides who is considered; it never decides the order.
         """
-        # A share each, not first-come. The pool has to be bounded — MaxSim
-        # below is pure Python over every segment of every candidate — but a
+        # A share each, not first-come. The pool has to be bounded - MaxSim
+        # below is pure Python over every segment of every candidate - but a
         # single overall cap is spent by the first vector before any other is
         # consulted, and the first vector is the whole query. That collapses
         # candidate generation back to single-vector recall, which is the one
@@ -548,7 +548,7 @@ class RAGService:
 
         Wide enough that a chunk one channel buries but the other would rank
         first still survives to fusion, and never narrower than what the
-        reranker is willing to read — a reranker handed exactly the chunks
+        reranker is willing to read - a reranker handed exactly the chunks
         that were going to be returned anyway can only reorder them.
         """
         appetite = int(getattr(self.rerank, "max_candidates", 0) or 0)
@@ -574,13 +574,13 @@ class RAGService:
         The lexical pool arrives ordered by ``ts_rank``, which was only ever a
         recall filter; it is reordered here by real BM25 before fusion. That
         BM25 scores against the pool rather than the whole corpus, so its IDF
-        is an approximation — sound for ordering a shortlist, which is all it
+        is an approximation - sound for ordering a shortlist, which is all it
         does, since the corpus-wide decision was already made by the SQL.
 
         The dense and late pools keep the order they arrived in: nearest and
         MaxSim are what those channels mean, and re-scoring here would say
         nothing new. When late interaction has something to say, the pooled
-        vector steps back to a lower weight — it is the same signal read less
+        vector steps back to a lower weight - it is the same signal read less
         precisely, so it should not vote twice at full strength.
         """
         chunks: Dict[object, KnowledgeChunk] = {}
@@ -594,7 +594,7 @@ class RAGService:
             # Membership of this pool is itself the match signal: the store's
             # own full-text query selected every member, so BM25 may order the
             # pool but must not empty it. Dropping its zeros deleted answers
-            # the store had found — Postgres indexes "user_id" as 'user' +
+            # the store had found - Postgres indexes "user_id" as 'user' +
             # 'id' while this tokenizer keeps it whole, so a query of
             # "user id" scored a matching chunk 0.0, and with the hash encoder
             # retrieval returned nothing for a question the corpus answers.
@@ -617,7 +617,7 @@ class RAGService:
             # actually ranked. Weighting the whole channel down because *some
             # other* chunk had segments demoted a chunk from 0.55 to 0.25 on
             # its neighbours' behalf, with no late contribution to make up the
-            # difference — buried by the arrival of a feature that had nothing
+            # difference - buried by the arrival of a feature that had nothing
             # to say about it.
             late_keys = {self._chunk_key(chunk) for chunk in late}
             covered = [
@@ -757,7 +757,7 @@ class RAGService:
         last ones. Empty input and an extractor refusal both arrive here.
 
         The cost: a re-scan whose extraction fails transiently drops that
-        path from retrieval until the next ingest. Recoverable, and logged —
+        path from retrieval until the next ingest. Recoverable, and logged -
         where an index answering with text the file no longer holds is not.
 
         `inline` text has no path to be a generation of, so it is added.
@@ -777,7 +777,7 @@ class RAGService:
         Best effort on purpose: this is an extra index over content that is
         already ingested and already retrievable. If the encoder fails here,
         the chunk keeps its pooled vector and its text, and the late channel
-        simply has nothing to say about it — which the fusion already treats
+        simply has nothing to say about it - which the fusion already treats
         as silence rather than as a bad score.
         """
         if not self.late_interaction or self._segment_index_broken:
@@ -804,8 +804,8 @@ class RAGService:
                 # that in fact succeeded, and the retry would duplicate it.
                 #
                 # And stop, latched for this service's life rather than for
-                # this call: these failures are structural — a missing
-                # table, a width mismatch — and `ingest_path` walks a tree
+                # this call: these failures are structural - a missing
+                # table, a width mismatch - and `ingest_path` walks a tree
                 # one file at a time, so a per-call stop still pays for
                 # `segments x chunks` embeddings and logs an identical
                 # warning once per file. Changing the setting rebuilds the
@@ -838,8 +838,8 @@ class RAGService:
 
         `source_identity` is what the resulting chunks claim to be the
         contents of, when that differs from where the bytes were read. One
-        object can be read two ways — the same bytes attached as `.pdf` and
-        as `.md` — and keying the index by the object made the second reading
+        object can be read two ways - the same bytes attached as `.pdf` and
+        as `.md` - and keying the index by the object made the second reading
         replace the first.
         """
         identity = source_identity or path
@@ -969,7 +969,7 @@ class RAGService:
         #
         # Measured against the base it was authorized within, because that is
         # the only frame where "internal" means anything. `path.name` is not
-        # enough — `bundle/.internal/secret.md` has an ordinary basename and
+        # enough - `bundle/.internal/secret.md` has an ordinary basename and
         # an internal position, and is refused when the same walk reaches it
         # from `files/`.
         if _internal_source(path, allowed_base):
@@ -986,8 +986,8 @@ class RAGService:
                 # unreadable document does not abandon a whole tree; failing
                 # to take the serialization primitive is not that, and
                 # swallowing it turned a source that never got its lock into
-                # a 201 with zero chunks, with the route's own 409 handler —
-                # the one that removes the source record — unreachable.
+                # a 201 with zero chunks, with the route's own 409 handler -
+                # the one that removes the source record - unreachable.
                 with (file_guard(path) if file_guard else nullcontext()):
                     try:
                         total_chunks += self.ingest_file(
@@ -1013,7 +1013,7 @@ class RAGService:
         # than the authority `authorize_path` just established. Descendants
         # were never checked against anything: `glob` yields a link and
         # `is_file()` follows it, so a link inside an authorized directory
-        # reads whatever it points at — another user's upload, or a file
+        # reads whatever it points at - another user's upload, or a file
         # outside `shared_fs_root` entirely.
         #
         # §18 makes authority the caller's own area or an artifact covering a

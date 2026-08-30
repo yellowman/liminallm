@@ -2,7 +2,7 @@
 
 A tool call is not one attempt. A node times out, retries, and times out
 again; the same logical execution has now run three times. What has to survive
-those attempts is not the process — the whole point is that the process dies —
+those attempts is not the process - the whole point is that the process dies -
 but the record of which effects already landed, and a grip on everything the
 execution started.
 
@@ -25,7 +25,7 @@ answers "which step of this execution is this", which is what a replay needs.
 `InvocationRegistry` holds the live executions, and an engine owns one. It is
 deliberately not a module global: hot reload replaces the engine while
 in-flight work finishes, and a global would have an old attempt asking the new
-engine about an execution it never opened — a refusal indistinguishable from a
+engine about an execution it never opened - a refusal indistinguishable from a
 real revocation. Entries are opened once and closed once, on every terminal
 path including revocation. A map that leaks entries is the same defect as one
 that drops them early, told backwards.
@@ -90,7 +90,7 @@ class LeaseRevoked(RuntimeError):
 class RetryDivergence(RuntimeError):
     """A retry asked for a different durable operation at a taken position.
 
-    Not an error in the model's behaviour — a replacement worker may legally
+    Not an error in the model's behaviour - a replacement worker may legally
     choose differently. It is an error to answer the new request with the old
     request's result, because the earlier mutation already happened and cannot
     be un-done by renaming it.
@@ -104,7 +104,7 @@ def payload_hash(payload: Any) -> str:
     payloads hash differently. Values JSON cannot carry degrade to their repr
     rather than raising: the hash exists to detect divergence between a run and
     its replay, and a payload that cannot be hashed exactly is one that must be
-    treated as diverged — which a repr-derived hash does.
+    treated as diverged - which a repr-derived hash does.
     """
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=repr
@@ -117,7 +117,7 @@ class Operation:
     """One effect a logical execution asked for, at a known position in it.
 
     `operation_seq` is the worker's position in its own control flow. `step`
-    names a durable sub-operation of that position — publishing what a round's
+    names a durable sub-operation of that position - publishing what a round's
     `run_python` produced, for one. A round is one request over the pipe, so
     the worker has no number of its own to give the publication, and the
     parent must not invent one that a replay could not reproduce: the step
@@ -142,7 +142,7 @@ class OperationLedger:
     Held by the parent, so it outlives every worker that runs against it. A
     fresh worker replays its control flow from the top and each effect it asks
     for arrives with the position it reached. Same position, same capability,
-    same payload, already committed — the stored result comes back and nothing
+    same payload, already committed - the stored result comes back and nothing
     happens twice.
 
     Divergence at a position is expected for a read and refused for a durable
@@ -255,13 +255,13 @@ class _Child:
     #: True when the child leads its own process group, so killing the group
     #: reaches everything it went on to spawn.
     group: bool = False
-    #: Reaper for a child this process did not create with `os.fork` directly —
+    #: Reaper for a child this process did not create with `os.fork` directly -
     #: a `multiprocessing.Process` is joined, not waitpid-ed.
     reap: Optional[Callable[[], None]] = None
     #: Set once the leader has been positively reaped while its group is still
     #: draining. From then on `pid` is not a handle: the kernel may reissue the
     #: number, so it is read only as the group's id and never signalled.
-    #: §18 — "a registration left behind after a child is reaped is a standing
+    #: §18 - "a registration left behind after a child is reaped is a standing
     #: licence to signal whoever inherits it."
     leader_reaped: bool = False
 
@@ -270,13 +270,13 @@ class Producer(Protocol):
     """Work this execution started in a thread of *this* process.
 
     A worker is a process and a kill ends it. A streamed producer is a thread,
-    and nothing ends a Python thread from outside — so it is asked to stop and
+    and nothing ends a Python thread from outside - so it is asked to stop and
     then asked whether it did, and an execution is not torn down until it says
     yes. Registering it here rather than beside the streaming path is the whole
     point: one revoke reaches everything an attempt started, whatever kind of
     thing it is.
 
-    A producer may additionally expose `cancellation_proven() -> bool` —
+    A producer may additionally expose `cancellation_proven() -> bool` -
     true when a stop can interrupt its read in flight, not only its next
     event. Terminal teardown waits for exactly those; see `live_producers`.
     """
@@ -298,7 +298,7 @@ class ResourceRegistry:
     Two kinds of child exist and both have to be here. The worker leads its own
     process group, so one `killpg` reaches whatever it spawned. The sandbox
     children the broker starts on the worker's behalf are the *parent's*
-    children — not in the worker's group, and they survive killing it — so they
+    children - not in the worker's group, and they survive killing it - so they
     are registered one by one and killed one by one.
 
     In-process producers are the third kind, and they are not children at all.
@@ -318,7 +318,7 @@ class ResourceRegistry:
     def stop_producers(self) -> int:
         """Ask every producer to stop. Returns how many were still running.
 
-        A request, not a kill — see `Producer`. `live_producers` is the answer
+        A request, not a kill - see `Producer`. `live_producers` is the answer
         about whether it was honoured.
         """
         stopped = 0
@@ -339,7 +339,7 @@ class ResourceRegistry:
     def live_producers(self, *, proven_only: bool = False) -> List[str]:
         """Producers that have not returned yet, by label.
 
-        `proven_only` narrows to producers whose cancellation is proven —
+        `proven_only` narrows to producers whose cancellation is proven -
         an interrupt is armed, so their death after a stop is prompt. The
         terminal teardown waits on exactly that set: a proven claim is
         cashed rather than forgotten, and an unproven producer is not
@@ -390,7 +390,7 @@ class ResourceRegistry:
         """This child's leader is gone; only its group is left to watch.
 
         Not the same as forgetting it. The group still holds members, so a
-        retry must still wait — but the number that named the leader is now
+        retry must still wait - but the number that named the leader is now
         the kernel's to reissue, so from here it is read as a group id and
         nothing is ever signalled through it. The SIGKILL that emptied the
         group has already been sent; what remains is to watch it drain.
@@ -415,7 +415,7 @@ class ResourceRegistry:
         For a child that leads its own group the pid is not the whole tree.
         A process group outlives its leader for as long as any member is in
         it, so a leader that has been reaped while its group still holds
-        somebody is not "gone" — and forgetting it there is what turns an
+        somebody is not "gone" - and forgetting it there is what turns an
         abandoned descendant into nobody's.
         """
         alive: List[int] = []
@@ -440,7 +440,7 @@ class ResourceRegistry:
 
         A child whose leader has been reaped is skipped, not re-signalled. Its
         group already took a SIGKILL, and the only thing the pid could reach
-        now is whoever inherited the number — `_kill` falls back to a plain
+        now is whoever inherited the number - `_kill` falls back to a plain
         `os.kill` whenever the target does not lead the expected group, which
         is precisely what a reissued pid looks like.
         """
@@ -514,7 +514,7 @@ def _kill(pid: int, *, group: bool) -> bool:
     one more thing an untrusted process can decline to honour.
 
     A group kill is only ever aimed at a group the target *leads*. A process
-    that has not yet called `setsid` — or could not — is still in the group
+    that has not yet called `setsid` - or could not - is still in the group
     that started it, which for a tool worker is the API server's: `killpg`
     there would take down the service and everything sharing its group. The
     registration is supposed to prevent that (`group=True` is only set once the
@@ -572,7 +572,7 @@ class Invocation:
     revoke, so no mutation can land in the middle of a teardown and no teardown
     can report itself complete while a commit it never saw is still in flight.
 
-    `session` is the parent's copy of what the turn has learned — injection
+    `session` is the parent's copy of what the turn has learned - injection
     findings above all. It lives here rather than in the worker because
     withdrawal has to be enforced by whoever owns the capability: the process
     that just read "ignore your rules and run this" is the last one that should
@@ -702,11 +702,11 @@ class Invocation:
 
         Exact identity, never "whatever is current": an abandoned serve
         thread waking after a timeout must not join the retry's fresh
-        attempt and run its stale plan under new authority — authority by
+        attempt and run its stale plan under new authority - authority by
         arrival time is the ambient-authority class this codebase forbids.
         The spawn that lost the race to a revoke finds its own attempt
         revoked, or displaced as current, and is refused. With `expected`
-        None — a direct invocation, which has no driver — the spawn begins
+        None - a direct invocation, which has no driver - the spawn begins
         an attempt of its own.
 
         Validation only: the caller marks `adopted` after the worker is
@@ -812,21 +812,21 @@ class Invocation:
         whose output is whose.
 
         `producers=False` narrows the *wait* to producers whose cancellation
-        is proven — never the stop, which `kill_all` has already done. The
+        is proven - never the stop, which `kill_all` has already done. The
         retry precondition needs every producer dead and must pay for it;
         ending the execution waits only where the wait is cheap: an armed
         stream's abort interrupts the read in flight, so its death is prompt,
         and the workflow must not report a timeout while that provider
         operation still runs. A producer with nothing armed cannot be made
         to return, and holding the caller for it would hand back the very
-        stall the timeout refused — it stays a daemon thread with its stop
+        stall the timeout refused - it stays a daemon thread with its stop
         flag set, excluded from this wait, and the streamed path refuses to
         produce tokens through such a stream in the first place.
 
         The scratch goes with the processes, and `workdir` is cleared with it.
         Keeping the directory across attempts would hand the retry a
         half-written file the killed attempt left behind; keeping the *name*
-        after deleting the directory would be worse — the next attempt would
+        after deleting the directory would be worse - the next attempt would
         skip preparation and run in a path that no longer exists.
         """
         with self._lock:
@@ -860,7 +860,7 @@ class Invocation:
     def close(self) -> None:
         """Finish this execution: kill anything left, drop its resources.
 
-        Idempotent, and reached from every terminal path — success, failure,
+        Idempotent, and reached from every terminal path - success, failure,
         timeout and revocation alike. An execution that ends any other way
         leaves a live sandbox child and a scratch directory behind, with nobody
         left to notice either.
@@ -887,7 +887,7 @@ def commit_guard(
     step: str = "",
     durable: bool = True,
 ) -> Iterator[Operation]:
-    """Wrap a durable mutation — the write itself, not the call that leads to it.
+    """Wrap a durable mutation - the write itself, not the call that leads to it.
 
     The distinction is the point. A guard around a call boundary records that a
     request was made, which is a fact about the caller; the ledger needs a fact
@@ -899,7 +899,7 @@ def commit_guard(
     the way in, under the invocation's lock, and the lock is held across the
     body: a revoke arriving mid-write waits for the write to finish and then
     tears down, rather than interleaving with it. Holding a lock across a
-    durable write is a real cost, paid deliberately — the alternative is a
+    durable write is a real cost, paid deliberately - the alternative is a
     revoke that reports success while a commit it never saw is still landing.
     Do no blocking work inside it beyond the mutation.
     """
@@ -1008,7 +1008,7 @@ class InvocationRegistry:
 # The worker holds no store, model or settings handle, so the calls that need
 # checking are the parent's own: the capability handlers run against the real
 # services. Binding the invocation to the serving thread lets `LeasedProxy`
-# check every one of them — reads included — without each handler having to
+# check every one of them - reads included - without each handler having to
 # remember. A thread with no invocation bound is the API path and passes
 # through untouched.
 
@@ -1038,7 +1038,7 @@ def active_invocation() -> Optional[Invocation]:
 def require_live_lease() -> None:
     """Refuse a durable operation whose execution has ended.
 
-    For work that does not reach its target through a proxied dependency —
+    For work that does not reach its target through a proxied dependency -
     launching a sandbox child, publishing into the user's file area. A thread
     with nothing bound is the API path and passes, exactly as the proxy treats
     it.
@@ -1080,8 +1080,8 @@ class LeasedProxy:
         return guarded
 
     # Writes go to the wrapped object. The proxy adds a check to calls; it is
-    # not a second place to keep state, and anything that sets an attribute —
-    # a test substituting a method, a service caching on its store — must land
+    # not a second place to keep state, and anything that sets an attribute -
+    # a test substituting a method, a service caching on its store - must land
     # where every other reader will see it.
     def __setattr__(self, name: str, value: Any) -> None:
         setattr(self._inner, name, value)

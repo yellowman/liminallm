@@ -1,7 +1,7 @@
 """Voice and email: the logic around the third-party call, not the call.
 
 Both were under 40% and both are mostly network I/O, so these stay on what is
-actually ours — whether the service considers itself configured, what it does
+actually ours - whether the service considers itself configured, what it does
 when it is not, how addresses are redacted before they reach a log, and what
 goes into the message. The provider itself is not worth pretending to test.
 
@@ -45,7 +45,7 @@ def test_an_empty_key_does_not_count_as_configured(tmp_path):
 
 @pytest.mark.asyncio
 async def test_transcription_without_a_key_still_answers(tmp_path):
-    """It must return a shaped result, not raise — chat_turn reads
+    """It must return a shaped result, not raise - chat_turn reads
     `transcript` and refuses the turn when it is missing."""
     out = await VoiceService(str(tmp_path)).transcribe(b"spoken words", user_id="u1")
     assert out["transcript"] == "spoken words"
@@ -337,7 +337,7 @@ def fake_smtp():
 
 @pytest.mark.slow
 def test_an_unencrypted_relay_actually_delivers(fake_smtp):
-    """smtp_security="none" is the local-relay case — postfix on this box,
+    """smtp_security="none" is the local-relay case - postfix on this box,
     which is the ordinary self-hosted arrangement. It used to be unreachable:
     the flag claiming to allow plaintext only removed a port guard in front of
     an SSL connection, so there was no plaintext path at all."""

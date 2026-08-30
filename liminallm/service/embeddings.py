@@ -252,7 +252,7 @@ _EMBED_INPUT_MAX_CHARS = 8000
 def make_provider_encoder(client: Any, model_id: str) -> Callable[[str], List[float]]:
     """Real embeddings through an OpenAI-compatible client.
 
-    Works for OpenAI, the Gemini compat endpoint, and self-hosted servers —
+    Works for OpenAI, the Gemini compat endpoint, and self-hosted servers -
     whichever client the model backend already holds. A provider failure
     falls back to the deterministic hash vector, whose different dimension
     makes cosine against real vectors return a neutral 0.0 instead of noise:
@@ -282,7 +282,7 @@ def make_provider_batch_encoder(
     """The same endpoint, asked once for many texts.
 
     ``/embeddings`` takes an array, and late-interaction ingestion needs one
-    vector per segment — a 500-chunk file at eight segments each is 4000
+    vector per segment - a 500-chunk file at eight segments each is 4000
     embeddings, which one-at-a-time is 4000 sequential round trips. Falls back
     per text like the single encoder, and reorders by the response's own index
     rather than trusting arrival order.
@@ -320,7 +320,7 @@ class EmbeddingsService:
 
     ``is_semantic`` is the honesty flag: the default encoder is a
     deterministic hash whose cosine similarities are noise. Every consumer
-    that blends cosine into a ranking must check it — hash cosine polluting
+    that blends cosine into a ranking must check it - hash cosine polluting
     a BM25 score is worse than BM25 alone.
     """
 

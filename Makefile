@@ -55,16 +55,16 @@ test-fast:
 	python -m pytest tests/ -q --tb=short -m 'not slow and not browser'
 
 # The same lane across several processes. Each worker gets a Postgres, a Redis
-# database and a filesystem root of its own — see tests/test_worker_isolation.py
-# — because the per-test TRUNCATE assumes it owns the database.
+# database and a filesystem root of its own - see tests/test_worker_isolation.py
+# - because the per-test TRUNCATE assumes it owns the database.
 #
 # A fixed default rather than `-n auto`: Redis has sixteen numbered databases,
 # and on a large workstation `auto` would also start that many Postgres
 # clusters. Override with `make test-fast-xdist XDIST_WORKERS=8`.
 XDIST_WORKERS ?= 4
 # `loadfile` keeps a file's tests on one worker. Measured on a 4-core box it is
-# the same wall clock as the default per-test scheduler — 126.5s against 127.5s
-# over three paired runs, which is noise — so it is chosen for what it makes
+# the same wall clock as the default per-test scheduler - 126.5s against 127.5s
+# over three paired runs, which is noise - so it is chosen for what it makes
 # predictable rather than for speed: a module-scoped fixture is built once per
 # worker that sees the file, and tests written next to each other stay next to
 # each other. Override with XDIST_DIST=load.
@@ -82,12 +82,12 @@ test-fast-xdist:
 #
 # Parallelism buys more here than it does in the fast lane, because what makes
 # a test slow is usually waiting. Measured on a 4-core box: the 110 slow-marked
-# tests alone take 5m37s serially and 1m43s at -n 4, and this whole lane —
-# 2814 tests — takes 3m37s.
+# tests alone take 5m37s serially and 1m43s at -n 4, and this whole lane -
+# 2814 tests - takes 3m37s.
 #
 # This is the local gate, and what `make qa` runs. It is not the only signal:
 # GitHub CI runs the same selection serially, once per supported Python
-# version, which is a different question — whether the suite passes on an
+# version, which is a different question - whether the suite passes on an
 # interpreter this machine does not have.
 test-xdist:
 	@mkdir -p $(SHARED_FS_ROOT)
@@ -95,7 +95,7 @@ test-xdist:
 		-n $(XDIST_WORKERS) --dist $(XDIST_DIST)
 
 # The browser lane. Excluded from every lane above because it needs a Chromium
-# binary, which `pip install playwright` does not provide — run
+# binary, which `pip install playwright` does not provide - run
 # `playwright install chromium` once, or point LIMINALLM_CHROMIUM at a build.
 # It is not a second suite: it covers only what a browser can observe and a
 # TestClient cannot, which is what the page persists where scripts can read it
@@ -111,7 +111,7 @@ test-browser:
 # `-m 'not browser'` for the same reason every other lane has it, and it was
 # missed here when the marker was introduced: the dev extra installs Playwright
 # but not a Chromium binary, and a browser test with the library present and no
-# binary *errors* rather than skipping — measured. So this target collected the
+# binary *errors* rather than skipping - measured. So this target collected the
 # browser lane and failed on it after an ordinary `make install`.
 test-pg:
 	@bash -c '\
@@ -129,7 +129,7 @@ test-pg:
 # No `--select` and no `--ignore` on the first line: `[tool.ruff.lint]` in
 # pyproject.toml already says `select = [E, F, W, I]` and `ignore = [E501]`,
 # and CI's explicit flags only restate it. This line used to pass
-# `--ignore E402`, which does not *add* to the configured ignore list — it
+# `--ignore E402`, which does not *add* to the configured ignore list - it
 # replaces it. So locally E402 was suppressed and E501 was not, while CI had
 # it the other way round, and five E402s and two unsorted import blocks sat on
 # this branch through every local run and failed the first time CI saw them.

@@ -1,7 +1,7 @@
-"""RFC 6902 JSON Patch — one implementation.
+"""RFC 6902 JSON Patch - one implementation.
 
-Two grew independently. ConfigOps had the hardened traversal — root path,
-scalar traversal, and unbounded list indexes all answer 400 — but knew only
+Two grew independently. ConfigOps had the hardened traversal - root path,
+scalar traversal, and unbounded list indexes all answer 400 - but knew only
 add/replace/remove. The artifact PATCH route knew move/copy/test but swallowed
 every failure with ``pass``, so a patch that did nothing reported success.
 This module is the union: full verb set, hardened everywhere. Patch bodies
@@ -30,7 +30,7 @@ _OPERANDS: Dict[str, tuple] = {
 
 # RFC 6901 §4 array index: `0`, or a non-zero digit followed by digits. ASCII,
 # and no leading zeros. `str.isdigit()` accepted `01`, `007`, `١` and `０` as
-# ordinary indices, so several spellings named one position — and `²`, which
+# ordinary indices, so several spellings named one position - and `²`, which
 # satisfies `isdigit()` but not `int()`, left as an uncaught ValueError.
 _INDEX = re.compile(r"^(?:0|[1-9][0-9]*)$")
 _NEGATIVE_INDEX = re.compile(r"^-(?:0|[1-9][0-9]*)$")
@@ -43,7 +43,7 @@ def validate_op(op: Any) -> None:
     call this too, so the API can refuse a malformed patch before it reaches
     a store, without either side keeping its own copy of the rule.
 
-    Absence is the question, never truthiness — `value: null` is a legal
+    Absence is the question, never truthiness - `value: null` is a legal
     operand, and reading it as "no value" is how `{"op": "replace",
     "path": "/k"}` came to write `None` over a value nobody asked to change.
     """
@@ -77,12 +77,12 @@ def _require_pointer(op: Dict[str, Any], member: str, action: str) -> None:
 
     Presence was required and type was not, so `_segments_or_raise` reached
     for `.startswith` on whatever arrived and a number, null, array or object
-    left as an uncaught AttributeError — a 500 for a plainly bad request, and
+    left as an uncaught AttributeError - a 500 for a plainly bad request, and
     reachable over the wire because both API models take `List[dict]`.
 
     Refused rather than coerced: `str(42)` is `"42"`, a pointer that is not
     the one anybody wrote, which is the failure this module exists to stop.
-    `bool` is excluded explicitly — it is not a `str`, but saying so keeps
+    `bool` is excluded explicitly - it is not a `str`, but saying so keeps
     the check honest next to the JSON-value rules below.
     """
     value = op[member]
@@ -103,7 +103,7 @@ def meta_ops(key: str, value: Any) -> List[Dict[str, Any]]:
     when `meta` is missing, so a proposal against a bare artifact still
     applies. That was written, and it is wrong. ConfigOps stores a patch and
     applies it later, and `add` on a member that is already present replaces
-    it — so if anything puts a `meta` there in between (another pending
+    it - so if anything puts a `meta` there in between (another pending
     patch, a direct edit, the second producer on the same artifact), the
     baked `add /meta {}` silently wipes it. The data loss is not avoided,
     only deferred across the propose/apply gap.
@@ -122,7 +122,7 @@ def meta_ops(key: str, value: Any) -> List[Dict[str, Any]]:
     What it gives up is the bare-artifact case, where the patch is refused
     instead of applying. That is a visible dead end rather than silent
     damage, and closing it properly means either version-gating stored
-    patches or moving these annotations to the artifact's own `meta` column —
+    patches or moving these annotations to the artifact's own `meta` column -
     both larger than the engine.
     """
     return [{"op": "add", "path": f"/meta/{key}", "value": value}]
@@ -182,7 +182,7 @@ def json_equal(left: Any, right: Any) -> bool:
     Python makes `True == 1` and `False == 0`, and carries that through lists
     and dicts, so `test` passed on a value of a different JSON type. It is
     the one verb whose whole job is guarding the operations behind it, so a
-    generous comparison does not merely misreport — it lets a mutation run on
+    generous comparison does not merely misreport - it lets a mutation run on
     a precondition that was never met.
 
     JSON has one number type, so `1` and `1.0` are one value. Booleans are
@@ -242,12 +242,12 @@ def _segments_or_raise(path: str) -> List[str]:
     became `/a/b`, `/a/` became `/a`, `a/b` was taken for `/a/b`, and `~1`
     and `~0` were never decoded, so `/a~1b` addressed a key literally spelled
     `a~1b` rather than the key `a/b`. Both spellings can exist in one
-    document, so that last pair does not fail — it writes to a real location
+    document, so that last pair does not fail - it writes to a real location
     nobody named. This module exists to stop exactly that.
     """
     if path == "":
         # §5: the empty pointer is the whole document. Every verb here edits
-        # a member of a container, so there is nothing to serve — but it is
+        # a member of a container, so there is nothing to serve - but it is
         # refused out loud, because returning quietly reports success.
         raise BadRequestError(
             "patch path addresses the whole document", detail={"path": path}
@@ -257,7 +257,7 @@ def _segments_or_raise(path: str) -> List[str]:
             "patch path is not a JSON Pointer",
             detail={"path": path, "expected": "a pointer begins with '/'"},
         )
-    # `"/"` is one empty token: the member keyed "". Not the document root —
+    # `"/"` is one empty token: the member keyed "". Not the document root -
     # that is `""`, handled above.
     return [_unescape(token, path) for token in path[1:].split("/")]
 
@@ -296,7 +296,7 @@ def _walk_parent(doc: Any, segments: List[str], path: str) -> Any:
     """Walk to the parent of the last segment, creating nothing.
 
     Every write verb goes through here, because a patch names a location in a
-    document that already exists — it does not describe a document to build.
+    document that already exists - it does not describe a document to build.
     The creating version of this walk is what let `replace /a/b` invent an
     `a`, report success, and leave the value the caller meant to change
     exactly as it was.
@@ -340,7 +340,7 @@ def _require_target(parent: Any, key: str, path: str) -> None:
 def _read_index(seg: str, path: str) -> int:
     """RFC 6902 array indices are non-negative digit runs. Python's list[-1]
     would otherwise quietly serve `/xs/-1` on the read paths (move/copy/test)
-    while the write path refuses it — the same op legal on one side of a
+    while the write path refuses it - the same op legal on one side of a
     round trip and not the other.
 
     Both messages are direction-neutral, because this is reached from four
@@ -355,7 +355,7 @@ def _read_index(seg: str, path: str) -> int:
     # keeps its own message: Python would happily serve `/xs/-1` from the end,
     # and "not found" would send the reader looking for a missing element
     # rather than at the index they wrote. Matched strictly for the same
-    # reason as the positive form — `"-²".lstrip("-").isdigit()` was true and
+    # reason as the positive form - `"-²".lstrip("-").isdigit()` was true and
     # `int("-²")` was not.
     if _NEGATIVE_INDEX.match(seg):
         raise BadRequestError(
@@ -426,7 +426,7 @@ def _set_at(parent: Any, key: str, value: Any, path: str, *, insert: bool) -> No
         #
         # What this defends is the address, not the heap. Nothing here pads a
         # list, so without the check `/xs/999999999` on two elements falls
-        # through to a single `append` and lands at index 2 — measured. The
+        # through to a single `append` and lands at index 2 - measured. The
         # failure is that it silently *means* `/xs/2`, which is the same
         # wrong-location bug as everything else in this module. A constant
         # ceiling used to sit here instead and got the ordinary case wrong,
@@ -479,7 +479,7 @@ def apply_op(doc: dict, op: Dict[str, Any]) -> None:
     elif action in ("move", "copy"):
         # Present because `validate_op` required it. Defaulting it to "" used
         # to send a verb with no source through the tokenizer, which reported
-        # it as a patch that "addresses the whole document" — a true sentence
+        # it as a patch that "addresses the whole document" - a true sentence
         # about an operand the caller never wrote.
         from_path = op["from"]
         from_segments = _segments_or_raise(from_path)

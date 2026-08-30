@@ -1,8 +1,8 @@
 """The native Gemini backend, and structured history resume on every provider.
 
-Driven through httpx.MockTransport with real SSE bytes, so the wire format —
+Driven through httpx.MockTransport with real SSE bytes, so the wire format -
 x-goog-api-key, :generateContent / :streamGenerateContent?alt=sse, contents /
-systemInstruction / functionDeclarations — is what's asserted, not internals.
+systemInstruction / functionDeclarations - is what's asserted, not internals.
 """
 
 from __future__ import annotations
@@ -143,7 +143,7 @@ def _armed(response: httpx.Response) -> httpx.Response:
     """Give a mocked streaming response the interrupt handle production has.
 
     Streaming now fails closed on a network response whose socket cannot be
-    reached — the backend advertises `supports_stream_cancel`, and a stream
+    reached - the backend advertises `supports_stream_cancel`, and a stream
     that cannot arm the interrupt refuses rather than streaming on a claim
     it cannot keep. A `MockTransport` response has no real socket, so the
     streaming tests declare a fake one; without it they would be testing the
@@ -183,7 +183,7 @@ def test_prompt_adapters_reach_the_system_instruction_exactly_once():
     """SPEC §5.0.1: LLMService materializes, the backend transports.
 
     This used to call the backend directly and assert it placed the text
-    itself — which is the second-materializer contract. On the product path
+    itself - which is the second-materializer contract. On the product path
     the service had already placed it, so the same instruction went out
     twice. Driven through the service now, and counted rather than merely
     found present, because "present" was true throughout the defect.
@@ -297,8 +297,8 @@ def test_the_context_window_comes_from_the_models_probe():
 
 def test_the_same_history_resumes_on_every_provider_wire():
     """The chat shape is the lingua franca; each provider's converter must
-    carry the whole structure — system prompt, the completed tool round, the
-    resuming question — without loss."""
+    carry the whole structure - system prompt, the completed tool round, the
+    resuming question - without loss."""
     # chat/completions: the internal shape IS the wire shape.
     assert RESUME_HISTORY[4]["role"] == "tool"
 
@@ -335,7 +335,7 @@ def test_every_provider_reports_the_rich_usage_keys():
 
 
 # ---------------------------------------------------------------------------
-# Thought signatures — found live: Gemini 400s a resumed functionCall that
+# Thought signatures - found live: Gemini 400s a resumed functionCall that
 # lacks one ("Function call is missing a thought_signature")
 # ---------------------------------------------------------------------------
 
@@ -367,7 +367,7 @@ def test_a_foreign_history_gets_the_documented_placeholder():
 
 
 # ---------------------------------------------------------------------------
-# Admin key resolution — the gemini_api_key setting flows to both Gemini
+# Admin key resolution - the gemini_api_key setting flows to both Gemini
 # backends, with the generic provider key and GEMINI_API_KEY env as fallbacks
 # ---------------------------------------------------------------------------
 
@@ -421,7 +421,7 @@ class TestAdminKeyResolution:
         assert "generativelanguage" in svc.backend._base_url
 
     def test_runtime_wires_the_setting_into_the_gemini_config(self):
-        """The adapter_configs dict runtime builds must carry the setting —
+        """The adapter_configs dict runtime builds must carry the setting -
         this is the seam _build_backend reads."""
         import inspect
 
@@ -432,7 +432,7 @@ class TestAdminKeyResolution:
 
 
 # ---------------------------------------------------------------------------
-# Reasoning effort — the admin setting reached every backend but this one
+# Reasoning effort - the admin setting reached every backend but this one
 # ---------------------------------------------------------------------------
 
 
@@ -528,7 +528,7 @@ class TestThinkingConfig:
 
 
 def test_the_streaming_usage_fallback_uses_the_shared_estimator():
-    """A word count undercounts CJK roughly fourfold — that is why there is
+    """A word count undercounts CJK roughly fourfold - that is why there is
     one estimator."""
     from liminallm.service.tokenizer_utils import estimate_token_count
 
@@ -573,7 +573,7 @@ def test_the_stream_also_retries_once_without_the_rejected_thinking_config():
 
 
 class TestNativeTemperature:
-    """The native backend must honour the same policy as the compat ones — a
+    """The native backend must honour the same policy as the compat ones - a
     setting that works on one backend and is silently ignored on another is
     the bug this branch already fixed once, for reasoning effort."""
 

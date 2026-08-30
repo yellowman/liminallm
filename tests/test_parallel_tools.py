@@ -3,7 +3,7 @@
 The properties under test are exactly the ones parallelism could break:
 result and snippet order, the same-round taint withdrawal (a web_fetch that
 records an injection finding must withdraw run_python later in the SAME
-round), and the thread-local egress guard reaching every worker — the socket
+round), and the thread-local egress guard reaching every worker - the socket
 allowlist permits when no policy is set on the connecting thread, so a
 worker without the guard would be a hole, not a slowdown.
 """

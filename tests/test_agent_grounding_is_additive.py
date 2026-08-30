@@ -1,7 +1,7 @@
 """Tool capability adds to grounding; it never replaces it.
 
 A turn takes the tool-agent workflow whenever `_turn_needs_tools()` says the
-deployment has something to offer — an attachment, web tools, a published MCP
+deployment has something to offer - an attachment, web tools, a published MCP
 server. That decision is about capability. It said nothing about grounding,
 and it silently took grounding away: `llm.generic` validates `context_id`,
 retrieves for it and injects the chunks, while the agent planner never
@@ -14,7 +14,7 @@ universal: any of the three triggers loses the same context. The triggers are
 parameterized here for that reason.
 
 The model is the only thing faked. The store, the retriever, the planner and
-the agent loop are real, and the fake makes no tool call on purpose — a
+the agent loop are real, and the fake makes no tool call on purpose - a
 context the user selected must not depend on the model guessing it should go
 looking for it.
 """
@@ -162,7 +162,7 @@ class TestASelectedContextSurvivesToolRouting:
         Parameterized over why the turn is on that path at all. If only the
         web case were covered, a fix that special-cased the web default would
         pass while an operator with a published MCP server still lost every
-        selected context — the defect is tool routing's, not web's.
+        selected context - the defect is tool routing's, not web's.
         """
         user_id, ctx_id = grounded_context(store)
 
@@ -255,7 +255,7 @@ class TestTheStreamingPathIsGroundedToo:
     `_stream_agent_files_node` calls `_explicit_context_grounding` itself,
     passes its own arguments into `_build_agent_context`, and seeds its own
     worker plan. Sharing the assembly function does not make any of that
-    shared, so the batch witnesses above say nothing about it — which is the
+    shared, so the batch witnesses above say nothing about it - which is the
     altitude mistake this file exists to stop making twice.
     """
 
@@ -305,7 +305,7 @@ class TestGroundingObeysThePromptBudget:
 
     `_apply_prompt_budget` drops context from its low-priority end before it
     drops any conversation history. Grounding appended straight onto
-    `system_content` is not context as far as that function is concerned — it
+    `system_content` is not context as far as that function is concerned - it
     is part of an indivisible system block, so the pruner reaches past it and
     evicts turns instead, and once the block alone overflows the turn is
     refused rather than trimmed.
@@ -362,7 +362,7 @@ class TestGroundingObeysThePromptBudget:
 
         Reporting the retrieved set would name chunks the model never saw,
         which is the same class of lie as reporting a context that was never
-        injected — just one stage later.
+        injected - just one stage later.
         """
         user_id, ctx_id = grounded_context(store)
         web_on(monkeypatch, engine)

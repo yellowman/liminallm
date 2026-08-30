@@ -23,7 +23,7 @@ BASE = ""
 """The serving base identity these fixtures' adapters declare.
 
 SPEC §5.1 ties LoRA weights to one frozen base, so serving refuses an adapter
-that does not declare the base it is being applied to — a fixture without one
+that does not declare the base it is being applied to - a fixture without one
 describes an adapter the artifact schema could not store either.
 """
 
@@ -31,7 +31,7 @@ describes an adapter the artifact schema could not store either.
 @pytest.fixture(scope="module", autouse=True)
 def checkpoint(tmp_path_factory):
     """autouse so BASE is set before any test in the module reads it, whatever
-    order they run in — an unset BASE would refuse weights for the wrong
+    order they run in - an unset BASE would refuse weights for the wrong
     reason."""
     global BASE
     directory = _build_checkpoint(tmp_path_factory.mktemp("gate_model"))
@@ -65,7 +65,7 @@ class TestRouterGatesReachTheModel:
         candidate lookup and return the gates separately for tracing, so
         every routed turn composed at 1.0 regardless of policy.
 
-        Run against the runtime's real engine, real store and real router —
+        Run against the runtime's real engine, real store and real router -
         the value has to survive the actual hand-offs, which is the whole
         point of the finding.
         """
@@ -160,7 +160,7 @@ class TestGateAwareKvCache:
         quiet = backend._adapter_signature([{**adapter, "weight": 0.2}])
         loud = backend._adapter_signature([{**adapter, "weight": 0.8}])
         assert quiet != loud
-        # Same gate, same identity — the cache must still be usable.
+        # Same gate, same identity - the cache must still be usable.
         assert quiet == backend._adapter_signature([{**adapter, "weight": 0.2}])
         # And the base (no adapters) stays distinct from any gated stack.
         assert backend._adapter_signature([]) == "base"

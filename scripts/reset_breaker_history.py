@@ -3,8 +3,8 @@
 
 Run this during a coordinated breaker representation change (SPEC §18.3).
 The breaker's failure history is ephemeral, per-window state, and its two
-representations — the legacy plain counter at `circuit:*:failures` and the
-rolling-window sorted set at `circuit:*:failures:v2` — are independent
+representations - the legacy plain counter at `circuit:*:failures` and the
+rolling-window sorted set at `circuit:*:failures:v2` - are independent
 ledgers that must not run side by side. A representation change is therefore
 a coordinated reset, not a rolling deploy:
 
@@ -15,7 +15,7 @@ a coordinated reset, not a rolling deploy:
     4. start the replicas on the new representation;
     5. never overlap the two representations.
 
-Purging — rather than letting the old keys expire on their TTL — is what
+Purging - rather than letting the old keys expire on their TTL - is what
 makes the reset survive a rollback: a rollback inside the ≤60s TTL would
 otherwise find the old counter still live and resume counting from it. A
 rollback repeats the same drain/purge in reverse (purge `failures:v2`).
@@ -48,7 +48,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-# The valid representation names come from RedisCache — one source of truth, so
+# The valid representation names come from RedisCache - one source of truth, so
 # the runbook and this script never name a raw Redis glob and cannot drift from
 # the storage layer. Importing the class loads no config.
 from liminallm.storage.redis_cache import RedisCache  # noqa: E402
@@ -98,7 +98,7 @@ def main():
         sys.exit(1)
     # Deliberately NOT setting TEST_MODE: this talks to the real Redis the
     # fleet uses. TEST_MODE only gates the Redis-absent fallback, and a purge
-    # command must never take it — if Redis is down, failing loudly is right.
+    # command must never take it - if Redis is down, failing loudly is right.
 
     try:
         asyncio.run(reset_breaker_history(args.representation, args.dry_run))

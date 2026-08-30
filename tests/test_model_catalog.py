@@ -1,7 +1,7 @@
 """The model catalogue: context windows, reasoning families, provider wiring.
 
-The table is a *fallback* — provider discovery and the model_context_window
-setting both outrank it — so these tests pin the properties that make it safe
+The table is a *fallback* - provider discovery and the model_context_window
+setting both outrank it - so these tests pin the properties that make it safe
 to fall back on, not a frozen copy of every published number.
 """
 
@@ -27,13 +27,13 @@ from liminallm.service.model_backend import (
 
 class TestContextWindows:
     @pytest.mark.parametrize("model,window", [
-        # Google — verified against a live ListModels call.
+        # Google - verified against a live ListModels call.
         ("gemini-3.6-flash", 1_048_576),
         ("gemini-flash-latest", 1_048_576),
         ("gemini-2.5-pro", 1_048_576),
         ("gemini-2.5-flash-image", 32_768),
         ("gemini-3-pro-image-preview", 131_072),
-        # OpenAI — tier splits within one version.
+        # OpenAI - tier splits within one version.
         ("gpt-5.2", 400_000),
         ("gpt-5.6-sol", 1_050_000),
         ("gpt-5.6-terra", 1_050_000),
@@ -82,7 +82,7 @@ class TestContextWindows:
         assert context_window_from_table(model) == window
 
     def test_an_unknown_model_gets_no_guess(self):
-        """None means "ask the provider or use the default" — a wrong guess
+        """None means "ask the provider or use the default" - a wrong guess
         here would silently mis-budget every turn."""
         assert context_window_from_table("some-unreleased-model") is None
         assert context_window_from_table("") is None
@@ -115,7 +115,7 @@ class TestContextWindows:
 
     def test_no_table_holds_a_duplicate_prefix(self):
         """A duplicate is dead weight at best and two disagreeing answers at
-        worst — longest-prefix picks whichever it reaches first."""
+        worst - longest-prefix picks whichever it reaches first."""
         for name, table in [("known", KNOWN_CONTEXT_WINDOWS),
                             *HOSTED_CONTEXT_WINDOWS.items()]:
             prefixes = [prefix for prefix, _ in table]
@@ -144,7 +144,7 @@ class TestHostedWindows:
         assert context_window_from_table("glm-5.2") == 1_000_000
 
     def test_an_unlisted_host_falls_through_to_the_family(self):
-        """A provider with no hosted table is not an error — the model family
+        """A provider with no hosted table is not an error - the model family
         still answers."""
         assert context_window_from_table("glm-5.2", provider="openai") == 1_000_000
         assert context_window_from_table("glm-5.2", provider="") == 1_000_000
@@ -166,7 +166,7 @@ class TestHostedWindows:
         assert context_window_from_table("openai/gpt-oss-120b", provider="groq") == 131_072
 
     def test_the_backend_passes_its_provider_into_the_lookup(self):
-        """Without this the hosted tables are unreachable — the whole point of
+        """Without this the hosted tables are unreachable - the whole point of
         keying them by provider."""
         import inspect
 
@@ -321,7 +321,7 @@ class TestProviderWiring:
 
     def test_a_new_provider_gets_workable_default_capabilities(self):
         """These providers serve one model per request with no adapter
-        multiplexing — the default — so none of them needs a bespoke entry."""
+        multiplexing - the default - so none of them needs a bespoke entry."""
         for provider in ("xai", "deepseek", "moonshot", "qwen", "baichuan",
                          "minimax", "mistral", "cohere", "groq", "cerebras",
                          "fireworks", "meta"):
@@ -334,7 +334,7 @@ class TestListingDiscovery:
     """Resolving a window out of a /models listing.
 
     A reseller's listing holds hundreds of models. Reading a window from it
-    without checking which model it belongs to is an over-guess — the one
+    without checking which model it belongs to is an over-guess - the one
     direction the whole fallback chain is built to avoid.
     """
 
@@ -358,7 +358,7 @@ class TestListingDiscovery:
         ) == 262_144
 
     def test_it_does_not_hand_back_an_unrelated_models_window(self):
-        """Without the id check this returns 1,000,000 — the first entry —
+        """Without the id check this returns 1,000,000 - the first entry -
         for a 32K model, and the turn overflows."""
         from liminallm.service.model_backend import _window_from_json
 
@@ -418,7 +418,7 @@ def test_an_unknown_model_warns_rather_than_budgeting_8192_silently(monkeypatch)
 
 
 def test_a_recognised_model_stays_at_info(monkeypatch):
-    """The warning has to mean something — a model the table knows is not an
+    """The warning has to mean something - a model the table knows is not an
     operator problem."""
     from unittest.mock import MagicMock
 
@@ -465,7 +465,7 @@ class TestAdapterCompatibility:
         assert AdapterMode.REMOTE not in get_compatible_adapter_modes(backend), backend
 
     def test_every_selectable_backend_declares_its_modes(self):
-        """A backend an admin can pick must not rely on the default — that is
+        """A backend an admin can pick must not rely on the default - that is
         how hybrid got dropped in the first place."""
         from liminallm.config import BACKEND_ADAPTER_COMPATIBILITY, ModelBackend
 

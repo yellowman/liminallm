@@ -2,7 +2,7 @@
 
 Every previous test stopped at a seam: `_select_adapters` on one side,
 `_blend_adapter_weights` on the other. The defects that survived those tests
-lived precisely between them — a gate computed and dropped, a version pinned
+lived precisely between them - a gate computed and dropped, a version pinned
 by a caller rather than by the artifact, weights loaded for an adapter still
 on the prompt rung.
 
@@ -32,8 +32,8 @@ from liminallm.service.training import TrainingService  # noqa: E402
 from tests.harness import get_test_store  # noqa: E402
 from tests.test_local_transformer import _build_checkpoint  # noqa: E402
 
-# Every test in this module runs the real thing — training steps, a forward
-# pass, an eval gate — so it is measured in seconds rather than milliseconds.
+# Every test in this module runs the real thing - training steps, a forward
+# pass, an eval gate - so it is measured in seconds rather than milliseconds.
 # `make test-fast` skips these; `make test` and the pre-commit gate do not,
 # because what they exercise is not covered anywhere else.
 pytestmark = pytest.mark.slow
@@ -75,7 +75,7 @@ class TestLadderEndToEnd:
         its holdout by well under the 1% production bar, so every run took
         the refusal branch and the decoy, the gate scaling and the generated
         turn were never reached. The threshold is a product tuning constant,
-        so the test relaxes *it* — the training, the gate logic, the
+        so the test relaxes *it* - the training, the gate logic, the
         promotion and the serving path all stay real, and the improvement is
         still asserted to be real.
         """
@@ -94,7 +94,7 @@ class TestLadderEndToEnd:
         training = TrainingService(
             store, str(tmp_path), runtime_base_model=str(checkpoint)
         )
-        # The skill is BORN on the prompt rung, the way §7.3 creates it —
+        # The skill is BORN on the prompt rung, the way §7.3 creates it -
         # not conjured as an already-trained artifact by the test.
         clusterer = SemanticClusterer(store, llm=None, training=training)
         born = clusterer.promote_skill_adapters(min_size=5, weights_min_events=10)
@@ -209,7 +209,7 @@ class TestLadderEndToEnd:
     def test_a_prompt_rung_adapter_never_loads_weights(
         self, tmp_path, checkpoint
     ):
-        """SPEC §5.5: weights arrive on graduation, not before — even if a
+        """SPEC §5.5: weights arrive on graduation, not before - even if a
         training job has already written a version directory."""
         adapter_dir = tmp_path / "adapters" / "skill"
         version_dir = adapter_dir / "v0001"
@@ -251,7 +251,7 @@ class TestBrokenCheckpointFailsClosed:
         self, tmp_path, checkpoint
     ):
         """`_model_state is None` used to mean both "dev box, use the
-        stand-in" and "misconfigured, refuse" — so a refused request was
+        stand-in" and "misconfigured, refuse" - so a refused request was
         followed by one answered from the synthetic model."""
         import shutil
 
@@ -269,7 +269,7 @@ class TestBrokenCheckpointFailsClosed:
             assert backend._checkpoint_state == "broken", f"attempt {attempt}"
 
     def test_an_absent_checkpoint_still_uses_the_stand_in(self, tmp_path):
-        """The dev/CI lane must stay open — that is the whole reason the
+        """The dev/CI lane must stay open - that is the whole reason the
         states are distinguished rather than merged."""
         backend = LocalJaxLoRABackend(str(tmp_path / "nothing"), str(tmp_path))
         result = backend.generate(

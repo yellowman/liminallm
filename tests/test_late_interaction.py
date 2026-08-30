@@ -113,7 +113,7 @@ def test_the_pooled_vector_steps_back_when_late_interaction_speaks():
 
 # Subjects on their own axes. "marsupial" sits close to "quokka" without
 # being it, which is what makes the decoy chunk a near miss rather than an
-# unrelated one — the case where averaging actually costs you the answer.
+# unrelated one - the case where averaging actually costs you the answer.
 _NEAR = 0.9
 _SUBJECTS = {
     "quokka": [(1, 1.0)],
@@ -124,7 +124,7 @@ _SUBJECTS = {
 
 
 def _subject_encoder(text: str) -> list[float]:
-    """A vector per subject named, averaged — as a real encoder would pool."""
+    """A vector per subject named, averaged - as a real encoder would pool."""
     lowered = text.lower()
     hits = [axes for word, axes in _SUBJECTS.items() if word in lowered]
     vec = [0.0] * EMBEDDING_DIM
@@ -142,7 +142,7 @@ def _near_miss_corpus(store):
     ``/mixed`` answers the query but also discusses something else, so its
     pooled vector is the average of the two and sits 0.71 from the query.
     ``/decoy`` is about a neighbouring subject only, and its pooled vector
-    sits 0.9 from the query — closer. Pooled similarity picks the wrong one.
+    sits 0.9 from the query - closer. Pooled similarity picks the wrong one.
     """
     user = store.create_user(email=f"li_{uuid.uuid4().hex[:8]}@example.com")
     ctx = store.upsert_context(user.id, f"li-{uuid.uuid4().hex[:6]}", "fixture")
@@ -176,7 +176,7 @@ def _retriever(store, *, late: bool):
 
 
 def test_pooled_similarity_alone_picks_the_near_miss(store):
-    """The baseline this feature exists to fix — asserted, not assumed.
+    """The baseline this feature exists to fix - asserted, not assumed.
 
     The query word appears in no document, so BM25 is silent and only the
     vector channels decide. Averaged over its whole chunk, the right answer
@@ -192,7 +192,7 @@ def test_pooled_similarity_alone_picks_the_near_miss(store):
 
 
 def test_late_interaction_finds_the_chunk_on_its_best_part(store):
-    """Same corpus, same encoder, same query — segments kept separate.
+    """Same corpus, same encoder, same query - segments kept separate.
 
     ``/mixed`` owns a segment that is exactly the query, so MaxSim scores it
     1.0 against the decoy's 0.9, and the answer comes back first.
@@ -210,7 +210,7 @@ def test_a_chunk_with_no_segments_is_not_penalised_only_unranked(store):
     """Coverage grows with ingestion, so a mixed corpus must still work.
 
     Content ingested before late interaction was turned on has no segment
-    vectors. The late channel simply has nothing to say about it — silence,
+    vectors. The late channel simply has nothing to say about it - silence,
     which the fusion already distinguishes from a bad score.
     """
     def encoder(_text: str) -> list[float]:
@@ -294,7 +294,7 @@ def test_candidate_generation_with_no_user_refuses_rather_than_widens(store, abs
     own query.
 
     `late_candidate_ids` scopes by owner like the others, and without that
-    check `_chunk_scope` builds a WHERE clause with no owner term — so the
+    check `_chunk_scope` builds a WHERE clause with no owner term - so the
     query runs and offers every user's segments as candidates. Measured, no
     test in the fast lane caught its removal. Its siblings are covered beside
     the hybrid fixture in `test_rag.py`; this one needs a segmented corpus, so
@@ -314,7 +314,7 @@ def test_candidate_generation_with_no_user_refuses_rather_than_widens(store, abs
 
 def test_every_query_part_gets_a_share_of_the_candidate_pool(store, monkeypatch):
     """A single overall cap is spent by the first vector, which is the whole
-    query — collapsing candidate generation back to single-vector recall.
+    query - collapsing candidate generation back to single-vector recall.
 
     MaxSim could then only reorder what a pooled vector already found, which
     is the one thing this channel exists not to be.
@@ -347,7 +347,7 @@ def test_segment_indexing_stops_for_the_whole_run_not_one_file(store, monkeypatc
     """ingest_path walks a tree one file at a time.
 
     A per-call stop still paid `segments x chunks` provider embeddings and
-    logged an identical warning for every file in the tree — 10,000 files at
+    logged an identical warning for every file in the tree - 10,000 files at
     eight segments is 80,000 billed calls, all discarded.
     """
     user = store.create_user(email=f"lb_{uuid.uuid4().hex[:8]}@example.com")

@@ -13,7 +13,7 @@ content, never who was entitled to the source. Knowing a pathname became the
 whole of the authority, which is exactly what the artifact row exists to stop.
 
 So the tests below are about provenance, not syntax. A path is permitted
-because something persisted says the caller may have it, or it is refused —
+because something persisted says the caller may have it, or it is refused -
 and an unprovable claim is refused, the same rule the workflow permission
 model already follows.
 """
@@ -64,8 +64,8 @@ def tenants(runtime):
 def shared_object(runtime):
     """A real file under `shared_fs_root/shared`, with no artifact behind it.
 
-    Nothing in the app writes here — `/shared` is populated by an operator or
-    by an artifact's `fs_path` — so the fixture puts the bytes on disk exactly
+    Nothing in the app writes here - `/shared` is populated by an operator or
+    by an artifact's `fs_path` - so the fixture puts the bytes on disk exactly
     as a deployment would, and each test decides what provenance to give it.
     """
     root = Path(runtime.settings.shared_fs_root) / "shared" / _unique("corpus")
@@ -91,7 +91,7 @@ def _authorize(runtime, path, *, user):
 def _artifact(runtime, path, *, owner, visibility):
     """An artifact row whose `fs_path` names `path`.
 
-    Written with SQL because `create_artifact` computes `fs_path` itself — it
+    Written with SQL because `create_artifact` computes `fs_path` itself - it
     is where the artifact's own payload was persisted, always under
     `artifacts/{id}`. That is the finding underneath these tests: SPEC §18
     justifies `/shared` access with "an artifact whose visibility is shared or
@@ -184,7 +184,7 @@ class TestSharedNeedsAnArtifactNotAPathname:
         self, runtime, shared_object
     ):
         """`app_user.tenant_id` is NOT NULL, so this is not a user row without
-        a tenant — it is a principal whose tenant did not resolve. `None` is
+        a tenant - it is a principal whose tenant did not resolve. `None` is
         the absence of the answer, and it must not match one."""
         from liminallm.service.fs import authorize_path
 
@@ -215,7 +215,7 @@ class TestSharedNeedsAnArtifactNotAPathname:
         """`/shared/corpus` must not answer for `/shared/corpus-2`.
 
         Coverage is an ancestor relation between paths, not a prefix relation
-        between strings — and the cheap way to implement it (`LIKE fs_path ||
+        between strings - and the cheap way to implement it (`LIKE fs_path ||
         '%'`) gets exactly this case wrong while passing every other test here.
         """
         directory = shared_object.parent
@@ -246,7 +246,7 @@ class TestSharedNeedsAnArtifactNotAPathname:
 class TestTheExceptionIsForSharedAndNowhereElse:
     """§18 states the exception with a destination in it.
 
-    "`artifact.visibility in ('shared','global')` **points into `/shared`**" —
+    "`artifact.visibility in ('shared','global')` **points into `/shared`**" -
     so an artifact is not a general-purpose grant that happens to name a path.
     Searching artifacts for any candidate under `shared_fs_root` made it one:
     a row covering `artifacts/{id}/v1.json`, or covering another user's files,
@@ -255,7 +255,7 @@ class TestTheExceptionIsForSharedAndNowhereElse:
 
     @pytest.fixture
     def outside_shared(self, runtime, tenants):
-        """A real path under the root but outside `/shared` — another user's
+        """A real path under the root but outside `/shared` - another user's
         file, which is the version of this that matters."""
         victim = tenants["colleague"]
         files = (
@@ -272,7 +272,7 @@ class TestTheExceptionIsForSharedAndNowhereElse:
         """Asked as `owner`, not as `colleague`: `colleague` owns that
         directory and would be granted it by the ownership rule, which would
         make this test pass without the artifact rule doing anything. `owner`
-        is in the same tenant — so the artifact would grant it — and owns
+        is in the same tenant - so the artifact would grant it - and owns
         nothing here.
         """
         _artifact(
@@ -293,7 +293,7 @@ class TestTheExceptionIsForSharedAndNowhereElse:
     def test_a_global_artifact_cannot_reach_the_artifact_store(
         self, runtime, tenants
     ):
-        """The one path an artifact really does own — its own payload — is
+        """The one path an artifact really does own - its own payload - is
         still not `/shared`, so it is still not this exception."""
         payload = (
             Path(runtime.settings.shared_fs_root)

@@ -3,7 +3,7 @@
 `count_messages` existed and was tested; `_calibrate_from_usage` summed bare
 `count()` calls instead, so the per-message wire overhead every chat format
 adds was never in the estimate. `observe()` then saw estimated < actual and
-pushed the character factor up to close the gap — correcting a per-message
+pushed the character factor up to close the gap - correcting a per-message
 cost with a per-character multiplier, which is only right at one history
 length and drifts with every other.
 """
@@ -53,7 +53,7 @@ def test_the_estimate_includes_per_message_overhead(engine, counter):
 
 
 def test_every_message_is_charged_its_overhead(engine, counter):
-    """Three pieces, three messages — the old code counted one flat string's
+    """Three pieces, three messages - the old code counted one flat string's
     worth of nothing extra however long the history got."""
     engine._calibrate_from_usage(
         "prompt", ["snippet"], [{"content": "history"}], {"prompt_tokens": 99}

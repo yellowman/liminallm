@@ -7,7 +7,7 @@ The rule, frozen:
     increments; tool-level success clears. Transport and retry path do not
     change the ledger. A call refused before invocation records nothing.
 
-An invocation *starts* when its serve begins — the worker is spawned, or the
+An invocation *starts* when its serve begins - the worker is spawned, or the
 stream's producer runs. Resolution, admission, the breaker check itself,
 input validation and plan assembly all happen before that point, so their
 failures are refusals, not tool health. Two deliberate boundary rulings, both
@@ -17,7 +17,7 @@ measured against the previous behaviour first:
   records a failure. A hung backend whose `timeout_seconds` exceeds the node
   budget would otherwise never record an outcome at all, and the breaker
   could not protect against exactly the hang it exists for.
-* An attempt abandoned by its caller — a cancel, a revoked lease — records
+* An attempt abandoned by its caller - a cancel, a revoked lease - records
   nothing. The tool was not proven unhealthy, and a user's cancel habit must
   not open their tenant's breaker.
 
@@ -25,7 +25,7 @@ Measured on the previous code (each row one attempt, real engine, real
 ledger): streamed failures recorded 0 and streamed successes cleared
 nothing; a healthy tool whose *consumer's* `output_schema` refused the node
 was charged a tool failure; so were input-validation refusals, unresolved
-references, plan-phase crashes and caller revocations — none of which ran
+references, plan-phase crashes and caller revocations - none of which ran
 the tool. All keys were the node's reference spelling, so two specs that
 share a spelling shared a breaker across scopes.
 """
@@ -138,7 +138,7 @@ class _Ctx:
 
         Derived through the engine's own resolution, because the real store
         seeds the default tools as artifact rows: `llm.generic` resolves to
-        a persisted artifact, and the identity is that row — not the
+        a persisted artifact, and the identity is that row - not the
         spelling. Witnesses that assert an exact count read the spelling key
         *too*, so a write that regresses to the reference spelling is a
         miscount, not a miss.
@@ -165,7 +165,7 @@ def _raise(*a, **k):
 
 
 class _StreamBackend:
-    """A cancellable streaming backend: one token, then the answer — or a
+    """A cancellable streaming backend: one token, then the answer - or a
     failure before any token when told to fail. `on_stream` runs at the top
     of each provider call, for witnesses that change the world mid-retry."""
 
@@ -181,7 +181,7 @@ class _StreamBackend:
         self.truncate = truncate
         self.stream_calls = 0
         self.on_stream = None
-        #: When set, the stream blocks on this event after its first token —
+        #: When set, the stream blocks on this event after its first token -
         #: the shape of a provider mid-read when a cancel lands.
         self.block_after_token = None
         #: A pause between two tokens, so a cancel set on the first is
@@ -220,8 +220,8 @@ class _SpyCache:
 
     Delegation rather than a hand-made stand-in: every read and the Lua
     arithmetic stay the real object's, and the spy only observes. Needed
-    because the real ledger masks one class of defect — recording a failure
-    while the breaker is open is a no-op in the atomic script — so "the
+    because the real ledger masks one class of defect - recording a failure
+    while the breaker is open is a no-op in the atomic script - so "the
     counter did not move" cannot distinguish a refusal that records nothing
     from a refusal whose recording was silently swallowed.
     """
@@ -253,7 +253,7 @@ def _stream_ctx(fail=False, stall=False, fail_after_token=False, truncate=False)
 class _SlowCheckCache:
     """The real cache with a stalled breaker check, for the witness that
     preparation time comes out of the attempt's budget, not on top of it.
-    With `once=True` only the first check stalls — the shape of a transient
+    With `once=True` only the first check stalls - the shape of a transient
     stall whose retry must then get its retry."""
 
     def __init__(self, inner, delay, once=False):
@@ -360,8 +360,8 @@ class TestTheTransportDoesNotChangeTheLedger:
 
     @pytest.mark.asyncio
     async def test_a_clean_truncation_is_a_failure(self):
-        """A provider that returns mid-answer without an error event — a
-        clean TCP EOF — started its serve and produced no completed result.
+        """A provider that returns mid-answer without an error event - a
+        clean TCP EOF - started its serve and produced no completed result.
         That is a tool failure, distinguishable now from an interruption:
         the pump knows a stop cut the stream short, and only the stop stays
         silent. Five clean EOFs must open the breaker."""
@@ -402,7 +402,7 @@ class TestNodeCorrectnessIsNotToolHealth:
     @pytest.mark.asyncio
     async def test_an_output_schema_refusal_records_the_tools_success(self):
         """The tool answered; the consumer's schema refused the node. The
-        node fails — and the ledger records a success, clearing the count."""
+        node fails - and the ledger records a success, clearing the count."""
         c = _Ctx()
         art = c.tool(
             name := _u("strict"),
@@ -439,7 +439,7 @@ class TestARefusalBeforeInvocationRecordsNothing:
     @pytest.mark.asyncio
     async def test_a_circuit_open_refusal_records_nothing(self):
         """The control that already held: the breaker's own refusal must not
-        feed the breaker. The spy is what makes it airtight — the real
+        feed the breaker. The spy is what makes it airtight - the real
         ledger no-ops a failure recorded while open, so the counter alone
         cannot see an engine that wrongly records on refusal."""
         c = _Ctx()
@@ -487,7 +487,7 @@ class TestARefusalBeforeInvocationRecordsNothing:
     @pytest.mark.asyncio
     async def test_the_invocation_backstop_refusal_records_nothing(self):
         """`_invoke_tool` keeps its own preflight as the last line of defense
-        for a caller that skipped admission — the seams refuse first, so
+        for a caller that skipped admission - the seams refuse first, so
         only a direct probe reaches it. Its refusal must be as silent in
         the ledger as the seams' are."""
         c = _Ctx()
@@ -514,7 +514,7 @@ class TestARefusalBeforeInvocationRecordsNothing:
 
     @pytest.mark.asyncio
     async def test_a_plan_phase_failure_records_nothing(self):
-        """Plan assembly is engine work — attachments, context, budgets. A
+        """Plan assembly is engine work - attachments, context, budgets. A
         crash there proves nothing about the tool, whose body never ran."""
         c = _Ctx()
 
@@ -546,7 +546,7 @@ class TestTheStartedAttemptBoundary:
 
     @pytest.mark.asyncio
     async def test_a_deadline_before_the_worker_spawns_records_nothing(self):
-        """`started` means the worker actually started — not that the serve
+        """`started` means the worker actually started - not that the serve
         was scheduled into a thread pool. A deadline that expires while the
         serve is queued or stalled short of its spawn proves nothing about
         the tool."""
@@ -567,7 +567,7 @@ class TestTheStartedAttemptBoundary:
     @pytest.mark.asyncio
     async def test_a_deadline_during_the_ready_wait_records_the_failure(self):
         """The other edge of `started`: the worker has started and is
-        registered — only the READY handshake is outstanding. A node
+        registered - only the READY handshake is outstanding. A node
         deadline expiring there kills a real, running worker, and that is
         a started serve cut off: a breaker failure. Marking `started` only
         after `spawn()` returns leaves a window as long as the handshake
@@ -614,7 +614,7 @@ class TestTheStartedAttemptBoundary:
         """The deadline is absolute and preparation spends it. A breaker
         check that stalls past the node budget must not hand the body a
         fresh clock afterwards: the attempt times out, the tool never
-        starts, and nothing is recorded — preparation never `started`."""
+        starts, and nothing is recorded - preparation never `started`."""
         c = _Ctx()
         c.engine.cache = _SlowCheckCache(c.cache, 0.5)
         ran = []
@@ -636,7 +636,7 @@ class TestTheStartedAttemptBoundary:
         def revoked(*a, **k):
             # Stands for a worker that spawned and whose lease was then
             # revoked mid-serve: the real serve marks `started` at the
-            # spawn, so this double does too — otherwise the recorder's
+            # spawn, so this double does too - otherwise the recorder's
             # started gate masks the very write this witness polices.
             if k.get("observation") is not None:
                 k["observation"].started = True
@@ -658,7 +658,7 @@ class TestTheBreakerBindsEachAttempt:
     async def test_a_breaker_tripped_mid_execution_stops_the_next_attempt(self):
         """The fifth failure arrives on attempt one of a retrying node. The
         retry is a new invocation, and an open breaker refuses it before it
-        starts — checking once at node entry lets retries walk past the trip
+        starts - checking once at node entry lets retries walk past the trip
         their own first attempt caused."""
         c = _Ctx()
         await c.seed_failures(c.ident(), 4)
@@ -736,7 +736,7 @@ class TestTheBreakerBindsEachAttempt:
 
 class TestATimedOutAttemptIsNotTheExecution:
     """The driver's timeout revoke must scope to the attempt that timed out.
-    A revoke that finds no current `Attempt` cancels the logical execution —
+    A revoke that finds no current `Attempt` cancels the logical execution -
     fail-closed and right for a revoke racing the first spawn, wrong for a
     node timeout whose retry policy still owes the node a retry."""
 
@@ -804,7 +804,7 @@ class TestATimedOutAttemptIsNotTheExecution:
 
 
 class TestAuthorityTravelsByExactAttempt:
-    """A worker spawn joins the attempt it was created for — never whatever
+    """A worker spawn joins the attempt it was created for - never whatever
     attempt happens to be current when an abandoned thread finally wakes up.
     Ambient authority by arrival time is the class tranche 2 removed."""
 
@@ -812,7 +812,7 @@ class TestAuthorityTravelsByExactAttempt:
     async def test_a_late_serve_cannot_adopt_the_retry_attempt(self):
         """Attempt one's serve is still queued when the node times out and
         the retry begins. When that stale thread finally spawns, it must be
-        refused — not adopt the retry's fresh attempt and run the old plan
+        refused - not adopt the retry's fresh attempt and run the old plan
         beside the retry's own worker."""
         c = _Ctx()
         real_serve = c.engine._serve_invocation
@@ -850,8 +850,8 @@ class TestAuthorityTravelsByExactAttempt:
 
     def test_adoption_requires_the_exact_live_attempt(self):
         """The `Invocation` contract itself: adoption names the attempt the
-        spawn belongs to, and anything else — a revoked attempt, a
-        different current attempt, a cancelled execution — is refused."""
+        spawn belongs to, and anything else - a revoked attempt, a
+        different current attempt, a cancelled execution - is refused."""
         from liminallm.service.invocation import Invocation, LeaseRevoked
 
         inv = Invocation(_u("inv"), tool="t")
@@ -877,7 +877,7 @@ class TestAuthorityTravelsByExactAttempt:
     async def test_a_spawn_failure_leaves_the_retry_prompt(self):
         """`process.start()` raising is an ordinary retryable failure. It
         must not strand a half-adopted attempt whose `finished` nobody will
-        ever set — that turns a one-line OSError into the thirty-second
+        ever set - that turns a one-line OSError into the thirty-second
         unreaped path."""
         import liminallm.service.tool_worker as tool_worker_mod
 
@@ -1021,11 +1021,11 @@ class TestAuthorityTravelsByExactAttempt:
 class TestAStaleServeLeavesNothing:
     @pytest.mark.asyncio
     async def test_a_stale_serve_after_close_leaves_no_scratch(self):
-        """The invocation is closed — cancelled, terminated, cleaned. A
+        """The invocation is closed - cancelled, terminated, cleaned. A
         serve thread waking after that allocates its scratch outside the
         lock, then is refused at the adoption check inside it. What it must
         not do is leave that directory behind, because the second `close()`
-        is an idempotent no-op with nobody left to remove it — so the
+        is an idempotent no-op with nobody left to remove it - so the
         refused spawn deletes the directory it made, itself."""
         import os
         import uuid as uuid_mod
@@ -1084,7 +1084,7 @@ class TestAStalledScratchDoesNotBlockRevocation:
     ):
         """A node deadline revokes through the invocation lock. If the
         scratch allocation runs while that lock is held, a slow `mkdtemp`
-        holds the revoke off for its whole duration — and the hard
+        holds the revoke off for its whole duration - and the hard
         wall-clock deadline earlier rounds established is gone, replaced by
         "the deadline, plus however long the filesystem took". Allocation
         runs outside the lock now; only the revalidated ownership transfer
@@ -1167,7 +1167,7 @@ class TestTheWindowIsARollingWindow:
     async def test_a_slow_drip_outside_any_window_never_trips(self):
         """SPEC's contract is N failures inside one window. A per-failure
         TTL refresh turns that into "a chain with no gap over the window",
-        so a slow drip — one failure every fifty seconds, forever — trips a
+        so a slow drip - one failure every fifty seconds, forever - trips a
         breaker whose sixty-second window never held five failures."""
         rt = get_runtime()
         cache = rt.cache
@@ -1206,8 +1206,8 @@ class TestTheWindowIsARollingWindow:
 # A representation change is a coordinated reset, not a rolling mixed-version
 # deploy. The version keeps the boundary crash-safe; it does not unify two
 # independent ledgers, so v2 owns its own key and never reads or clears a
-# stray legacy one. The cutover procedure itself — draining, then purging the
-# superseded namespace — is pinned separately below.
+# stray legacy one. The cutover procedure itself - draining, then purging the
+# superseded namespace - is pinned separately below.
 # =============================================================================
 
 
@@ -1219,7 +1219,7 @@ class TestTheFailureKeyIsRolloutCompatible:
         """Merged main stores the breaker count as a plain string at
         `:failures`, written with `INCR`. The rolling window makes that key a
         sorted set, and the ZSET commands raise `WRONGTYPE` against a string
-        — which the breaker preflight does not mask, so every call for a tool
+        - which the breaker preflight does not mask, so every call for a tool
         with 1–4 recent failures would error the moment a new replica rolls
         out. The window uses a versioned key, so the legacy counter is left
         untouched and neither side reads the other's type."""
@@ -1247,12 +1247,12 @@ class TestTheFailureKeyIsRolloutCompatible:
         """Representation isolation, not the cutover procedure. `:failures`
         and `:failures:v2` are independent ledgers, and the v2 code path must
         never opportunistically read a stray legacy counter into its window
-        or clear one on success — half-migrating them would rebuild the "one
+        or clear one on success - half-migrating them would rebuild the "one
         success clears only one ledger" partition the two-ledger design
         forbids (SPEC §18.3). So the steady-state v2 code touches v2 alone.
 
         This is defense-in-depth on the code, independent of deployment. The
-        cutover itself does not leave a stray legacy key lying around — it
+        cutover itself does not leave a stray legacy key lying around - it
         purges the superseded namespace, pinned by
         `test_a_reset_purges_the_superseded_history_against_rollback`. Here
         we only prove that if such a key is present, v2 ignores it."""
@@ -1289,8 +1289,8 @@ class TestTheFailureKeyIsRolloutCompatible:
     async def test_a_reset_purges_the_superseded_history_against_rollback(self):
         """Abandoning the old counter to its TTL is not a reset if the old
         representation can come back inside that window. There is no
-        mixed-version serving in this sequence — the deployment contract is
-        followed perfectly — and the reset still fails: a rollback re-reads a
+        mixed-version serving in this sequence - the deployment contract is
+        followed perfectly - and the reset still fails: a rollback re-reads a
         still-live legacy `:failures` and resumes counting from it, opening a
         breaker the reset was supposed to have cleared. So the reset purges
         the superseded representation's failure history rather than trusting
@@ -1324,7 +1324,7 @@ class TestTheFailureKeyIsRolloutCompatible:
             f"rollback (resumed at {resumed}, not 1): the reset abandoned it "
             f"to its TTL instead of purging it"
         )
-        # The shared cooldown survives — an unhealthy tool stays open.
+        # The shared cooldown survives - an unhealthy tool stays open.
         assert await cache.client.exists(open_key) == 1, (
             "the reset purged the shared `:open` cooldown; it must survive a "
             "representation change"
@@ -1377,15 +1377,15 @@ class TestTheWindowClockIsTheLedgers:
         serving host's. Threshold 2, window 60s: two failures moments apart
         are inside one real minute and must trip. But if the first is
         recorded by a replica whose clock runs 100 seconds slow, it lands
-        with a past score, and the next — normally-clocked — replica prunes
+        with a past score, and the next - normally-clocked - replica prunes
         everything older than its own now-minus-window before counting,
         dropping that failure early. The breaker then never sees two. Read
         against the ledger's own clock the skew is inert, and the two
         failures trip it.
 
         (The mirror direction, a fast replica scoring in the future, is
-        masked by the set's own window-length TTL — the future entry is
-        evicted by real time before it can outlast the window — so the
+        masked by the set's own window-length TTL - the future entry is
+        evicted by real time before it can outlast the window - so the
         early-prune direction is the one a witness can pin.)"""
         import liminallm.storage.redis_cache as rc_mod
 
@@ -1431,7 +1431,7 @@ class TestCancelDuringPreparationStopsTheProvider:
     @pytest.mark.asyncio
     async def test_a_cancel_set_during_preparation_never_starts_the_provider(self):
         """The cancel lands while preparation is blocked in the breaker
-        check. Preparation then returns normally — and the provider must
+        check. Preparation then returns normally - and the provider must
         not start on a revoked attempt: the producer gate checks the exact
         attempt's liveness under the invocation lock before anything runs."""
         c, backend = _stream_ctx()
@@ -1472,7 +1472,7 @@ class TestDispatchIsNotFreeClock:
     async def test_the_transport_decision_spends_the_node_deadline(self):
         """The streamed turn's only resolver runs inside the attempt's
         deadline. A resolver that stalls longer than the node budget must
-        time the attempt out — not run on free clock and then hand the
+        time the attempt out - not run on free clock and then hand the
         provider a fresh one."""
         c, backend = _stream_ctx()
         real_resolve = c.engine._resolve_tool
@@ -1501,8 +1501,8 @@ class TestDispatchIsNotFreeClock:
 
 class TestFreshAuthorityIsFreshlyAdjudicated:
     """Re-resolving per attempt is only half of tranche 2's rule. The other
-    half is that everything a resolved tool must pass before any body runs —
-    the privileged conjunction, the input schema — is decided against the
+    half is that everything a resolved tool must pass before any body runs -
+    the privileged conjunction, the input schema - is decided against the
     spec the attempt actually resolved, not the one the first attempt saw."""
 
     @pytest.mark.asyncio
@@ -1510,7 +1510,7 @@ class TestFreshAuthorityIsFreshlyAdjudicated:
         """Attempt one runs the caller's own non-privileged spec and fails;
         the spec is retired; attempt two falls through to an admin-owned
         *privileged* spec of the same name. An ordinary caller must be
-        refused `forbidden` before that body starts — a preflight carried
+        refused `forbidden` before that body starts - a preflight carried
         over from the retired spec is an authority bypass, not staleness."""
         rt = get_runtime()
         store = rt.store
@@ -1635,8 +1635,8 @@ class TestRecoveryIsNotToolHealth:
 
     @pytest.mark.asyncio
     async def test_a_cancel_between_events_does_not_record(self):
-        """The other cancel arrival: the pump has started — `started` is
-        marked — and the cancel is discovered when the next event lands,
+        """The other cancel arrival: the pump has started - `started` is
+        marked - and the cancel is discovered when the next event lands,
         not by the stop cutting a blocked read. The drain then runs its
         no-answer tail with the acknowledgment in hand, and the caller's
         cancel must still leave the ledger untouched."""
@@ -1667,7 +1667,7 @@ class TestRecoveryIsNotToolHealth:
         """The attempt's own contract, probed at the seam: the running paths
         stop iterating at a forwarded `cancel_ack`, so the drain's tail
         only ever runs post-acknowledgment for a consumer that drains to
-        the end — and for that consumer the distinction must hold: an
+        the end - and for that consumer the distinction must hold: an
         acknowledged interruption records nothing, a truncation records
         the failure."""
         from liminallm.service.node_attempt import StreamedNodeAttempt
@@ -1704,7 +1704,7 @@ class TestRecoveryIsNotToolHealth:
     @pytest.mark.asyncio
     async def test_a_salvaged_partial_answer_still_records_the_failure(self):
         """The agent keeps a partial answer when its final stream dies after
-        a token — the user keeps what was on their screen. The breaker must
+        a token - the user keeps what was on their screen. The breaker must
         still see the provider failure: the salvage is user-facing recovery,
         and a partial `tool_result` that overwrites the observation with
         success turns five provider deaths into a clean bill of health."""
@@ -1750,7 +1750,7 @@ class TestStreamedPlanningIsNotTheServe:
 
     @pytest.mark.asyncio
     async def test_an_agent_serve_hang_records_a_failure(self):
-        """The agent body reaches its worker serve — the backend declares
+        """The agent body reaches its worker serve - the backend declares
         tool support and the context assembly offers a tool, else the body
         delegates to the plain LLM node before any serve exists."""
         c, backend = _stream_ctx()
@@ -1808,7 +1808,7 @@ class TestStreamedPlanningIsNotTheServe:
     async def test_a_failed_agent_degrades_to_a_plain_answer_not_a_cancel(self):
         """The attachment agent, when its serve fails with no tokens emitted,
         degrades to a plain LLM answer. It revokes first to take down the
-        failed worker before the fallback runs — but that revoke is a
+        failed worker before the fallback runs - but that revoke is a
         degradation, not the caller walking away, so the fallback producer
         must still start. The producer gate refuses a *cancelled* invocation,
         not one revoked for degradation (SPEC §18.3): a caller who never
@@ -1883,7 +1883,7 @@ class TestStreamedPlanningIsNotTheServe:
 class TestTheDirectInvocationIsTheSameLedger:
     """`POST /v1/tools/{id}/invoke` starts tool invocations like any node
     attempt, so it checks the same breaker and records through the same
-    writer — otherwise the direct API is an unmetered way to hammer a tool
+    writer - otherwise the direct API is an unmetered way to hammer a tool
     the breaker has already cut off for every workflow."""
 
     def _descriptor(self, c):
@@ -1941,7 +1941,7 @@ class TestTheDirectInvocationIsTheSameLedger:
     async def test_direct_admission_order_matches_the_transports(self):
         """One admission order everywhere: preflight, then breaker. With both
         grounds to refuse, the direct endpoint gives the same answer a
-        workflow attempt gives — validation, not circuit-open."""
+        workflow attempt gives - validation, not circuit-open."""
         c = _Ctx()
         art = c.tool(
             name := _u("ordfoo"),
@@ -2026,8 +2026,8 @@ class TestBreakerIdentityIsTheResolvedTool:
         tool, same breaker: the implicit spelling is not a bypass.
 
         Admission requires `tool` on a `tool_call` node, so the schema is
-        handed to the engine the way legacy rows reach it — through what the
-        store vouches for — rather than created as a new artifact."""
+        handed to the engine the way legacy rows reach it - through what the
+        store vouches for - rather than created as a new artifact."""
         from unittest.mock import patch
 
         from liminallm.service.tool_namespace import (

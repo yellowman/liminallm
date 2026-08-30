@@ -4,22 +4,22 @@ SPEC §18 has always said tool workers run in a spawned child process under
 POSIX rlimits with a wall-clock kill. What ran instead was a thread pool, and a
 thread is not a boundary anything can act on: a node timeout cancelled the
 coroutine awaiting the thread, the thread carried on, and the retry ran beside
-its own predecessor — sharing a working directory, a sandbox child, and a claim
+its own predecessor - sharing a working directory, a sandbox child, and a claim
 on the answer. "Cancelled" described who had stopped watching.
 
 Two halves live here because they are the two ends of one pipe:
 
-* the **child** — `_worker_main` and the bodies below it. It leads its own
+* the **child** - `_worker_main` and the bodies below it. It leads its own
   process group, so one `killpg` reaches whatever it went on to spawn. It
   imports no store, no model client, no settings and no credentials; every
   effect it can have is a request to the broker on the other end.
-* the **parent** — `spawn` and `WorkerHandle`. It registers the child against
+* the **parent** - `spawn` and `WorkerHandle`. It registers the child against
   the invocation before anything is awaited, so the process is killable from
   the moment it exists rather than from the moment the parent notices it.
 
 Keeping the child's imports to the standard library is not tidiness. It is what
-makes the spawn affordable — a fresh interpreter that imported the service
-layer would cost far more than the work most tools do — and it is what keeps
+makes the spawn affordable - a fresh interpreter that imported the service
+layer would cost far more than the work most tools do - and it is what keeps
 the promise that the worker holds nothing worth stealing. `spawn` re-imports
 this module in the child, so every module-level import here is paid on every
 tool call: the logger and the invocation types are parent-side only and are
@@ -91,7 +91,7 @@ class BrokerClient:
         # the broker's `FrameBudget` is the cap that counts and it grows as
         # the broker answers; a second copy of it in this process would drift
         # from the real one and refuse frames the broker would have taken.
-        # Inbound, the broker is the trusted end — a cap here would defend a
+        # Inbound, the broker is the trusted end - a cap here would defend a
         # disposable rlimited process against its own parent.
         send_frame(
             self._conn,
@@ -114,8 +114,8 @@ def _apply_limits(limits: Dict[str, int]) -> None:
     """SPEC §18: memory hard cap, CPU seconds, max file size, no core dumps.
 
     Applied with the standard library rather than by importing the sandbox
-    module. The numbers are still the parent's — one `SandboxConfig` decides
-    them — but a child that imported the service layer to read them would pay
+    module. The numbers are still the parent's - one `SandboxConfig` decides
+    them - but a child that imported the service layer to read them would pay
     for exactly the imports this process exists to do without.
 
     **Fails closed.** These are the hard caps SPEC declares, and a wall-clock
@@ -153,7 +153,7 @@ def _confine(scratch: str) -> None:
     deployment's database url and provider keys, every host path, and an
     outbound socket were all still available to it. The broker being its
     *intended* channel is not the same as the broker being its *only* channel
-    — one bug in a body is the difference, and that is exactly the bug this
+    - one bug in a body is the difference, and that is exactly the bug this
     process exists to contain.
 
     Same mechanism `run_python` uses (service/confine.py) and the same rule:
@@ -213,7 +213,7 @@ def _worker_main(
 
     Everything this process says is JSON (service/wire.py). SPEC §18 names it
     the untrusted half of the boundary, and a pickle would have let it choose
-    which class the *broker* constructs while decoding — before the broker
+    which class the *broker* constructs while decoding - before the broker
     could check anything about the message.
     """
     from liminallm.service.wire import WireError, send_frame
@@ -223,7 +223,7 @@ def _worker_main(
     except (AttributeError, OSError):
         # No sessions on this platform, or already a group leader. The pgid
         # reported below will not equal our pid, so the parent keeps killing by
-        # single pid — the group shortcut is lost, nothing else is.
+        # single pid - the group shortcut is lost, nothing else is.
         pass
     try:
         send_frame(conn, {"ready": True, "pid": os.getpid(), "pgid": os.getpgid(0)})
@@ -274,7 +274,7 @@ def _worker_main(
     try:
         send_frame(conn, {"done": True, "result": result}, max_bytes=None)
     except WireError as exc:
-        # Not representable as data — a body returned an object. Say so in a
+        # Not representable as data - a body returned an object. Say so in a
         # frame that is, rather than letting the broker read a silence it
         # would report as a dead worker.
         try:
@@ -384,11 +384,11 @@ def _body_python(
 def _body_agent_loop(
     broker: BrokerClient, _tool: str, plan: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Multi-round, model-driven tool use — the reason this process exists.
+    """Multi-round, model-driven tool use - the reason this process exists.
 
     Everything the model decides happens on this side: which tool, with what
     arguments, how many times. Everything that touches the world happens on the
-    other. That split is the containment — a page that talks the model into
+    other. That split is the containment - a page that talks the model into
     calling the interpreter reaches a broker that has already withdrawn it.
 
     A round's calls go over as one request rather than one each. The parent
@@ -402,7 +402,7 @@ def _body_agent_loop(
     deadline = time.monotonic() + float(plan.get("deadline_seconds") or 45.0)
     fallback_query = str(plan.get("message") or "")
     # The streaming caller wants the answer token by token, and the final round
-    # offers no tools — there is no model-chosen control flow left in it to
+    # offers no tools - there is no model-chosen control flow left in it to
     # contain. So the worker stops after the tool rounds and hands back the
     # conversation it built; the parent streams the last turn from there.
     stream_final = bool(plan.get("stream_final"))
@@ -512,7 +512,7 @@ BODY_NAMES = frozenset(_BODIES)
 
 #: Headroom on top of what the parent has handed the worker, for one model
 #: turn and the structure around it. Everything a body returns is made of
-#: bytes the parent supplied — the plan, then each broker reply — so the
+#: bytes the parent supplied - the plan, then each broker reply - so the
 #: parent's own outbound total is the natural budget, and this is what it does
 #: not account for: MAX_GENERATION_TOKENS of new text, plus keys and nesting.
 WORKER_FRAME_ALLOWANCE_BYTES = 1024 * 1024
@@ -586,12 +586,12 @@ class WorkerHandle:
         exception to that: a tool that starts a helper and then answers
         normally leaves it running, and the invocation forgets the worker one
         line later, so the helper becomes nobody's. SPEC §18 has no clause
-        about how the worker finished — "what the invocation started, the
+        about how the worker finished - "what the invocation started, the
         invocation can kill".
 
         `Process.is_alive()` is deliberately not consulted first. It joins an
         exited child, and a reaped pid is a number the kernel may hand to
-        anyone — the group has to be signalled while that pid still names it.
+        anyone - the group has to be signalled while that pid still names it.
 
         **The return value is the point.** §18 says "reaping is confirmed
         rather than bounded: a tree that will not die fails the node instead of
@@ -631,7 +631,7 @@ class WorkerHandle:
         self.leader_reaped = True
         # The leader being reaped is not the group being empty. A killed
         # member is still in the group until its parent reaps it, and once the
-        # leader is gone that parent is init — measured here, a group outlives
+        # leader is gone that parent is init - measured here, a group outlives
         # its reaped leader by about a second.
         #
         # So this reports and does not wait. Waiting would put that second on
@@ -664,12 +664,12 @@ def spawn(
     """Start a worker for one attempt at one tool call.
 
     The child is registered against the invocation before anything is awaited,
-    so a revoke arriving one instruction later still reaches it — but as a
+    so a revoke arriving one instruction later still reaches it - but as a
     **single pid**, not a group. `os.setsid()` runs in the child and cannot
     have happened yet when `start()` returns, so `os.getpgid(child)` still
     answers with the *parent's* group: a `killpg` in that window would SIGKILL
     the API server and everything sharing its group. Measured, not reasoned
-    about — `getpgid` on a just-started spawn child returns the parent's pgid.
+    about - `getpgid` on a just-started spawn child returns the parent's pgid.
 
     So the group is earned, not assumed. The child sends READY once `setsid`
     has actually happened, carrying the pgid it ended up in, and only a pgid
@@ -685,7 +685,7 @@ def spawn(
     budget = FrameBudget(_plan_bytes(plan))
     # Two phases, and the split is the whole point. The scratch is allocated
     # first, *outside* the invocation lock, as this thread's own temporary
-    # directory owned by nobody yet — because allocation is real filesystem
+    # directory owned by nobody yet - because allocation is real filesystem
     # I/O, and the node deadline revokes through this same lock: a `mkdtemp`
     # that stalls must not be able to hold a revoke off (SPEC §18.3), which
     # is exactly what happened when it ran inside the lock.
@@ -693,16 +693,16 @@ def spawn(
     # Then one linearization boundary under the lock: revalidate the exact
     # attempt this spawn was created for, transfer ownership of the scratch,
     # start and register the child, and transfer ownership last. A revoke
-    # serializes against this block — it lands before, and the adoption
+    # serializes against this block - it lands before, and the adoption
     # refuses with no child started, or it lands after and its sweep finds
-    # the registered child. `on_started` — the breaker's record that the
-    # worker really started, one attribute write, no-throw — fires inside the
+    # the registered child. `on_started` - the breaker's record that the
+    # worker really started, one attribute write, no-throw - fires inside the
     # same block: marked after `spawn` returns, a worker killed during the
     # READY handshake below died registered but never `started`.
     #
     # If the adoption refuses (stale attempt, closed execution), the scratch
     # was never handed to the invocation, so this thread deletes the
-    # directory it made — a stale serve leaves nothing behind. Once the path
+    # directory it made - a stale serve leaves nothing behind. Once the path
     # is registered, teardown owns it and a direct delete would race the
     # opener, so cleanup stops there.
     registered = False
@@ -768,7 +768,7 @@ def _plan_bytes(plan: Dict[str, Any]) -> int:
 def _await_ready(conn: Any, process: Any) -> bool:
     """Whether the child has proved it leads a process group of its own.
 
-    False on anything unexpected — a child that died, a pipe that closed, a
+    False on anything unexpected - a child that died, a pipe that closed, a
     platform with no sessions, a message that is not the handshake. Every one
     of those means the same thing here: keep killing by single pid, because a
     group kill would reach processes this worker does not own.
@@ -786,7 +786,7 @@ def _await_ready(conn: Any, process: Any) -> bool:
                 return False
             pgid, pid = message.get("pgid"), message.get("pid")
             # The pgid must be the child's own pid. Anything else is a group it
-            # shares with someone — the parent's, most likely — and killing it
+            # shares with someone - the parent's, most likely - and killing it
             # would take them down too.
             return bool(pgid) and pgid == pid == process.pid
         if not process.is_alive():

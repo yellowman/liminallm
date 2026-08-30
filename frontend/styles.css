@@ -291,7 +291,7 @@ body {
   margin: 0 auto;
 }
 
-/* Single-column layout (admin page) — panels toggle visibility, so stack them */
+/* Single-column layout (admin page) - panels toggle visibility, so stack them */
 .layout {
   display: block;
   width: 100%;
@@ -517,7 +517,7 @@ textarea {
   resize: vertical;
 }
 
-/* Buttons — one size, one shape, everywhere. A link that sits in a button
+/* Buttons - one size, one shape, everywhere. A link that sits in a button
    row takes the same shape: it navigates, so it stays an anchor. */
 button.primary,
 button.ghost,
@@ -579,7 +579,7 @@ button.minor:hover {
   border-color: var(--border);
 }
 
-/* Chat panel — a single reading column, measured like a magazine page */
+/* Chat panel - a single reading column, measured like a magazine page */
 /* The panel's own padding and the message list's stacked at the same seam.
    One of them is enough above the first message. */
 .chat-panel {
@@ -973,7 +973,7 @@ button.minor:hover {
 }
 
 /* =========================================================================
-   Turn navigator — tick marks at the right edge that expand into a jump list
+   Turn navigator - tick marks at the right edge that expand into a jump list
    ========================================================================= */
 .turn-rail {
   position: fixed;
@@ -1068,7 +1068,7 @@ button.minor:hover {
   border-radius: 6px;
   text-align: left;
   justify-content: flex-start;
-  /* The bars are the collapsed representation of the label — once the text is
+  /* The bars are the collapsed representation of the label - once the text is
      showing they are redundant, so they collapse away entirely. */
   gap: 0;
 }
@@ -1947,7 +1947,7 @@ button.minor:hover {
   font-family: var(--font-mono);
 }
 
-/* Type / visibility badges — neutral, uniform */
+/* Type / visibility badges - neutral, uniform */
 .type-badge,
 .visibility-badge {
   display: inline-block;
@@ -2807,8 +2807,8 @@ button.minor:hover {
 
    Density is the whole design. A hundred controls stacked one per row ran to
    fourteen screens; laying each group out as a grid and sizing cells by type
-   puts the same controls in a fraction of that, with related settings — the
-   eighteen rate limits, the four session windows — adjacent instead of
+   puts the same controls in a fraction of that, with related settings - the
+   eighteen rate limits, the four session windows - adjacent instead of
    scattered down a column.
    --------------------------------------------------------------------------- */
 

@@ -2,7 +2,7 @@
 
 A raw decoder has no out-of-band role structure: the role labels ARE tokens.
 So two code paths that write ``USER:`` and ``user:`` are not two styles of the
-same thing — they are two different inputs, and an adapter fitted to one is
+same thing - they are two different inputs, and an adapter fitted to one is
 being asked to serve the other. Training built history with uppercase labels
 and a ``CONTEXT_SNIPPET:`` marker while serving flattened with lowercase, so
 "same checkpoint, same tokenizer" still did not mean the same input.
@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import Any, Iterable, List, Optional, Sequence
 
 #: The label written before each turn. Lowercase, matching what serving has
-#: always emitted — training is the side that moves, because the serving
+#: always emitted - training is the side that moves, because the serving
 #: format is the one users' text has been flowing through.
 ROLE_LABELS = ("system", "user", "assistant", "tool")
 
@@ -36,7 +36,7 @@ def format_turn(role: str, content: str) -> str:
 
 
 def format_conversation(messages: Iterable[Any]) -> str:
-    """Messages — dicts or ORM rows — as the model's prompt text."""
+    """Messages - dicts or ORM rows - as the model's prompt text."""
     lines: List[str] = []
     for message in messages or []:
         if isinstance(message, dict):
@@ -56,7 +56,7 @@ def place_context(messages: List[Any], snippets: Sequence[str]) -> List[Any]:
 
     Placement is part of the representation. Training appended the context
     after every message (so it landed *after* the question) while serving
-    inserted it before the final user turn — same marker, different token
+    inserted it before the final user turn - same marker, different token
     order, which for a raw decoder is a different input. Whichever order is
     chosen, it has to be chosen once, here.
     """

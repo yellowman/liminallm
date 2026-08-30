@@ -154,7 +154,7 @@ test_redis_is_actually_configured() {
 
     # `redis_url` is a managed setting with no environment variable of its
     # own, so a bare REDIS_URL in the compose file configured nothing and left
-    # the default pointing at localhost — where, inside the app container,
+    # the default pointing at localhost - where, inside the app container,
     # there is no Redis. /healthz already tells "healthy" from
     # "not_configured", so the fallback cannot be exercised unnoticed.
     local response
@@ -168,7 +168,7 @@ test_redis_is_actually_configured() {
         # check_dependencies exits before this is reachable. Kept because the
         # failure it names is a harness fault, and counting it as a pass would
         # let the suite exit 0 having never established the invariant it is
-        # here for — as it briefly did.
+        # here for - as it briefly did.
         log_fail "cannot read checks.redis.status: no JSON parser on this host"
         return 1
     fi

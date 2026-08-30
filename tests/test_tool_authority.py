@@ -1,4 +1,4 @@
-"""Who is allowed to run what — SPEC §18 and the artifact permission rule.
+"""Who is allowed to run what - SPEC §18 and the artifact permission rule.
 
 Five authority questions the source answered from the wrong place:
 
@@ -6,8 +6,8 @@ Five authority questions the source answered from the wrong place:
   *admin-owned artifacts*. The check asked only whether the caller is an
   admin. A `check_privileged_access` helper took an `artifact_owner_id`,
   never read it, and had no callers at all; it is deleted. Any authenticated
-  user can create a `tool.spec` — `/v1/artifacts` depends on `get_user`, and
-  the schema permits additional properties — so a user could author
+  user can create a `tool.spec` - `/v1/artifacts` depends on `get_user`, and
+  the schema permits additional properties - so a user could author
   `privileged: true` and an admin invoking it would be granted the privileged
   sandbox for someone else's definition.
 
@@ -22,7 +22,7 @@ Five authority questions the source answered from the wrong place:
 
 * **shared means one tenant.** The `shared` branch read a `tenant_id` off the
   artifact. `Artifact` has no such field, so the value was always `None` and
-  the comparison accepted it as a match — every shared workflow was readable
+  the comparison accepted it as a match - every shared workflow was readable
   from every tenant.
 
 * **registry scope.** Direct invocation did
@@ -100,7 +100,7 @@ def _assert_ran(result: dict) -> None:
 
     Every "not forbidden" assertion here is also satisfied by `unknown tool`,
     which is what these tests returned while the specs named a handler
-    (`note_search`) that is not a key in `_builtin_tool_handlers` — the real
+    (`note_search`) that is not a key in `_builtin_tool_handlers` - the real
     one is `notes.search_v1`. The refusals were still refusals, but the
     control proved nothing.
     """
@@ -112,7 +112,7 @@ class TestPrivilegedToolsNeedAnAdminOwnedArtifact:
     def test_the_caller_is_only_half_the_question(self, runtime, users):
         """An ordinary user's `privileged: true` tool, invoked by an admin.
 
-        The caller check passes — they really are an admin — and the artifact
+        The caller check passes - they really are an admin - and the artifact
         they are running was written by someone else. SPEC requires both.
         """
         store = runtime.store
@@ -272,7 +272,7 @@ class TestPrivilegedToolsNeedAnAdminOwnedArtifact:
 
 class TestTheSandboxConfigStillHoldsItsOwnLine:
     """`get_tool_sandbox_config` is reachable on its own, so it keeps the
-    caller check — but it must no longer be the whole story."""
+    caller check - but it must no longer be the whole story."""
 
     def test_a_privileged_spec_still_needs_an_admin_caller(self):
         with pytest.raises(PrivilegedToolError):
@@ -326,7 +326,7 @@ class TestPrivateWorkflowsBelongToTheirOwner:
         """Grep the class: `get_latest_workflow` had two callers and neither
         passed an identity, so fixing one would have left the other as a way
         in. The rule lives in the store now, and `user_id` is a keyword with
-        no default — a caller cannot omit the question by accident."""
+        no default - a caller cannot omit the question by accident."""
         store = runtime.store
         workflow = store.create_artifact(
             "workflow",
@@ -367,7 +367,7 @@ class TestSharedMeansSharedWithinOneTenant:
 
     The first fix read `getattr(artifact, "tenant_id", None)`, which was
     therefore always `None`, and then accepted the workflow when either side
-    was `None` — so every `shared` workflow was readable from every tenant.
+    was `None` - so every `shared` workflow was readable from every tenant.
     The tenant of a shared artifact is its *owner's*; that is the only place
     it is recorded.
     """
@@ -458,7 +458,7 @@ class TestListingCarriesTheSameRule:
 
     `list_artifacts` had the same fail-open default twice: asked for
     `private` with no owner it dropped the owner clause, and asked for
-    `shared` with no tenant it dropped the tenant clause — returning
+    `shared` with no tenant it dropped the tenant clause - returning
     everyone's rows in both cases. Neither is reachable from `/v1/artifacts`
     today, which is exactly why it would still be there later.
     """
@@ -499,8 +499,8 @@ class TestListingCarriesTheSameRule:
 class TestAnInvocationStaysBoundToTheArtifactItNamed:
     """`/tools/{id}/invoke` authorizes one row and must execute that row.
 
-    Artifact names carry no uniqueness constraint, and `schema.name` — the
-    key a tool is resolved by — is free text inside the spec. The route
+    Artifact names carry no uniqueness constraint, and `schema.name` - the
+    key a tool is resolved by - is free text inside the spec. The route
     checked out artifact A and handed the engine a bare `dict(A.schema)`;
     the engine threw the id away and resolved `schema["name"]` again. Two
     tools may answer to one name, so the row that ran was whichever the
@@ -586,8 +586,8 @@ class TestAnInvocationStaysBoundToTheArtifactItNamed:
         The admin asks for `harmless.id`, a plain unprivileged tool. A second
         tool answering to the same `schema.name` is global and declares
         `privileged: true` with an ordinary owner. Resolving by name finds
-        only the global one — the authorized row is another user's private
-        artifact, which no by-name lookup for this caller can see — so the
+        only the global one - the authorized row is another user's private
+        artifact, which no by-name lookup for this caller can see - so the
         request for a harmless tool came back refused as a privileged one.
         """
         store = runtime.store
@@ -622,8 +622,8 @@ class TestAnInvocationStaysBoundToTheArtifactItNamed:
     def test_a_bare_spec_still_works_and_claims_no_provenance(
         self, runtime, users
     ):
-        """Callers that legitimately hold no artifact — a workflow node, a
-        test — keep working, but an unattributed spec cannot be privileged."""
+        """Callers that legitimately hold no artifact - a workflow node, a
+        test - keep working, but an unattributed spec cannot be privileged."""
         result = asyncio.run(
             runtime.workflow.invoke_tool(
                 {

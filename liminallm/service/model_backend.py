@@ -37,15 +37,15 @@ logger = get_logger(__name__)
 def get_adapter_mode(adapter: dict) -> str:
     """The adapter's stated mode (SPEC §5.0.1): local, remote, prompt, hybrid.
 
-    Stated, not inferred. Every stored adapter carries an explicit mode — the
+    Stated, not inferred. Every stored adapter carries an explicit mode - the
     schema.sql repair normalized old artifacts and the validator refuses new
-    ones without it — so inference is not a runtime responsibility. The dict
+    ones without it - so inference is not a runtime responsibility. The dict
     arrives in two shapes (an artifact row with nested schema, or the
     flattened candidate the router builds), hence the two reads.
 
     An absent adapter is weightless and promptless: prompt mode.
 
-    An absent mode fails closed — "" matches no compatibility matrix, so the
+    An absent mode fails closed - "" matches no compatibility matrix, so the
     adapter is filtered out rather than served. Defaulting it to hybrid was
     the deleted compatibility behaviour wearing a shorter spelling: it would
     let anything that slipped past the validator be interpreted, which is the
@@ -102,7 +102,7 @@ def mode_value(mode) -> str:
     """An adapter mode as its comparable string, enum member or not.
 
     `get_adapter_mode` returns the raw string when an artifact states a mode
-    and an `AdapterMode` member when it infers one — and `AdapterMode` is a
+    and an `AdapterMode` member when it infers one - and `AdapterMode` is a
     `str` Enum whose `str()` is "AdapterMode.HYBRID". Normalizing with a bare
     `str()` therefore produced a value matching nothing, so every comparison
     against the mode constants silently failed for adapters that stated no
@@ -130,8 +130,8 @@ def effective_gate(adapter: dict) -> float:
 
         g = clamp(g_router, 0, 1)
 
-    One definition, because every consumer — LoRA weights, prompt injection,
-    remote passthrough, the KV signature, inference accounting — has to agree
+    One definition, because every consumer - LoRA weights, prompt injection,
+    remote passthrough, the KV signature, inference accounting - has to agree
     on which adapters are in the effective request. Where the weight lives is
     not an `or` chain: 0.0 is a meaningful gate and also falsy.
     """
@@ -152,8 +152,8 @@ def active_adapters(adapters: Optional[List[dict]]) -> List[dict]:
     """The effective adapter set: those the router left with `g > 0`, each
     carrying its canonical `g` as `weight`.
 
-    SPEC §5.0.1 gives the gate two meanings, in order — activation, then
-    intensity — and this function answers **both**. `g == 0` (including any
+    SPEC §5.0.1 gives the gate two meanings, in order - activation, then
+    intensity - and this function answers **both**. `g == 0` (including any
     negative weight, which §8.1 clamps) means the adapter is absent from the
     request, so it is removed here, once, before anything mechanism-specific
     happens to it. Everything that survives carries the clamped, precedence-
@@ -168,7 +168,7 @@ def active_adapters(adapters: Optional[List[dict]]) -> List[dict]:
     on the adapter without editing the caller's dict.
 
     Routing traces are built from the router's own output, not from this
-    list, so a zero-gated adapter stays auditable — "the router assigned this
+    list, so a zero-gated adapter stays auditable - "the router assigned this
     a zero gate" is not the same fact as "this adapter affected inference".
     """
     result: List[dict] = []
@@ -202,14 +202,14 @@ class StreamAbortHandle:
     Measured, because the obvious answers do not work: with a provider that
     stalls mid-stream, `Response.close`, `Client.close`, closing the network
     stream and even `socket.close()` all left the reading thread blocked for
-    the full stall — only `socket.shutdown(SHUT_RDWR)` woke it, immediately,
+    the full stall - only `socket.shutdown(SHUT_RDWR)` woke it, immediately,
     with a protocol error the stream generator reports as its error event.
     `close()` drops a reference to the descriptor; `shutdown()` tears down the
     connection under the blocked `recv`, which is the thing that must end.
 
     Arming happens at TCP connect, not at response headers. httpx forwards a
     per-request `trace` extension to httpcore, whose `connect_tcp.complete`
-    (and `start_tls.complete`) events carry the network stream — so the
+    (and `start_tls.complete`) events carry the network stream - so the
     socket is in hand before the request is even written, and a provider that
     accepts the connection and never sends headers is still interruptible.
     Waiting for `attach_response` left exactly that gap: the producer blocked
@@ -225,7 +225,7 @@ class StreamAbortHandle:
     then shuts the socket down on arrival rather than handing the producer a
     connection nobody wants. Each retry's connect re-attaches, so an aborted
     handle kills replacement connections as they appear. What remains before
-    any socket exists — DNS and the TCP connect itself — is bounded by the
+    any socket exists - DNS and the TCP connect itself - is bounded by the
     client's connect timeout, a strictly smaller residue than the read
     timeout this closes.
     """
@@ -292,7 +292,7 @@ class StreamAbortHandle:
 #: The abort handle for the stream the current thread is building, read by
 #: `ArmingClient.send`. Thread-local because the SDK builds its requests
 #: internally: there is no per-call seam to pass the handle through, but the
-#: request is sent on the calling thread — the stream's pump thread.
+#: request is sent on the calling thread - the stream's pump thread.
 _STREAM_HANDLE = threading.local()
 
 
@@ -302,14 +302,14 @@ class ArmingClient(httpx.Client):
     Given to the OpenAI SDK as the *streaming* client's transport, never the
     blocking one. For requests sent while a `StreamAbortHandle` is bound to
     the thread, it injects the handle's trace (arming at connect) and
-    refuses to send at all once the handle is aborted — the SDK retries
+    refuses to send at all once the handle is aborted - the SDK retries
     transport errors, and without the refusal the abort of one request
     started the next.
 
     The pool keeps no idle connections, and that is the arming guarantee.
     The first version forced `Connection: close` instead, which governs
     retention *after* a request, not whether an already-idle pooled
-    connection satisfies it — measured: a warmed client served the
+    connection satisfies it - measured: a warmed client served the
     close-headered streaming request on the pooled socket, no connect event
     fired, and the handle never armed. With `max_keepalive_connections=0`
     nothing is ever idle, so every request connects fresh and the trace has
@@ -345,7 +345,7 @@ def _arm_or_refuse(
     """Arm the handle from a network response, or the error refusing to stream.
 
     The rule that keeps the capability honest per stream: a *network*
-    response whose socket cannot be reached is refused before any token —
+    response whose socket cannot be reached is refused before any token -
     the backend advertised an interrupt this stream cannot deliver, and
     streaming anyway is how a 200ms timeout ran to the provider's own. No
     response object at all means an in-memory double or fallback, where no
@@ -370,7 +370,7 @@ class CancellableStream:
     """A stream-event iterator with a real interrupt.
 
     What `supports_stream_cancel = True` promises the caller: iterating this
-    yields the backend's events, and `abort()` — from any thread — makes a
+    yields the backend's events, and `abort()` - from any thread - makes a
     read that is currently blocked return instead of running to the
     provider's own timeout. The consumer that stops between events still just
     stops; `abort` is for the read in flight.
@@ -429,7 +429,7 @@ class ModelBackend(Protocol):
         iterator it returns can really be stopped: a stop between events is
         honoured, and a read blocked inside the iterator can be interrupted
         from another thread (`CancellableStream.abort`). Undeclared means
-        ``False`` — a workflow node's `timeout_ms` is a SPEC §9.2 obligation,
+        ``False`` - a workflow node's `timeout_ms` is a SPEC §9.2 obligation,
         and a capability that cannot be proven is not claimed. Backends
         without it do not stream; the node runs on the ordinary executor
         instead.
@@ -545,7 +545,7 @@ class StubBackend:
 #
 # The prompt budget must come from the model actually serving requests, not a
 # constant. Resolution, most authoritative first:
-#   1. an explicit override (admin setting / MODEL_CONTEXT_WINDOW) — handled
+#   1. an explicit override (admin setting / MODEL_CONTEXT_WINDOW) - handled
 #      by the caller, not here;
 #   2. asking the provider (Gemini's models endpoint states inputTokenLimit;
 #      self-hosted OpenAI-compatible servers like vLLM/LoRAX put
@@ -571,14 +571,14 @@ class TemperaturePolicy(str, Enum):
     # silently ignores it.
     CONDITIONAL = "conditional"
     # Never send. Either the API rejects it, or the model is trained around
-    # one fixed value and moving it degrades output — Gemini 3 loops, Kimi
+    # one fixed value and moving it degrades output - Gemini 3 loops, Kimi
     # and Muse Spark prescribe 1.0.
     OMIT = "omit"
 
 
 # Longest-prefix, as with context windows. Unmatched models are TUNABLE: an
 # unknown id is most often a conventional open model on a self-hosted server,
-# and this only decides whether an explicitly configured value is honoured —
+# and this only decides whether an explicitly configured value is honoured -
 # nothing is ever sent on its own.
 _TEMPERATURE_POLICIES: List[Tuple[str, TemperaturePolicy]] = [
     # OpenAI. 5.1/5.2/5.4 take temperature only at reasoning "none"; the mini
@@ -663,7 +663,7 @@ def temperature_param(
         return {}
     return {"temperature": configured}
 
-# Longest-prefix wins. This is the *fallback* — the provider probe
+# Longest-prefix wins. This is the *fallback* - the provider probe
 # (GeminiBackend's models/{id}, an adapter server's config) is consulted first,
 # and model_context_window overrides everything. So each value is the safe
 # published number, never a beta or extended tier: under-guessing costs a
@@ -716,8 +716,8 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     ("claude-mythos-5", 1_000_000),
     # xAI. Newer is not larger here: 4.5 is the current flagship at 500K while
     # 4.3 and the 4.20 deployments carry 1M. The slugs retired on 2026-05-15
-    # (grok-4-fast, grok-4-0709, grok-3, grok-code-fast-1) still resolve — xAI
-    # routes them to newer models — so the 256K floor under-guesses rather than
+    # (grok-4-fast, grok-4-0709, grok-3, grok-code-fast-1) still resolve - xAI
+    # routes them to newer models - so the 256K floor under-guesses rather than
     # overflowing. grok-build-latest aliases 4.5, but an alias target can move,
     # so it takes the same conservative floor as grok-build-0.1.
     ("grok", 131_072),
@@ -854,7 +854,7 @@ def _longest_prefix(lowered: str, table: List[Tuple[str, int]]) -> Optional[int]
 # reranking as a fix for embedding's limits comes from a large hosted model
 # reading a whole shortlist in one pass; nothing establishes that a small
 # local model does the same job, and this stage can drop the user's context.
-# So the list is an allowlist of the tested shape, not a survey — an
+# So the list is an allowlist of the tested shape, not a survey - an
 # unrecognized model reads as "no evidence" and reranking stays off.
 RERANK_CAPABLE_PREFIXES: Tuple[str, ...] = (
     "gpt-4o", "gpt-4.1", "gpt-5", "o1", "o3", "o4",
@@ -877,7 +877,7 @@ _PARAM_SIZE = re.compile(r"(?:^|[-_/x:])(\d+(?:\.\d+)?)b(?:$|[-_./:])", re.IGNOR
 # A prefix match cannot tell a flagship from the distilled sibling that
 # shares its name, and the difference is the whole point of the list: the
 # evidence is about large models. "gpt-4o" would otherwise admit
-# "gpt-4o-mini", which is the *default* model_path — so an out-of-the-box
+# "gpt-4o-mini", which is the *default* model_path - so an out-of-the-box
 # install would turn reranking on for the smallest model in the family.
 #
 # Matched as whole name parts, never as substrings: "mini" is inside
@@ -908,7 +908,7 @@ def model_can_rerank(model_id: str) -> bool:
         return False
 
     # A declared size beats family membership in both directions. A name that
-    # says it is small is small whatever family it belongs to — otherwise the
+    # says it is small is small whatever family it belongs to - otherwise the
     # allowlist would admit "gemini-2.0-flash-8b" on the strength of the
     # prefix and never reach the size at all.
     sizes = [float(match) for match in _PARAM_SIZE.findall(tail)]
@@ -923,7 +923,7 @@ def context_window_from_table(
     """Longest matching prefix for this host, else for the model family.
 
     The host is consulted first because a reseller's serving limit overrides
-    the model's native ceiling. Returns None for an unknown model — the caller
+    the model's native ceiling. Returns None for an unknown model - the caller
     then falls back to DEFAULT_CONTEXT_WINDOW rather than to a guess.
     """
     lowered = (model_id or "").lower()
@@ -942,7 +942,7 @@ _WINDOW_KEYS = (
 )
 
 
-# A listing can be long — Together publishes several hundred models — but not
+# A listing can be long - Together publishes several hundred models - but not
 # unbounded; a payload past this is treated as not naming the model.
 _MAX_LISTING_ENTRIES = 2048
 
@@ -950,8 +950,8 @@ _MAX_LISTING_ENTRIES = 2048
 def _entry_names(entry: dict, model: str) -> bool:
     """Does this listing entry describe the model we asked about?
 
-    Hosts qualify ids in their own way — Together's `moonshotai/Kimi-K3`,
-    Gemini's `models/gemini-3.6-flash` — so the trailing segment counts too.
+    Hosts qualify ids in their own way - Together's `moonshotai/Kimi-K3`,
+    Gemini's `models/gemini-3.6-flash` - so the trailing segment counts too.
     """
     for key in ("id", "name", "model"):
         value = entry.get(key)
@@ -1109,7 +1109,7 @@ class ApiAdapterBackend:
         # this provider only ships chat/completions (sticky for the process).
         self._responses_ok: Optional[bool] = None
         self.client = None
-        #: The SDK client streams go through — over `ArmingClient`, whose
+        #: The SDK client streams go through - over `ArmingClient`, whose
         #: pool keeps nothing idle so every stream connects fresh and arms.
         self._stream_client = None
         self._ensure_client()
@@ -1141,7 +1141,7 @@ class ApiAdapterBackend:
                 window, source = DEFAULT_CONTEXT_WINDOW, "default"
             self._context_window = window
             # "default" means neither the provider nor the table knew this
-            # model, so every turn is budgeted against 8192 — for a
+            # model, so every turn is budgeted against 8192 - for a
             # million-token model that is under one percent of its window,
             # and nothing else says so. Worth an operator's attention.
             log = logger.warning if source == "default" else logger.info
@@ -1183,7 +1183,7 @@ class ApiAdapterBackend:
             # Streaming gets its own SDK client over `ArmingClient`, and only
             # streaming: the arming guarantee is a pool that keeps nothing
             # idle, and one shared client let a blocking call's keep-alive
-            # connection satisfy the next streaming request — no connect
+            # connection satisfy the next streaming request - no connect
             # event, no armed handle, and the abort chain built on `armed`
             # collapsed. The SDK builds its requests internally, so the
             # client is the only seam the handle's trace can enter through.
@@ -1229,7 +1229,7 @@ class ApiAdapterBackend:
         """Sampling args to send, which is nothing unless an operator set one.
 
         The previous default of 0.2 went out on every non-reasoning request,
-        overriding whatever each provider tuned its model around — and several
+        overriding whatever each provider tuned its model around - and several
         now document that moving temperature degrades output rather than
         merely varying it.
         """
@@ -1332,7 +1332,7 @@ class ApiAdapterBackend:
 
     def _try_responses(self, call):
         """Run one /responses call. Returns the response, or None when the
-        provider turns out to have no such endpoint — the one case where
+        provider turns out to have no such endpoint - the one case where
         falling back to chat/completions is correct. Any other failure is the
         provider's real answer and propagates.
 
@@ -1366,7 +1366,7 @@ class ApiAdapterBackend:
 
         The chat transport names its details differently from Responses
         (prompt_tokens_details / completion_tokens_details), and both OpenAI
-        and vLLM's prefix caching report cached_tokens there — dropping them
+        and vLLM's prefix caching report cached_tokens there - dropping them
         silenced exactly the servers the self-hosted lane runs. Same
         convention as responses_compat.usage_dict: the rich keys ride as
         flat ints, so the agent loop aggregates them and the served usage
@@ -1405,7 +1405,7 @@ class ApiAdapterBackend:
         """One turn of an OpenAI-style tool-calling exchange.
 
         Returns the assistant's content, any tool calls it requested, and the
-        raw assistant message to append before sending tool results back — the
+        raw assistant message to append before sending tool results back - the
         caller drives the loop.
         """
         self._ensure_client()
@@ -1496,7 +1496,7 @@ class ApiAdapterBackend:
         abort_handle: Optional[StreamAbortHandle] = None,
     ):
         """Stream via /responses. Returns True if any event was emitted (the
-        caller must not fall through to chat), False to fall back — which is
+        caller must not fall through to chat), False to fall back - which is
         only safe when nothing has been yielded yet."""
         full_content = ""
         usage: Dict[str, Any] = {}
@@ -1571,7 +1571,7 @@ class ApiAdapterBackend:
     #: The streams below carry a real interrupt: `_abort_handle.attach_response`
     #: exposes the in-flight response's socket, and `CancellableStream.abort`
     #: shuts it down under a blocked read. Declared only because that handle
-    #: exists — see `ModelBackend.generate_stream`.
+    #: exists - see `ModelBackend.generate_stream`.
     supports_stream_cancel = True
 
     def generate_stream(
@@ -1620,7 +1620,7 @@ class ApiAdapterBackend:
 
         if self.client:
             try:
-                # The streaming client, whose pool keeps nothing idle — a
+                # The streaming client, whose pool keeps nothing idle - a
                 # blocking call's keep-alive connection must not satisfy this
                 # request, or no connect event fires and the handle never
                 # arms. Falling back to `self.client` keeps hand-installed
@@ -1723,7 +1723,7 @@ class ApiAdapterBackend:
 
         # §5.0.1: a zero-gated adapter is absent from the request, so it
         # reaches neither the prompt, nor the provider, nor `applied`. It is
-        # not "dropped" either — dropping records an adapter the backend
+        # not "dropped" either - dropping records an adapter the backend
         # could not honour, and this one was never asked for.
         for adapter in active_adapters(adapters):
             mode = get_adapter_mode(adapter)
@@ -1743,12 +1743,12 @@ class ApiAdapterBackend:
             if mode in (AdapterMode.PROMPT, AdapterMode.HYBRID):
                 # `applied` is a claim that the adapter affected inference
                 # (§5.0.1), so it is built from the mechanisms actually
-                # present, one entry each — never from the mode alone. A
+                # present, one entry each - never from the mode alone. A
                 # hybrid carrying neither instructions nor a remote id
                 # changed nothing and must not appear here.
                 #
-                # The text itself is already in the messages — LLMService
-                # materializes it (§5.0.1) — so extracting it here only
+                # The text itself is already in the messages - LLMService
+                # materializes it (§5.0.1) - so extracting it here only
                 # answers whether there was anything to materialize.
                 has_prompt = bool(self._extract_prompt_instructions(adapter))
                 has_remote = bool(
@@ -1850,7 +1850,7 @@ class ApiAdapterBackend:
                     if caps.gate_weights:
                         # §5.0.1: a multi-LoRA provider that accepts weights
                         # applies `g` exactly, so it must be sent the same `g`
-                        # the rest of the kernel used — clamped, and resolved
+                        # the rest of the kernel used - clamped, and resolved
                         # through the same precedence. Re-reading the raw dict
                         # here sent 5.0 for an adapter this kernel treats as
                         # 1.0, and 1.0 for one whose gate lived in its schema.
@@ -1934,7 +1934,7 @@ class ApiAdapterBackend:
 # The local tool channel. A raw checkpoint has no second wire, so the channel
 # is a contract the backend enforces: tools are advertised in the prompt, the
 # model emits a <tool_call>{json}</tool_call> block (the de-facto local
-# standard — Qwen and Hermes templates emit exactly this tag), and the backend
+# standard - Qwen and Hermes templates emit exactly this tag), and the backend
 # parses that block out of MODEL OUTPUT ONLY. Input text is never parsed,
 # which is the same property that makes the channel unforgeable by documents
 # at an API provider: a document can spell the tag, but it lands in input,
@@ -1954,7 +1954,7 @@ MAX_TOOL_CALL_CHARS = 10_000
 def extract_tool_calls(completion: str) -> Tuple[str, List[Dict[str, str]]]:
     """Split a completion into (content, tool_calls) per the local contract.
 
-    Only well-formed blocks become calls — a JSON object with a string name
+    Only well-formed blocks become calls - a JSON object with a string name
     and a dict of arguments, inside the size bound. A malformed block stays in
     the content as ordinary text, where downstream treats it as prose; turning
     almost-JSON into a guessed call would be the reranker's digit-harvesting
@@ -2007,14 +2007,14 @@ class LocalJaxLoRABackend:
     - LOCAL, and HYBRID with a promoted version: LoRA matrices from
       ``fs_root``, composed per §5.2 and scaled by the router's gate.
     - PROMPT, and HYBRID with nothing promoted: **no weights**, and no
-      instructions either — those are already in ``messages``.
+      instructions either - those are already in ``messages``.
 
     ``prompt_instructions`` are placed by ``LLMService._build_adapter_prompts``
     before any backend is called: the choice of representation is a §5.0.1
     rule about the *pair* (mode, backend) rather than a backend's decision,
     and one materializer is what keeps a prompt from being injected twice. A
     prompt-rung adapter passed straight to this class therefore changes
-    nothing — the messages it would have changed were the caller's to prepare.
+    nothing - the messages it would have changed were the caller's to prepare.
 
     The backend keeps a tokenizer and (optional) Flax model resident, reads
     LoRA matrices from ``fs_root`` paths, and runs a lightweight JAX forward
@@ -2028,7 +2028,7 @@ class LocalJaxLoRABackend:
 
     #: This backend cannot be held to a node timeout. `generate_stream` runs
     #: the whole forward pass in `generate` before its first yield, so there is
-    #: no point between events at which a stop request could be honoured — and
+    #: no point between events at which a stop request could be honoured - and
     #: no way to interrupt a JAX call from another thread. Declaring it sends
     #: streamed nodes down the ordinary executor, which runs the body in a
     #: worker process that a kill does end.
@@ -2107,7 +2107,7 @@ class LocalJaxLoRABackend:
         """The checkpoint's own tokenizer, loading it if needed.
 
         This is the same tokenizer used to encode prompts for generation, so
-        anything counting with it counts exactly what the model will see —
+        anything counting with it counts exactly what the model will see -
         no vendor library, no network, no estimate.
         """
         self._ensure_tokenizer()
@@ -2227,7 +2227,7 @@ class LocalJaxLoRABackend:
 
     #: The modes whose representation on this backend is weights (§5.0.1's
     #: compatibility matrix). Stated positively, because "not PROMPT" also
-    #: admitted REMOTE — an adapter this class advertises as incompatible.
+    #: admitted REMOTE - an adapter this class advertises as incompatible.
     WEIGHT_BEARING_MODES = frozenset({AdapterMode.LOCAL, AdapterMode.HYBRID})
 
     @staticmethod
@@ -2278,7 +2278,7 @@ class LocalJaxLoRABackend:
         adapter_id = adapter.get("id", "unknown")
 
         # SPEC §5.5: a prompt-rung adapter carries instructions, never
-        # weights. Defense in depth alongside the version pin — the ladder
+        # weights. Defense in depth alongside the version pin - the ladder
         # says weights arrive only on graduation to hybrid/local, so files
         # that happen to exist on disk must not change that.
         mode = self._adapter_mode_of(adapter)
@@ -2287,7 +2287,7 @@ class LocalJaxLoRABackend:
             return {}
         if mode not in self.WEIGHT_BEARING_MODES:
             # §5.0.1's matrix says `remote` is incompatible with this backend,
-            # and the router filters on it before policy evaluation — so an
+            # and the router filters on it before policy evaluation - so an
             # incompatible adapter arriving here is a broken hand-off, not a
             # transient state like "nothing promoted yet". Refusing visibly
             # rather than treating it as weightless: the alternative was
@@ -2302,8 +2302,8 @@ class LocalJaxLoRABackend:
 
         # SPEC §5.4.6/§5.5: only a promoted version may be served, and that
         # decision comes BEFORE the filesystem is touched. `_adapter_path`
-        # is not inert — it raises for a missing user context, an owner
-        # mismatch, or a path outside fs_root — so resolving first turned an
+        # is not inert - it raises for a missing user context, an owner
+        # mismatch, or a path outside fs_root - so resolving first turned an
         # adapter that authorizes no weights at all into a failed request.
         # An unpromoted hybrid is prompt fallback; whatever its `fs_dir` says
         # is irrelevant, because nothing will read it. Same inert-state ->
@@ -2322,7 +2322,7 @@ class LocalJaxLoRABackend:
 
         # SPEC §5.1: an adapter is fitted to the model that serves it, and
         # training refuses to run when the bases disagree. Serving holds the
-        # same line — B·A was optimized against one particular frozen W, and
+        # same line - B·A was optimized against one particular frozen W, and
         # passing the eval gate on that W says nothing about W'.
         #
         # After resolution and before the cache, so it guards exactly what it
@@ -2398,16 +2398,16 @@ class LocalJaxLoRABackend:
 
         SPEC §5.5, entire: `current_version <= 0` (or absent) authorizes no
         weights; `N > 0` authorizes exactly this adapter's
-        `vNNNN/params.json`. Nothing else is authoritative — not a direct
+        `vNNNN/params.json`. Nothing else is authoritative - not a direct
         `params.json`, not `latest`, not a directory scan, not the mere
         presence of a file.
 
         There is no lane for an artifact with no `current_version`: serving a
-        directory scan reopens every hole this method closes — `latest` aimed
+        directory scan reopens every hole this method closes - `latest` aimed
         elsewhere serves another adapter's weights, a bare `vNNNN` serves what
         a gate-rejected run leaves
         behind, and a versionless *hybrid* got weights from the file while the
-        service, reading only metadata, injected its prompt fallback — the two
+        service, reading only metadata, injected its prompt fallback - the two
         voices §5.0.1 forbids. The lane existed for artifacts the adapter
         schema has required `current_version` from for some time, so it was
         compatibility code for state that cannot be created. Deleting it is
@@ -2509,11 +2509,11 @@ class LocalJaxLoRABackend:
 
         The distinction is the whole point:
 
-        ``ABSENT``  no checkpoint on disk — a dev box or CI. The synthetic
+        ``ABSENT``  no checkpoint on disk - a dev box or CI. The synthetic
                     stand-in is allowed, and logged, because it exercises the
                     plumbing and answers nothing.
         ``VALID``   loaded; the real model serves.
-        ``BROKEN``  a checkpoint exists but cannot be served — its tokenizer
+        ``BROKEN``  a checkpoint exists but cannot be served - its tokenizer
                     will not load, the weights will not read, or the
                     tokenizer disagrees with its vocabulary. This is a
                     production configuration failure, and it must fail
@@ -2521,7 +2521,7 @@ class LocalJaxLoRABackend:
 
         Using ``_model_state is None`` to mean both "dev fallback" and
         "misconfigured" meant a broken checkpoint quietly answered from the
-        stand-in on the very next request — the opposite of the refusal this
+        stand-in on the very next request - the opposite of the refusal this
         was supposed to implement.
         """
         if self._model_state is not None or self._checkpoint_state is not None:
@@ -2588,13 +2588,13 @@ class LocalJaxLoRABackend:
         per-request (§5.3), so the same adapter at 0.2 and at 0.8 is a
         different effective model, and every cached K/V tensor was computed
         under one of them. Keying on id+version alone would let a 0.2 request
-        continue a prefix computed at 0.8 — the cheapest possible way to
+        continue a prefix computed at 0.8 - the cheapest possible way to
         serve a model nobody asked for.
 
         Zero-gated adapters are excluded, because §5.0.1 says they are not in
         the effective request at all: `[X @ 0]` and `[]` are the same model,
         so they must be the same key. Hashing them was safe in the sense that
-        it only ever cost a reuse — but it made this function disagree with
+        it only ever cost a reuse - but it made this function disagree with
         composition about what "the effective stack" means, and the value of
         one canonical answer is that there is nowhere for the two to drift.
         """
@@ -2688,7 +2688,7 @@ class LocalJaxLoRABackend:
             ids = ids[-(window - 1) :]
 
         if ids and (max(ids) >= config.vocab_size or min(ids) < 0):
-            # The tokenizer and the checkpoint disagree — a configuration
+            # The tokenizer and the checkpoint disagree - a configuration
             # error, not a request error. Clamping the id into range is the
             # same "fold it into a token the user never wrote" that training
             # refuses, and answering from an arbitrary embedding is worse
@@ -2769,7 +2769,7 @@ class LocalJaxLoRABackend:
         }
         if cached_tokens:
             # Reused prefill, reported the way every other transport reports
-            # it — so input_tokens_details.cached_tokens fills in on the
+            # it - so input_tokens_details.cached_tokens fills in on the
             # served surface with no consumer change.
             usage["cached_tokens"] = cached_tokens
         return {"content": self._decode(generated), "usage": usage}
@@ -2802,8 +2802,8 @@ class LocalJaxLoRABackend:
         # adapter. Filtering here makes the backend correct when called
         # directly, not only downstream of LLMService.
         adapters = active_adapters(adapters)
-        # Weights are the only mechanism this backend performs — prompts are
-        # materialized by LLMService (§5.0.1) — so weight-specific state and
+        # Weights are the only mechanism this backend performs - prompts are
+        # materialized by LLMService (§5.0.1) - so weight-specific state and
         # this turn's accounting both come from the adapters that can
         # actually carry weights: past the gate, not the prompt rung, and
         # promoted. An open-gated `local` adapter with nothing promoted
@@ -2920,7 +2920,7 @@ class LocalJaxLoRABackend:
 
         Advertise-then-parse works for any checkpoint; whether a given model
         actually emits the block is behaviour, and behaviour is visible where
-        it belongs — consumers log transport="text" when a verdict arrived as
+        it belongs - consumers log transport="text" when a verdict arrived as
         prose. Side-effect free on purpose: reading a capability flag must not
         load a tokenizer or touch JAX.
         """
@@ -2963,12 +2963,12 @@ class LocalJaxLoRABackend:
     ) -> dict:
         """One tool-calling turn over the local forward pass.
 
-        Same dict shape as the API backend — content, tool_calls with
-        arguments as a JSON string, assistant_message, usage — so nothing
+        Same dict shape as the API backend - content, tool_calls with
+        arguments as a JSON string, assistant_message, usage - so nothing
         downstream can tell the transports apart. The contract that keeps the
         channel honest lives in one line: ``extract_tool_calls`` reads the
-        COMPLETION and never the prompt, so input text — a chunk, a fetched
-        page, a pasted document — cannot write to the tool channel. Only the
+        COMPLETION and never the prompt, so input text - a chunk, a fetched
+        page, a pasted document - cannot write to the tool channel. Only the
         model's own output tokens can.
         """
         augmented = list(messages or [])
@@ -3022,7 +3022,7 @@ class LocalJaxLoRABackend:
 
         **Layout.** The directory holding a `params.json` is named for the
         adapter that owns it. Containment under `fs_root` proved only that a
-        path was inside the shared root — which every adapter's directory is —
+        path was inside the shared root - which every adapter's directory is -
         so an artifact whose schema said `fs_dir: adapters/B` had B's
         `v0001/params.json` served as A's version 1. That is the
         `A/latest → B/v0001` substitution one level earlier, and reachable
@@ -3104,8 +3104,8 @@ class LocalJaxLoRABackend:
         if self._promoted_version_of(adapter) <= 0:
             return  # nothing promoted yet; also weightless by design.
         if self._gate_weight_of(adapter) == 0.0:
-            # Redundant by construction now — composition skips closed gates
-            # before it loads anything — but kept so the helper states the
+            # Redundant by construction now - composition skips closed gates
+            # before it loads anything - but kept so the helper states the
             # whole rule for any future caller rather than half of it.
             return  # a closed gate contributes nothing anyway.
         raise ValueError(
@@ -3157,7 +3157,7 @@ class LocalJaxLoRABackend:
         weight is wrong twice over. For
         one adapter it computed (gA)/g = A, so the router's gate cancelled
         itself and 0.2 behaved identically to 1.0. For two it formed B̄Ā,
-        whose expansion contains B_1A_2 and B_2A_1 — products of one
+        whose expansion contains B_1A_2 and B_2A_1 - products of one
         adapter's up-projection with another's down-projection, which the
         SPEC sum contains no term for. Ranks may differ between adapters;
         concatenation handles that without any padding.
@@ -3171,7 +3171,7 @@ class LocalJaxLoRABackend:
             # The gate decides FIRST. In `W_eff = W + Σ_j g_j α_j B_j A_j` a
             # term with g_j = 0 is not in the sum, so a closed-gate adapter is
             # not part of the effective model and nothing about its weights
-            # can matter — not the base they declare, not their checksum, not
+            # can matter - not the base they declare, not their checksum, not
             # whether the file parses at all. Reading the gate after the load
             # made "a closed gate is unaffected" (§5.1) true only when the
             # file happened to be missing: a zero-gated adapter with a
@@ -3186,7 +3186,7 @@ class LocalJaxLoRABackend:
             weights = self._load_adapter_weights(adapter, user_id=user_id)
             if not weights:
                 # An adapter the router selected must not vanish from the
-                # stack. Weightless is legitimate only where §5.5 says so —
+                # stack. Weightless is legitimate only where §5.5 says so -
                 # the prompt rung, or nothing promoted yet; a promoted
                 # local/hybrid adapter with an open gate whose file will not
                 # resolve means serving a stack the router did not choose.
@@ -3236,7 +3236,7 @@ class LocalJaxLoRABackend:
             else:
                 # Concatenation needs every contribution to project the same
                 # space. Dropping the odd one out and applying the rest is
-                # precisely the partial application SPEC §5.2 forbids — the
+                # precisely the partial application SPEC §5.2 forbids - the
                 # request would be served by a stack the router never chose.
                 in_widths = {a.shape[1] for a, _ in parts}
                 out_widths = {b.shape[0] for _, b in parts}
@@ -3275,8 +3275,8 @@ class LocalJaxLoRABackend:
                 raise ValueError("adapter owner mismatch")
             # Containment only, here. The identity half of §5.5 is checked on
             # the *resolved* params path, beside the base-model rule, so an
-            # adapter that will contribute no weights — nothing promoted, a
-            # closed gate, a directory that does not exist — stays a no-op
+            # adapter that will contribute no weights - nothing promoted, a
+            # closed gate, a directory that does not exist - stays a no-op
             # instead of raising. Refusing at path-computation time makes a
             # malformed-but-inert artifact fail every turn it is routed into.
             base = self.fs_root.resolve()
@@ -3293,7 +3293,7 @@ class LocalJaxLoRABackend:
         # The adapter ROOT. Returning `latest` when it existed handed version
         # resolution a directory that has no vNNNN inside it, so a promoted
         # artifact with adapters/A/v0001 became unservable merely because
-        # A/latest also existed — and it contradicted §5.5, which says
+        # A/latest also existed - and it contradicted §5.5, which says
         # serving does not consult that pointer. Version resolution alone
         # chooses the directory.
         return str(safe_join(self.fs_root, f"adapters/{adapter_id}"))

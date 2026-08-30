@@ -1,7 +1,7 @@
 """The two chat transports do the same turn.
 
-They had drifted three ways, all silently — no inference slot, no cache
-warming, no post-turn work on the non-streaming branch — because there were no
+They had drifted three ways, all silently - no inference slot, no cache
+warming, no post-turn work on the non-streaming branch - because there were no
 WebSocket tests at all. The structural checks catch a new divergence where it
 is written; the end-to-end ones prove the turn completes on the socket.
 """

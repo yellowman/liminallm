@@ -50,7 +50,7 @@ services:
       # this service configures beyond the six environment-only settings goes
       # here: managed settings have no environment variables of their own, so
       # a bare REDIS_URL reached nothing and left redis_url on its localhost
-      # default — inside this container, nowhere.
+      # default - inside this container, nowhere.
       INSTANCE_SETTINGS_JSON: >-
         {"model_backend":"stub","redis_url":"redis://redis:6379/0","enable_mfa":false}
       # Filesystem

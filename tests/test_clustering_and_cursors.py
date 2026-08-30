@@ -1,8 +1,8 @@
 """Keyset cursors, and the clustering the router's skills emerge from.
 
 Both were around 40% covered. The clustering tests here stay on the parts that
-are pure functions of their input — k-means, reservoir sampling, parsing a
-model's label reply — because those decide which adapters exist, and a model
+are pure functions of their input - k-means, reservoir sampling, parsing a
+model's label reply - because those decide which adapters exist, and a model
 reply is not a format anyone controls.
 """
 
@@ -172,7 +172,7 @@ def test_reservoir_sampling_of_a_short_run_keeps_everything(clusterer):
 
 
 def test_reservoir_sampling_is_uniform_enough_to_be_a_sample(clusterer):
-    """Not a statistics test — just that it does not always pick the head,
+    """Not a statistics test - just that it does not always pick the head,
     which is what a broken reservoir degenerates to."""
     random.seed(1234)
     tail_hits = sum(
@@ -259,7 +259,7 @@ def test_the_skill_prompt_names_the_skill(clusterer):
 
 
 def test_the_skill_prompt_carries_at_most_three_exemplars(clusterer):
-    """SPEC §5.6: born as behaviour-as-prompt, and deliberately short —
+    """SPEC §5.6: born as behaviour-as-prompt, and deliberately short -
     small models pay for every token."""
     out = clusterer._skill_prompt_instructions(
         _Cluster("Debugging", ""), [_event(f"example {i}") for i in range(10)]

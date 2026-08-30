@@ -2,8 +2,8 @@
 
 The Responses API is the primary endpoint for OpenAI and compatible
 providers: richer usage (reasoning and cached-token counts), typed output
-items, and first-class reasoning control. The rest of this codebase — the
-agent loop, adapters, history assembly — speaks chat-completions shape, and
+items, and first-class reasoning control. The rest of this codebase - the
+agent loop, adapters, history assembly - speaks chat-completions shape, and
 providers that only ship /chat/completions still exist, so the chat shape
 stays the internal lingua franca and this module translates at the wire.
 
@@ -62,8 +62,8 @@ def _content_parts(content: Any, *, assistant: bool) -> Any:
 
 
 def to_input_items(messages: List[dict]) -> List[dict]:
-    """A chat-completions history — including the agent loop's assistant
-    tool_calls and role:"tool" results — as Responses input items."""
+    """A chat-completions history - including the agent loop's assistant
+    tool_calls and role:"tool" results - as Responses input items."""
     items: List[dict] = []
     for msg in messages or []:
         role = msg.get("role") or "user"
@@ -117,7 +117,7 @@ def to_tools(tools: List[dict]) -> List[dict]:
 def usage_dict(response: Any) -> Dict[str, int]:
     """Responses usage, mapped to the internal shape plus the richer fields.
 
-    reasoning_tokens and cached_tokens ride along as extra int keys — the
+    reasoning_tokens and cached_tokens ride along as extra int keys - the
     agent loop sums every int in usage, so they aggregate across rounds and
     surface in the turn's usage without any consumer changing.
     """
@@ -194,7 +194,7 @@ def reasoning_param(effort: Optional[str]) -> Optional[dict]:
     """The configured effort as the Responses reasoning parameter.
 
     Chat sent it as extra_body reasoning_effort. "none" (disable thinking,
-    honored by some compat providers) has no Responses equivalent — omit the
+    honored by some compat providers) has no Responses equivalent - omit the
     parameter and let the model default."""
     if not effort or effort == "none":
         return None

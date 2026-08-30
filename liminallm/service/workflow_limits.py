@@ -23,7 +23,7 @@ class ExecutionBudget:
     success.
 
     So the budget is an object the loop and the fan-out both hold, and a
-    fan-out reserves before it starts — an over-budget batch never begins any
+    fan-out reserves before it starts - an over-budget batch never begins any
     of it, rather than being cut off partway through. Every entry in
     `parallel.next` costs one, a repeated id included: each occurrence is an
     execution, whatever it is named.

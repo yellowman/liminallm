@@ -10,7 +10,7 @@ The clock is the harder half. Three collectors already walk that namespace on
 their own schedules, and each one measures age from something on disk. Once
 the account's rows are gone, `sweep_generations` finds no conversations, so
 its referenced-checksum set is empty and every generation the account ever
-made becomes collectable at once — judged by the blob's own mtime, which is
+made becomes collectable at once - judged by the blob's own mtime, which is
 weeks old. A turn that resolved one of those blobs a moment before the
 deletion then reads a filesystem where it is gone.
 
@@ -122,7 +122,7 @@ class TestAResetTokenNamesAnAccount:
 
     Issuance stored the address and completion looked up whichever account
     owned it at the time. Delete the requester, register the same address, and
-    the old token changes the new account's password — a credential transfer
+    the old token changes the new account's password - a credential transfer
     between two unrelated users, using nothing but the ordinary reset flow.
     """
 
@@ -294,7 +294,7 @@ class TestTheAccountOwnsItsWholeNamespace:
 
         Every assertion there is that something still exists, which is also
         what a pass that ran no sweeps produces. Measured: unwire any of the
-        three from `_run_cleanup_pass` and that test still passes — the
+        three from `_run_cleanup_pass` and that test still passes - the
         exclusion was never what kept those files. So the same fixture runs
         the same pass against a live account, where all three collectors must
         take their own kind of debris.
@@ -337,7 +337,7 @@ class TestSubordinateSweepsDoNotUndercutTheGrace:
 
     `sweep_generations` marks from what conversations reference. Delete the
     account and there are no conversations, so the mark set is empty and every
-    generation the user ever made looks unreferenced — judged by the blob's own
+    generation the user ever made looks unreferenced - judged by the blob's own
     mtime, which is old. That is the right clock for its normal race and the
     wrong one for this event.
     """
@@ -450,7 +450,7 @@ class TestSubordinateSweepsDoNotUndercutTheGrace:
         assert deletion.get("status") in (200, 204), deletion
         assert set(generations.glob("*/*")) == before, (
             "an account deletion landed inside a running generation sweep, and "
-            "the sweep finished on its stale answer — reclaiming a generation "
+            "the sweep finished on its stale answer - reclaiming a generation "
             "the erasure had just promised an hour of grace"
         )
 
@@ -472,7 +472,7 @@ class TestSubordinateSweepsDoNotUndercutTheGrace:
         So the assertion is about the schedule directly, and it is taken at the
         destructive step rather than at the guard: while this account's files
         are being removed, the deletion is still waiting. Pausing at the guard
-        instead would only prove the guard was entered — measured, a body
+        instead would only prove the guard was entered - measured, a body
         moved outside the `with` survived that version of this test. A set
         read once at the top of the pass makes neither true.
 
@@ -581,7 +581,7 @@ class TestRetirementIsDurableAndRetryable:
         assert not namespace.exists()
 
     def test_debris_from_before_this_existed_is_enrolled_not_removed(self, client):
-        """First observed, then collected — never removed on sight."""
+        """First observed, then collected - never removed on sight."""
         from liminallm.service.users import sweep_user_namespaces
 
         runtime = get_runtime()
@@ -782,8 +782,8 @@ class TestHotStateGoesWithTheAccount:
         which is why this can be forced: drop the index and the session must
         still go.
 
-        The plain case — delete an account, its cached session stops
-        resolving — is this test with the index left in place, so it is this
+        The plain case - delete an account, its cached session stops
+        resolving - is this test with the index left in place, so it is this
         one and not two.
         """
         runtime = get_runtime()
@@ -844,11 +844,11 @@ class TestHotStateGoesWithTheAccount:
         """Every category is its own attempt.
 
         The first version ran all of them inside one `try`, so a failure
-        revoking sessions meant no conversation summary was even attempted —
+        revoking sessions meant no conversation summary was even attempted -
         one unreachable key pattern leaving an account's messages readable.
 
-        The purge has two loops — the families it can address by name and the
-        ones it has to scan for — and each keeps its own `try`. So each is
+        The purge has two loops - the families it can address by name and the
+        ones it has to scan for - and each keeps its own `try`. So each is
         refused a family it attempts early, and the assertion is on a family it
         attempts after that: refusing a later one would prove nothing, because
         the earlier one is gone whether or not the categories are independent.
@@ -953,7 +953,7 @@ class TestAnInFlightRequestCannotUndoTheErasure:
           -> the completed response,
              back for 24 hours
 
-    A liveness check before the write does not close it — that is the same
+    A liveness check before the write does not close it - that is the same
     check-then-act the collectors had, one participant further along. Only a
     lock held across the decision and the write does.
 
@@ -976,7 +976,7 @@ class TestAnInFlightRequestCannotUndoTheErasure:
         guard, which shows the guard is entered and held. A caller that passes
         its own pair has put the pause at the statement that actually writes,
         which is the stronger placement and the one that catches a guard
-        released too early — measured, a claim written after the `with` block
+        released too early - measured, a claim written after the `with` block
         survived the weaker version of this.
         """
         import threading
@@ -1097,8 +1097,8 @@ class TestAnInFlightRequestCannotUndoTheErasure:
 
         Deleting first and then entering the guard proves the liveness
         predicate and nothing about where the lock is held. This pauses at the
-        cache acquisition itself — the statement that actually creates
-        `idemp:...:<user>:...` — so a guard that answered and released before
+        cache acquisition itself - the statement that actually creates
+        `idemp:...:<user>:...` - so a guard that answered and released before
         it lets the deletion through during the pause.
         """
         import threading
@@ -1209,7 +1209,7 @@ class TestAnInFlightRequestCannotUndoTheErasure:
         Holding the account across a blocking per-blob wait means a deletion
         inherits that wait, once per contended blob. The sweep takes each
         blob's lock without waiting instead, because a blob it skips is one
-        the next pass collects — the upload is the side that must publish.
+        the next pass collects - the upload is the side that must publish.
         """
         import hashlib
         import os
@@ -1268,8 +1268,8 @@ class TestAnInFlightRequestCannotUndoTheErasure:
     def test_the_two_guards_answer_different_questions(self, client):
         """Debris to a collector is not a principal to a writer.
 
-        A user id with no account row and no retirement — the namespace of an
-        account erased long enough ago that its record was cleared — is
+        A user id with no account row and no retirement - the namespace of an
+        account erased long enough ago that its record was cleared - is
         something a collector may act on and something no write may happen on
         behalf of. Reusing the collector's boolean on the write side is how a
         caller ends up writing for an account that is not there.

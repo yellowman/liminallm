@@ -5,7 +5,7 @@ sole control and changes only through config ops. The physical lifecycle said
 otherwise: `delete_user` removed every row with that `owner_user_id` whatever
 its visibility, and the foreign key cascaded independently, so deleting the
 admin who published a tool server also deleted the server, its versions and
-its patch history — with no review and no record that it had ever existed.
+its patch history - with no review and no record that it had ever existed.
 
 That is not an escape: it needs an admin and it fails closed. It is a
 contradiction between two rules the installation states about itself, and it
@@ -13,7 +13,7 @@ made installation-wide configuration share a personnel account's lifetime.
 
 The model these fix on: publishing detaches. A private artifact still dies
 with its account. A published one keeps its row, its versions and its audit
-trail, and loses its owner — which for an MCP server means it goes inert,
+trail, and loses its owner - which for an MCP server means it goes inert,
 because the admin attestation is what made it a capability, and it stays that
 way until an admin re-publishes it.
 """
@@ -75,7 +75,7 @@ class TestDeletingThePublisherLeavesTheConfiguration:
         """The reviewer's red, end to end through the routes that do it.
 
         One admin publishes, another deletes the first. The row, its version
-        history and its patch history all have to still be there afterwards —
+        history and its patch history all have to still be there afterwards -
         the audit trail especially, because cascading it away removes the
         record of what the installation used to be configured to do.
         """
@@ -107,7 +107,7 @@ class TestDeletingThePublisherLeavesTheConfiguration:
 
         The admin attestation is what made this a capability, and the admin is
         gone. So the row stays, the history stays, and no turn gets its tools
-        until an admin publishes it again — which is the same answer
+        until an admin publishes it again - which is the same answer
         `servers_for_turn` already gives any artifact with no owner.
         """
         publisher_id, publisher = _account(client, "inert", admin=True)
@@ -134,8 +134,8 @@ class TestDeletingThePublisherLeavesTheConfiguration:
         """The erasure guarantee is not weakened, only narrowed.
 
         A private artifact is the account's own, and account deletion has to
-        keep meaning that its data is gone. Only publishing — which is an
-        admin act that binds the artifact into everyone else's work — changes
+        keep meaning that its data is gone. Only publishing - which is an
+        admin act that binds the artifact into everyone else's work - changes
         the answer.
         """
         owner_id, owner = _account(client, "priv", admin=True)
@@ -158,8 +158,8 @@ class TestDeletingThePublisherLeavesTheConfiguration:
         """The database's own answer, not the delete path's.
 
         `delete_user` is one caller. The constraint decides what happens on
-        every other path there will ever be — a maintenance statement, a
-        future admin flow, a restore — and it cannot see visibility, so every
+        every other path there will ever be - a maintenance statement, a
+        future admin flow, a restore - and it cannot see visibility, so every
         answer it could give on its own destroys something. CASCADE removes
         published configuration; SET NULL leaves a private artifact, and its
         payload, behind an account that was deleted.
@@ -298,7 +298,7 @@ class TestAFreshDatabaseGetsTheRightKey:
 
     The two are different questions and only one of them was covered. An
     already-provisioned database keeps the corrected constraint no matter what
-    the file says — the migration is `IF confdeltype = 'c'`, so re-applying it
+    the file says - the migration is `IF confdeltype = 'c'`, so re-applying it
     to a database that has already been fixed does nothing. So reverting the
     file failed no test, which is a hole for exactly the case that matters:
     a new installation.

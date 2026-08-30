@@ -2,7 +2,7 @@
 
 These are the tools that touch the network, the interpreter and the filesystem.
 Before the split they could only be reached through a fully-constructed engine,
-which meant their edge cases — web disabled, no attachments, nothing matched —
+which meant their edge cases - web disabled, no attachments, nothing matched -
 went uncovered.
 """
 

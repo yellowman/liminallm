@@ -67,10 +67,10 @@ class RedisCache:
     # plain counter at `:failures` and this sorted set are independent
     # ledgers, so with both live a success clears only one and failures split
     # across both may each stay under threshold. A change of representation
-    # is a coordinated reset — old replicas drained before new ones serve,
+    # is a coordinated reset - old replicas drained before new ones serve,
     # the previous history purged by `purge_breaker_failure_history` (not
     # merely left to expire: a rollback inside the TTL would otherwise find
-    # it live again) — not a rolling deploy. The version is what keeps that
+    # it live again) - not a rolling deploy. The version is what keeps that
     # boundary safe rather than
     # corrupting: a straggler still `INCR`-ing the plain `:failures` string
     # cannot make this set's `ZADD`/`ZCOUNT` fail `WRONGTYPE`. It is a reset
@@ -439,12 +439,12 @@ return {1, tokens, 0}
         The whole point is that the read and the removal are one step. Reading
         first and deleting after the work is done leaves the token readable for
         the length of that work, so two requests holding it both get a subject
-        and both proceed — and for a token that arrives by email, that window
+        and both proceed - and for a token that arrives by email, that window
         is reachable by anyone who has read the message, and by an ordinary
         double-click.
 
         `GETDEL`, with an `EVAL` for a redis-py old enough not to have the
-        method — `AttributeError` is a missing client method, not a server
+        method - `AttributeError` is a missing client method, not a server
         that refuses the command. The server side needs Redis 6.2 or newer to
         answer `GETDEL` at all, and `docker-compose.test.yml` pins Redis 7, so
         there is nothing here that reaches an older one. Supporting a server
@@ -456,7 +456,7 @@ return {1, tokens, 0}
         email verification. The version that mattered was written three times,
         and only one of the three was written this way.
 
-        Returns the stored subject, or None if the token was not there — which
+        Returns the stored subject, or None if the token was not there - which
         includes the case where somebody else has just taken it.
         """
         key = f"{prefix}:{token}"
@@ -576,7 +576,7 @@ return {1, tokens, 0}
         `SCAN`, never `KEYS`: this walks the whole keyspace in bounded slices
         instead of blocking the server for the length of it. Account deletion
         is rare, so paying a scan for the key families that carry no index is
-        the right trade — the alternative is maintaining a per-user index for
+        the right trade - the alternative is maintaining a per-user index for
         each of them and getting the erasure wrong whenever one expires.
 
         `keeps` re-checks each key, because a glob cannot express "this exact
@@ -613,7 +613,7 @@ return {1, tokens, 0}
         not be able to prevent an erasure. What it must not do is give up
         early. Each family is its own attempt, because one unreachable key
         pattern is not a reason to leave the rest of an erased account's
-        content readable — the first version of this ran every category inside
+        content readable - the first version of this ran every category inside
         one `try`, so a failure revoking sessions meant no conversation
         summary was even attempted.
 
@@ -953,7 +953,7 @@ return {1, tokens, 0}
         # tripped past the window, or score it in the past and be pruned
         # early. One clock, the ledger's, so the window means the same thing
         # to every replica (SPEC §18). The member is a caller-supplied unique
-        # id — data, not a clock — so two failures at the same instant both
+        # id - data, not a clock - so two failures at the same instant both
         # count.
         lua_script = """
         -- Check if circuit is already open
@@ -1014,7 +1014,7 @@ return {1, tokens, 0}
         to its window-length TTL leaves a resurrection window: a rollback to
         the old representation inside that TTL finds the old counter still
         live and resumes counting from it, opening a breaker the reset was
-        meant to have cleared — with no mixed-version serving at any point.
+        meant to have cleared - with no mixed-version serving at any point.
         Purging the superseded namespace after draining its replicas closes
         that window in both directions.
 
@@ -1023,7 +1023,7 @@ return {1, tokens, 0}
         raises before any glob is built, so this destructive purge can never
         be widened into `circuit:*:*` and reach the shared `:open` cooldown
         or another tool's history. The glob ends at the resolved suffix, so
-        `legacy` does not match `v2` and neither matches `:open` — an
+        `legacy` does not match `v2` and neither matches `:open` - an
         already-open breaker keeps its cooldown across the reset, which is
         deliberate (an unhealthy tool is not made healthy by a representation
         change). Never flushes the database.

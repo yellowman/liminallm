@@ -1,9 +1,9 @@
 """One chat turn, independent of the transport that carried it.
 
 POST /chat and the /chat/stream WebSocket differ only in how the reply reaches
-the client. Everything else — resolving the conversation, checking context
+the client. Everything else - resolving the conversation, checking context
 ownership, transcribing voice, persisting both messages, scheduling the
-post-turn work, warming the cache — is the same turn, and was written twice.
+post-turn work, warming the cache - is the same turn, and was written twice.
 Three things had already drifted, all silently: the socket never warmed the
 cache, its non-streaming branch scheduled nothing, and a conversation it
 created never recorded its ``active_context_id``.
@@ -134,7 +134,7 @@ async def _transcribe(runtime, payload: str, user_id: str) -> tuple[str, dict]:
 
 @contextmanager
 def _unguarded(_capability: str, _payload: Any):
-    """Stand-in for a caller with no ledger — the streaming path, and tests."""
+    """Stand-in for a caller with no ledger - the streaming path, and tests."""
     yield SimpleNamespace(replayable=False, result=None)
 
 
@@ -157,7 +157,7 @@ async def finish(
     ``commit`` is the request's ledger (``IdempotencyGuard.commit``). SPEC §11.3
     makes storing the assistant message the first durable mutation of the write
     path, so it is guarded here, around the append itself. Guarding the route
-    instead would record that a turn was attempted — which is what the
+    instead would record that a turn was attempted - which is what the
     idempotency slot already records, and is not the same claim as "the message
     is in the table".
     """

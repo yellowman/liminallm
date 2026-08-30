@@ -7,7 +7,7 @@ cookies, CSRF and same-origin rules are in play. Neither is reachable from
 opinion about `HttpOnly`.
 
 The server runs in a thread rather than a subprocess so it shares this
-process's already-configured runtime — the same Postgres and Redis the rest
+process's already-configured runtime - the same Postgres and Redis the rest
 of the suite uses, with no environment plumbing to keep in step.
 """
 

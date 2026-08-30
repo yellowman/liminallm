@@ -1,7 +1,7 @@
 """What crosses a pipe from a process we assume is hostile.
 
 Two boundaries in this codebase are declared untrusted on the child side. SPEC
-§18 makes the tool worker the untrusted half of the broker boundary — it "runs
+§18 makes the tool worker the untrusted half of the broker boundary - it "runs
 model-chosen control flow over attacker-controlled bytes". §19.5 says the
 extraction child is where parsers run because "assume the parsers are
 compromisable".
@@ -9,7 +9,7 @@ compromisable".
 Both used `multiprocessing.Connection.send()`/`recv()`, and `recv()` unpickles.
 Python's own documentation warns that this is unsafe from an untrusted peer:
 unpickling runs `__reduce__`, so the dangerous operation happens **in the
-parent**, while it is decoding — before any check the parent might make. That
+parent**, while it is decoding - before any check the parent might make. That
 collapses both boundaries: the decoder is a route back into the API process,
 and "compromise stays in the disposable child" stops being true.
 
@@ -100,9 +100,9 @@ class TestTheExtractionSandboxDoesNotUnpickleItsChild:
         assert result == {"ok": True, "items": ["a", "b"], "count": 2}
 
     def test_a_real_error_still_reaches_the_caller_as_itself(self, tmp_path):
-        """Callers translate specific failures — `extract_text` re-raises
+        """Callers translate specific failures - `extract_text` re-raises
         `ExtractError`, `extract_archive_sandboxed` cleans up on
-        `ArchiveExtractionError` — so the type has to survive as data."""
+        `ArchiveExtractionError` - so the type has to survive as data."""
         from liminallm.service.archive import ArchiveExtractionError
         from liminallm.service.sandbox import run_in_sandbox
 
@@ -172,7 +172,7 @@ class TestTheErrorChannelNamesTypesItDoesNotChoose:
     """A type crosses as a name; the parent decides what a name may become.
 
     The vocabulary is the parent's, so a child cannot ask for a class to be
-    constructed — which is the property the old pickle channel had inverted.
+    constructed - which is the property the old pickle channel had inverted.
     """
 
     def test_a_type_the_caller_did_not_allow_for_stays_a_sandbox_error(self, tmp_path):
@@ -230,7 +230,7 @@ class TestFramesAreBounded:
             + b'"}}'
         )
         # Written from a thread on purpose. A frame this size does not fit in
-        # the socket buffer, so the write blocks until someone reads it — and
+        # the socket buffer, so the write blocks until someone reads it - and
         # the reader under test is the one that must *refuse* to. Doing it
         # inline deadlocks the test, which is itself the shape of the property:
         # the parent never takes the bytes.
@@ -257,7 +257,7 @@ class TestFramesAreBounded:
 
     def test_the_budget_grows_only_by_what_the_broker_sent(self):
         """The worker returns the conversation it was handed, so the parent's
-        own outbound total is the honest allowance — not a guess about sizes."""
+        own outbound total is the honest allowance - not a guess about sizes."""
         from liminallm.service.tool_worker import (
             WORKER_FRAME_ALLOWANCE_BYTES,
             FrameBudget,
@@ -270,7 +270,7 @@ class TestFramesAreBounded:
 
 
 class TestTheSandboxTerminatesItsDescendants:
-    """§19.5's parsers spawn grandchildren — `pdftoppm`, tesseract — and the
+    """§19.5's parsers spawn grandchildren - `pdftoppm`, tesseract - and the
     wall-clock kill is described as disposing of the job, not of one pid."""
 
     def test_a_grandchild_does_not_outlive_the_wall_clock(self, marker, tmp_path):
@@ -301,8 +301,8 @@ class TestASuccessfulToolCallLeavesNothingRunning:
     does the worker"; "what the invocation started, the invocation can kill."
 
     Neither sentence has an exception for succeeding. The timeout and
-    revocation paths learned about process groups; the ordinary path — a tool
-    that shells out, answers, and exits — did not, and the registration was
+    revocation paths learned about process groups; the ordinary path - a tool
+    that shells out, answers, and exits - did not, and the registration was
     dropped a line later, so the helper was nobody's.
     """
 
@@ -386,7 +386,7 @@ class TestRequiredLimitsFailClosed:
     All four are required, because `run_in_sandbox` is shared. §19.5 names
     memory, CPU and file size for the parser; §21.2 names those *and no core
     dumps* for `run_python`, which comes through the same function. The
-    stricter contract governs — the alternative is a mode switch whose only
+    stricter contract governs - the alternative is a mode switch whose only
     purpose is to let one untrusted child dump core.
     """
 
@@ -458,7 +458,7 @@ def _group_leader_with_a_child(marker: Path):
     """A process shaped like the sandbox child: leads a group, spawns into it.
 
     `start_new_session=True` is `setsid`, which is what `_sandbox_entry` now
-    does before it runs anything — so the group this leaves behind is the one
+    does before it runs anything - so the group this leaves behind is the one
     a teardown has to reach.
     """
     import subprocess
@@ -483,8 +483,8 @@ def _send_and_swallow(conn, raw: bytes) -> None:
 
     The refusal leaves this write blocked with nowhere to go; closing an end is
     what ends it, so failing here is the expected outcome. Which failure
-    depends on which end closes first — a broken pipe from the reader, or a
-    handle pulled out from under this thread — so all of them are the answer.
+    depends on which end closes first - a broken pipe from the reader, or a
+    handle pulled out from under this thread - so all of them are the answer.
     """
     try:
         conn.send_bytes(raw)

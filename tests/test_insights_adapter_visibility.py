@@ -6,7 +6,7 @@ clusters are both read for that user. The adapter list alone was read with an
 unscoped `list_artifacts(type_filter="adapter")`.
 
 The store treats an unscoped artifact listing as a question about public
-visibility, deliberately — caller identity is what adds that caller's private
+visibility, deliberately - caller identity is what adds that caller's private
 rows, and tenant identity is what adds their tenant's shared ones. So the
 panel did not leak: it collapsed to `visibility='global'` and never showed a
 user the per-user adapter their own feedback had just created.

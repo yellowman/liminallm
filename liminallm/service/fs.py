@@ -135,7 +135,7 @@ def is_internal_path(relative: str | Path) -> bool:
     this question and they must not answer it differently: a path the listing
     omits, and download and delete treat as absent, is a path ingestion must
     refuse. It was spelled twice inside `routes.py` alone and a third time
-    nowhere — which is how the manifest became a chunk.
+    nowhere - which is how the manifest became a chunk.
 
     Authorization is a separate question and stays separate. `authorize_path`
     says whether a caller may read a path; this says whether the path is the
@@ -193,7 +193,7 @@ def authorize_path(
 
     SPEC §18 gives filesystem authority two sources and no third:
 
-    * the caller's own area — `safe_join(base=/users/{user_id}, relative)`;
+    * the caller's own area - `safe_join(base=/users/{user_id}, relative)`;
     * an artifact whose *persisted* visibility is `shared` or `global` and
       whose `fs_path` covers what is being asked for **under `/shared`**.
 
@@ -205,7 +205,7 @@ def authorize_path(
     A pathname is not one of them. `POST /contexts/{id}/sources` used to accept
     anything underneath `shared_fs_root/shared` because it was underneath that
     directory, and then checked that the destination context belonged to the
-    caller — which establishes who receives the content and never who was
+    caller - which establishes who receives the content and never who was
     entitled to the source. Knowing a name became the whole of the authority.
 
     Authority is decided on where the path **resolves**, not how it reads:
@@ -267,7 +267,7 @@ def authorize_path(
 def _artifact_authorizes(store, artifact, *, user_id: str, tenant_id) -> bool:
     """Whether this artifact row entitles this caller to the path it names.
 
-    Only `shared` and `global` — the two §18 names. `private` is deliberately
+    Only `shared` and `global` - the two §18 names. `private` is deliberately
     absent: the caller's own authority is their `/users/{id}` root and is
     already spent there, so honouring a private row here would let an artifact
     widen a caller's filesystem reach beyond their own area, which is not one
@@ -276,7 +276,7 @@ def _artifact_authorizes(store, artifact, *, user_id: str, tenant_id) -> bool:
     visibility = getattr(artifact, "visibility", "private")
     owner_id = getattr(artifact, "owner_user_id", None)
     if visibility == "shared":
-        # `shared` is within one tenant, and the tenant is the owner's —
+        # `shared` is within one tenant, and the tenant is the owner's -
         # `artifact` has no tenant column of its own.
         if not owner_id or not tenant_id:
             return False
@@ -294,7 +294,7 @@ def adapter_dir_owner(path) -> str:
     One predicate for both ends of §5.5, because both ask the same question:
     training, before it writes a version into a directory, and serving, once
     it has resolved which `params.json` it would read. Handles every layout
-    the resolver produces — `.../A`, `.../A/vNNNN/params.json` and the
+    the resolver produces - `.../A`, `.../A/vNNNN/params.json` and the
     never-versioned `.../A/params.json`.
     """
     candidate = Path(str(path))
@@ -312,7 +312,7 @@ def server_owned_artifact_dirs(
 
     Deliberately *not* `schema.fs_dir`. That is accepted by
     `adapter_root` when their final component matches the adapter's id, which
-    is enough authority to stop adapter A serving adapter B's weights — it is
+    is enough authority to stop adapter A serving adapter B's weights - it is
     not authority to destroy. The schema is user-editable, so a value like
     `<shared>/something-important/<their-own-artifact-id>` satisfies that rule
     while naming somebody else's data, and cleanup that trusted it would
@@ -332,7 +332,7 @@ def adapter_root(base: Path, adapter_id: str, explicit=None) -> Path:
     """The directory holding one adapter's versions, bound to its identity.
 
     An explicit ``fs_dir`` says **where** an adapter's directory
-    lives — a per-user root, a different mount — never **whose** it is. Its
+    lives - a per-user root, a different mount - never **whose** it is. Its
     final component must therefore be the adapter's own id, which both
     documented layouts already satisfy: ``adapters/{adapter_id}`` and
     ``/users/{user_id}/adapters/{adapter_id}``.
@@ -340,7 +340,7 @@ def adapter_root(base: Path, adapter_id: str, explicit=None) -> Path:
     Containment under ``base`` alone was not enough. It proved the path was
     inside the shared root, which every adapter's directory is, so an artifact
     whose schema named ``adapters/B`` had B's ``v0001/params.json`` served as
-    A's version 1 — the same substitution as ``A/latest → B/v0001``, one level
+    A's version 1 - the same substitution as ``A/latest → B/v0001``, one level
     earlier, and reachable through ordinary artifact creation because the
     adapter schema accepts additional properties.
 
@@ -403,7 +403,7 @@ def file_digest(path: str | Path) -> Optional[str]:
     caller did not ask for.
 
     None is "no answer", not "no match". Every caller compares the result
-    with an expected digest, and None fails that comparison — which is the
+    with an expected digest, and None fails that comparison - which is the
     safe direction for all of them: an unreadable file is not a confirmed
     dedupe hit and is not a verified attachment.
     """
@@ -424,7 +424,7 @@ def namespace_key(files_dir: str | Path, relative_name: str) -> str:
     always name the same depth: extraction of `outer/dir/inner.zip` publishes
     into `outer/dir/inner`, while a recursive delete targets `outer`. Locking
     each side's own path gives two keys that never meet, and the delete walks
-    through a tree the extractor is still filling — later members recreate the
+    through a tree the extractor is still filling - later members recreate the
     ancestry with `mkdir(parents=True, exist_ok=True)`, so both requests report
     success over a partial tree. Measured before this rule existed.
 
@@ -443,7 +443,7 @@ def publication_key(fs_root: str | Path, fs_path: str | Path) -> str:
 
     A worker holds an absolute path and the shared root; a route holds the
     user's files directory and a relative name. Both have to arrive at the
-    same key or they take different locks and never see each other — which is
+    same key or they take different locks and never see each other - which is
     not hypothetical: a queue that keyed on the file's own parent let a
     recursive delete of a tree run straight through a job indexing a file
     inside it, and the job then failed on a file removed underneath it.
@@ -454,13 +454,13 @@ def publication_key(fs_root: str | Path, fs_path: str | Path) -> str:
     like the layout finds the archive's copy: a job on
     `bundle/users/fake/files/inner.md` would key on that inner directory
     while a delete of `bundle` keys on the tree, and the two never meet.
-    Shape is not identity — position under the root is.
+    Shape is not identity - position under the root is.
 
     No `resolve()`. The lock is on the persistent name, which is what every
     other side of this locks; resolving would key two names for one file and
     follow a symlink out of the namespace it belongs to.
 
-    A path outside any user's files directory — an adapter, a shared object —
+    A path outside any user's files directory - an adapter, a shared object -
     has no tree to belong to, and keying it on itself is both stable and
     correct for something nothing else contends on.
     """
@@ -469,7 +469,7 @@ def publication_key(fs_root: str | Path, fs_path: str | Path) -> str:
     # Recognise through a symlink, name from the logical root. `safe_join`
     # resolves the paths it hands back, so a stored `fs_path` can be spelled
     # with the physical root while a route builds its key from the configured
-    # one — the same file under two names, and so two locks. Matching against
+    # one - the same file under two names, and so two locks. Matching against
     # both spellings closes that. Resolving the *target* to choose the key
     # would reopen it from the other side: the lock is on the persistent name,
     # and a symlinked entry inside the tree would key outside its namespace.
@@ -496,7 +496,7 @@ def path_lock(
     """Serialise everything that publishes one path, across replicas.
 
     A publication is not one write. An upload puts bytes on disk, reads them
-    back to index them, and records a checksum — three artefacts that have to
+    back to index them, and records a checksum - three artefacts that have to
     describe the same generation, and three moments another request can land
     between. Making each step atomic does not help: measured, two uploads of
     one name left the second upload's bytes on disk, the second upload's
@@ -505,7 +505,7 @@ def path_lock(
 
     `flock`, for two reasons that rule out the alternatives. It is held by an
     open file description rather than by a process, so two threads in one API
-    process serialise on it exactly as two replicas do — measured both ways;
+    process serialise on it exactly as two replicas do - measured both ways;
     an in-process `threading.Lock` would be blind to the other replica, and
     §22 puts `shared_fs_root` in common between them deliberately. And the
     kernel drops it when the descriptor closes, so a replica that dies holding
@@ -513,7 +513,7 @@ def path_lock(
     built out of `O_EXCL` and a stale file.
 
     Blocking, so call it off the event loop. `key` is any stable string naming
-    what is being published — for a file, its path.
+    what is being published - for a file, its path.
 
     Raises `PathLockTimeout` rather than proceeding unserialised.
     """

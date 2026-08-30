@@ -1,7 +1,7 @@
 """Getting text out of uploaded files, which are attacker-controlled bytes.
 
-Every parser behind this — Pillow's C decoders, pypdf, expat, tesseract,
-poppler — is treated as compromisable, so extraction runs in a disposable
+Every parser behind this - Pillow's C decoders, pypdf, expat, tesseract,
+poppler - is treated as compromisable, so extraction runs in a disposable
 rlimited child. These drive the real parsers (all present here: Pillow, pypdf,
 tesseract, pdftoppm) rather than stubbing them, because a stub cannot tell you
 the sandbox actually held.
@@ -42,7 +42,7 @@ def test_a_text_file_comes_back_verbatim(tmp_path):
 
 def test_utf8_survives(tmp_path):
     f = tmp_path / "u.md"
-    f.write_text("héllo — ünïcode ✓", encoding="utf-8")
+    f.write_text("héllo - ünïcode ✓", encoding="utf-8")
     assert "ünïcode" in extract_text(f)["text"]
 
 
