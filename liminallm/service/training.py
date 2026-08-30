@@ -419,6 +419,30 @@ class TrainingService:
         # pinned rule does not make persona training unrunnable.
         job = self.store.get_training_job(job_id) if job_id else None
         pinned_job = job is not None and job.preference_event_ids is not None
+        # A job authorizes one adapter. `adapter_id` and `job_id` arrive
+        # independently, so nothing forced them to agree: adapter B could be
+        # fitted to job A's pinned evidence, write B's version directory, and
+        # update A's record. Checked before any evidence is resolved or
+        # anything is written.
+        if job is not None and job.adapter_id != adapter.id:
+            raise ConstraintViolation(
+                "training job belongs to another adapter",
+                {"job_id": job.id, "job_adapter": job.adapter_id,
+                 "adapter_id": adapter.id},
+            )
+        # A skill adapter graduates only through the ladder. Invoked
+        # directly it would select live events, train, and record a job
+        # pinned to whatever it happened to pick - so a skill that had
+        # earned nothing beyond its prompt rung could reach weights by a
+        # route §5.5's gate never authorized, bypassing the replica-safe
+        # enqueue on the way. The worker already owns the correct path, so
+        # this refuses rather than re-deriving the gate here. A persona
+        # adapter is not cluster-bound and is unaffected.
+        if adapter_schema_now.get("cluster_id") and job is None:
+            raise ConstraintViolation(
+                "skill training requires a queued job",
+                {"adapter_id": adapter.id},
+            )
         # SPEC §7.3: skill adapters (cluster-bound, not owned by a single user)
         # pool positive events across every contributor to the cluster; a
         # personal skill trains from its one owner's history instead, and

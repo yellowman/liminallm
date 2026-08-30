@@ -195,7 +195,9 @@ class TestAPartialEvidenceSetRefusesTheRun:
             owner_user_id=owner.id,
         )
         job = store.create_training_job(owner.id, adapter.id)
-        assert job.preference_event_ids in ([], None)
+        assert job.preference_event_ids is None, (
+            "a persona job must be live, not pinned-and-empty"
+        )
 
         training = TrainingService(store, str(tmp_path))
         # No base checkpoint here, so this skips rather than trains - but it
@@ -208,6 +210,184 @@ class TestAPartialEvidenceSetRefusesTheRun:
             owner.id, adapter_id=adapter.id, job_id=job.id
         )
         assert result is not None, "the persona run was refused, not skipped"
+
+
+class TestSkillTrainingOnlyArrivesThroughItsJob:
+    """The evidence gate is not the only door unless it is the only door.
+
+    Direct invocation selected live events, trained, and only afterwards
+    recorded a job pinned to whatever it happened to pick. A skill that
+    had earned nothing more than its prompt rung could graduate that way,
+    through a route §5.5 never authorized, and the replica-safe enqueue
+    was bypassed along with it.
+    """
+
+    def test_a_skill_adapter_refuses_direct_training(self, tmp_path):
+        store = get_test_store()
+        owner = _user(store, "solo")
+        cluster = _cluster(store, user_id=owner.id)
+        # A prompt rung only: six answers, one sitting, nothing near the bar.
+        _seed(store, owner, cluster.id, conversations=6, per_conversation=1)
+        training = TrainingService(store, str(tmp_path))
+        adapter_id = SemanticClusterer(
+            store, llm=None, training=training
+        ).promote_skill_adapters(min_size=5)[0]
+        assert [j for j in store.list_training_jobs()
+                if j.adapter_id == adapter_id] == []
+
+        with pytest.raises(ConstraintViolation, match="queued job"):
+            training.train_from_preferences(owner.id, adapter_id=adapter_id)
+
+        assert [j for j in store.list_training_jobs()
+                if j.adapter_id == adapter_id] == [], (
+            "the refused run still queued a job"
+        )
+        adapter = store.get_artifact(adapter_id)
+        assert adapter.schema.get("current_version", 0) == 0
+        assert adapter.schema["mode"] == "prompt"
+
+    def test_a_persona_adapter_still_trains_directly(self, tmp_path):
+        """The refusal is for cluster-bound adapters only."""
+        store = get_test_store()
+        owner = _user(store, "persona")
+        convo = store.create_conversation(owner.id, title="t")
+        store.append_message(convo.id, "user", "user", "q")
+        reply = store.append_message(convo.id, "assistant", "assistant", "a")
+        store.record_preference_event(
+            owner.id, convo.id, reply.id, "positive",
+            corrected_text="use tabs", context_embedding=[0.1] * 64,
+            context_text="context",
+        )
+        adapter = store.create_artifact(
+            "adapter", f"persona_{uuid.uuid4().hex[:6]}",
+            {"kind": "adapter.lora", "mode": "local", "base_model": "b",
+             "current_version": 0},
+            owner_user_id=owner.id,
+        )
+        training = TrainingService(store, str(tmp_path))
+        training._run_jax_optax_training = lambda *a, **k: {
+            "status": "skipped", "reason": "no base checkpoint"
+        }
+
+        assert training.train_from_preferences(
+            owner.id, adapter_id=adapter.id
+        ) is not None
+
+
+class TestAJobOnlyAuthorizesItsOwnAdapter:
+    def test_another_adapters_job_is_refused(self, tmp_path):
+        """Otherwise one adapter's evidence fits a different adapter.
+
+        The job and the adapter arrive as separate arguments, so nothing
+        forced them to agree: adapter B could be fitted to job A's pinned
+        evidence, write B's version directory, and update A's record.
+        """
+        store = get_test_store()
+        owner, adapter_a, job_a, training = _earned_personal_job(store, tmp_path)
+        adapter_b = store.create_artifact(
+            "adapter", f"other_{uuid.uuid4().hex[:6]}",
+            {"kind": "adapter.lora", "mode": "local", "base_model": "b",
+             "current_version": 0},
+            owner_user_id=owner.id,
+        )
+
+        with pytest.raises(ConstraintViolation, match="another adapter"):
+            training.train_from_preferences(
+                owner.id, adapter_id=adapter_b.id, job_id=job_a.id
+            )
+
+        assert store.get_artifact(adapter_b.id).schema["current_version"] == 0
+        assert store.get_training_job(job_a.id).status == "queued"
+
+
+class TestPinnedEvidenceStaysInsideOneTenant:
+    """A cluster can span tenants; the adapter it produces cannot.
+
+    The gate collected every positive event for a cluster with no tenant
+    filter, so a cross-tenant cluster pinned foreign evidence onto its job.
+    The resolver then refuses that run - correctly - but only after the
+    gate had already declared the skill's weights earned, and the counts it
+    recorded included contributors the adapter may never serve.
+    """
+
+    def _tenant_user(self, store, tenant, cluster_id, threads, secret):
+        user = store.create_user(
+            email=f"{uuid.uuid4().hex[:8]}@{tenant}.test", tenant_id=tenant
+        )
+        for _ in range(threads):
+            convo = store.create_conversation(user.id, title="t")
+            store.append_message(convo.id, "user", "user", "q")
+            reply = store.append_message(convo.id, "assistant", "assistant", secret)
+            store.record_preference_event(
+                user.id, convo.id, reply.id, "positive",
+                corrected_text=secret, context_embedding=[0.1] * 64,
+                cluster_id=cluster_id, context_text=secret,
+            )
+        return user
+
+    def test_a_cross_tenant_cluster_pins_only_its_own_tenant(self, tmp_path):
+        store = get_test_store()
+        cluster = _cluster(store)  # shared: no user_id
+        for _ in range(3):
+            self._tenant_user(store, "acme", cluster.id, 4, "ACME_SECRET")
+        self._tenant_user(store, "initech", cluster.id, 4, "INITECH_SECRET")
+
+        training = TrainingService(store, str(tmp_path))
+        adapter_id = SemanticClusterer(
+            store, llm=None, training=training
+        ).promote_skill_adapters(
+            min_size=5, weights_min_events=8, weights_min_messages=8
+        )[0]
+        adapter = store.get_artifact(adapter_id)
+        assert adapter.schema["tenant_id"] == "acme"
+
+        job = [j for j in store.list_training_jobs()
+               if j.adapter_id == adapter_id][0]
+        owners = {
+            store.get_preference_event(e).user_id
+            for e in job.preference_event_ids
+        }
+        tenants = {store.get_user(u).tenant_id for u in owners}
+        assert tenants == {"acme"}, (
+            f"the job pinned evidence from {tenants}; a run authorized by "
+            "another tenant's events cannot lawfully train on them, so the "
+            "gate must not count or pin them in the first place"
+        )
+        evidence = adapter.schema["lifecycle"]["evidence"]
+        assert evidence["users"] == 3, (
+            "the recorded contributor count included another tenant's users"
+        )
+
+
+class TestThePinnedDistinctionRoundTripsThroughStorage:
+    """`or []` in the row mapper collapsed live and pinned-invalid into one.
+
+    Asserting `in ([], None)` would not have caught that, so this asserts
+    each direction on its own.
+    """
+
+    def test_none_stays_none_and_empty_stays_empty(self, tmp_path):
+        store = get_test_store()
+        owner = _user(store, "roundtrip")
+        adapter = store.create_artifact(
+            "adapter", f"rt_{uuid.uuid4().hex[:6]}",
+            {"kind": "adapter.lora", "mode": "local", "base_model": "b",
+             "current_version": 0},
+            owner_user_id=owner.id,
+        )
+
+        live = store.create_training_job(owner.id, adapter.id)
+        assert store.get_training_job(live.id).preference_event_ids is None, (
+            "a live job came back pinned-and-empty"
+        )
+
+        pinned_empty = store.create_training_job(
+            owner.id, adapter.id, preference_event_ids=[]
+        )
+        assert store.get_training_job(pinned_empty.id).preference_event_ids == [], (
+            "a pinned-but-invalid job came back live, which is the opposite "
+            "of what it says"
+        )
 
 
 class TestPinnedExactnessSurvivesPreparation:

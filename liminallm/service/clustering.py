@@ -829,6 +829,39 @@ class SemanticClusterer:
         visibility = "private" if cluster.user_id else "shared"
         owner = self.store.get_user(owner_id)
         tenant_id = owner.tenant_id if owner else None
+        if shared and tenant_id:
+            # A cluster can span tenants; the adapter it produces cannot.
+            # Re-measure and pin inside the owner's tenant only. Counting
+            # the whole cluster would let another tenant's contributors
+            # push this one over the qualifying bar, and pinning them would
+            # name evidence the run is then not authorized to train on -
+            # which the resolver correctly refuses, but only after the gate
+            # already claimed the skill had earned its weights.
+            scoped = self.store.list_preference_events(
+                cluster_id=cluster.id, tenant_id=tenant_id
+            )
+            positive = [
+                e
+                for e in scoped
+                if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0
+            ]
+            evidence = self._evidence(positive)
+            if not positive:
+                self.logger.warning(
+                    "skill_promotion_no_tenant_evidence",
+                    cluster_id=cluster.id,
+                    tenant_id=tenant_id,
+                )
+                return
+            if evidence["users"] < shared_prompt_min_users:
+                self.logger.info(
+                    "shared_skill_needs_more_contributors",
+                    cluster_id=cluster.id,
+                    tenant_id=tenant_id,
+                    users=evidence["users"],
+                    required=shared_prompt_min_users,
+                )
+                return
         # base_model is required by the adapter schema; source it from the
         # runtime/training base model so promotion validates instead of
         # silently failing.

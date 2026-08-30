@@ -112,7 +112,13 @@ class TestLadderEndToEnd:
         assert skill.schema["mode"] == "prompt"
         assert skill.schema.get("current_version", 0) == 0
 
-        result = training.train_from_preferences(user.id, adapter_id=skill.id)
+        # Through the job its gate queued: a skill adapter refuses a direct
+        # call, which is the bypass that rule closes (SPEC §5.5.3).
+        job = [j for j in store.list_training_jobs()
+               if j.adapter_id == skill.id][0]
+        result = training.train_from_preferences(
+            user.id, adapter_id=skill.id, job_id=job.id
+        )
         assert result["jax_trace"]["status"] == "ok", result["jax_trace"].get("reason")
         gate = result["eval_gate"]
         # Real improvement, not merely a relaxed bar.
