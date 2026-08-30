@@ -1,6 +1,6 @@
 """The small uncovered islands: error paths one branch wide.
 
-Each of these is a covered module's last dark corner — an SMTP failure class,
+Each of these is a covered module's last dark corner - an SMTP failure class,
 a corrupted cache entry, a validator's raise. None is speculative: every
 branch here is reachable in production, just never walked by the suite.
 """
@@ -133,7 +133,7 @@ async def test_an_absent_entry_is_also_a_miss(cache):
 @pytest.mark.asyncio
 async def test_without_redis_admission_admits():
     """Single-process deployment: no shared counter exists, so no cap. The
-    alternative — refusing all chat because Redis is absent — is worse."""
+    alternative - refusing all chat because Redis is absent - is worse."""
     from liminallm.service import admission
 
     runtime = SimpleNamespace(cache=None, settings=None)
@@ -568,7 +568,7 @@ def test_a_starttls_send_logs_in_and_delivers(mailer, monkeypatch):
 
 
 def test_an_ssl_send_never_speaks_before_encryption(monkeypatch):
-    """smtp_security='ssl' uses SMTP_SSL — no starttls upgrade step exists."""
+    """smtp_security='ssl' uses SMTP_SSL - no starttls upgrade step exists."""
     _WorkingSMTP.log = []
     monkeypatch.setattr(smtplib, "SMTP_SSL", _WorkingSMTP)
     monkeypatch.setattr(

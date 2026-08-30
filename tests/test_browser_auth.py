@@ -3,7 +3,7 @@
 SPEC §17.10: the SPA keeps the access token; `session_id` and `refresh_token`
 ride as `HttpOnly` cookies the page cannot read. A durable credential in
 `sessionStorage` is readable by any script that reaches the page, and it
-outlives the access token it was meant to replace — which is the whole reason
+outlives the access token it was meant to replace - which is the whole reason
 the cookie exists.
 
 These run a real browser against the real server because that is the only
@@ -103,7 +103,7 @@ class TestTheBrowserHoldsOneCredential:
 
         A `refresh_token` in `sessionStorage` is a durable credential any
         script on the page can read, which is exactly what moving it into an
-        `HttpOnly` cookie was for — the cookie is set either way, so keeping
+        `HttpOnly` cookie was for - the cookie is set either way, so keeping
         the copy only removes the protection.
 
         `session_id` is the same argument: it is the handle MFA and the
@@ -157,7 +157,7 @@ class TestTheRefreshIsTheCookiesJob:
     The whole point of moving the refresh token out of reach is that the
     recovery still works. So the witness is the lifecycle, not the storage
     snapshot: sign in, break the access token, make the app do something, and
-    require that it recovered — using a credential it could not read, sending
+    require that it recovered - using a credential it could not read, sending
     nothing durable of its own, and exactly once.
     """
 
@@ -224,7 +224,7 @@ class TestTheAdminConsoleHoldsTheSameLine:
     """A second page with its own copy of the rule is a second place to break.
 
     The console has its own `persistAuth` and its own storage keys, so the
-    chat SPA's witness says nothing about it — measured, re-persisting the
+    chat SPA's witness says nothing about it - measured, re-persisting the
     refresh token here left the chat tests green. Both pages are the same
     origin and the same cookies; the rule has to hold on both.
     """
@@ -296,8 +296,8 @@ class TestSigningOutTakesWhatAnOlderSessionLeft:
 def _totp(secret_b32: str, *, when: float | None = None) -> str:
     """A code the server's own verifier will accept.
 
-    Same parameters `service/auth.py` declares — SHA1, six digits, a
-    thirty-second step — and checked against RFC 6238's published vector
+    Same parameters `service/auth.py` declares - SHA1, six digits, a
+    thirty-second step - and checked against RFC 6238's published vector
     rather than against our reading of the server: secret
     `12345678901234567890` at T=59 is 287082.
     """
@@ -320,8 +320,8 @@ class TestMfaEnrolsWithoutAReadableSessionId:
 
     Both MFA routes used to require `body.session_id` and compare it to the
     cookie, so the SPA had to keep a readable copy of the very handle those
-    routes authenticate with. The relationship is inverted now — the cookie is
-    the browser's authority — and this drives the real enrolment through the
+    routes authenticate with. The relationship is inverted now - the cookie is
+    the browser's authority - and this drives the real enrolment through the
     real UI to show the flow still completes with nothing readable to send.
     """
 
@@ -373,7 +373,7 @@ class TestMfaEnrolsWithoutAReadableSessionId:
 
         # `evaluate`, not `wait_for_function`: the latter polls a synchronous
         # predicate, and an async arrow hands it a Promise, which is always
-        # truthy — measured, that version passed with the whole verify path
+        # truthy - measured, that version passed with the whole verify path
         # broken. This awaits the answer and asserts on it.
         enabled = page.evaluate(
             "async () => {"

@@ -1,7 +1,7 @@
 """A real decoder-only transformer forward pass, in plain JAX.
 
 What this replaces: both serving and training used to run LoRA over a
-*synthetic* embedding table — ``sin(arange(...))`` — with no attention and no
+*synthetic* embedding table - ``sin(arange(...))`` - with no attention and no
 layers. That made the local lane shape-correct and semantically empty: it
 could not answer anything, and there was no KV state, which is why local
 `cached_tokens` had nothing to report. This module is the base model those
@@ -167,7 +167,7 @@ def load_checkpoint(model_dir: str | Path) -> Tuple[ModelConfig, Dict[str, Any]]
 
     Weights arrive as numpy (safetensors' framework-neutral read) and are cast
     to float32 once here; JAX moves them to the device on first use. Missing
-    tensors raise rather than defaulting — a half-loaded model answers
+    tensors raise rather than defaulting - a half-loaded model answers
     confidently and wrongly, which is worse than not starting.
     """
     import numpy as np
@@ -244,7 +244,7 @@ def _lora_delta(jnp, x, lora: Optional[Dict[str, Any]], key: str):
     """The LoRA update for one projection, or nothing.
 
     ``B @ A @ x`` with B zero-initialized is exactly zero, so a fresh adapter
-    is the identity — the property the tests pin.
+    is the identity - the property the tests pin.
     """
     if not lora:
         return None
@@ -356,7 +356,7 @@ def sample_token(
 ) -> int:
     """One token from the final-position logits.
 
-    Greedy when temperature is 0 — the deterministic default, so a test can
+    Greedy when temperature is 0 - the deterministic default, so a test can
     assert on output at all.
     """
     if temperature <= 0.0:
@@ -394,7 +394,7 @@ def validate_lora_weights(
 
     SPEC §5.2 says names outside the declared shape are never partially
     applied. Collecting the invalid ones, logging them and returning the
-    valid subset — which is what the assembly functions used to do — is
+    valid subset - which is what the assembly functions used to do - is
     partial application with a log line attached: an adapter carrying one
     foreign matrix still changed the model through its recognized ones.
 
@@ -438,7 +438,7 @@ def validate_lora_weights(
             )
         # Every prefix, scale included: a `.scale` whose projection has no
         # matrices is an adapter that contributes nothing while looking
-        # non-empty — which slipped past the "a selected adapter never
+        # non-empty - which slipped past the "a selected adapter never
         # silently leaves the stack" rule, because the raw dict was truthy.
         keys.add(".".join(parts[:3]))
 
@@ -491,7 +491,7 @@ def lora_by_layer(
             index = int(parts[1])
         except ValueError:
             continue
-        # `scale` is the α of SPEC §5.2 — part of the serialization contract.
+        # `scale` is the α of SPEC §5.2 - part of the serialization contract.
         if 0 <= index < num_layers and parts[3] in ("A", "B", "scale"):
             layers[index][f"{parts[2]}.{parts[3]}"] = jnp.asarray(
                 value, dtype=jnp.float32
@@ -526,7 +526,7 @@ def lora_layer_index(
 
     Computed once, outside any traced function: the assembly inside a loss
     function must be pure array plumbing, with the string parsing already
-    done. ``slots`` defaults to the trainable matrices — α is a fixed
+    done. ``slots`` defaults to the trainable matrices - α is a fixed
     hyperparameter, so a trainer asks for it separately and carries it as a
     constant rather than handing it to the optimizer.
     """

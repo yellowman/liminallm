@@ -9,8 +9,8 @@ from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.training import EVAL_MIN_RELATIVE_IMPROVEMENT, TrainingService
 from tests.harness import get_test_store
 
-# Every test in this module runs the real thing — training steps, a forward
-# pass, an eval gate — so it is measured in seconds rather than milliseconds.
+# Every test in this module runs the real thing - training steps, a forward
+# pass, an eval gate - so it is measured in seconds rather than milliseconds.
 # `make test-fast` skips these; `make test` and the pre-commit gate do not,
 # because what they exercise is not covered anywhere else.
 pytestmark = pytest.mark.slow
@@ -167,7 +167,7 @@ class TestEvalGate:
         """The ladder end to end, against a real base model.
 
         This used to run without any checkpoint, which trained LoRA against a
-        synthetic embedding table — the loss fell, the gate passed, and the
+        synthetic embedding table - the loss fell, the gate passed, and the
         promoted weights fitted no model that exists. Training now refuses to
         run without `params_base` (SPEC §5.4.4), so the test supplies one and
         the assertions mean what they say.
@@ -193,7 +193,7 @@ class TestEvalGate:
         # Training helps: holdout loss falls on a repetitive corpus.
         assert gate["eval_after"] < gate["eval_before"]
         # And the gate applies its own rule rather than a mood. How far the
-        # loss falls depends on the data and the hyperparameters — asserting a
+        # loss falls depends on the data and the hyperparameters - asserting a
         # magnitude here would pin the behaviour of a small random fixture, so
         # what is pinned is the decision itself.
         assert gate["promoted"] is (

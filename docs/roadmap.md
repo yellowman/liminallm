@@ -6,8 +6,8 @@ none of it is normative.
 
 ## delivered phases (historical)
 
-The SPEC's original §14 phase plan — vanilla chat + files, RAG + artifacts,
-preferences + persona adapter, clusters + skill adapters, LLM as architect —
+The SPEC's original §14 phase plan - vanilla chat + files, RAG + artifacts,
+preferences + persona adapter, clusters + skill adapters, LLM as architect -
 is delivered. It is recorded here so the SPEC does not instruct an agent to
 build tables that already exist. The one durable rule from that section
 lives on in SPEC §16: no new hard-coded modes; new behaviors arrive as
@@ -35,7 +35,7 @@ artifacts.
   onboard without pasting keys.
 - structured tool output (`structuredContent`) beside the text.
 - the consequential one: an mcp **client** in the kernel loop, consuming
-  external servers as tools under the taint discipline — each server
+  external servers as tools under the taint discipline - each server
   assigned a taint class, egress withdrawal extended to third-party tools,
   so outside capability never outruns the injection defenses.
 

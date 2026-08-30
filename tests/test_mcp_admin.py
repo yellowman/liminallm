@@ -1,8 +1,8 @@
 """Configuring a remote MCP server through the API an operator actually has.
 
 `servers_for_turn` requires a globally visible, admin-owned artifact. Nothing
-persisted through `POST /v1/artifacts` was ever global — the route did not
-accept a visibility and the store defaults to private — so the whole feature
+persisted through `POST /v1/artifacts` was ever global - the route did not
+accept a visibility and the store defaults to private - so the whole feature
 was reachable only by writing the row by hand. These are the reds for the path
 that closes it, and for the privilege boundary that path opens.
 """
@@ -158,7 +158,7 @@ class TestRetiringAServerGoesThroughConfigOps:
     """Publishing moves an artifact out of its owner's sole control.
 
     `_get_private_artifact` says so and refuses PATCH and DELETE for anything
-    published — "changed and retired through config ops, not here". So the way
+    published - "changed and retired through config ops, not here". So the way
     an operator turns a server off has to be the review flow, and that has to
     actually work on this artifact type rather than be a sentence in a
     docstring. Both halves are checked here: the CRUD route refusing, and the
@@ -199,7 +199,7 @@ class TestRetiringAServerGoesThroughConfigOps:
     def test_a_reviewed_patch_takes_the_server_out_of_the_turn(
         self, client, admin_headers
     ):
-        """Propose, approve, apply — then ask the turn, not the response."""
+        """Propose, approve, apply - then ask the turn, not the response."""
         with MCPFixture(f"off{uuid.uuid4().hex[:6]}") as fixture:
             artifact_id = self._publish(client, admin_headers, fixture)
 

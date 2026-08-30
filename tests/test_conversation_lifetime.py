@@ -7,7 +7,7 @@ and nothing may be able to recreate that state afterwards.
 
 The implicit attachment index is the hard case. It is a separate
 `knowledge_context` row, and its only tie to the chat used to live in
-`meta.conversation_id` — a JSON string with no relational meaning. Deleting
+`meta.conversation_id` - a JSON string with no relational meaning. Deleting
 the conversation left the index and its chunks behind, still holding the text
 of files the user attached to a chat they deleted.
 """
@@ -120,7 +120,7 @@ class TestDeletingAChatTakesItsChatOnlyState:
 
         `delete_conversation` removed the conversation row and its messages.
         The implicit context is a different table with no relational tie to
-        the conversation, so it stayed — and its chunks stayed with it,
+        the conversation, so it stayed - and its chunks stayed with it,
         holding the text of a file attached to a chat that no longer exists.
         """
         user_id, headers = _account(client)
@@ -231,8 +231,8 @@ class TestAnUploadCannotOutliveItsConversation:
 
         The upload validates the conversation early and does the expensive
         work afterwards, so a deletion in between is a real schedule, not a
-        contrived one. Recording the attachment already noticed — the row
-        lock finds no conversation and returns None — but that None was
+        contrived one. Recording the attachment already noticed - the row
+        lock finds no conversation and returns None - but that None was
         turned into an empty list and the route still answered 200, after
         creating an implicit context and indexing chunks under a
         conversation that no longer existed.
@@ -444,7 +444,7 @@ class TestTheGuardKeysOnTheKeyNotTheDescription:
 
         The capability guard refuses conversation indexes so one chat cannot
         read another's attachment by naming its id (SPEC §19.5). It used to
-        ask `meta.auto`, which is a description the row may simply not have —
+        ask `meta.auto`, which is a description the row may simply not have -
         anything inserting the relationship without also writing the JSON got
         a context that authorization treated as an ordinary one.
         """
@@ -543,7 +543,7 @@ class TestDeletingAChatRetiresItsCachedState:
         """Terminal workflow state is not retained at all.
 
         The engine wrote `completed`, `failed` and `timeout` states carrying
-        result content, traces, context snippets and vars — and nothing ever
+        result content, traces, context snippets and vars - and nothing ever
         read them back. Retaining them meant a second copy of a chat's
         content with its own lifetime, so deletion would have needed
         machinery to enumerate and remove it. Not writing it is smaller and

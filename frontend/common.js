@@ -103,7 +103,7 @@ const envelopeError = (payload, raw, fallbackMessage) => {
 //
 // Both pages had their own copy and both had drifted. The console's version
 // treated 429 as a fatal client error instead of backing off, and never
-// refreshed an expired token on 401 — so an admin session simply failed where
+// refreshed an expired token on 401 - so an admin session simply failed where
 // a chat session recovered. These are the chat versions, which had both.
 //
 // `state`, `apiBase` and `persistAuth` come from whichever page loaded this.
@@ -151,7 +151,7 @@ const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
 // carries on its own and this code could not read if it wanted to. So the body
 // is empty: `refresh_token` in it would require the page to hold a durable
 // credential, which is the thing §17.10 moved into the cookie. `tenant_id` is
-// gone with it — the server derives the tenant from the hostname, and echoing
+// gone with it - the server derives the tenant from the hostname, and echoing
 // back the value it had just sent was never anything but "matches" or 401.
 //
 // `credentials: 'same-origin'` is the default, and stated rather than assumed
@@ -180,7 +180,7 @@ const requestEnvelope = async (url, options, fallbackMessage) => {
   let resp = await fetchWithRetry(url, options);
 
   // The trigger is "we had an authenticated session", not "a refresh token is
-  // visible to JS" — which is no longer true of any browser session. One
+  // visible to JS" - which is no longer true of any browser session. One
   // attempt: a second would be retrying a cookie the server just rejected.
   if (resp.status === 401 && state.accessToken) {
     const refreshed = await tryRefreshToken();

@@ -574,7 +574,7 @@ class SemanticClusterer:
                 "applicability": {
                     "natural_language": "Skill: "
                     + (cluster.label or "")
-                    + " – "
+                    + " - "
                     + (cluster.description or ""),
                 },
             }

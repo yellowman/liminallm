@@ -1,7 +1,7 @@
 """The Responses API is the primary endpoint; chat/completions is the fallback.
 
-Everything internal stays chat-shaped — the agent loop, adapters, history
-assembly — so responses_compat translates at the wire, and APIBackend probes
+Everything internal stays chat-shaped - the agent loop, adapters, history
+assembly - so responses_compat translates at the wire, and APIBackend probes
 once: a provider answering 404/405 for /responses is chat-only for the rest
 of the process.
 """
@@ -376,7 +376,7 @@ def test_no_fixed_usage_key_list_survives_in_the_merge_paths():
 def test_our_own_conversion_bug_is_not_blamed_on_the_provider():
     """is_unsupported() reads AttributeError/TypeError as "this SDK has no
     /responses". Conversion and parsing raise those same types, so they run
-    outside the guarded call — otherwise one malformed message would turn the
+    outside the guarded call - otherwise one malformed message would turn the
     endpoint off for the whole process and log it as the provider's fault."""
     backend = _backend(_client(responses_create=lambda **kw: _response()))
     # A history entry the converter cannot handle: .get() on a string raises
@@ -415,7 +415,7 @@ class TestTheServedUsageObeysTheShapeItAdvertises:
 
     Providers do not agree on that. Measured from our own Gemini fixture
     (`test_gemini_native.py`): promptTokenCount 10 + candidatesTokenCount 5 is
-    15, while totalTokenCount is 22 — because thoughtsTokenCount 7 is
+    15, while totalTokenCount is 22 - because thoughtsTokenCount 7 is
     *additive* there, not a subset of candidates. Passed straight through, we
     advertised 7 reasoning tokens inside 5 output tokens and a total that did
     not add up.
@@ -467,8 +467,8 @@ class TestTheServedUsageObeysTheShapeItAdvertises:
             ), f"reasoning exceeds the output it is a part of: {usage} -> {served}"
 
     def test_cached_never_exceeds_the_input_it_is_part_of(self):
-        # Both providers already agree here — cached is a subset of the prompt
-        # count in each — so this pins the half that is currently correct.
+        # Both providers already agree here - cached is a subset of the prompt
+        # count in each - so this pins the half that is currently correct.
         served = self._served(
             {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
              "cached_tokens": 3}

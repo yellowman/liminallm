@@ -88,8 +88,8 @@ class TestAdmissionValidatesAgainstTheExecutionAudience:
     """Not the publisher's identity: the audience the artifact declares.
 
     Alice may own a private tool and a shared workflow that calls it. Asking
-    "can Alice resolve this?" passes, and Bob — who may legitimately run the
-    shared workflow — cannot resolve Alice's private tool. That admits a
+    "can Alice resolve this?" passes, and Bob - who may legitimately run the
+    shared workflow - cannot resolve Alice's private tool. That admits a
     workflow known at publication time not to work for its declared audience.
     """
 
@@ -138,7 +138,7 @@ class TestAdmissionValidatesAgainstTheExecutionAudience:
 
     def test_an_ownerless_seeded_builtin_is_usable_and_unprivileged(self, store, engine):
         """SPEC distinguishes ownerless system artifacts. A seeded global tool
-        resolves and can never be privileged — do not manufacture an owner for
+        resolves and can never be privileged - do not manufacture an owner for
         it to satisfy `privileged`."""
         d = engine._resolve_tool("llm.generic", SYSTEM_SCOPE)
         assert d is not None, "the seeded builtin stopped resolving"
@@ -148,7 +148,7 @@ class TestAdmissionValidatesAgainstTheExecutionAudience:
 
     def test_an_ownerless_shared_tool_reaches_no_tenant(self, store):
         """`shared` is scoped through the owner's tenant, and `artifact` has no
-        tenant column. An ownerless shared row therefore belongs to nobody —
+        tenant column. An ownerless shared row therefore belongs to nobody -
         the same rule listing already applies."""
         u = store.create_user(email=f"{_u('os')}@t.local", tenant_id=_u("ost"))
         name = _u("detached")
@@ -191,8 +191,8 @@ class TestAmbiguityFailsClosed:
         Observed through execution rather than a resolver call, so this
         measures what the turn actually invokes. Both orders must give the
         same answer; today they give opposite ones. `shared-newer` therefore
-        passes already — by accident, because `created_at DESC` happens to
-        agree — so `shared-older` is the real red and the pair together is
+        passes already - by accident, because `created_at DESC` happens to
+        agree - so `shared-older` is the real red and the pair together is
         what says the rule stopped depending on insertion order.
         """
         from liminallm.service.workflow import WorkflowEngine
@@ -235,7 +235,7 @@ class TestTheResolverIsNotAListing:
     ):
         """Measured: `list_artifacts` returns 100 rows ordered
         `created_at DESC`, so 110 newer tools push the referenced one off
-        page one and it becomes unresolvable — visible, undeleted, and gone.
+        page one and it becomes unresolvable - visible, undeleted, and gone.
         """
         u = store.create_user(email=f"{_u('pg')}@t.local", tenant_id=_u("pgt"))
         name = _u("early")
@@ -253,7 +253,7 @@ class TestTheResolverIsNotAListing:
     def test_a_deleted_tool_cannot_resurrect_from_the_startup_cache(self, store):
         """The registry is built once in `__init__` from a listing. Measured:
         delete the artifact and the same engine still resolves it, with
-        `artifact_id=None` — unattributed, and executable."""
+        `artifact_id=None` - unattributed, and executable."""
         from liminallm.service.workflow import WorkflowEngine
         rt = get_runtime()
         u = store.create_user(email=f"{_u('gh')}@t.local", tenant_id=_u("ght"))
@@ -279,7 +279,7 @@ class TestAHandlerMustBeExecutable:
 
     Measured: a spec named `badhandler` with `handler: "no.such.handler"`
     resolves as a name, and `_resolve_worker_tool` falls through to returning
-    the tool's own name — which is neither a worker body nor a host handler.
+    the tool's own name - which is neither a worker body nor a host handler.
     """
 
     def test_a_spec_whose_handler_names_nothing_is_refused(self, store):
@@ -294,7 +294,7 @@ class TestAHandlerMustBeExecutable:
 
     def test_one_definition_of_executable(self):
         """Admission cannot instantiate a `WorkflowEngine` to ask what is
-        executable, so the host handler names live in a pure module — and the
+        executable, so the host handler names live in a pure module - and the
         engine's own map is checked against it, or the two lists drift."""
         from liminallm.service import tool_worker
         from liminallm.service.tool_namespace import (
@@ -361,7 +361,7 @@ class TestExecutionCarriesThePublicationScope:
         `_execute_parallel_nodes` calls `_execute_node_with_retry` itself,
         carrying only the runner's `user_id` and `tenant_id`. Carrying
         publication scope correctly through the driving loop and forgetting it
-        here would leave children resolving under the runner — measured, Bob's
+        here would leave children resolving under the runner - measured, Bob's
         child ran `agent.code_v1`.
         """
         from liminallm.service.workflow import WorkflowEngine
@@ -410,8 +410,8 @@ class TestStreamingSelectsTheCapabilityAfterResolving:
     on main rather than a hazard the fix would introduce:
 
     ==========  ==========================================================
-    blocking    ran `agent.code_v1` — it already obeys the override
-    streaming   ran `generate_stream` — it never looked
+    blocking    ran `agent.code_v1` - it already obeys the override
+    streaming   ran `generate_stream` - it never looked
     ==========  ==========================================================
 
     The fix is to resolve the descriptor first and decide streamability from
@@ -474,11 +474,11 @@ class TestStreamingSelectsTheCapabilityAfterResolving:
         """The complement, and red today for its own reason.
 
         A custom name whose handler *is* `llm.generic` is not on the
-        hard-coded list, so it never streams — measured, `generate_stream` was
+        hard-coded list, so it never streams - measured, `generate_stream` was
         not called at all. Deciding by resolved handler fixes that too.
 
         It is the complement rather than a control because deleting the
-        special case entirely — never stream — would satisfy the test above
+        special case entirely - never stream - would satisfy the test above
         and fail this one.
         """
         from liminallm.service.workflow import WorkflowEngine
@@ -517,8 +517,8 @@ class TestEveryAdmissionPathAsksTheQuestion:
         self, client, admin_headers
     ):
         """A *private* workflow, deliberately. `PATCH /v1/artifacts` refuses a
-        global one for an unrelated reason — published artifacts change
-        through config ops — so patching a global row here would have measured
+        global one for an unrelated reason - published artifacts change
+        through config ops - so patching a global row here would have measured
         that rule instead of this one."""
         made = client.post("/v1/artifacts", headers=admin_headers, json={
             "type": "workflow", "name": _u("patchwf"),
@@ -605,8 +605,8 @@ class TestAuthorityIsCheckedOnBothPaths:
     streaming   ran `generate_stream`
     ==========  ==============================================
 
-    Resolving the descriptor before dispatch — which the streaming path now
-    does — is not enough on its own, because the descriptor is then dropped.
+    Resolving the descriptor before dispatch - which the streaming path now
+    does - is not enough on its own, because the descriptor is then dropped.
     The preflight has to be shared, and streaming may specialise token
     production only after it passes. `_stream_llm_node` must not become a
     second implementation of tool authorization.
@@ -714,7 +714,7 @@ class TestTheHandlerNamesTheBody:
     body actually selected      notes.search_v1
     ==========================  ================
 
-    Admission approves one executable handler and runtime executes another —
+    Admission approves one executable handler and runtime executes another -
     the exact divergence this tranche exists to remove.
     """
 
@@ -766,7 +766,7 @@ class TestAStreamedNodeObeysTheNodeContract:
     §9.2: per-node `max_retries`, `backoff_ms` and `timeout_ms` are
     overridable, a node past its timeout fails, and tool inputs *and outputs*
     are JSON-Schema validated. §18.3 is the single normative home for the
-    numbers — 2 retries by default, hard cap 3, 1s then 4s backoff, 15s node
+    numbers - 2 retries by default, hard cap 3, 1s then 4s backoff, 15s node
     timeout capped at 60s.
 
     The streamable branch does not call `_execute_node_with_retry`; the branch
@@ -786,7 +786,7 @@ class TestAStreamedNodeObeysTheNodeContract:
     being skipped, not just the two things `tool_preflight` now covers.
 
     Retry and timeout are separate normative properties and get separate
-    witnesses. Retrying a stream is only meaningful before the first token —
+    witnesses. Retrying a stream is only meaningful before the first token -
     after that a retry would emit a second answer, which is the boundary
     `emitted_tokens` already draws.
     """
@@ -932,7 +932,7 @@ class TestAmbiguityThatAppearsLater:
     does not revisit the workflows already naming it. This passes today, so it
     is a guard rather than a red: it stops a later change reintroducing a
     first-match at the execution altitude, which the deletion and cache
-    witnesses would not catch — they prove runtime asks canonical state, not
+    witnesses would not catch - they prove runtime asks canonical state, not
     that it handles two canonical answers.
     """
 
@@ -1083,7 +1083,7 @@ class TestAStreamedAttemptCanBeStopped:
         """Not merely abandoned. The producer must see the stop, or the node
         timeout is a description of what the caller stopped waiting for.
 
-        The producer never ends by itself. A bounded one made this vacuous —
+        The producer never ends by itself. A bounded one made this vacuous -
         mutation found it: the loop ran out during the wait, so the `finally`
         fired whether or not anything had asked it to stop.
         """
@@ -1097,7 +1097,7 @@ class TestAStreamedAttemptCanBeStopped:
 
         def generate_stream(*a, **k):
             # Effectively unbounded against the 5s assertion below, so the
-            # `finally` cannot fire because the loop ran out — that made the
+            # `finally` cannot fire because the loop ran out - that made the
             # first version vacuous. But not literally unbounded: under a
             # mutation that removes the deadline the driver drains this
             # forever, and a witness that hangs measures nothing. 20s makes
@@ -1143,7 +1143,7 @@ class TestAStreamedAttemptCanBeStopped:
                 peak = max(peak, live)
             try:
                 # Past its own timeout, and not interruptible until the sleep
-                # returns — the case the confirmation exists for.
+                # returns - the case the confirmation exists for.
                 _time.sleep(0.4)
                 yield {"event": "token", "data": "late"}
             finally:
@@ -1162,7 +1162,7 @@ class TestAStreamedAttemptCanBeStopped:
     async def test_a_node_with_an_output_schema_holds_its_tokens(self, store):
         """SPEC §9.2 validates outputs, and a token already on the screen
         cannot be withdrawn. So a node with a schema streams nothing until its
-        finished answer passes — the refusal is not enough on its own."""
+        finished answer passes - the refusal is not enough on its own."""
         engine, wf, u = self._engine_for(
             store, {"next": "fin"}, "hold",
             output_schema={"type": "object", "required": ["impossible_field"]},
@@ -1197,7 +1197,7 @@ class TestAStreamedAttemptCanBeStopped:
     async def test_a_backend_that_cannot_be_stopped_does_not_stream(self, store):
         """`LocalJaxLoRABackend` runs the whole forward pass before its first
         yield, so no scheduling makes `timeout_ms` enforceable against it. The
-        answer still arrives — through the executor that runs the body in a
+        answer still arrives - through the executor that runs the body in a
         worker a kill does end."""
         engine, wf, u = self._engine_for(store, {"next": "fin"}, "nc")
         engine.llm.backend.supports_stream_cancel = False
@@ -1229,7 +1229,7 @@ class TestAStreamedAttemptIsAnAttempt:
     That is not bookkeeping. `Invocation.revoke` reads `_current is None` as
     "nothing has started" and refuses the whole execution, deliberately, so a
     revoke landing before the first spawn is not forgotten by the attempt that
-    follows it. `_previous_attempt_is_dead` calls `revoke("retry")` — so on a
+    follows it. `_previous_attempt_is_dead` calls `revoke("retry")` - so on a
     streamed retry the execution is cancelled, and the next attempt then calls
     the provider anyway because nothing on that path begins an attempt or asks
     whether it still holds authority.
@@ -1315,15 +1315,15 @@ class TestAStreamedAttemptIsAnAttempt:
     async def test_a_cancel_stops_the_next_provider_request(self, store):
         """The companion, and the one that names the mechanism.
 
-        The execution is cancelled outright during attempt one — the exact
+        The execution is cancelled outright during attempt one - the exact
         state `revoke("retry")` produces when it finds no current attempt, and
         the same state `POST /chat/cancel` produces through the watcher. A
         cancelled execution has no authority, so attempt two must not reach
         the provider.
 
         Cancelling here rather than setting the cancel event, because the
-        event is read in two incidental places — `_pumped` checks it per event
-        and the driver checks it inside `if sleep_ms > 0` — and each can end
+        event is read in two incidental places - `_pumped` checks it per event
+        and the driver checks it inside `if sleep_ms > 0` - and each can end
         the turn for a reason that is not the lease. `backoff_ms: 0` closes
         the second of those, and cancelling directly closes the first.
         """
@@ -1352,7 +1352,7 @@ class TestOneCanonicalOutputOnBothPaths:
     """SPEC §9.2 validates the tool's output, not a transport's projection of
     it.
 
-    Blocking validates the tool result — for `llm.generic`,
+    Blocking validates the tool result - for `llm.generic`,
     `{content, usage, context_snippets}`. Streaming rebuilt a node-ish object
     with a `status` key the tool never produced and validated that instead, so
     a schema that fits the real output can pass one path and fail the other.
@@ -1421,9 +1421,9 @@ class TestTheCancelCapabilityIsProven:
     a real interrupt.
 
     Measured before this existed: both shipped network backends block
-    *inside* an event — the OpenAI-compatible SDK in synchronous chunk
+    *inside* an event - the OpenAI-compatible SDK in synchronous chunk
     iteration under a 30s client timeout, native Gemini in `iter_lines()`
-    under a 60s one — and neither `Response.close`, `Client.close`, closing
+    under a 60s one - and neither `Response.close`, `Client.close`, closing
     the network stream nor `socket.close()` woke the blocked read. Only
     `socket.shutdown(SHUT_RDWR)` did. A default of "yes unless declared no"
     therefore claimed an ability the shipped backends did not have, and a
@@ -1485,7 +1485,7 @@ class TestTheCancelCapabilityIsProven:
     @pytest.mark.asyncio
     async def test_stop_interrupts_a_read_in_flight(self):
         """The pump half of the promise: `stop()` reaches the iterator's
-        `abort()`, and the producer thread is then confirmably dead — not
+        `abort()`, and the producer thread is then confirmably dead - not
         merely no longer waited for."""
         import threading
         import time as _time
@@ -1576,7 +1576,7 @@ class TestTheShippedBackendsHonourTheirDeclaration:
     a provider that stalls mid-stream: first token through, then `stop()`,
     then the producer must be confirmably dead in far less time than the
     stall. This is the difference between declaring the capability and
-    having it — the declaration alone passed every test that does not
+    having it - the declaration alone passed every test that does not
     actually block.
     """
 
@@ -1653,7 +1653,7 @@ class TestTheShippedBackendsHonourTheirDeclaration:
     @pytest.mark.asyncio
     async def test_the_fallback_holds_a_blocked_body_to_the_deadline(self, store):
         """The other half of the fallback claim. A non-cancellable backend's
-        node runs on the ordinary executor — whose body for `llm.generic` is
+        node runs on the ordinary executor - whose body for `llm.generic` is
         the *parent's* `llm.generate`, not something a worker kill reaches.
         The deadline must bind anyway: the node fails at `timeout_ms` while
         the body runs on as authorityless work."""
@@ -1702,7 +1702,7 @@ class TestTheStreamedResultCarriesItsGrounding:
 
     Blocking `llm.generic` returns `context_snippets` beside `content` and
     `usage`; the streamed node retrieved the same snippets, put them in the
-    prompt, and then reported none — its `message_done` came straight from
+    prompt, and then reported none - its `message_done` came straight from
     the backend, which never saw the retrieval. So the turn's grounding
     vanished on the streamed transport, and an `output_schema` mentioning
     `context_snippets` validated a different object per path.
@@ -1743,7 +1743,7 @@ class TestTheStreamedResultCarriesItsGrounding:
 def _never_headers_server():
     """A provider that accepts the TCP connection and never sends a byte.
 
-    The reader is then blocked *entering* the stream — before any response
+    The reader is then blocked *entering* the stream - before any response
     object, and before `attach_response` has a socket to arm.
     """
     import socket as socketmod
@@ -1775,7 +1775,7 @@ class TestCancellationIsProvenForTheWholeAttempt:
 
     Two gaps, both before `attach_response` succeeds. A provider that accepts
     the connection and stalls pre-headers leaves the producer blocked with no
-    socket armed, so `abort()` records a flag and interrupts nothing — and
+    socket armed, so `abort()` records a flag and interrupts nothing - and
     `close()` then forgot the producer, so the workflow returned its timeout
     while the provider operation ran on. And a transport that exposes no
     socket armed nothing, silently, while the backend stayed advertised as
@@ -1813,7 +1813,7 @@ class TestCancellationIsProvenForTheWholeAttempt:
         self, store
     ):
         """Gemini path: the node times out at 400ms; when `run_streaming`
-        returns, the producer — and with it the provider operation — must
+        returns, the producer - and with it the provider operation - must
         already be dead, not running until the client's own 60s timeout."""
         import time as _time
 
@@ -1832,7 +1832,7 @@ class TestCancellationIsProvenForTheWholeAttempt:
             # Pin the window: `context_window` is lazily probed against the
             # provider on the prompt-budget path, and against this stalled
             # one that probe blocks for the client's read timeout. A real
-            # engine finding, but a pre-existing one — this witness measures
+            # engine finding, but a pre-existing one - this witness measures
             # the streamed producer, not the probe.
             llm.backend._context_window = 8192
             engine, wf, u, held = self._engine_with(
@@ -1894,7 +1894,7 @@ class TestCancellationIsProvenForTheWholeAttempt:
     @pytest.mark.asyncio
     async def test_a_socketless_transport_cannot_stream_unarmed(self):
         """A transport that exposes no socket arms nothing. The stream must
-        refuse before the first token, or prove its death on stop — silence
+        refuse before the first token, or prove its death on stop - silence
         plus `supports_stream_cancel = True` is the one forbidden pairing."""
         import threading
 
@@ -1951,7 +1951,7 @@ class TestTheCanonicalOutputCoversEveryStreamableHandler:
     """`agent.files_v1` streams too, and its blocking result carries
     `artifacts` and `injection_findings` beside the four keys the streamed
     reconstruction kept. A strict schema for the real result must get the
-    same verdict on both transports — the previous fix repaired exactly
+    same verdict on both transports - the previous fix repaired exactly
     `llm.generic` and left the same defect one handler over.
     """
 
@@ -1972,7 +1972,7 @@ class TestTheCanonicalOutputCoversEveryStreamableHandler:
         "additionalProperties": False,
     }
 
-    #: What the worker's agent loop returns — the blocking tool result.
+    #: What the worker's agent loop returns - the blocking tool result.
     RESULT = {
         "content": "the answer",
         "usage": {"total_tokens": 3},
@@ -2043,7 +2043,7 @@ class TestTheCanonicalOutputCoversEveryStreamableHandler:
         assert blocking_ok == streaming_ok, (
             f"one result, one schema, two verdicts: blocking "
             f"{'passed' if blocking_ok else 'failed'} and streaming "
-            f"{'passed' if streaming_ok else 'failed'} — the streamed "
+            f"{'passed' if streaming_ok else 'failed'} - the streamed "
             f"reconstruction dropped fields the tool produced. "
             f"streaming events: {[e for e in events if e.get('event') == 'error']}"
         )
@@ -2055,7 +2055,7 @@ class TestTheCanonicalOutputCoversEveryStreamableHandler:
 
 class TestAnAbortedHandleSendsNothing:
     """The SDK retries transport errors, and the socket shutdown that kills
-    one blocked request reads as exactly that — so without a refusal at the
+    one blocked request reads as exactly that - so without a refusal at the
     send seam, aborting request one *started* request two, blocked in the
     same place. The refusal is what bounds teardown to the request already
     in flight rather than the SDK's whole retry budget: after an abort, the
@@ -2110,7 +2110,7 @@ class TestAnAbortedHandleSendsNothing:
 class TestTheChatGateRefusesASocketlessResponse:
     """The gemini socketless witness proves `_arm_or_refuse` itself; this
     proves the OpenAI-compatible chat branch actually consults it. A stream
-    whose response exposes no socket must be refused before any token —
+    whose response exposes no socket must be refused before any token -
     mutation showed removing that branch's gate was invisible to every
     other test, because the SDK witnesses either run over real sockets
     (armed at connect) or use fakes with no response object at all.
@@ -2125,7 +2125,7 @@ class TestTheChatGateRefusesASocketlessResponse:
         backend._responses_ok = False  # pin the chat branch
 
         class FakeStream:
-            #: A real httpx response, but with no network_stream behind it —
+            #: A real httpx response, but with no network_stream behind it -
             #: the shape a socketless transport hands the SDK.
             response = httpx.Response(200)
 
@@ -2147,7 +2147,7 @@ class TestTheChatGateRefusesASocketlessResponse:
 
         # On the client streaming actually uses. The first version faked
         # only `.client`, and when streaming moved to `_stream_client` the
-        # witness went vacuous — it passed on a connection-refused error
+        # witness went vacuous - it passed on a connection-refused error
         # from the real client, gate or no gate, and the gate's mutation
         # survived.
         backend.client = FakeClient()
@@ -2234,7 +2234,7 @@ class TestAWarmedPoolCannotDisarmTheStream:
     """The arming mechanism assumed every streaming request opens a fresh
     connection. A pooled keep-alive connection breaks that: the request is
     satisfied on the already-idle socket, no `connect_tcp.complete` fires,
-    the handle stays unarmed — and the whole chain built on `armed` follows
+    the handle stays unarmed - and the whole chain built on `armed` follows
     it down: abort interrupts nothing, `cancellation_proven` is false, the
     terminal teardown excludes the producer from its wait, and the workflow
     returns its timeout while the provider request runs on.
@@ -2247,7 +2247,7 @@ class TestAWarmedPoolCannotDisarmTheStream:
     @pytest.mark.asyncio
     async def test_the_window_probe_must_not_disarm_the_stream(self, store):
         """End to end: the real probe warms the pool, the streaming POST
-        arrives on the same socket and stalls pre-headers. No pinning —
+        arrives on the same socket and stalls pre-headers. No pinning -
         the pin in the cold-pool witnesses is exactly what made the arming
         premise artificially true."""
         import time as _time
@@ -2310,7 +2310,7 @@ class TestAWarmedPoolCannotDisarmTheStream:
     def test_a_stream_request_never_reuses_a_warmed_connection(self):
         """The premise itself, at the client: after an ordinary request has
         warmed the pool, a handle-bound streaming request must open a fresh
-        connection — and therefore arm. Witnessing only the cold-pool case
+        connection - and therefore arm. Witnessing only the cold-pool case
         proved what happens when the premise happens to hold."""
         from liminallm.service.model_backend import (
             ArmingClient,
@@ -2396,7 +2396,7 @@ class TestAFinishedStreamIsFinished:
     stream that has already delivered its final event has nothing left to
     time out. `bounded` checked the clock before asking the iterator, so
     the post-final-event pull raised `TimeoutError` where the iterator
-    would have raised `StopAsyncIteration` — and the driver then treated a
+    would have raised `StopAsyncIteration` - and the driver then treated a
     completed, client-delivered answer as a node timeout. With no tokens
     emitted (an empty completion) that even retried, so a second answer
     could follow one the client had already received.
@@ -2452,7 +2452,7 @@ class TestBothPreflightsSeeTheSameInputs:
     node's inputs carry no `message`, then validates; streaming validated
     the raw resolved inputs. A tool whose `input_schema` requires `message`
     on a node that omits it therefore passed blocking and was refused on
-    the streamed path — even though `_stream_llm_node` would have read the
+    the streamed path - even though `_stream_llm_node` would have read the
     user message anyway.
     """
 
@@ -2538,7 +2538,7 @@ class TestABlockingBodyNeverStartsAfterItsDeadline:
     the streamed exception to every attempt type: with the budget spent
     after the event phase, the driver awaited `result()` unbounded. For a
     streamed attempt that collects an already-computed field; for a
-    blocking attempt `result()` is where the tool body *starts* — so work
+    blocking attempt `result()` is where the tool body *starts* - so work
     began after its deadline, unbounded, which SPEC's binding per-node
     timeout exists to forbid. `timeout_ms: 0` is admissible today and
     makes the route deterministic: empty events, terminal grace, spent
@@ -2574,7 +2574,7 @@ class TestABlockingBodyNeverStartsAfterItsDeadline:
             wf.id, None, "hi", None, user_id=u.id, tenant_id=u.tenant_id)
         assert not started, (
             "a node with timeout_ms: 0 started its tool body after its "
-            "deadline — the exhausted-budget branch ran it unbounded"
+            "deadline - the exhausted-budget branch ran it unbounded"
         )
         errors = [e for e in out.get("workflow_trace", [])
                   if e.get("status") == "error"]
@@ -2583,7 +2583,7 @@ class TestABlockingBodyNeverStartsAfterItsDeadline:
     @pytest.mark.asyncio
     async def test_the_driver_itself_refuses_an_unstarted_body(self, store):
         """The same property at the driver, with the node dict handed
-        straight in — so admission hygiene (a future `minimum: 1` on
+        straight in - so admission hygiene (a future `minimum: 1` on
         `timeout_ms`) cannot make this witness pass while the driver stays
         wrong. The attempt is blocking-shaped: empty events, a body that
         only runs inside `result()` and records that it started."""
@@ -2601,7 +2601,7 @@ class TestABlockingBodyNeverStartsAfterItsDeadline:
             #: omitted it, and the witness went vacuous: the driver raised
             #: `AttributeError` inside the `elif`, the generic handler turned
             #: that into an ordinary failed attempt, and `assert not started`
-            #: passed because the fake crashed — not because the intended
+            #: passed because the fake crashed - not because the intended
             #: refusal ran. The §V rule again: a double built from belief
             #: about an interface encodes the belief.
             result_ready_after_events = False

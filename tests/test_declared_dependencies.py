@@ -2,14 +2,14 @@
 
 `httpx` was imported at module scope by five files in `liminallm/service` and
 appeared in no dependency list. It worked for as long as it did because
-`openai` depends on it, so every install happened to bring it along — a direct
+`openai` depends on it, so every install happened to bring it along - a direct
 import satisfied by somebody else's requirement. When CI resolved a set
 without it, the application did not degrade: it failed to import at all, and
 every test job died in the conftest before collecting a single test.
 
 The rule this enforces is about *where* an import sits, not what it names.
-A module-scope import is a hard requirement — the package cannot load without
-it — so it has to be declared. A function-local one is this repository's idiom
+A module-scope import is a hard requirement - the package cannot load without
+it - so it has to be declared. A function-local one is this repository's idiom
 for an optional capability (`numpy` inside the checkpoint loader, `tiktoken`
 inside a `try:` that falls back to a heuristic count), and those are left
 alone: their absence is a feature that turns off, not a service that will not
@@ -37,7 +37,7 @@ import pytest
 
 try:  # 3.11+
     import tomllib
-except ModuleNotFoundError:  # 3.10 — the floor this project supports
+except ModuleNotFoundError:  # 3.10 - the floor this project supports
     import tomli as tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -46,7 +46,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 #: the ones this project actually declares; a new entry belongs here when a
 #: new dependency's two names disagree.
 #:
-#: Keyed by the bare distribution name, lowercased — `_DIST` below has already
+#: Keyed by the bare distribution name, lowercased - `_DIST` below has already
 #: stripped any extra by the time this is consulted, so `uvicorn[standard]`
 #: would be an entry that never matches.
 _IMPORT_NAME = {
@@ -66,7 +66,7 @@ def _declared() -> tuple[set[str], dict[str, set[str]], set[str]]:
     """(base, {extra: its dependencies}, marker-gated), as import names.
 
     Parsed with a regex rather than `packaging.requirements`, which is itself
-    a transitively-supplied import — pytest happens to depend on it. A test
+    a transitively-supplied import - pytest happens to depend on it. A test
     about undeclared dependencies should not rest on one.
 
     The third set is every name whose requirement carries an environment
@@ -139,7 +139,7 @@ def test_every_module_scope_import_is_declared():
     }
 
     assert not undeclared, (
-        "imported at module scope but not in [project] dependencies — the "
+        "imported at module scope but not in [project] dependencies - the "
         "package cannot be imported without these:\n"
         + "\n".join(f"  {name}: {', '.join(files)}" for name, files in undeclared.items())
     )
@@ -152,7 +152,7 @@ def test_a_test_module_imports_only_what_every_lane_installs():
     itself when the package is absent: it fails *collection*, and a collection
     error aborts the whole run before any marker deselects anything. So a
     module-scope import in `tests/` has to be satisfied by every lane, and the
-    narrowest is the browser lane — base plus the dev extra, less anything a
+    narrowest is the browser lane - base plus the dev extra, less anything a
     marker gates, because a declaration is not an installation. See
     `test_a_marker_gated_dependency_is_not_treated_as_installed`.
 
@@ -176,7 +176,7 @@ def test_a_test_module_imports_only_what_every_lane_installs():
 
     assert not unavailable, (
         "imported at module scope in tests/ but not installed by every CI "
-        "lane — this aborts collection rather than skipping. Move each behind "
+        "lane - this aborts collection rather than skipping. Move each behind "
         "pytest.importorskip:\n"
         + "\n".join(f"  {name}: {', '.join(files)}" for name, files in unavailable.items())
     )
@@ -186,14 +186,14 @@ def test_a_marker_gated_dependency_is_not_treated_as_installed():
     """Declaring a package and installing it are different claims.
 
     The check above allows a module-scope import in `tests/` if the name is in
-    base or dev. Read without markers, that list said `tomli` — declared in
+    base or dev. Read without markers, that list said `tomli` - declared in
     the dev extra as `tomli>=2.0; python_version < '3.11'`, and therefore
     installed on 3.10 and on nothing else. The browser lane runs 3.11, where
     it is absent. So a module-scope `import tomli` would have passed the
     guard and still aborted that lane's collection, which is the exact
     failure the guard was written to catch.
 
-    Any marker disqualifies a name, not just this one — the parse cannot
+    Any marker disqualifies a name, not just this one - the parse cannot
     evaluate markers and should not pretend to.
     """
     base, extras, conditional = _declared()
@@ -216,8 +216,8 @@ def test_a_marker_gated_dependency_is_not_treated_as_installed():
 def test_the_check_can_see_something(package, expected):
     """A guard against the guard passing because it found nothing.
 
-    If the walk stops working — a moved package, a parse that silently yields
-    nothing — the assertions above become vacuously true and report a clean
+    If the walk stops working - a moved package, a parse that silently yields
+    nothing - the assertions above become vacuously true and report a clean
     dependency list forever.
     """
     imports = _module_scope_imports(package)
@@ -231,7 +231,7 @@ def test_no_name_mapping_is_unreachable():
     """Every key in the map must survive `_DIST` unchanged, or it never fires.
 
     The map originally carried `uvicorn[standard]` and `psycopg[binary]`,
-    which `_DIST` reduces to `uvicorn` and `psycopg` before the lookup — so
+    which `_DIST` reduces to `uvicorn` and `psycopg` before the lookup - so
     those two entries could not match, and the default branch happened to
     produce the same answer. A wrong entry in that shape would be silent.
     """
@@ -244,7 +244,7 @@ def test_no_name_mapping_is_unreachable():
 def test_a_soft_dependency_stays_out_of_module_scope(name):
     """The two this rule deliberately does not require.
 
-    Both are imported inside a function, which is what makes them optional —
+    Both are imported inside a function, which is what makes them optional -
     `numpy` in the checkpoint loader that only the training extra reaches, and
     `tiktoken` inside a `try:` that falls back to a heuristic token count. If
     either moves to module scope it stops being optional, and the test above

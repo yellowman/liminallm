@@ -24,7 +24,7 @@ _EMBED_BACKFILL_PER_PASS = 30
 
 
 def _spawn(coro) -> None:
-    """Run a coroutine in the background, or drop it where there is no loop —
+    """Run a coroutine in the background, or drop it where there is no loop -
     a sync context should skip background polish rather than raise."""
     try:
         task = asyncio.create_task(coro)
@@ -80,7 +80,7 @@ def schedule_turn_labels(
 def backfill_message_embeddings(runtime, history, user_id: str) -> None:
     """Persist per-turn embeddings for semantic recall. Real encoder only,
     skips what is already embedded, bounded so one pass cannot stall on a
-    backlog — the next turn continues it."""
+    backlog - the next turn continues it."""
     embeddings = runtime.embeddings
     if not embeddings.is_semantic:
         return
@@ -126,7 +126,7 @@ def schedule_conversation_digest(runtime, *, conversation_id: str, user_id: str)
             await asyncio.to_thread(
                 backfill_message_embeddings, runtime, history, user_id
             )
-            # Digest exactly what falls outside the model's verbatim window —
+            # Digest exactly what falls outside the model's verbatim window -
             # the same budget boundary the workflow serves with.
             keep_tokens = runtime.workflow.history_budget()
             count = runtime.workflow._count_fn()

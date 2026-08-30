@@ -81,7 +81,7 @@ class StubStore:
         """The named contexts this owner has, mirroring the real store.
 
         Authorization asks about particular ids rather than reading a page,
-        so the double has to answer that question too — a stub that only
+        so the double has to answer that question too - a stub that only
         knows the old method silently authorizes nothing, and the test then
         fails somewhere else entirely.
         """

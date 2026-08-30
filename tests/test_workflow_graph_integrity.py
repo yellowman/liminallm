@@ -7,8 +7,8 @@ Three parts of one rule:
 * every graph edge resolves to a declared node.
 
 The engine did none of them, and each failure is silent rather than loud. A
-dangling `entrypoint` fell back to `next(iter(node_map))` — whatever node
-happened to be first — so a published workflow ran from a node the operator
+dangling `entrypoint` fell back to `next(iter(node_map))` - whatever node
+happened to be first - so a published workflow ran from a node the operator
 never named. A dangling `next` hit `if not node: continue`, so the
 continuation simply vanished. Duplicate ids collapsed in the `node_map` dict
 comprehension, one node quietly replacing the other.
@@ -22,7 +22,7 @@ and looked complete.
 Measuring them once was not enough, because *which* fields a node reads is
 decided by its type. Asking the question globally let a graph declare
 `end -> side`, have the validator confirm the edge resolves, and have
-execution stop at `end` — a resolved edge that never runs is the same silent
+execution stop at `end` - a resolved edge that never runs is the same silent
 divergence one level in. The node type is that shape again: `_execute_node`
 runs anything it does not recognise as a `tool_call`, so a node typed
 `"swich"` was admitted and then invoked its tool.
@@ -35,14 +35,14 @@ shape without declaring any edge at all: its meaning *is* its status, and the
 parallel executor reads only `"error"` out of a child's status.
 
 The last file in the rule is the runtime's own. Two budgets bound a run, and
-on exhaustion both fell through to the ordinary result — so a valid 101-node
+on exhaustion both fell through to the ordinary result - so a valid 101-node
 chain ran 100 nodes and returned a success. A graph that declares more work
 than the runtime will do is the same divergence as one whose edges the runtime
 ignores; the budgets stay, and exhausting one is an error.
 
 And the budget has to cover the work that actually happens. A parallel child
 runs inside `_execute_parallel_nodes`, which the driving loop's counter never
-sees, and every child launches at once — so a three-node graph repeating one
+sees, and every child launches at once - so a three-node graph repeating one
 child id ran 150 concurrent tool invocations against a budget of 16 and
 reported success.
 
@@ -53,8 +53,8 @@ execution" is the defect, not the fallback.
 
 Execution has two altitudes of its own, and the same rule has to hold on
 both. `run_streaming` streams three tools without calling the blocking
-executor, so the decisions the blocking path makes *around* a tool call — the
-circuit-breaker preflight and the `on_error` handoff — did not happen there
+executor, so the decisions the blocking path makes *around* a tool call - the
+circuit-breaker preflight and the `on_error` handoff - did not happen there
 at all.
 """
 
@@ -76,7 +76,7 @@ def _loaded(schema):
     references mean.
 
     These graphs are about structure rather than about which tool a name
-    reaches, so they run in the system namespace — the same one the engine
+    reaches, so they run in the system namespace - the same one the engine
     uses for the workflows it synthesises for itself.
     """
     return ResolvedWorkflow(schema, SYSTEM_SCOPE)
@@ -85,7 +85,7 @@ def _loaded(schema):
 # kinds so the positive controls are not narrower than the refusals.
 #
 # The parallel children were `work` and `other`, each declaring `next: "join"`
-# while `fan` also declared `after: "join"` — so the fixture looked like it
+# while `fan` also declared `after: "join"` - so the fixture looked like it
 # exercised a child's `next` when in fact `after` was doing all the work and
 # those two edges never contributed anything. A witness at the wrong altitude.
 # The children now declare nothing, which is what the executor actually
@@ -166,7 +166,7 @@ class TestTheDeclaredGraphIsChecked:
 
     def test_a_dangling_on_error_is_a_problem(self):
         """Nor is `on_error`. The executor takes it instead of `next` when a
-        tool call fails — which is exactly when a workflow can least afford to
+        tool call fails - which is exactly when a workflow can least afford to
         silently stop."""
         assert graph_problems(_graph(work__on_error="nowhere"))
 
@@ -327,7 +327,7 @@ class TestAReferenceHasTheShapeTheExecutorReads:
     pending node id, and `on_error` is wrapped as one next-node id, so a list
     in either position reaches `node_map.get(...)` as a list rather than a
     node id. Neither field is in the artifact kind schema, so JSON Schema does
-    not reject the shape either — measured, `{"after": ["join"]}` passed both
+    not reject the shape either - measured, `{"after": ["join"]}` passed both
     admission layers with zero problems and then failed at execution.
 
     This is the second half of the lesson from measuring fields the schema did
@@ -383,14 +383,14 @@ class TestAnEdgeIsReadByTheNodeTypeThatDeclaresIt:
 
     The node type itself is the same shape one level up. SPEC §9 names four,
     the kind schema accepted any string, and `_execute_node` treats anything
-    it does not recognise as a `tool_call` — so a node typed `"swich"` was
+    it does not recognise as a `tool_call` - so a node typed `"swich"` was
     admitted and then silently invoked its tool. Verified: it was accepted at
     admission and traced `{"node": "x", "status": "ok"}`.
     """
 
     def _one(self, node):
         """That node, somewhere for its edges to point, and a legal parallel
-        child — so a case about `parallel` measures the field under test and
+        child - so a case about `parallel` measures the field under test and
         not the separate rule about what a child may be."""
         return {"kind": "workflow.chat", "entrypoint": node["id"], "nodes": [
             node,
@@ -441,7 +441,7 @@ class TestAnEdgeIsReadByTheNodeTypeThatDeclaresIt:
 
     def test_an_unknown_node_type_is_a_problem(self):
         """SPEC §9 names four. `_execute_node` recognises `switch`, `parallel`
-        and `end`, and runs *everything else* as a tool call — so a typo does
+        and `end`, and runs *everything else* as a tool call - so a typo does
         not fail, it invokes."""
         problems = graph_problems(self._one({
             "id": "x", "type": "swich", "tool": "llm.generic", "next": "side",
@@ -474,7 +474,7 @@ class TestAnEdgeIsReadByTheNodeTypeThatDeclaresIt:
 
         `graph_problems` refuses the same graph a moment after JSON Schema
         does, so an end-to-end admission test cannot tell which layer said
-        no — measured, reverting the enum alone still returned 400. The kind
+        no - measured, reverting the enum alone still returned 400. The kind
         schema is the published contract that external tooling reads and that
         SPEC §9 writes as an enum, so it gets a witness of its own.
         """
@@ -519,14 +519,14 @@ class TestAParallelChildIsRunOnceAndItsSuccessorsDiscarded:
     """The third dimension: not what a node reads, but how it was reached.
 
     `_execute_parallel_nodes` calls `_execute_node_with_retry` and throws the
-    successor list away — `result, _ = await ...`. So the same node declaring
+    successor list away - `result, _ = await ...`. So the same node declaring
     the same edge means one thing on the ordinary path and nothing at all as a
     parallel child. Measured on the graph below, `graph_problems` returned
     `[]` and the run traced `['fan', 'join']`: `choose` executed, returned
     `['side']`, and `side` never ran.
 
-    Which is this tranche's invariant once more — a declared, resolving edge
-    that execution ignores — reached by a different route.
+    Which is this tranche's invariant once more - a declared, resolving edge
+    that execution ignores - reached by a different route.
 
     The narrow reading, and the one SPEC §9 supports ("fan-out to multiple
     nodes, then join"): `parallel.next` names children that run once, and
@@ -564,14 +564,14 @@ class TestAParallelChildIsRunOnceAndItsSuccessorsDiscarded:
 
     def test_an_end_as_a_parallel_child_is_a_problem(self):
         """`end` declares no edges, so the discarded-successor rule passes it
-        cleanly — and `end` is the one node type whose meaning is its status.
+        cleanly - and `end` is the one node type whose meaning is its status.
 
         On the ordinary path `status == "end"` stops the workflow.
         `_execute_parallel_nodes` reads only `"error"` out of a child's
         status, so `"end"` is an ordinary successful child and the parent
         walks on to its `after`. Measured on the graph below,
         `graph_problems` returned `[]` and the run traced
-        `['fan', 'side']` — the node named `end` ended nothing.
+        `['fan', 'side']` - the node named `end` ended nothing.
 
         SPEC §9.1: `end` produces the final response. That belongs where the
         ordinary loop can see it.
@@ -662,8 +662,8 @@ class TestAParallelChildIsRunOnceAndItsSuccessorsDiscarded:
 
         This runs the refused graph with the graph check disabled, so it pins
         `_execute_parallel_nodes`'s behaviour and not the rule built on top of
-        it. If `parallel` ever becomes a recursive subgraph executor — a SPEC
-        decision — this fails and says the rule above needs revisiting.
+        it. If `parallel` ever becomes a recursive subgraph executor - a SPEC
+        decision - this fails and says the rule above needs revisiting.
         """
         from liminallm.service.workflow import WorkflowEngine
         from tests.test_workflow_retry_timeout import (
@@ -683,7 +683,7 @@ class TestAParallelChildIsRunOnceAndItsSuccessorsDiscarded:
         out = await engine.run("wf", None, "hello", None, user_id="u")
         ran = [entry.get("node") for entry in out.get("workflow_trace") or []]
         assert "side" not in ran, (
-            f"a parallel child's successor ran after all — the rule that "
+            f"a parallel child's successor ran after all - the rule that "
             f"refuses this graph is now measuring nothing: {ran}"
         )
 
@@ -731,7 +731,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
     What was wrong is what happened on exhaustion. The step budget is the
     `while` condition, so the loop simply stopped with work still pending; the
     visit budget logged `workflow_loop_detected` and `break`. Both then fell
-    through to the ordinary result — blocking returned a normal answer,
+    through to the ordinary result - blocking returned a normal answer,
     streaming emitted `message_done`.
 
     Nothing pins node count at admission, so this is reachable with a
@@ -756,7 +756,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
         nodes.append({"id": f"n{n}", "type": "end"})
         return {"kind": "workflow.chat", "entrypoint": "n0", "nodes": nodes}
 
-    # A loop whose exit condition never fires — the graph the visit guard
+    # A loop whose exit condition never fires - the graph the visit guard
     # exists for. Three nodes, not two, and that is measured rather than
     # chosen: with `max_steps = min(100, 2n + 10)` and
     # `max_visits = max(2, ceil(max_steps / n))`, a two-node cycle reaches its
@@ -820,8 +820,8 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
             f"{out.get('content')!r}"
         )
         # Which budget, not merely that one ran out. The step-limit fallback
-        # would otherwise cover this case too — a visit-limit break also
-        # leaves work pending — and the two mechanisms would share one
+        # would otherwise cover this case too - a visit-limit break also
+        # leaves work pending - and the two mechanisms would share one
         # witness while looking separately covered.
         assert out.get("error") == "workflow_node_revisit_limit", out.get("error")
 
@@ -883,7 +883,7 @@ class TestAnExhaustedExecutionBudgetIsNotSuccess:
 
         A list `next` can leave siblings queued when an `end` runs, so
         "stopped with work pending" is not the same thing as "ran out of
-        budget". This started as a control over an *inference* — the loop
+        budget". This started as a control over an *inference* - the loop
         used to conclude after the fact that leftover work meant exhaustion,
         and this is the shape that inference got wrong. The reservation
         replaced it: exhaustion is now recorded where the refusal happens, so
@@ -911,7 +911,7 @@ class TestFanOutIsChargedToTheSameBudget:
 
     `visited` was incremented only in the driving loop. A parallel child runs
     inside `_execute_parallel_nodes`, which touches neither `visited` nor
-    `visited_nodes` — and builds every child task before awaiting a single
+    `visited_nodes` - and builds every child task before awaiting a single
     `asyncio.gather`. The validator permits any number of leaf `tool_call`
     children, and nothing caps fan-out. So the loop sees:
 
@@ -932,7 +932,7 @@ class TestFanOutIsChargedToTheSameBudget:
     ===========================  ==============  =========================
 
     The second is the sharper one. Three nodes, a budget of sixteen, and one
-    repeated child id — each occurrence is an execution, so a graph that
+    repeated child id - each occurrence is an execution, so a graph that
     names one node ran a hundred and fifty concurrent tool calls. These are
     real worker invocations, not bookkeeping.
 
@@ -991,7 +991,7 @@ class TestFanOutIsChargedToTheSameBudget:
         Counting here rather than at `_execute_node_with_retry` on purpose:
         this is the boundary where a node execution becomes a real worker
         invocation, which is what the budget exists to bound. It is also the
-        one place both paths share — streaming special-cases `llm.generic` in
+        one place both paths share - streaming special-cases `llm.generic` in
         its driving loop but not for parallel children.
         """
         calls = []
@@ -1014,7 +1014,7 @@ class TestFanOutIsChargedToTheSameBudget:
         out = await engine.run("wf", None, "hello", None, user_id="u")
         assert calls == [], (
             f"{len(calls)} tool invocations began inside a 100-execution "
-            f"budget — the reservation must refuse the batch before it starts"
+            f"budget - the reservation must refuse the batch before it starts"
         )
         assert out.get("status") == "error", out.get("content")
         assert out.get("error") == "workflow_step_limit", out.get("error")
@@ -1040,7 +1040,7 @@ class TestFanOutIsChargedToTheSameBudget:
         same budget.
 
         This fan-out fits. What follows it does not, once the children are
-        counted — and completes if they are free.
+        counted - and completes if they are free.
         """
         schema = self._fan(40, chain=70)
         assert graph_problems(schema) == []
@@ -1096,7 +1096,7 @@ class TestTheEngineRefusesGraphsItsSchemaWouldNowRefuse:
     """The runtime altitude for the node-semantics rule.
 
     Schema tests alone would be the wrong evidence: the whole reason for a
-    second altitude is rows that never passed today's schema — written before
+    second altitude is rows that never passed today's schema - written before
     the enum existed, or imported. Those reach `run` directly.
     """
 
@@ -1143,7 +1143,7 @@ class TestTheEngineRefusesGraphsItsSchemaWouldNowRefuse:
 
 class TestANodeIdIsUsableAsAnId:
     """`node_map` is keyed by id and drops falsy ones, so a declared node with
-    an empty id disappears — the same silent-removal shape as a duplicate."""
+    an empty id disappears - the same silent-removal shape as a duplicate."""
 
     def test_an_empty_node_id_is_a_problem(self):
         schema = json.loads(json.dumps(VALID))
@@ -1177,7 +1177,7 @@ class TestStreamingRefusesTheSameGraphs:
     `run_streaming` is a separate graph execution path with its own copy of
     the repair semantics: the same entrypoint fallback and the same
     `if not node: continue`. Blocking chat fails closed on an invalid row
-    while streaming chat silently runs a different graph — which is the exact
+    while streaming chat silently runs a different graph - which is the exact
     row this tranche exists to protect.
     """
 
@@ -1216,7 +1216,7 @@ class TestStreamingRefusesTheSameGraphs:
             f"the graph was executed before it was checked: {events[:3]}"
         )
         assert first["data"]["code"] == "validation_error", first
-        # Before any token, trace or node execution — the point of failing
+        # Before any token, trace or node execution - the point of failing
         # closed is that nothing downstream ever saw the repaired graph.
         assert not any(e.get("event") in {"token", "trace"} for e in events), events
 
@@ -1246,7 +1246,7 @@ class TestAFailedToolTakesItsErrorEdge:
 
     The ordinary tool tail swaps `next` for `on_error` on an error result. The
     circuit-open branch builds its own error result, reads `next`, and returns
-    before reaching that swap — so an open breaker sends the turn down the
+    before reaching that swap - so an open breaker sends the turn down the
     *success* path, into nodes that assume outputs the failed node never
     produced.
 
@@ -1320,7 +1320,7 @@ class TestAFailedToolTakesItsErrorEdge:
 
         Found by a mutation rather than by review: removing `on_error` from
         the chooser entirely killed only the circuit-open witness, which meant
-        the primary path — a tool that simply fails — was resting on the
+        the primary path - a tool that simply fails - was resting on the
         breaker case to notice. An unknown tool name is an ordinary error
         result, and tool names are not graph-validated yet, so this reaches
         the failure tail rather than the breaker branch.
@@ -1340,8 +1340,8 @@ class TestAStreamedToolObeysTheSameControlPlane:
     """The same rule, on the path that produces tokens.
 
     `run_streaming` does not call `_execute_node_with_retry` for the three
-    tools it streams — `llm.generic`, `llm.generic_chat_v1`, `agent.files_v1`
-    — it enters `_stream_llm_node` directly. Both of the decisions the
+    tools it streams - `llm.generic`, `llm.generic_chat_v1`, `agent.files_v1`
+    - it enters `_stream_llm_node` directly. Both of the decisions the
     blocking path makes around a tool call therefore did not happen here:
 
     * the circuit-breaker preflight lives in `_execute_node`, so an open
@@ -1415,7 +1415,7 @@ class TestAStreamedToolObeysTheSameControlPlane:
         """The preflight half, on its own so a mutation can reach it alone.
 
         An open breaker means "stop calling this tool". Streaming called it
-        anyway, which is the failure the breaker exists to prevent — and it
+        anyway, which is the failure the breaker exists to prevent - and it
         did so for the one tool every ordinary chat turn uses.
         """
         calls = self._stream(engine, monkeypatch, schema=self.BREAKER,
@@ -1497,7 +1497,7 @@ class TestAStreamedToolObeysTheSameControlPlane:
         """The boundary the `on_error` handoff must not cross.
 
         A token that has been yielded is already on the client's screen. If
-        recovery then streams a second answer, both land in one bubble —
+        recovery then streams a second answer, both land in one bubble -
         measured, the client received `['PARTIAL ', 'RECOVERED ANSWER']` and
         the run traced `['tool', 'recover', 'fin']`.
 
@@ -1542,7 +1542,7 @@ class TestAStreamedToolObeysTheSameControlPlane:
         """The other control, and the reason the fix is not "always call
         `_successors`".
 
-        With no `on_error` declared, the chooser falls through to `next` — so
+        With no `on_error` declared, the chooser falls through to `next` - so
         handing every failure to it would send a failed node down the
         *success* path, into nodes that assume outputs it never produced.
         A graph that names nowhere to go on failure ends where it always did.

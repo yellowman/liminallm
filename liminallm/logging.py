@@ -123,8 +123,8 @@ def log_workflow_trace(trace: list, logger: Optional[Any] = None) -> None:
 # Patterns that indicate sensitive information in error messages
 _SENSITIVE_ERROR_PATTERNS = [
     # A SQL statement pasted into an exception message. Matching a bare verb
-    # would eat ordinary prose — "delete conversation failed", "update the
-    # adapter first" — so a clause keyword has to follow the verb before this
+    # would eat ordinary prose - "delete conversation failed", "update the
+    # adapter first" - so a clause keyword has to follow the verb before this
     # counts as SQL. These messages are shown to users; over-redaction makes
     # the field useless, which is its own failure.
     r'(?i)\b(select|insert|update|delete|replace)\b[^\n]{0,200}?'
@@ -143,7 +143,7 @@ _SENSITIVE_ERROR_PATTERNS = [
     r'(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}',
     # A bare JWT, which reaches a log without its header often enough.
     r'\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
-    # A connection URI carrying credentials — psycopg puts the DSN in its
+    # A connection URI carrying credentials - psycopg puts the DSN in its
     # exception text, so this is the common way a database password escapes.
     r'(?i)\b[a-z][a-z0-9+.\-]*://[^\s:@/]+:[^\s@]+@\S*',
     # Stack traces

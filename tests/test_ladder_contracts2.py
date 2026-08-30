@@ -37,7 +37,7 @@ BASE = ""
 """The serving base identity these fixtures' adapters declare.
 
 SPEC §5.1 ties LoRA weights to one frozen base, so serving refuses an adapter
-that does not declare the base it is being applied to — a fixture without one
+that does not declare the base it is being applied to - a fixture without one
 describes an adapter the artifact schema could not store either.
 """
 
@@ -45,7 +45,7 @@ describes an adapter the artifact schema could not store either.
 @pytest.fixture(scope="module", autouse=True)
 def checkpoint(tmp_path_factory):
     """autouse so BASE is set before any test in the module reads it, whatever
-    order they run in — an unset BASE would refuse weights for the wrong
+    order they run in - an unset BASE would refuse weights for the wrong
     reason."""
     global BASE
     directory = _build_checkpoint(tmp_path_factory.mktemp("contract2_model"))
@@ -132,7 +132,7 @@ class TestValidationHappensPerAdapter:
 class TestOrphanScaleCannotHide:
     def test_a_scale_only_adapter_is_refused(self, tmp_path, checkpoint, config):
         """The raw dict is non-empty, so the "never silently leaves the
-        stack" check did not fire — and composition, which iterates `.A`,
+        stack" check did not fire - and composition, which iterates `.A`,
         produced nothing. A promoted adapter contributed exactly nothing
         while looking present."""
         _write(tmp_path / "scaly" / "v0001", {"layers.0.attn_q.scale": 0.5})
@@ -269,8 +269,8 @@ class TestVersionAuthorityIsAbsolute:
     ):
         """§5.5 pins the version; it has to pin the adapter too.
 
-        `fs_dir` was validated only for containment under `fs_root` — which
-        every adapter's directory satisfies — so an artifact naming
+        `fs_dir` was validated only for containment under `fs_root` - which
+        every adapter's directory satisfies - so an artifact naming
         `adapters/B` had B's `v0001/params.json` served as A's version 1.
         Same substitution as `A/latest → B/v0001`, one level earlier, and
         reachable through ordinary artifact creation because the adapter
@@ -379,7 +379,7 @@ class TestVersionAuthorityIsAbsolute:
         """§5.5, entire: `current_version > 0` or nothing.
 
         There is no versionless lane. It served a direct `params.json` and,
-        before that, scanned `latest` then `v*` then any subdirectory — so
+        before that, scanned `latest` then `v*` then any subdirectory - so
         every hole this resolver closes had reopened inside it. It existed for
         artifacts the adapter schema has long required `current_version` from,
         which is to say for state the system cannot create.
@@ -424,7 +424,7 @@ class TestTheWorkerCarriesTheGateDecision:
         """Executed, not inspected.
 
         The first version of this test read the worker's source for the
-        literal default — which proves the character is present, not that a
+        literal default - which proves the character is present, not that a
         rejected run leaves the adapter uncredited. This drives the real
         `_process_job` against a gate-rejected result.
         """
@@ -475,7 +475,7 @@ class TestOneBaseIdentityRuleForBothEnds:
 
     Training compared the two strings with `!=` while serving compared final
     path components, so `/models/m` stored against a runtime of `m` was a
-    refusal on one side and a match on the other — and which spelling a
+    refusal on one side and a match on the other - and which spelling a
     deployment happened to store decided whether an adapter could train.
     """
 
@@ -537,7 +537,7 @@ class TestWeightsOnlyServeTheirOwnBase:
 
         Training refuses a base mismatch outright; serving used to accept one
         with a warning, and "same family" accepted it silently. B·A was
-        optimized against one particular frozen W — an eval gate passed on
+        optimized against one particular frozen W - an eval gate passed on
         that W says nothing about a different one, however similar the name.
         """
         _write(tmp_path / "foreign" / "v0001", _valid_pair(config))
@@ -557,7 +557,7 @@ class TestWeightsOnlyServeTheirOwnBase:
         """An adapter that does not say what it was trained against cannot
         demonstrate it was trained against this. (The artifact schema
         requires base_model, so this shape cannot reach serving from a real
-        artifact — it fails closed anyway.)"""
+        artifact - it fails closed anyway.)"""
         _write(tmp_path / "silent" / "v0001", _valid_pair(config))
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         with pytest.raises(ValueError, match="declares base model None"):
@@ -630,7 +630,7 @@ class TestWeightsOnlyServeTheirOwnBase:
 class TestAClosedGateRemovesTheAdapterFromTheModel:
     """§5.2: in `W_eff = W + Σ_j g_j α_j B_j A_j`, a term with `g_j = 0` is
     not in the sum. The adapter is not part of the effective model, so
-    nothing about its weights can matter — not the base they declare, not
+    nothing about its weights can matter - not the base they declare, not
     their checksum, not whether the file parses.
 
     The earlier closed-gate test pointed `fs_dir` at a directory with no
@@ -667,7 +667,7 @@ class TestAClosedGateRemovesTheAdapterFromTheModel:
             )
             == {}
         )
-        # Control: the very same adapter, gate open, is refused — so the
+        # Control: the very same adapter, gate open, is refused - so the
         # no-op above came from the gate and not from a harmless fixture.
         with pytest.raises(ValueError, match="serves"):
             backend._blend_adapter_weights(
@@ -739,7 +739,7 @@ class TestOnlyAPromotedVersionAuthorizesWeights:
 
     The resolver test above proves the path rule. This proves what it is
     for: a versionless hybrid used to take weights from a direct file while
-    the service, reading only metadata, injected its prompt fallback — the
+    the service, reading only metadata, injected its prompt fallback - the
     two voices §5.0.1 forbids, arrived at because the two sides asked
     different questions. One of them is now unable to ask.
     """
@@ -824,8 +824,8 @@ class TestOnlyAPromotedVersionAuthorizesWeights:
         """`current_version <= 0` authorizes no weights, and that decision
         comes before any path is resolved.
 
-        `_adapter_path` is not inert — it raises for a missing user context,
-        an owner mismatch, or a path outside `fs_root` — so resolving first
+        `_adapter_path` is not inert - it raises for a missing user context,
+        an owner mismatch, or a path outside `fs_root` - so resolving first
         turned an adapter that authorizes nothing into a failed request. An
         unpromoted hybrid is prompt fallback; whatever its `fs_dir` says is
         irrelevant, because nothing will read it. The earlier tests here used
@@ -846,7 +846,7 @@ class TestOnlyAPromotedVersionAuthorizesWeights:
             user_id=None,
             config=config,
         ) == {}
-        # Control: promoted, and the path is consulted again — this one
+        # Control: promoted, and the path is consulted again - this one
         # really is outside the root, and refusing it is correct.
         with pytest.raises(ValueError, match="fs_root"):
             backend._blend_adapter_weights(
@@ -865,7 +865,7 @@ class TestOnlyAPromotedVersionAuthorizesWeights:
     ):
         """The local analogue of the API accounting bug: weights are the only
         mechanism this backend performs, so an open-gated `local` adapter
-        with nothing promoted applied none — and must not size the tokenizer
+        with nothing promoted applied none - and must not size the tokenizer
         or name itself in `usage.adapter_id`."""
         _write(tmp_path / "adapters" / "P" / "v0001", _valid_pair(config))
         backend = LocalJaxLoRABackend(
@@ -913,7 +913,7 @@ class TestTheBackendServesOnlyItsOwnModes:
     `local_lora` accepts local, prompt and hybrid; `remote` is incompatible.
     The weight path tested only "not the prompt rung", which let a promoted
     `remote` adapter through path resolution, base and identity validation
-    and into composition — so a provider-hosted adapter was applied as local
+    and into composition - so a provider-hosted adapter was applied as local
     LoRA weights because a `params.json` happened to sit under its directory.
     """
 
@@ -957,7 +957,7 @@ class TestTheBackendServesOnlyItsOwnModes:
         assert backend._blend_adapter_weights(
             [{**base, "mode": "hybrid"}], user_id="u", config=config
         )
-        # The prompt rung is carried by its instructions, weightlessly — not
+        # The prompt rung is carried by its instructions, weightlessly - not
         # refused, because it is a mode this backend accepts.
         assert backend._blend_adapter_weights(
             [{**base, "mode": "prompt"}], user_id="u", config=config
@@ -967,7 +967,7 @@ class TestTheBackendServesOnlyItsOwnModes:
 class TestPromotionSurvivesConvenienceState:
     def test_a_failing_latest_symlink_does_not_undo_a_promotion(self, tmp_path):
         """`latest` takes no part in serving (§5.5), so it must not be able to
-        abort a run after the gate passed and the version was bumped — which
+        abort a run after the gate passed and the version was bumped - which
         left the §5.4.6 audit unwritten and, on the worker path, retried
         against weights that were already authoritative."""
         service = TrainingService(store=None, fs_root=str(tmp_path))
@@ -999,7 +999,7 @@ class TestPromotionSurvivesConvenienceState:
 
 class TestTrainingAndServingSerializeIdentically:
     def test_the_canonical_conversation_serialization_matches(self, tmp_path):
-        """Not "context: appears somewhere" — the same conversation and
+        """Not "context: appears somewhere" - the same conversation and
         snippet must produce the same string on both sides, ordering
         included.
 

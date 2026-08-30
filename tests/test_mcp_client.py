@@ -139,7 +139,7 @@ class TestTheModelNamespaceIsOurs:
             assert set(names) == {"foo.bar", "foo/bar", "foo-bar"}
             assert len(set(names.values())) == 3, names
             # A hyphen is already provider-safe, so it is not a collision at
-            # all — the two that do collide are the ones carrying a character
+            # all - the two that do collide are the ones carrying a character
             # the namespace cannot keep.
             assert names["foo-bar"] == "mcp__svc__foo-bar"
 
@@ -168,7 +168,7 @@ class TestTheModelNamespaceIsOurs:
         The bound is a provider's limit on a function name, not this module's
         preference, so a test that reads the module's own constant asserts
         nothing: raising the constant to 1000 makes it pass while the names it
-        produces stop being callable. Measured — that is exactly what the
+        produces stop being callable. Measured - that is exactly what the
         earlier version of this test did.
         """
         long_a = "x" * 90 + "_alpha"
@@ -234,9 +234,9 @@ class TestAuthorityIsPersistedAndLocal:
     def test_a_tenant_shared_server_is_not_the_installations(self, store):
         """`shared` is a tenant's, `global` is the installation's.
 
-        The invariant, not the mechanism. Two things enforce it — the explicit
+        The invariant, not the mechanism. Two things enforce it - the explicit
         `visibility="global"` and the fact that this lookup passes no tenant to
-        widen to — and no test here can separate them, because dropping the
+        widen to - and no test here can separate them, because dropping the
         filter changes nothing while the call carries no identity. Kept for
         what it does assert: a shared row is not a capability, however that
         ends up being true.
@@ -252,7 +252,7 @@ class TestAuthorityIsPersistedAndLocal:
         """Written the only way it can exist: straight into the table.
 
         `validate_artifact` requires `url` on create and on update, so nothing
-        going through the store can produce this row — but `servers_for_turn`
+        going through the store can produce this row - but `servers_for_turn`
         reads persisted state it did not write, and a restore from an older
         dump or an operator's UPDATE can put a shape there that the validator
         would refuse. One unusable row must cost its own server and not the
@@ -349,7 +349,7 @@ class TestAuthorityIsPersistedAndLocal:
         """`server_taint_class` defaults a typo to `egress`, which is safe but
         silent: the operator asked for `local_read` and got a tool that
         disappears on a tainted turn with nothing saying why. The enum is the
-        other half — a classification that is not one of the two is a write
+        other half - a classification that is not one of the two is a write
         error, so the mistake surfaces where it can be corrected.
         """
         from liminallm.service.artifact_validation import ArtifactValidationError
@@ -406,7 +406,7 @@ class TestTheNetworkPolicyOwnsTheConnection:
         """Validating the configured URL is not enough: the client follows.
 
         The guard is at the socket, so the second host is refused at connect
-        time rather than by anything that inspects the URL — which is why the
+        time rather than by anything that inspects the URL - which is why the
         assertion is that the destination never heard from us.
         """
         with MCPFixture("target", {"secret": "leaked"}) as target:
@@ -426,7 +426,7 @@ class TestMetadataIsUntrustedBeforeAnythingIsCalled:
     """The channel that reaches the model first, and used to reach it raw.
 
     A result is capped, scanned and wrapped. A tool's `description` and
-    `inputSchema` went straight into the model's tool contract — earlier than
+    `inputSchema` went straight into the model's tool contract - earlier than
     any call, so earlier than any scan. A server that never answered a single
     call could put "ignore previous instructions" in front of the model with
     the turn untainted and every native egress tool still callable.
@@ -501,7 +501,7 @@ class TestMetadataIsUntrustedBeforeAnythingIsCalled:
 
         The wire field is `inputSchema` and the SDK's model aliases it to
         `input_schema`. Reading the wire name off the Python object returns
-        `None` — no error, no warning, just every remote tool offered with an
+        `None` - no error, no warning, just every remote tool offered with an
         empty parameter list. Measured: that is what this module did until the
         schema tests below were written, and every earlier test passed because
         they handed arguments to `call` directly instead of through a model.
@@ -578,7 +578,7 @@ class TestMetadataIsUntrustedBeforeAnythingIsCalled:
         """The check itself must survive what it is checking.
 
         A recursive walk over attacker-supplied JSON is a `RecursionError` the
-        sender picks the timing of, and `json.dumps` hits the same wall — so
+        sender picks the timing of, and `json.dumps` hits the same wall - so
         depth is answered iteratively, before anything recurses.
         """
         deep: dict = {}
@@ -593,7 +593,7 @@ class TestMetadataIsUntrustedBeforeAnythingIsCalled:
         """The pre-call exhaustion channel.
 
         A result is capped at `MAX_RESULT_CHARS`, but discovery had no cap at
-        all — so a server that never successfully executed anything could
+        all - so a server that never successfully executed anything could
         still fill the context by advertising thousands of tools.
         """
         many = {f"tool_{i}": "ok" for i in range(200)}

@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterator, List, Tuple
 # not in that schema at all, so reading it would have given three of the five
 # edge kinds and looked complete.
 #
-#   entrypoint          run(), choosing where to start — a graph-level field
+#   entrypoint          run(), choosing where to start - a graph-level field
 #   next                tool_call continuation, and parallel's children
 #   on_error            taken instead of `next` when a tool call fails
 #   after               where a parallel fan-in continues
@@ -110,7 +110,7 @@ def _references(
                 if isinstance(branch, dict) and branch.get("next") is not None:
                     # The switch executor appends `branch["next"]` as one
                     # value and does not flatten, so a list here is not
-                    # fan-out — that is what `parallel` is for (SPEC §9).
+                    # fan-out - that is what `parallel` is for (SPEC §9).
                     yield f"node {node_id!r} branch {index}", branch["next"], False
 
 
@@ -119,7 +119,7 @@ def _references(
 # flow: it discards the successor list, and it reads only `"error"` out of the
 # child's status. So a child carries no control flow of its own in either
 # direction. `switch` and nested `parallel` lose the edges they declare, and
-# `end` loses the one thing that makes it an `end` — on the ordinary path
+# `end` loses the one thing that makes it an `end` - on the ordinary path
 # `status == "end"` stops the workflow, and as a child it is just a successful
 # node the parent continues past.
 #
@@ -136,7 +136,7 @@ def _parallel_child_problems(
     """Control flow a child of this node carries and the parallel throws away.
 
     A third dimension: not what a node reads, but how it was reached. Two
-    rules, because there are two ways to carry it — a type whose semantics the
+    rules, because there are two ways to carry it - a type whose semantics the
     parallel drops, and an edge the parallel discards.
 
     Making `parallel` a recursive subgraph executor instead would be a
@@ -197,7 +197,7 @@ def graph_problems(schema: Any) -> List[str]:
         node_id = node.get("id")
         if not isinstance(node_id, str) or not node_id:
             # `node_map` is keyed by id and drops the falsy ones, so a node
-            # declared with an empty or non-string id disappears — the same
+            # declared with an empty or non-string id disappears - the same
             # silent removal a duplicate causes, and reported the same way
             # rather than skipped.
             problems.append(
@@ -232,7 +232,7 @@ def graph_problems(schema: Any) -> List[str]:
         node_type = _node_type(node)
         if node_type not in _NODE_EDGES:
             # `_execute_node` recognises `switch`, `parallel` and `end`, and
-            # runs everything else as a tool call — so a typo does not fail,
+            # runs everything else as a tool call - so a typo does not fail,
             # it invokes. SPEC §9 names exactly these four.
             problems.append(
                 f"node {node.get('id')!r} has type {node_type!r}, which is "

@@ -1,20 +1,20 @@
 """A minimal MCP server over Streamable HTTP (single POST endpoint).
 
-Speaks the Model Context Protocol — JSON-RPC 2.0, protocol revision
-2025-06-18 — far enough for an external agent to initialize, list tools and
+Speaks the Model Context Protocol - JSON-RPC 2.0, protocol revision
+2025-06-18 - far enough for an external agent to initialize, list tools and
 call them. The tools are the kernel's own read-only retrieval surfaces,
 note_search and knowledge_search, backed by the exact services the internal
 agent loop uses, so an outside agent grounds itself in the same vault and
 knowledge contexts the kernel's own turns do.
 
 Deliberately not the whole spec: stateless (no Mcp-Session-Id), no
-server-initiated SSE stream (GET answers 405), no resources or prompts yet —
+server-initiated SSE stream (GET answers 405), no resources or prompts yet -
 SPEC §13.1 carries the roadmap. JSON-RPC batching was removed from the
 protocol in 2025-06-18 and is rejected here by name.
 
 Only read tools are exposed, on purpose: they reach nothing outside the
 install, so there is no egress for an injected document to abuse, and the
-retrieved text is data for the caller — never instructions to this server.
+retrieved text is data for the caller - never instructions to this server.
 """
 
 from __future__ import annotations
@@ -194,14 +194,14 @@ def _call_tool(runtime, principal: AuthContext, params: Dict[str, Any]) -> dict:
         is_error = False
     except McpToolError as exc:
         text, is_error = str(exc), True
-    except Exception:  # noqa: BLE001 — a tool crash is the tool's result
+    except Exception:  # noqa: BLE001 - a tool crash is the tool's result
         logger.exception("mcp_tool_failed", tool=name, user_id=principal.user_id)
         text, is_error = "tool execution failed.", True
     return {"content": [{"type": "text", "text": text}], "isError": is_error}
 
 
 def handle_message(runtime, principal: AuthContext, body: Any) -> Optional[dict]:
-    """One JSON-RPC message in, one response out — or None for notifications."""
+    """One JSON-RPC message in, one response out - or None for notifications."""
     if isinstance(body, list):
         return _error(
             None, -32600, "Batch requests were removed in MCP 2025-06-18."

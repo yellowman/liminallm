@@ -50,8 +50,8 @@ def test_a_secret_in_a_message_does_not_reach_the_body(leak):
 
 
 def test_a_secret_in_the_details_does_not_reach_the_body():
-    """`details` is the machine-built half — a driver's exception text, a
-    resolved path, a matched pattern — and leaked while only `message` was
+    """`details` is the machine-built half - a driver's exception text, a
+    resolved path, a matched pattern - and leaked while only `message` was
     ever considered."""
     body = _error_response(409, "conflict", {"password": "hunter2"})
     assert _body(body)["error"]["details"]["password"] == "[REDACTED]"
@@ -136,7 +136,7 @@ def test_a_service_error_reaches_the_client_sanitized(client, auth_headers):
 
 def test_the_handler_survives_an_error_with_no_details():
     """The sanitizer must not turn a clean 4xx into a 500 by tripping on
-    None — it runs inside the exception handler."""
+    None - it runs inside the exception handler."""
     exc = ServiceError("plain failure")
     assert _error_response(exc.status_code, exc.message, None).status_code >= 400
 

@@ -1,7 +1,7 @@
 """Rank fusion for hybrid retrieval.
 
-Retrieval runs more than one channel — dense for meaning, lexical for the
-exact word — and the two produce numbers that share no scale. Cosine is
+Retrieval runs more than one channel - dense for meaning, lexical for the
+exact word - and the two produce numbers that share no scale. Cosine is
 bounded to [-1, 1]. BM25 is unbounded, and its magnitude depends on the pool
 it was scored against, so normalizing it means dividing by a maximum that
 moves with every query: the same chunk scores differently depending on what
@@ -10,7 +10,7 @@ it happened to be ranked beside.
 Reciprocal rank fusion reads only the position a channel put a chunk in, and
 never the number the channel attached to it. That removes the normalization
 problem entirely, and it lets a chunk both channels rank well beat one that
-only a single channel loves — which a weighted sum of scores cannot do once
+only a single channel loves - which a weighted sum of scores cannot do once
 the weights are fixed.
 
 Weights say which channel is trusted more, per SPEC §2.5.
@@ -28,7 +28,7 @@ LEXICAL_WEIGHT = 0.45
 # Late interaction is the stronger reading of the same semantic signal: it
 # compares the query against each part of a chunk instead of against one
 # averaged point. So it leads when it is available, and the pooled vector
-# steps back rather than out — a pooled embedding still says something about
+# steps back rather than out - a pooled embedding still says something about
 # the chunk as a whole that no single best-matching part does.
 LATE_WEIGHT = 0.55
 POOLED_WITH_LATE_WEIGHT = 0.25
@@ -67,7 +67,7 @@ def ranked_positive(scores: Sequence[float]) -> List[int]:
     """Indices a channel actually matched, best first.
 
     Zero is silence, not a weak opinion. A channel that scored nothing must
-    not still impose an order on the documents it failed to match — under
+    not still impose an order on the documents it failed to match - under
     rank fusion that arbitrary order would carry the channel's full weight.
     """
     positive = [index for index, score in enumerate(scores) if score > 0]

@@ -109,7 +109,7 @@ def test_notes_are_owner_scoped(client, auth_headers):
         client.delete(f"/v1/notes/{note['id']}", headers=other_headers).status_code
         == 404
     )
-    # Same title in another vault is fine — the namespace is per user.
+    # Same title in another vault is fine - the namespace is per user.
     resp = client.post(
         "/v1/notes", headers=other_headers, json={"title": "Private", "content": ""}
     )
@@ -200,9 +200,9 @@ class _ScriptedLLM:
     def generate(self, prompt, **kwargs):
         self.calls += 1
         # Chronological framing puts the older note in the A slot; match the
-        # header only — Bridge's *content* quotes the title.
-        if f'NOTE A — "{self.contradiction_title}"' in prompt:
-            return {"content": "CONTRADICTS — the author reversed the earlier claim."}
+        # header only - Bridge's *content* quotes the title.
+        if f'NOTE A - "{self.contradiction_title}"' in prompt:
+            return {"content": "CONTRADICTS - the author reversed the earlier claim."}
         return {"content": "UNRELATED. Different topics."}
 
 
@@ -242,9 +242,9 @@ def test_witness_endpoint_smoke(client, auth_headers, monkeypatch):
 
 
 def test_verdict_parsing_is_defensive():
-    assert notes.parse_verdict("CONTRADICTS — you changed your mind")[0] == "CONTRADICTS"
+    assert notes.parse_verdict("CONTRADICTS - you changed your mind")[0] == "CONTRADICTS"
     assert notes.parse_verdict("agrees, both say the same")[0] == "AGREES"
-    assert notes.parse_verdict("EVOLVES — the claim narrowed over time")[0] == "EVOLVES"
+    assert notes.parse_verdict("EVOLVES - the claim narrowed over time")[0] == "EVOLVES"
     assert notes.parse_verdict("The verdict is UNRELATED.")[0] == "UNRELATED"
     assert notes.parse_verdict("complete nonsense output")[0] == "UNRELATED"
     assert notes.parse_verdict(None)[0] == "UNRELATED"
@@ -270,8 +270,8 @@ def test_judge_pair_presents_older_note_first():
     newer = N("Newer", datetime(2026, 5, 1))
     older = N("Older", datetime(2024, 2, 1))
     notes.judge_pair(Capture(), newer, older)  # passed newest-first on purpose
-    assert captured["prompt"].index('NOTE A — "Older"') < captured["prompt"].index(
-        'NOTE B — "Newer"'
+    assert captured["prompt"].index('NOTE A - "Older"') < captured["prompt"].index(
+        'NOTE B - "Newer"'
     )
 
 
@@ -282,7 +282,7 @@ def test_witness_reports_evolution_with_path(client, auth_headers):
 
     class Evolver:
         def generate(self, prompt, **kwargs):
-            return {"content": "EVOLVES — the position narrowed from all to most."}
+            return {"content": "EVOLVES - the position narrowed from all to most."}
 
     note = runtime.store.get_note(b["id"])
     report = notes.witness_report(
@@ -307,8 +307,8 @@ def test_vault_sweep_judges_strongest_pairs(client, auth_headers):
             self.calls += 1
             # Match headers, not raw substrings: "Plants fine"'s content quotes
             # [[Meat required]], so any pair involving it contains both strings.
-            if 'NOTE A — "Meat required"' in prompt and 'NOTE B — "Plants fine"' in prompt:
-                return {"content": "CONTRADICTS — direct reversal."}
+            if 'NOTE A - "Meat required"' in prompt and 'NOTE B - "Plants fine"' in prompt:
+                return {"content": "CONTRADICTS - direct reversal."}
             return {"content": "UNRELATED."}
 
     judge = Judge()
@@ -950,7 +950,7 @@ def test_scanned_pdf_rasterizes_through_poppler(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Containers are text, image, or both — decided per page/attachment
+# Containers are text, image, or both - decided per page/attachment
 
 
 @pytest.mark.skipif(not _HAS_OCR, reason="tesseract not installed")
@@ -1117,7 +1117,7 @@ def test_parsing_happens_in_a_different_process(tmp_path):
         assert result["method"] == "pidprobe"
         assert int(pid_file.read_text()) == os.getpid()
         # Sandboxed: the child imports extract fresh, so the runtime-registered
-        # probe is absent — proof the parse ran in another interpreter (plugins
+        # probe is absent - proof the parse ran in another interpreter (plugins
         # for the child register via EXTRACT_READER_PLUGINS instead).
         with pytest.raises(extract.ExtractError):
             extract.extract_text(path, readers=("pidprobe",))

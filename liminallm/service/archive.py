@@ -4,7 +4,7 @@ Un-archives user uploads (.zip, .tar, .tar.gz, .tgz, single-file .gz) with
 defense-in-depth against hostile archives:
 
 - Entry-count, per-member, and total-size budgets are enforced while
-  *streaming* the decompressed bytes — header sizes are never trusted, so a
+  *streaming* the decompressed bytes - header sizes are never trusted, so a
   zip bomb is stopped at the byte limit no matter what its metadata claims.
 - A compression-ratio cap compares bytes written against the on-disk archive
   size (again, not the headers).
@@ -17,7 +17,7 @@ defense-in-depth against hostile archives:
 - ``extract_archive_sandboxed`` runs the whole job in a resource-limited
   child process (memory/CPU/file-size rlimits plus a wall-clock kill).
 
-On any budget violation the destination directory is removed — extraction is
+On any budget violation the destination directory is removed - extraction is
 all-or-nothing for resource failures, while per-entry policy skips (bad name,
 disallowed extension, symlink) are reported in the result.
 """
@@ -51,7 +51,7 @@ MAX_PATH_DEPTH = 16
 _CHUNK = 64 * 1024
 
 # A skip report quotes the member name the archive gave, which the archive
-# chose and nothing else bounds — the extracted names are held to
+# chose and nothing else bounds - the extracted names are held to
 # MAX_PATH_DEPTH components of 255 characters, but a rejected one never went
 # through that. Held to the same budget so the manifest a caller receives is
 # bounded by the entry count, and so is the frame carrying it.
@@ -128,16 +128,16 @@ class _Budget:
         # No small-archive exemption. This used to be
         # `max(1 MiB, archive_bytes * max_ratio)`, which meant the configured
         # 100:1 cap was not a cap below a megabyte: measured, a 726-byte zip
-        # expanded to 600 KiB — about 846:1 — and extracted. §21.3 states the
+        # expanded to 600 KiB - about 846:1 - and extracted. §21.3 states the
         # ratio cap with no floor in it.
         #
         # The floor's own justification was backwards. It read "an empty-file
         # tar is mostly header" and so expands past the ratio; measured, an
-        # empty-file tar is 10240 bytes on disk and expands to 0 — a ratio of
+        # empty-file tar is 10240 bytes on disk and expands to 0 - a ratio of
         # zero, which no cap could trouble.
         if self.total > self.archive_bytes * self.max_ratio:
             raise ArchiveExtractionError(
-                f"compression ratio exceeds {self.max_ratio}:1 — refusing to "
+                f"compression ratio exceeds {self.max_ratio}:1 - refusing to "
                 "extract (archive bomb suspected)"
             )
 

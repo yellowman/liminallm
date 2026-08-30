@@ -63,7 +63,7 @@ async def test_a_rate_limit_round_trips_through_redis():
     allowed, _, _ = await runtime.cache.check_rate_limit(
         key, 2, 60, return_remaining=True
     )
-    assert not allowed, "the bucket never emptied — is this the real client?"
+    assert not allowed, "the bucket never emptied - is this the real client?"
 
 
 def test_redis_url_has_no_environment_variable():
@@ -106,7 +106,7 @@ def test_docker_has_one_schema_authority():
     """`scripts/migrate.sh` applies the schema. Nothing else may.
 
     Mounting `sql/` into `/docker-entrypoint-initdb.d` makes Postgres apply
-    `schema.sql` itself on first boot — before the migrate service runs, and
+    `schema.sql` itself on first boot - before the migrate service runs, and
     without the `-v embedding_dim` that only `migrate.sh` passes. Every
     `CREATE TABLE IF NOT EXISTS` in the real run is then a no-op, so the
     entrypoint's defaults are what the database keeps.
@@ -155,8 +155,8 @@ def test_the_migrate_container_is_told_the_same_embedding_width_as_the_app():
 def test_ci_applies_the_schema_the_way_production_does():
     """CI must run the command a deploy runs, not reimplement it.
 
-    Calling psql on sql/schema.sql directly means scripts/migrate.sh — the
-    command SPEC §13.6 names and Docker invokes — is never executed by CI, so
+    Calling psql on sql/schema.sql directly means scripts/migrate.sh - the
+    command SPEC §13.6 names and Docker invokes - is never executed by CI, so
     a break in it is found by an operator instead.
     """
     import pathlib
@@ -181,7 +181,7 @@ def test_ci_does_not_let_pytest_repair_the_migrated_database():
 
     Running the deploy command proves the command executes; it does not prove
     it built anything. `conftest` applying the schema unconditionally closes
-    that gap in the wrong direction — gut migrate.sh to `exit 0` and the
+    that gap in the wrong direction - gut migrate.sh to `exit 0` and the
     schema step still passes, conftest builds the schema on the empty database
     it left, and the suite goes green.
     """
@@ -207,7 +207,7 @@ def test_ci_does_not_let_pytest_repair_the_migrated_database():
     assert migrated < testing, "CI runs pytest before it applies the schema"
     assert (steps[testing].get("env") or {}).get("TEST_SCHEMA_PREPARED"), (
         "the pytest step does not set TEST_SCHEMA_PREPARED, so conftest "
-        "reapplies sql/schema.sql over whatever migrate.sh did — or did not — "
+        "reapplies sql/schema.sql over whatever migrate.sh did - or did not - "
         "produce, and the suite cannot fail because of it."
     )
 
@@ -218,7 +218,7 @@ def test_a_prepared_database_that_is_empty_stops_the_suite():
 
     Setting TEST_SCHEMA_PREPARED in CI is only worth anything if the harness
     honours it. Against an empty database that claims to be prepared, the
-    suite must refuse — that refusal is exactly what a no-op migrate.sh would
+    suite must refuse - that refusal is exactly what a no-op migrate.sh would
     produce in CI, and it is the signal the previous arrangement swallowed.
     """
     import subprocess
@@ -256,7 +256,7 @@ def test_a_prepared_database_that_is_empty_stops_the_suite():
         "prepared. TEST_SCHEMA_PREPARED is not suppressing the repair, so a "
         "migrate.sh that built nothing would still go green in CI."
     )
-    # Not "does the word migrate appear" — the tracebacks of this very file
+    # Not "does the word migrate appear" - the tracebacks of this very file
     # would satisfy that. The refusal has to be the store's schema check.
     output = done.stdout + done.stderr
     assert "Missing required Postgres tables" in output, (
@@ -282,7 +282,7 @@ def test_the_store_writes_where_the_runtime_thinks_it_does():
 
     A runtime-built store is handed `settings.shared_fs_root`, so the two
     agreed by construction. The shared store is built by the harness, and it
-    used to mint a second temporary directory of its own — leaving artifact
+    used to mint a second temporary directory of its own - leaving artifact
     payloads written under one root while filesystem authority, adapters,
     archive staging and the interpreter all resolved paths under another.
 
@@ -308,13 +308,13 @@ def test_the_bootstrap_artifacts_survive_the_per_test_truncate():
     default chat workflow and tool specs. While the store was rebuilt per
     test, the per-test TRUNCATE was undone by the next construction. With one
     store for the session that construction happens once, so the first
-    TRUNCATE removed the defaults and the remaining tests ran without them —
+    TRUNCATE removed the defaults and the remaining tests ran without them -
     exercising fallbacks where production runs on seeded rows.
     """
     artifacts = get_runtime().store.list_artifacts()
     assert any(a.name == "default_chat_workflow" for a in artifacts), (
-        "the default chat workflow is missing, so this test — and every test "
-        "after the first — runs in a boot state production never has"
+        "the default chat workflow is missing, so this test - and every test "
+        "after the first - runs in a boot state production never has"
     )
     tools = {
         a.schema.get("name")
@@ -328,7 +328,7 @@ def test_the_bootstrap_artifacts_survive_the_per_test_truncate():
 # `PostgresStore.sessions` is an in-memory dictionary that `_truncate_all`
 # cannot reach, so with a session-wide store it accumulated across the whole
 # run. Not the primary read path today, which is why this is isolation rather
-# than a product bug — but a cache whose contents depend on test order is a bad
+# than a product bug - but a cache whose contents depend on test order is a bad
 # thing to leave in place. These two run in file order: the first dirties the
 # cache, the second requires it to have been cleared between them.
 
@@ -351,7 +351,7 @@ def test_compose_does_not_seed_the_filesystem_root_through_settings():
     """`shared_fs_root` is environment-only; Compose has to agree.
 
     It is no longer a managed setting, so a `shared_fs_root` key in
-    INSTANCE_SETTINGS_JSON is filtered out as unknown — silently. The stack
+    INSTANCE_SETTINGS_JSON is filtered out as unknown - silently. The stack
     kept working only because the environment default happened to equal the
     mounted path.
     """
@@ -418,7 +418,7 @@ def _consumed_environment_variables() -> frozenset[str]:
 
     Not "the name occurs in source". A constant naming a variable nothing
     reads any more would satisfy that, and a name that looks configured while
-    reaching nothing is the whole defect this guards against — measured, an
+    reaching nothing is the whole defect this guards against - measured, an
     earlier version of this passed on a planted `DEPRECATED = "FUTURE_DEAD"`.
 
     Three interfaces, because there are three:
@@ -432,7 +432,7 @@ def _consumed_environment_variables() -> frozenset[str]:
 
     Shell is deliberately excluded. Measured: no compose variable needs it,
     and matching `$VAR` in `scripts/*.sh` admits every local a script sets for
-    itself — including `ALLOW_REDIS_FALLBACK_DEV`, one of the dead names this
+    itself - including `ALLOW_REDIS_FALLBACK_DEV`, one of the dead names this
     exists to catch. A variable a shell script alone consumes would be a false
     positive here; the failure message says so.
     """
@@ -466,7 +466,7 @@ def test_no_compose_variable_reaches_nothing(filename):
     `REDIS_URL` sat in both files beside the settings that do work. But
     `redis_url` is a managed setting with no environment variable of its own,
     so the container did not degrade to the in-process path, it failed to
-    boot — and the file said otherwise either way. A dead name is
+    boot - and the file said otherwise either way. A dead name is
     indistinguishable from a live one until something measures what consumes
     it, which is what `_consumed_environment_variables` does.
 
@@ -492,7 +492,7 @@ def test_no_compose_variable_reaches_nothing(filename):
     assert not dead, (
         f"{filename} declares variables nothing consumes: {dead}. Either the "
         "setting is managed and belongs in INSTANCE_SETTINGS_JSON, or the "
-        "name is stale and should go — leaving it makes the file claim a "
+        "name is stale and should go - leaving it makes the file claim a "
         "configuration the deployment never receives. If a shell script is "
         "the only consumer, that is this check's known false positive: give "
         "the name an `env_field` or read it in Python, rather than widening "

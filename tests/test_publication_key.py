@@ -3,7 +3,7 @@
 `publication_key` is the single answer to "which lock does a mutation of this
 path take", and every side of a publication asks it: the upload route, the
 delete route, and the re-index queue. If two of them disagree about the key
-for one file, they take different locks and never see each other — which is
+for one file, they take different locks and never see each other - which is
 not hypothetical, it is the defect this function was extracted to fix.
 
 Two ways to get the answer wrong, and they pull in opposite directions.
@@ -17,9 +17,9 @@ nearest directory shaped like the layout finds the archive's copy.
 
 So the rule has three parts, and this file pins all three:
 
-* the root may be recognised through a symlink — resolve it to *match*;
-* the key is built from the **logical** root — never the resolved spelling;
-* the user's files directory is at a fixed depth below that root — never the
+* the root may be recognised through a symlink - resolve it to *match*;
+* the key is built from the **logical** root - never the resolved spelling;
+* the user's files directory is at a fixed depth below that root - never the
   nearest thing shaped like one.
 """
 
@@ -47,7 +47,7 @@ def test_a_symlinked_root_and_a_lookalike_tree_still_name_one_namespace(
     The path is what a store row actually holds: `safe_join` resolved it, so
     it is spelled with the physical root. The tree inside it mirrors the
     layout, so the nearest `users/*/files` is the archive's. The key has to
-    come out as the logical root's `bundle` either way — that is the name the
+    come out as the logical root's `bundle` either way - that is the name the
     route locks when it deletes the tree.
     """
     physical, logical = _layout(tmp_path)

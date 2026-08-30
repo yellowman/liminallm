@@ -10,7 +10,7 @@ logger = get_logger(__name__)
 
 DEFAULT_VOCAB_SIZE = 32000
 MAX_GENERATION_TOKENS = 4096
-# Sanity ceiling for a single inbound message. Not a model budget — that is
+# Sanity ceiling for a single inbound message. Not a model budget - that is
 # derived per model in the workflow, which can prune; validation can only
 # reject, so this is generous enough to accept a pasted document on a
 # large-window model and still stop absurd payloads.
@@ -28,7 +28,7 @@ def estimate_token_count(text: str) -> int:
     """Tokenizer-free estimate, deliberately conservative (over-counts).
 
     Splits by script: CJK characters bill near 1:1, everything else at
-    4 chars/token with a word-count floor. The single estimator — the
+    4 chars/token with a word-count floor. The single estimator - the
     calibrated TokenCounter multiplies this by a learned factor; validation
     and compaction use it raw.
     """

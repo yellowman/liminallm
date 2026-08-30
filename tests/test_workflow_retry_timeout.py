@@ -31,8 +31,8 @@ from liminallm.storage.common import get_default_tool_specs
 def _loaded(schema):
     """What `get_latest_workflow` returns: a schema and the namespace its tool
     references mean. These tests are about retry and timeout mechanics, so the
-    system namespace — the one the engine uses for workflows it synthesises
-    itself — is the right one."""
+    system namespace - the one the engine uses for workflows it synthesises
+    itself - is the right one."""
     return ResolvedWorkflow(schema, SYSTEM_SCOPE)
 
 
@@ -62,8 +62,8 @@ class MockStore:
     def resolve_tool_spec(self, name, scope):
         """Resolve a default tool the way the real store would.
 
-        Built from `get_default_tool_specs()` — the same definition
-        `_ensure_default_artifacts` seeds from — rather than a table written
+        Built from `get_default_tool_specs()` - the same definition
+        `_ensure_default_artifacts` seeds from - rather than a table written
         here, so this double cannot disagree with production about what a
         default tool's handler is.
 
@@ -101,7 +101,7 @@ class MockLLM(LLMService):
 
     A hand-written stand-in with one `generate` on it answered every capability
     question by not having the attribute, so tests here could not see a
-    capability the engine now asks about — `stream_is_cancellable`, which the
+    capability the engine now asks about - `stream_is_cancellable`, which the
     real property resolves from the backend. Subclassing keeps the one
     behaviour these tests do rely on (a canned completion) while the rest of
     the interface stays the real one.
@@ -729,7 +729,7 @@ class TestTheWorkflowDeadlineIsRealWallClock:
       remaining budget still slept a full backoff on top.
 
     `MAX_NODE_TIMEOUT_SECONDS` existed but capped the tool spec's
-    `timeout_seconds`, not this outer node timeout — the constant was right
+    `timeout_seconds`, not this outer node timeout - the constant was right
     and unused where it mattered.
     """
 
@@ -802,7 +802,7 @@ class TestTheWorkflowDeadlineIsRealWallClock:
         """*Independently* capped, which the budget bound can hide.
 
         With a small workflow budget the remaining-time bound is the smaller
-        of the two and the cap is never exercised — a version that dropped
+        of the two and the cap is never exercised - a version that dropped
         `MAX_NODE_TIMEOUT_SECONDS` entirely passed a five-second-budget test.
         So this one gives the workflow ten minutes and asks only about the
         cap.
@@ -850,7 +850,7 @@ class TestTheWorkflowDeadlineIsRealWallClock:
         assert seen and seen[0] is not None
         assert seen[0] <= MAX_NODE_TIMEOUT_SECONDS, (
             "a node asked for 600s inside a workflow with 600s of budget and "
-            f"got {seen[0]}s — the kernel cap is not applied independently"
+            f"got {seen[0]}s - the kernel cap is not applied independently"
         )
 
     @pytest.mark.asyncio
@@ -956,6 +956,6 @@ class TestTheWorkflowDeadlineIsRealWallClock:
             elapsed = time.monotonic() - start
 
         assert elapsed < 5.0, (
-            f"a workflow with a 1s deadline returned after {elapsed:.1f}s — the "
+            f"a workflow with a 1s deadline returned after {elapsed:.1f}s - the "
             "node's own timeout_ms governed, not the workflow's remaining budget"
         )

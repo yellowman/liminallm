@@ -36,7 +36,7 @@ services:
       MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
       # Where this container keeps its data. Environment-only, because the
       # Postgres store is handed this root before any database-managed setting
-      # can be read — a stored value would move it for every service built
+      # can be read - a stored value would move it for every service built
       # afterwards while the store kept writing where it started. It is
       # deliberately NOT in INSTANCE_SETTINGS_JSON below: the app filters that
       # to managed settings, so a key there is dropped without a word.
@@ -86,7 +86,7 @@ services:
       - postgres-data:/var/lib/postgresql/data
       # sql/ is deliberately NOT mounted into /docker-entrypoint-initdb.d.
       # That would apply schema.sql on first boot, before the migrate service
-      # and without the -v embedding_dim only migrate.sh passes — and since
+      # and without the -v embedding_dim only migrate.sh passes - and since
       # every statement is IF NOT EXISTS, the later real run would then be a
       # no-op that silently keeps the entrypoint's 1536-wide default.
     healthcheck:

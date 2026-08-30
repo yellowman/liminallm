@@ -9,8 +9,8 @@ SPEC §18 states the contract as an observable property, not a mechanism:
 The service owns every user's files, so the interpreter inheriting the service
 uid is the wrong trust boundary and no amount of unix permission checking
 fixes it: the paths have to be *absent* from the process's view, not merely
-unreadable. Everything else the sandbox does — rlimits, the wall-clock kill,
-the network denial, removing the process-spawn entry points — is defense in
+unreadable. Everything else the sandbox does - rlimits, the wall-clock kill,
+the network denial, removing the process-spawn entry points - is defense in
 depth around this.
 
 One backend per platform, and **no degraded fallback**. A platform with no
@@ -18,7 +18,7 @@ backend cannot run `run_python` at all; falling back to an unconfined process
 would be the same-uid unrestricted filesystem this module exists to remove,
 with a docstring claiming otherwise.
 
-* Linux: a user + mount namespace with a fresh tmpfs root — the workdir bound
+* Linux: a user + mount namespace with a fresh tmpfs root - the workdir bound
   rw, the runtime bound ro, everything else simply not mounted. Unprivileged:
   `CLONE_NEWUSER` grants the caps needed for the mounts inside the namespace
   only.
@@ -92,7 +92,7 @@ def _write_proc(path: str, value: str, *, operation: str) -> None:
     Labelled the way `unshare` and `mount` are, and for the same reason. A
     bare `PermissionError: [Errno 13] ... '/proc/self/setgroups'` names the
     file but not the operation, and the operation is what tells an operator
-    which kernel policy refused them — the difference between "this host has
+    which kernel policy refused them - the difference between "this host has
     user namespaces switched off" and "this host allowed the namespace and
     then refused the mapping inside it".
 
@@ -116,7 +116,7 @@ def _linux_available() -> bool:
 
     Read from /proc rather than probed by actually unsharing. `unshare` is
     irreversible for the caller, so the probe has to happen somewhere other
-    than the asking process — and the obvious somewhere, a forked child, is
+    than the asking process - and the obvious somewhere, a forked child, is
     the wrong tool: this question is asked from the API process, which has JAX
     loaded and threads running, and `os.fork()` there risks the child
     deadlocking on a lock held by a thread that does not exist in it. (The
@@ -133,7 +133,7 @@ def _linux_available() -> bool:
     # Two knobs that must permit, and one that must not forbid. The third is
     # why reading the first two alone was wrong: on a stock Ubuntu 24.04 host
     # both of those say yes, `unshare` then *succeeds*, and the process holds
-    # no capabilities in the namespace it just created — so the identity
+    # no capabilities in the namespace it just created - so the identity
     # mapping is refused and confinement fails after this said it was
     # available. Measured on a GitHub-hosted runner: clone=1,
     # max_user_namespaces=63838, apparmor_restrict_unprivileged_userns=1, and
@@ -175,7 +175,7 @@ def _linux_confine(workdir: str, runtime: Sequence[str], root: Optional[str] = N
     )
     # NEWNET as well: with no interfaces but a down loopback there is no
     # network to reach, which is what SPEC asks for. Blocking `socket` at
-    # import cannot do this — it missed `_socket`, and any already-loaded
+    # import cannot do this - it missed `_socket`, and any already-loaded
     # module can hand out the same primitive. The import denial stays as
     # defense in depth, the way `pledge` without `inet` is on OpenBSD.
     if libc.unshare(_CLONE_NEWUSER | _CLONE_NEWNS | _CLONE_NEWNET) != 0:
@@ -193,7 +193,7 @@ def _linux_confine(workdir: str, runtime: Sequence[str], root: Optional[str] = N
     # pivot_root nothing can reach it to remove it: the old root is detached
     # and the process's own root is the tmpfs mounted on top. So the caller
     # supplies a path it already cleans up. Absent one, it goes beside the
-    # workdir rather than into the system temp root — a caller that cleans up
+    # workdir rather than into the system temp root - a caller that cleans up
     # after its own workdir then cleans up after this too, and one that does
     # not leaks in a place it is already leaking.
     root = root or f"{workdir.rstrip('/')}-confine-root"
@@ -244,7 +244,7 @@ def _linux_confine(workdir: str, runtime: Sequence[str], root: Optional[str] = N
 # --- openbsd: unveil + pledge ---------------------------------------------
 
 # Standard-library modules whose implementation is a shared object. Loading one
-# is a `dlopen`, which maps pages `PROT_EXEC` — and `pledge` denies that
+# is a `dlopen`, which maps pages `PROT_EXEC` - and `pledge` denies that
 # without the `prot_exec` promise. The child is spawned, not forked, so it
 # starts with none of these resident and the first `import zipfile` in model
 # code would be killed rather than refused. Granting `prot_exec` would fix the
@@ -281,7 +281,7 @@ def _openbsd_available() -> bool:
 def _openbsd_confine(workdir: str, runtime: Sequence[str], root: Optional[str] = None) -> str:
     """Expose only these paths, then drop the capabilities left over.
 
-    Unverified on this machine — there is no OpenBSD host here to run the
+    Unverified on this machine - there is no OpenBSD host here to run the
     contract test against, so treat it as implemented-but-unproven until it
     passes `tests/test_interpreter_confinement.py` on one. The calls
     themselves are the documented ones: `unveil` per path, a locking
@@ -318,7 +318,7 @@ def _openbsd_confine(workdir: str, runtime: Sequence[str], root: Optional[str] =
     # No `inet`, no `proc`/`exec`: the network and process-spawn denials the
     # sandbox already applies in Python, made structural.
     # No `tmppath`: pledge(2) lists it as "No longer available", so naming it
-    # fails the whole call — and it granted /tmp, which `unveil` above does
+    # fails the whole call - and it granted /tmp, which `unveil` above does
     # not expose anyway. TMPDIR points at the workdir; `cpath`/`wpath` there
     # is what temporary files actually need.
     # No `prot_exec`: see `_NATIVE_WARMUP`. Denying new executable mappings is
@@ -354,7 +354,7 @@ def runtime_paths() -> list[str]:
 
     The language runtime and its installed packages, and nothing that holds
     user data, service configuration or secrets. `sys.prefix` is the virtualenv
-    when there is one — that subtree, not the project directory around it.
+    when there is one - that subtree, not the project directory around it.
     """
     candidates: Iterable[str] = (
         sys.base_prefix,
@@ -384,7 +384,7 @@ def confine(
 
     `root` is where the new root is mounted. It must be a path the caller
     already owns and removes, and a *sibling* of `workdir` rather than a child
-    of it — the Linux backend binds `workdir` into the new root, and a mount
+    of it - the Linux backend binds `workdir` into the new root, and a mount
     point inside it would be bound into itself. Callers that omit it leak one
     empty directory per call, because after `pivot_root` nothing is left that
     can reach the host path to clean it.
@@ -404,5 +404,5 @@ def confine(
     raise ConfinementUnavailable(
         f"no filesystem confinement backend for platform {sys.platform!r} "
         f"({platform.machine()}); model-written code will not be run "
-        "unconfined — see SPEC §18"
+        "unconfined - see SPEC §18"
     )

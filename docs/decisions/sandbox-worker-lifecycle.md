@@ -10,13 +10,13 @@ closed a hole. This file records the holes.
 Tool handlers used to run on a pool thread. `future.cancel()` returns false
 for anything already running, so a node timeout cancelled the coroutine and
 the handler carried on beside its own retry. That is why the unit of tool
-execution is a spawned worker process per attempt — a process can be
+execution is a spawned worker process per attempt - a process can be
 killed; a thread can only be asked.
 
 ## the setsid window
 
 The child calls `setsid` after `start()` returns, so until it has,
-`getpgid(child)` answers with the *parent's* group — and a `killpg` in that
+`getpgid(child)` answers with the *parent's* group - and a `killpg` in that
 window SIGKILLs the api server and everything sharing its group. The child
 therefore *earns* the group: it sends a ready handshake once `setsid` has
 actually happened, carrying the pgid it landed in, and only a pgid equal to
@@ -28,7 +28,7 @@ the whole process group.
 
 A pid outlives its process only as a number, and the kernel reuses numbers,
 so a registration left behind after a child is reaped is a standing licence
-to signal whoever inherits that number — redeemed at teardown, against a
+to signal whoever inherits that number - redeemed at teardown, against a
 stranger. Registration hands back the means to undo it, and the normal exit
 path uses it.
 
@@ -46,7 +46,7 @@ The guard goes around the *mutation*, never around the call that leads to
 it: between "the handler was entered" and "the row exists" there is a
 window, and a retry landing inside it either duplicates the write or skips
 it depending on which side of the boundary the guard sat. (The same shape
-appeared twice more in the account-erasure work — see docs/ISSUES.md,
+appeared twice more in the account-erasure work - see docs/ISSUES.md,
 tranches 2G.4 "the write side" and "the claim is a write".)
 
 ## why the ledger is ordered, not content-addressed
@@ -58,7 +58,7 @@ result)` lets a replacement worker replay its control flow and stamp each
 request with its position: a committed step at that position returns its
 stored result instead of happening twice; a divergent durable retry is
 refused; a read simply runs again. A step still `pending` when its attempt
-died becomes `unknown`, not `failed` — nothing left can say whether it
+died becomes `unknown`, not `failed` - nothing left can say whether it
 landed, and a durable `unknown` is refused rather than repeated.
 
 The payload hash of a publication covers the *bytes* of each file, not only
@@ -90,13 +90,13 @@ confinement at all.
 permits additional properties, so an ordinary user could author
 `privileged: true` and an admin invoking it would be handed the privileged
 sandbox for someone else's definition. Ownership is read from the artifact
-row, never from a field inside `schema` — a spec naming its own owner is
+row, never from a field inside `schema` - a spec naming its own owner is
 quoting itself.
 
 Two related resolution rules earned the same way:
 
 - Caching a private tool into the process-wide registry made one user's
-  private definition resolvable for every later request in that process —
+  private definition resolvable for every later request in that process -
   resolution is per request.
 - Handing the engine a bare schema and letting it resolve the name again is
   a substitution: names carry no uniqueness constraint, so the second
@@ -108,13 +108,13 @@ Two related resolution rules earned the same way:
 
 Hot reload replaces the engine while in-flight work finishes. A process
 global would have an old attempt asking the new engine about an execution
-it never opened — a refusal indistinguishable from a real revocation. The
+it never opened - a refusal indistinguishable from a real revocation. The
 registry of live executions belongs to the engine, and each entry is opened
 once and closed once on every terminal path, revocation included.
 
 The check also follows the work, not the thread that started it: parallel
 reads run in a nested pool, the bound invocation is thread-local, and an
-unbound thread reads as the api path and passes every check — so the
+unbound thread reads as the api path and passes every check - so the
 invocation is re-applied in every worker, on every call, reads included. A
 list of "write methods" would be a guess about which calls matter.
 
@@ -122,8 +122,8 @@ list of "write methods" would be a guess about which calls matter.
 
 A turn that has read a possible injection loses `run_python`, `web_fetch`,
 and `web_search` for the rest of the turn. The findings live on the
-invocation, parent-side, and the refusal happens at the capability — not
-merely inside the round that usually carries it — because the worker is the
+invocation, parent-side, and the refusal happens at the capability - not
+merely inside the round that usually carries it - because the worker is the
 untrusted side: "it asks through the round" describes the intended
 protocol, not a constraint on a compromised one, and a worker that has just
 read a hostile page can ask for `web.fetch` directly. The process that read

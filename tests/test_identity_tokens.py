@@ -11,7 +11,7 @@ that by deleting the token *after* changing the password:
 
 Between the read and the delete the token is still there, so two requests
 holding the same token both read a subject and both proceed. The second one
-wins, and the password ends up being whichever of the two arrived last —
+wins, and the password ends up being whichever of the two arrived last -
 which for a token delivered by email is a window an attacker who has read the
 message can use deliberately, and a window an ordinary double-click can hit by
 accident.
@@ -20,8 +20,8 @@ accident.
 fallback for a Redis older than 6.2. This is the same primitive applied to the
 two identity tokens that were still reading first.
 
-The in-process fallback was already correct — its `pop()` under the state lock
-*is* the atomic consume — so the work there is to leave it alone, and to have
+The in-process fallback was already correct - its `pop()` under the state lock
+*is* the atomic consume - so the work there is to leave it alone, and to have
 a test that says so.
 """
 
@@ -109,7 +109,7 @@ class TestAResetTokenIsConsumedOnce:
         """Forced, not two calls that happen to serialize.
 
         The second attempt is made while the first is between consuming the
-        token and writing the password — the whole window the old order
+        token and writing the password - the whole window the old order
         created. Two ordinary concurrent calls would usually miss it.
         """
         runtime = get_runtime()
@@ -298,8 +298,8 @@ class TestIssuanceBelongsToTheAccountLifetime:
         """`/auth/reset/request` resolves the account, then writes the token.
 
         The erasure can commit and purge in between, leaving a fresh identity
-        token naming an account that no longer exists. Inert — completion
-        re-resolves the immutable id and finds nothing — but the erasure's own
+        token naming an account that no longer exists. Inert - completion
+        re-resolves the immutable id and finds nothing - but the erasure's own
         contract is that its identifiable state is gone when it returns, and
         this is the last write that could put some back.
         """
@@ -397,7 +397,7 @@ class TestIssuanceBelongsToTheAccountLifetime:
         Deleting before the request does not reach this: the route's own
         lookup fails first and the branch is skipped. What has to be covered
         is the account that was live at the lookup and gone at the write, and
-        the observable part of that is a `None` token — so this drives the
+        the observable part of that is a `None` token - so this drives the
         route by the contract rather than by re-staging the race, which
         `test_a_token_issued_under_an_erasure_does_not_outlive_it` already
         does for the service.

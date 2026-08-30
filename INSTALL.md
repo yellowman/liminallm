@@ -151,7 +151,7 @@ Only these are environment variables:
 | `<PROVIDER>_API_KEY` | no | `OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, … used when the matching admin setting is blank |
 | `INSTANCE_SETTINGS_JSON` | no | JSON object seeding managed settings on first boot only |
 
-Everything else — model, provider, Redis URL, SMTP, OAuth, rate limits — is set
+Everything else - model, provider, Redis URL, SMTP, OAuth, rate limits - is set
 in the admin console at `/` after signing in as an admin. `JWT_SECRET` is
 generated on first boot if unset.
 

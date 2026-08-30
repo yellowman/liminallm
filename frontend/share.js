@@ -68,7 +68,7 @@
       .join('');
   };
 
-  // Copy actions (message + code) — the chat page wires these on #messages,
+  // Copy actions (message + code) - the chat page wires these on #messages,
   // which does not exist here.
   document.addEventListener('click', (e) => {
     const flash = (btn) => {

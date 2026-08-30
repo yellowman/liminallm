@@ -415,7 +415,7 @@ class _InjectionHandler(http.server.BaseHTTPRequestHandler):
 class _FetchingBackend:
     """Backend that calls web_fetch once on a given URL, then answers."""
 
-    #: In-memory generator, never blocks — honest under the fail-closed
+    #: In-memory generator, never blocks - honest under the fail-closed
     #: streaming-cancel contract, and without it a streamed turn would take
     #: the non-streaming fallback instead of the path under test.
     supports_stream_cancel = True
@@ -487,7 +487,7 @@ def test_injection_findings_reach_the_workflow_trace(monkeypatch):
     #
     # Opting out of only the first was invisible for as long as it was, because
     # `connection_allowlist()` returns the *proxy's* host when a proxy is
-    # configured — so anywhere HTTPS_PROXY pointed at a loopback address, this
+    # configured - so anywhere HTTPS_PROXY pointed at a loopback address, this
     # test's target was allowlisted by coincidence of the developer's
     # environment. CI has no proxy, so the real target list applied and the
     # fetch was refused with "Egress address '127.0.0.1' is not allowlisted for
@@ -548,7 +548,7 @@ def test_title_cannot_break_out_of_the_envelope():
     assert "\n" not in title
     assert UNTRUSTED_CLOSE not in title
 
-    wrapped = wrap_untrusted("body text", source=f"{title} — http://evil.example")
+    wrapped = wrap_untrusted("body text", source=f"{title} - http://evil.example")
     assert wrapped.count(UNTRUSTED_OPEN) == 1
     assert wrapped.count(UNTRUSTED_CLOSE) == 1
 

@@ -20,7 +20,7 @@ def extract_prompt_instructions(adapter: dict, *, log_source: str = "adapter") -
     Both LLMService and model backends should use this function for consistency.
 
     Priority order per SPEC §5.0.1:
-    1. prompt_instructions — the one prompt field, top-level or schema-nested
+    1. prompt_instructions - the one prompt field, top-level or schema-nested
     2. Applicability natural language description (designed for LLM context)
     3. Description field ONLY if use_description_as_prompt is explicitly True
 

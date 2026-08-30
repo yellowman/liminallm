@@ -2,7 +2,7 @@
 
 It guards three attacker-influenced inputs: expressions the model writes into
 routing policies, files a user uploads, and hosts a tool is asked to fetch.
-The evaluator is the sharpest edge — policies are artifacts the LLM proposes
+The evaluator is the sharpest edge - policies are artifacts the LLM proposes
 edits to (SPEC §10), and `ast.Attribute` being unsupported is the one line
 between that and `().__class__.__bases__[0].__subclasses__()`.
 """
@@ -231,7 +231,7 @@ def test_an_unlisted_host_is_refused(egress_policy):
 
 def test_an_unlisted_address_is_refused(egress_policy):
     """httpx resolves DNS itself and hands the guard an IP, so the guard has
-    to handle a literal — and must not wave one through for being numeric."""
+    to handle a literal - and must not wave one through for being numeric."""
     egress_policy(["api.example.com"])
     with pytest.raises(SandboxError, match="not allowlisted"):
         _enforce_network_allowlist("169.254.169.254")  # cloud metadata
@@ -274,7 +274,7 @@ def test_reading_outside_the_sandbox_is_refused(scratch, attempt):
 
 
 def test_traversal_out_of_the_scratch_is_refused(scratch):
-    """resolve() is what collapses the .. — without it the prefix check passes."""
+    """resolve() is what collapses the .. - without it the prefix check passes."""
     with pytest.raises(SandboxError):
         validate_path_access(scratch.scratch_dir / ".." / ".." / "etc" / "passwd", scratch)
 
@@ -336,7 +336,7 @@ def test_no_spec_means_the_default_config():
 )
 def test_a_tool_cannot_raise_its_own_ceiling(asked, field, ceiling):
     """resource_limits comes off the tool.spec artifact, which the LLM can
-    propose edits to — so the ask is capped, not trusted."""
+    propose edits to - so the ask is capped, not trusted."""
     config = get_tool_sandbox_config({"resource_limits": asked})
     assert getattr(config, field) == ceiling
 
@@ -347,8 +347,8 @@ def test_a_tool_may_ask_for_less():
 
 
 # The privileged gate's caller half is exercised above, against
-# `get_tool_sandbox_config`. Its provenance half — SPEC §18's *admin-owned
-# artifact* — needs the persisted artifact row, so it lives in
+# `get_tool_sandbox_config`. Its provenance half - SPEC §18's *admin-owned
+# artifact* - needs the persisted artifact row, so it lives in
 # tests/test_tool_authority.py where a store is available.
 
 
@@ -437,7 +437,7 @@ def test_the_memory_cap_actually_stops_a_greedy_call(tmp_path):
 
 @pytest.mark.slow
 def test_a_wall_clock_timeout_kills_a_spinning_call(tmp_path):
-    """Backstops the CPU rlimit — a call blocked on I/O burns no CPU at all."""
+    """Backstops the CPU rlimit - a call blocked on I/O burns no CPU at all."""
     config = SandboxConfig(scratch_dir=tmp_path / "s", max_cpu_seconds=60)
     with pytest.raises(SandboxError):
         run_in_sandbox(_spin_forever, config=config, timeout=3)

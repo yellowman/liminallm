@@ -280,7 +280,7 @@ def test_an_idempotency_key_does_not_break_a_response_with_timestamps(
     """SPEC §18 accepts Idempotency-Key on these routes. It has to work.
 
     The guard cached `envelope.model_dump()`, which leaves `datetime` objects
-    as objects, and the record is then JSON-encoded — so every route whose
+    as objects, and the record is then JSON-encoded - so every route whose
     response carries `created_at` answered 500 the moment a client sent the
     header it is invited to send. Without the header the same request
     succeeds, which is why nothing noticed.

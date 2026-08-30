@@ -3,7 +3,7 @@
 `test_mcp_client.py` checks the client in isolation. This file checks the
 seam: that a configured server is discovered during prompt assembly, offered
 to the model in the shape the loop reads, dispatched by name through the
-parent, and withdrawn by the ordinary taint path — and that nothing carrying
+parent, and withdrawn by the ordinary taint path - and that nothing carrying
 the server's identity crosses into the worker.
 """
 
@@ -27,7 +27,7 @@ def engine(monkeypatch):
     """The real engine, pointed at loopback, on a tool-capable backend.
 
     Two things are replaced and nothing else. The allowlist, so the fixture
-    server on 127.0.0.1 is reachable — everything the guard does with it, the
+    server on 127.0.0.1 is reachable - everything the guard does with it, the
     thread-local application and the redirect re-check, is the real thing, and
     is the half several of these tests are about.
 
@@ -104,7 +104,7 @@ class TestTheTurnOffersWhatWasDiscovered:
         turn holding an envelope it has no rule for.
 
         Web is turned off for exactly that reason: it is on in this
-        environment, and with it on the rule appears either way — measured,
+        environment, and with it on the rule appears either way - measured,
         the first version of this test passed with the `or mcp_tools` removed.
         """
         monkeypatch.setattr(
@@ -192,7 +192,7 @@ class TestDispatchGoesThroughTheParent:
 
         The map is deliberately non-empty. An empty one proves nothing: with
         nothing to fall back to, a lookup that matched on the prefix alone
-        would answer "unknown" for the same reason a correct one does —
+        would answer "unknown" for the same reason a correct one does -
         measured, that is exactly what the first version of this test did.
         """
         name = f"real{uuid.uuid4().hex[:6]}"
@@ -239,7 +239,7 @@ class TestTheServersIdentityNeverCrossesThePipe:
 
         The worker chose the tool call, so it is the untrusted side. If a
         server's URL or its `taint_class` travelled in the plan, a compromised
-        worker could name a host of its own and call it `local_read` — which is
+        worker could name a host of its own and call it `local_read` - which is
         the same class of defect as accepting a `tenant_id` from a parameter.
         """
         name = f"sec{uuid.uuid4().hex[:6]}"
@@ -278,7 +278,7 @@ class TestBothPathsCarryTheMapToTheRound:
         """The worker sends a name over the pipe; this is where it is resolved.
 
         Driven through `_tools_round` rather than through `_run_round_tools`,
-        because the hand-off between them is the thing being checked — calling
+        because the hand-off between them is the thing being checked - calling
         the round directly passes the map by hand and proves the broker
         nothing.
         """
@@ -318,7 +318,7 @@ class TestBothPathsCarryTheMapToTheRound:
 
         Stopped at `_serve_invocation`: spawning a worker and streaming an
         answer needs a live model, and neither is what this checks. What it
-        checks is the one thing that differs between the two paths — whether
+        checks is the one thing that differs between the two paths - whether
         the context that reaches the broker carries this turn's servers.
         """
         captured: list = []

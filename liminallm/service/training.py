@@ -489,7 +489,7 @@ class TrainingService:
 
                 `adapter` here was read before the training run, so rebuilding
                 from `adapter.schema` replays a document that can be minutes
-                stale — long enough for a ConfigOps patch to be applied,
+                stale - long enough for a ConfigOps patch to be applied,
                 audited, and then erased when promotion takes the lock.
                 """
                 updated_schema = dict(locked)
@@ -538,7 +538,7 @@ class TrainingService:
                 reason=gate["reason"],
             )
         # SPEC §5.4: metrics are loss and preference alignment rate. The loss
-        # is the one the loop produced or there is none — there is no
+        # is the one the loop produced or there is none - there is no
         # fallback, because `1/(1+len(dataset))` reported that a run went well
         # because its dataset was large. A trained run always has one: the
         # loop appends a step per batch, and a run with no batches is skipped
@@ -709,8 +709,8 @@ class TrainingService:
         # per-user adapter their own feedback had just created.
         #
         # `user_id` is optional on this method and nothing in the product
-        # omits it. When it is omitted the store's answer stays what it was —
-        # the public set — rather than becoming an error or everything.
+        # omits it. When it is omitted the store's answer stays what it was -
+        # the public set - rather than becoming an error or everything.
         subject = self.store.get_user(user_id) if user_id else None
         adapter_candidates = list(
             self.store.list_artifacts(  # type: ignore[arg-type]
@@ -1015,8 +1015,8 @@ class TrainingService:
     def terminal_status(trace: Optional[dict], gate: Optional[dict]) -> str:
         """What a finished job should say happened. One rule, one place.
 
-        `skipped` did not train — no JAX, no base checkpoint, no tokenizer,
-        no LoRA matrices, no batches — so it has no loss to report and cannot
+        `skipped` did not train - no JAX, no base checkpoint, no tokenizer,
+        no LoRA matrices, no batches - so it has no loss to report and cannot
         have been turned down by an eval it never reached. `gate_rejected`
         trained and failed the holdout. `succeeded` trained and was promoted.
 
@@ -1092,7 +1092,7 @@ class TrainingService:
             # it is resolved from the store rather than searched for inside a
             # fetch window. Asking for the newest 200 messages and looking for
             # the target among them silently disabled the bound for any older
-            # event — the target simply was not in the window, and every later
+            # event - the target simply was not in the window, and every later
             # turn became training context.
             target_message = self.store.get_message(event.message_id or "")
             if target_message is None:
@@ -1114,7 +1114,7 @@ class TrainingService:
             )
             # Same placement rule serving uses (local_format.place_context):
             # appending the context after every message put it *after* the
-            # question at training time and *before* it at serving time —
+            # question at training time and *before* it at serving time -
             # one marker, two token orders, which is two inputs.
             turns = [
                 {"role": msg.role, "content": msg.content} for msg in messages
@@ -1165,7 +1165,7 @@ class TrainingService:
             """Tokens for one span. ``continuation`` suppresses special tokens.
 
             The target continues the prompt inside one sequence, so encoding
-            it with specials would splice a second BOS into the middle —
+            it with specials would splice a second BOS into the middle -
             training the model on a sequence shape it never sees at serving
             time.
 
@@ -1211,7 +1211,7 @@ class TrainingService:
                 budget = max_length + 1
                 # Target first: it is the supervised span, so it claims its
                 # room before the prompt gets any. An empty target is dropped,
-                # not padded to [0] — a zero there is not "no supervision", it
+                # not padded to [0] - a zero there is not "no supervision", it
                 # is supervision teaching the model to emit token 0, and it
                 # carries positive mask weight so no later check can catch it.
                 target_tokens = _encode(
@@ -1287,7 +1287,7 @@ class TrainingService:
         explicit = adapter_schema.get("fs_dir")
         # The same identity binding serving uses (§5.5). Containment alone let
         # an explicit root name *another* adapter's directory, and on this
-        # side that writes A's new version into B's tree — where serving would
+        # side that writes A's new version into B's tree - where serving would
         # then find it under B's own id, with B's promotion authorizing it.
         return adapter_root(Path(self.fs_root), adapter_id, explicit)
 
@@ -1316,7 +1316,7 @@ class TrainingService:
             # authority and has already been written by the time this runs.
             # Re-raising meant a failed symlink aborted the run *after* the
             # adapter was promoted, so the gate decision §5.4.6 requires for
-            # audit was never recorded — and on the worker path the job then
+            # audit was never recorded - and on the worker path the job then
             # retried against weights that were already authoritative.
             logger.warning(
                 "update_latest_symlink_failed",
@@ -1362,7 +1362,7 @@ class TrainingService:
         Three things here are load-bearing:
 
         * **Shapes come from the checkpoint.** `A ∈ ℝ^{r × d_in}` and
-          `B ∈ ℝ^{d_out × r}` where the projection decides d_in/d_out — k and
+          `B ∈ ℝ^{d_out × r}` where the projection decides d_in/d_out - k and
           v are narrower than q under grouped-query attention. Sizing both
           from a made-up hidden width produced matrices that fit no model.
         * **B starts at zero.** `B @ A` is then exactly zero, so a freshly
@@ -1422,7 +1422,7 @@ class TrainingService:
         The loop mirrors the lightweight JAX forward pass used by the
         ``LocalJaxLoRABackend``: the frozen base checkpoint is loaded once,
         the LoRA matrices are applied inside its attention projections, and
-        the gradient is taken with respect to those matrices alone — the base
+        the gradient is taken with respect to those matrices alone - the base
         parameters are closed over, never differentiated, so "only on
         adapters, never on the base model" is structural rather than a
         promise. Gradients are accumulated across ``accumulation_steps``
@@ -1431,7 +1431,7 @@ class TrainingService:
         """
         # Before anything else, because "no batches" is not a JAX question.
         # The loop below is `for batch in batches`, so an empty list took zero
-        # optimizer steps and still returned `ok` with `steps: []` — a run the
+        # optimizer steps and still returned `ok` with `steps: []` - a run the
         # gate then judged on an eval it had never moved.
         if not batches:
             return {"status": "skipped", "reason": "no training batches"}
@@ -1448,7 +1448,7 @@ class TrainingService:
 
         # SPEC §5.4.4: the loss is over `model_apply(params_base, lora_params,
         # inputs)`. Without a base model there is no such loss to compute, so
-        # the run is *skipped* — and §5.4.6 makes a skipped run unpromotable,
+        # the run is *skipped* - and §5.4.6 makes a skipped run unpromotable,
         # which leaves the adapter on the prompt rung. Training something
         # else and calling it a success is the failure this branch prevents.
         checkpoint = self._base_checkpoint()
@@ -1468,7 +1468,7 @@ class TrainingService:
             # Gradients through the real transformer are worth nothing if the
             # text reached it through an invented token space: the adapter
             # would be fitted to ids that serving never produces, and the
-            # holdout — tokenized the same wrong way — would happily agree.
+            # holdout - tokenized the same wrong way - would happily agree.
             # "Train against the model that will serve it" includes its
             # tokenizer.
             logger.warning(
@@ -1486,14 +1486,14 @@ class TrainingService:
 
         # A token the model has no embedding for means the tokenizer and the
         # checkpoint disagree. Clipping it to vocab_size-1 would train on a
-        # token nobody wrote — the mismatch has to be refused, the same way a
+        # token nobody wrote - the mismatch has to be refused, the same way a
         # missing checkpoint tensor is.
         for batch in list(batches) + list(eval_batches):
             for key in ("input_ids", "labels"):
                 for sequence in batch.get(key) or []:
                     # Both ends of [0, vocab_size), symmetrically with
                     # serving: a negative id is as far outside the vocabulary
-                    # as an oversized one, and it does not even fail loudly —
+                    # as an oversized one, and it does not even fail loudly -
                     # array indexing reads it from the end of the table, so
                     # training would fit the adapter to a token nobody wrote.
                     if sequence and (min(sequence) < 0 or max(sequence) >= vocab_size):
@@ -1509,7 +1509,7 @@ class TrainingService:
                         }
 
         # SPEC §5.2: any malformed or foreign name refuses the whole adapter.
-        # Training skips rather than raises — a skipped run cannot promote, so
+        # Training skips rather than raises - a skipped run cannot promote, so
         # the adapter waits on the prompt rung (§5.4.6).
         try:
             transformer.validate_lora_weights(config, params)
@@ -1542,7 +1542,7 @@ class TrainingService:
             Including α here made the "constant" comment above a lie: Optax
             updated it (the L2 term alone gives it a gradient), so the eval
             ran with the original α while the file written afterwards carried
-            the modified one — passing a gate under one model and serving
+            the modified one - passing a gate under one model and serving
             another.
             """
             return {
@@ -1600,8 +1600,8 @@ class TrainingService:
             """Holdout cross-entropy, without the regularizer.
 
             The gate asks whether predictions improved. Including the L2 term
-            would let a shrinking weight norm register as progress, and — since
-            B starts at zero and can only grow — it would count honest learning
+            would let a shrinking weight norm register as progress, and - since
+            B starts at zero and can only grow - it would count honest learning
             as a penalty against promotion.
             """
             if not eval_batches:

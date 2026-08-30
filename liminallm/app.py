@@ -160,7 +160,7 @@ _DEFAULT_ORIGINS = [
 def _cors_policy() -> tuple:
     """The origins and credentials flag currently in force.
 
-    Prefers the running instance's settings — which carry what an admin saved —
+    Prefers the running instance's settings - which carry what an admin saved -
     and falls back to the environment before the runtime exists (import time,
     and tests that construct the app directly).
     """
@@ -184,7 +184,7 @@ class DynamicCORSMiddleware:
     CORSMiddleware fixes its origins at construction, which used to mean the
     allowlist was whatever the environment said when the process started.
     Origins are an admin-managed setting now, so this re-reads the policy per
-    request and rebuilds the inner middleware only when it actually differs —
+    request and rebuilds the inner middleware only when it actually differs -
     reusing Starlette's implementation rather than reimplementing CORS, which
     is not a thing to get subtly wrong.
     """
@@ -401,8 +401,8 @@ async def serve_chat() -> FileResponse:
 
 
 # Public share pages (SPEC §18): read-only views of conversations the owner
-# explicitly published. The directory and pages are noindex by default — both
-# via X-Robots-Tag here and robots.txt below — so shared chats don't end up
+# explicitly published. The directory and pages are noindex by default - both
+# via X-Robots-Tag here and robots.txt below - so shared chats don't end up
 # in search engines unless that policy is deliberately changed.
 _SHARE_NOINDEX = {"X-Robots-Tag": "noindex, nofollow"}
 
@@ -438,7 +438,7 @@ async def serve_robots() -> Response:
 # The admin page carries its own sign-in form and every API it calls enforces
 # the admin role server-side. Requiring admin auth to serve the static HTML
 # made the page unreachable: browser navigation sends no Authorization header,
-# so this route always returned 403 — including to admins.
+# so this route always returned 403 - including to admins.
 @app.get("/admin", response_class=FileResponse)
 async def serve_admin() -> FileResponse:
     if not STATIC_DIR.exists():
@@ -496,7 +496,7 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
     Returns (checks, serving_ok, fully_healthy).
 
     ``serving_ok`` covers only what a replica needs in order to answer
-    requests — the database and the filesystem. Redis is deliberately excluded:
+    requests - the database and the filesystem. Redis is deliberately excluded:
     it is an optional accelerator (rate limits, idempotency, caches all fall
     back), so a Redis outage must not make every replica fail its readiness
     probe and drain the entire fleet. It still shows up as degraded in the body
@@ -525,7 +525,7 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
     if not checks.get("database"):
         checks["database"] = {"status": "healthy" if db_ok else "unhealthy"}
 
-    # Redis check (if configured). Never gates serving — see the docstring.
+    # Redis check (if configured). Never gates serving - see the docstring.
     redis_ok = True
     if runtime.cache is not None:
         redis_ok = await _run_bounded("redis", runtime.cache.verify_connection)
@@ -541,7 +541,7 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
             raise FileNotFoundError(fs_path)
         # Unique name per probe: SHARED_FS_ROOT is shared across replicas,
         # and concurrent probes racing on one fixed filename made read_text
-        # hit another probe's unlink — a spurious 503 that drained healthy
+        # hit another probe's unlink - a spurious 503 that drained healthy
         # replicas.
         health_file = fs_path / f".health_check-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         try:
@@ -593,7 +593,7 @@ async def readiness() -> Response:
 
     /healthz always returns 200 by design, which means an LB checking it can
     never drain a broken replica. This one answers with a status code, and only
-    fails on the dependencies that actually stop the replica from working —
+    fails on the dependencies that actually stop the replica from working -
     a Redis outage reports as degraded but stays ready, since every Redis-backed
     feature has a fallback.
     """
@@ -816,7 +816,7 @@ async def _run_cleanup_pass(runtime, shared_root: Path, max_age_hours: int) -> N
     Extracted from the loop so a test can execute the real thing once. A sweep
     that exists but is called by nothing is a disk leak with documentation:
     artifact payload reclamation was added and wired to neither this loop nor
-    anything else, so a deleted artifact's bytes stayed on disk forever — safe
+    anything else, so a deleted artifact's bytes stayed on disk forever - safe
     from use-after-delete only because nothing ever collected them.
     """
     from liminallm.service.artifacts import sweep_artifact_payloads

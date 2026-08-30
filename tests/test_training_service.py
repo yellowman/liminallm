@@ -78,7 +78,7 @@ class TestAJobSaysWhatActuallyHappened:
     "training did not run".
 
     The job was then written `succeeded` anyway, carrying
-    `1.0 / (1 + len(dataset_entries))` — a number no training produced. The
+    `1.0 / (1 + len(dataset_entries))` - a number no training produced. The
     worker overwrote it afterwards to `gate_rejected`, which its own comment
     defines as "a run that trained but failed the eval gate". So a run that
     never trained passed through a `succeeded` another replica could read,
@@ -192,7 +192,7 @@ class TestAJobSaysWhatActuallyHappened:
         """Zero optimizer updates is not a training run that went well.
 
         The loop is `for batch in batches`, so an empty list ran nothing and
-        still returned `ok` with `steps: []` — which the gate then judged on
+        still returned `ok` with `steps: []` - which the gate then judged on
         an eval it never moved.
         """
         store = get_test_store()
@@ -247,7 +247,7 @@ class TestAJobSaysWhatActuallyHappened:
 
         `TrainingService` writes `new_version` when the gate promotes, and the
         result it returns names the directory rather than the number. The
-        worker therefore leaves that column alone — which under
+        worker therefore leaves that column alone - which under
         "None preserves" it did by passing `None`, and under "None is NULL" it
         does by not passing it at all. Measured: passing `None` here erased a
         promoted version and nothing in the suite noticed.

@@ -81,7 +81,7 @@ and `remote_model_id` / `remote_adapter_id` (for API passthrough):
 On an API backend:
 
 1. Prompt instructions are injected into the system message once, by the
-   service (SPEC §5.0.1 — one materializer).
+   service (SPEC §5.0.1 - one materializer).
 2. If the adapter has a remote ID and the provider supports it, the ID is
    also passed to the API.
 3. With no remote ID, or no provider support, only the prompt injection
@@ -97,7 +97,7 @@ suggestion lists, recorded here because they date quickly:
   claude-opus-4-5, claude-sonnet-4, glm-4-plus.
 - `model_backend`: openai, anthropic, azure, azure_openai, vertex, gemini,
   google, bedrock, together, together.ai, lorax, adapter_server, sagemaker,
-  aws_sagemaker, zhipu, zhipu.ai, glm, stub — plus the local pair
+  aws_sagemaker, zhipu, zhipu.ai, glm, stub - plus the local pair
   local_lora / local_gpu_lora and the native `gemini_native`.
 - `embedding_model_id`: text-embedding, text-embedding-3-small,
   text-embedding-3-large, text-embedding-ada-002.

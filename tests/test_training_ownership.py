@@ -2,7 +2,7 @@
 
 Before this split, deciding an adapter had stopped earning its keep, turning a
 training loss into a router score, and re-embedding stale note vectors all
-lived in TrainingWorker — reachable only by constructing a worker and waiting
+lived in TrainingWorker - reachable only by constructing a worker and waiting
 for a tick. These exercise them directly.
 """
 

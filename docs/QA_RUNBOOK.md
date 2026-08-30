@@ -25,7 +25,7 @@ make qa
 
 The test suite starts its own throwaway cluster from the installed Postgres
 binaries, so no database needs to be running for `pytest`. A server you drive
-by hand needs a real one — see Step 3.
+by hand needs a real one - see Step 3.
 
 ### Docker Testing
 
@@ -127,7 +127,7 @@ curl -s -X POST "$BASE_URL/v1/chat" \
 
 ### Step 5: Run against a specific database (optional)
 
-Step 2 already exercises real Postgres — the suite starts its own cluster. Use
+Step 2 already exercises real Postgres - the suite starts its own cluster. Use
 this only to test against a particular server (a Docker container, a staging
 database, a different Postgres version):
 
@@ -339,7 +339,7 @@ idempotency, the session cache and the concurrency slots are all on their
 fallback path.
 
 `redis_url` is a managed setting. It has no environment variable of its own,
-so a `REDIS_URL` entry in the compose file configures nothing — it is seeded
+so a `REDIS_URL` entry in the compose file configures nothing - it is seeded
 through `INSTANCE_SETTINGS_JSON` instead, which
 `docker-compose.test.yml` now does for both `app` and `bootstrap`.
 

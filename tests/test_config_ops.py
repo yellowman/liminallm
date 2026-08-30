@@ -162,8 +162,8 @@ def test_the_original_schema_is_not_mutated(ops):
 def test_a_missing_intermediate_is_refused(ops):
     """Patch traversal names a place in the document; it does not build one.
 
-    This asserted the opposite — `add /a/b/c` on `{}` producing the whole
-    chain — and that creating walk is what let a ConfigOps patch address a
+    This asserted the opposite - `add /a/b/c` on `{}` producing the whole
+    chain - and that creating walk is what let a ConfigOps patch address a
     path the schema did not have, report `applied`, write a version, and
     leave the configuration serving consumes untouched
     (tests/test_patch_write_locations.py).
@@ -246,7 +246,7 @@ def test_an_op_missing_its_parts_is_refused(ops, op):
 def test_a_path_through_a_scalar_is_a_bad_request(ops, schema, path):
     """It used to raise a bare TypeError, which the API turned into a 500.
 
-    The patch body is model-authored, so this shape arrives routinely — and an
+    The patch body is model-authored, so this shape arrives routinely - and an
     admin reviewing a proposal deserves to be told which path is wrong rather
     than getting an opaque internal error.
     """
@@ -257,7 +257,7 @@ def test_a_path_through_a_scalar_is_a_bad_request(ops, schema, path):
 def test_the_whole_document_pointer_is_a_bad_request(ops):
     """RFC 6901 §5: the *empty* pointer is the whole document, not `/`.
 
-    This test used to assert the opposite — that `/` was the document root —
+    This test used to assert the opposite - that `/` was the document root -
     and the engine agreed with it. Both were wrong: `/` is one empty
     reference token, naming the member keyed "". The pointer that addresses
     the whole document is "", and it used to be ignored in silence, which is
@@ -287,7 +287,7 @@ def test_a_huge_list_index_is_refused(ops):
     becomes a memory exhaustion.
 
     The defence used to be a constant ceiling and is now the list's own
-    length, so the complaint is "out of range" rather than "too large" — and
+    length, so the complaint is "out of range" rather than "too large" - and
     it arrives before anything is allocated either way.
     """
     with pytest.raises(BadRequestError, match="out of range"):
@@ -316,7 +316,7 @@ def test_a_failing_op_abandons_the_whole_patch(ops):
 
 def test_a_non_numeric_list_index_is_refused_not_skipped(ops):
     """This used to be silently dropped, which meant a patch op that did
-    nothing reported success — the admin approved a change that never
+    nothing reported success - the admin approved a change that never
     happened. The reviewer is told which path is wrong instead."""
     with pytest.raises(BadRequestError, match="list index"):
         ops._apply_patch_to_schema(
@@ -339,7 +339,7 @@ def test_a_large_schema_is_truncated_to_valid_json(ops):
     big = {f"key_{i}": "x" * 200 for i in range(50)}
     out = ops._safe_truncate_json(big, 2000)
     assert len(out) <= 2000
-    parsed = json.loads(out)  # must still parse — a prompt gets this verbatim
+    parsed = json.loads(out)  # must still parse - a prompt gets this verbatim
     assert parsed["_truncated"] is True
 
 
@@ -363,7 +363,7 @@ def test_a_routing_policy_can_be_created(store):
     """SPEC §6.1 / §8.1: routing lives in `policy` artifacts, not in code.
 
     The workflow engine already queried for them and §13.4 documents the type
-    on the list endpoint, but validate_artifact had no schema for it — so
+    on the list endpoint, but validate_artifact had no schema for it - so
     POST /v1/artifacts {type: "policy"} answered "unknown artifact type" and
     the data half of routing-as-data could not be written at all.
     """
@@ -447,14 +447,14 @@ class TestAnApprovedPatchCannotReopenARetiredFormat:
     """ConfigOps is a write path, so the door has to be on it.
 
     Pass C's validator refuses an adapter without `mode` and refuses the nine
-    retired spellings — but `apply_config_patch` persisted whatever schema the
+    retired spellings - but `apply_config_patch` persisted whatever schema the
     service handed it, so an approved, model-authored patch could remove
     `mode` or add `backend` and put the old format back. The runtime then read
     the missing mode as hybrid, which is precisely the compatibility this
     tranche deleted.
 
     Asserted on all four consequences, because "it raised" is not the
-    guarantee — the artifact, its history and the patch's own status must all
+    guarantee - the artifact, its history and the patch's own status must all
     be untouched.
     """
 
@@ -524,8 +524,8 @@ class TestValidationIsAnchoredToTheArtifactsOwnType:
 
     The boundary helper chose its validator from the *incoming* schema's
     `kind`, so a patch could change which rules it would be judged by. An
-    adapter row whose schema was rewritten as `kind: tool.spec` — with the
-    two fields the tool schema requires — passed the tool validator, and the
+    adapter row whose schema was rewritten as `kind: tool.spec` - with the
+    two fields the tool schema requires - passed the tool validator, and the
     row stayed `type='adapter'` because only `schema` is updated. The door was
     still there; the patch walked to a different one.
 

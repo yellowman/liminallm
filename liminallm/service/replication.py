@@ -415,7 +415,7 @@ class AdvisoryLock:
     Postgres session advisory locks when a database is configured; otherwise a
     process-local lock, which is the correct answer for a single-process
     deployment. Failure to reach Postgres yields the lock rather than blocking
-    the work forever — background maintenance running twice is cheaper than
+    the work forever - background maintenance running twice is cheaper than
     never running.
     """
 

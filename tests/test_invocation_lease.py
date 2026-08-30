@@ -1,7 +1,7 @@
 """A tool call is a process the kernel can kill, and these are the proofs.
 
 `_invoke_tool` used to submit the handler to a `ThreadPoolExecutor` and await
-it with `asyncio.wait_for`. On timeout it called `future.cancel()` — which
+it with `asyncio.wait_for`. On timeout it called `future.cancel()` - which
 returns `False` for anything already running, because a `concurrent.futures`
 future can only cancel work that has not started. The engine returned "tool
 timed out" to the workflow, and the thread ran on with `user_id` and
@@ -12,7 +12,7 @@ Tranche 1b.1 replaced that with what SPEC §18 always said: a spawned worker
 process per attempt, a parent-owned broker serving every effect, and a ledger
 keyed by the logical execution. The four properties below are its closure
 conditions, and each one was false before in a way no assertion about return
-values could see — the work carried on in a thread nobody was waiting for.
+values could see - the work carried on in a thread nobody was waiting for.
 
 So most of these tests assert on processes and on files: whether a request went
 out, whether a child was started, whether a tree is gone. That is the only
@@ -106,7 +106,7 @@ class TestNoRetryBeforeThePriorTreeIsDead:
 
     This is the condition the old `_reap` could not meet. It waited
     `REAP_GRACE_SECONDS` and returned, so a handler outliving the grace was
-    still running when the next attempt began — and a thread cannot be killed,
+    still running when the next attempt began - and a thread cannot be killed,
     so bounded reaping was the best a thread worker could do.
     """
 
@@ -299,7 +299,7 @@ class TestARevokedInvocationLaunchesNoSandboxChild:
         A sandbox child is the *parent's* child, not the worker's, so killing
         the worker never reaches it: it has to be registered as it starts. And
         it has to be *un*registered once reaped, because a pid outlives the
-        process only as a number and the kernel reuses numbers — a registration
+        process only as a number and the kernel reuses numbers - a registration
         left behind is a standing licence to SIGKILL whoever gets it next,
         redeemed at teardown.
         """
@@ -503,7 +503,7 @@ class TestTwoIdsBecauseTheyAnswerDifferentQuestions:
     def test_a_revoke_landing_before_the_first_spawn_is_not_forgotten(self):
         """There is no attempt to scope it to, so it refuses the execution.
 
-        The other reading — scope it to the attempt that has not started yet —
+        The other reading - scope it to the attempt that has not started yet -
         loses the revocation entirely, which is the failure this whole tranche
         is about.
         """
@@ -599,7 +599,7 @@ class TestTheOperationLedger:
 class TestWithdrawalIsEnforcedAtTheCapability:
     """§21.1 says the refusal happens at the capability, and it has to.
 
-    The agent loop reaches `_execute_agent_tool`, which checks taint — but that
+    The agent loop reaches `_execute_agent_tool`, which checks taint - but that
     is the *worker* following the intended protocol. The worker is the
     untrusted side of this boundary by construction, so a compromised one can
     skip `tools.round` and ask the broker for `web.fetch` directly. The check
@@ -721,7 +721,7 @@ class TestPublicationHappensOnce:
 
         A retry runs the model's code again. The same code writing
         `result.csv` from a different branch produces the same *name* over
-        different *content* — and replaying on the name alone would leave
+        different *content* - and replaying on the name alone would leave
         attempt one's file in the user's area while attempt two's answer
         describes what it computed, with nothing reporting the disagreement.
         """
@@ -780,7 +780,7 @@ class TestTheRequestLedgerRecordsWhatLanded:
     """`commit_guard` wraps the write, not the handler.
 
     The idempotency slot already records that a request was entered. What it
-    cannot say is which of that request's mutations landed — an upload writes
+    cannot say is which of that request's mutations landed - an upload writes
     bytes and then ingests them, and those are two facts.
     """
 
@@ -936,7 +936,7 @@ class TestTheWorkerIsActuallyConfined:
     #: child. Named secrets are a weaker check than they look: the scrubbing
     #: assertion below is only meaningful for a variable the parent actually
     #: had, and two of the three it used to name were not set by this suite at
-    #: all — `REDIS_URL` never was, and `JWT_SECRET` stopped being when the
+    #: all - `REDIS_URL` never was, and `JWT_SECRET` stopped being when the
     #: dead exports went. A sentinel cannot go quietly vacuous that way.
     _SENTINEL_ENV = "LIMINALLM_CONFINEMENT_SENTINEL"
 
@@ -1022,7 +1022,7 @@ class TestTheWorkerIsActuallyConfined:
         Run in-process against a real pipe: a spawned child cannot see a
         monkeypatch, and the property under test is the ordering inside
         `_worker_main`, not the spawn. A wall-clock kill is not a substitute
-        for an address-space cap — it stops a slow worker, not one that
+        for an address-space cap - it stops a slow worker, not one that
         allocates 40GB in a second.
 
         The send half is a real connection, so the frames asserted on are the
@@ -1074,7 +1074,7 @@ class TestTheWorkerIsActuallyConfined:
 class TestTheGroupKillCannotReachTheServer:
     """`os.setsid()` happens in the child, after `start()` returns.
 
-    Until it has, `os.getpgid(child)` answers with the *parent's* group — so a
+    Until it has, `os.getpgid(child)` answers with the *parent's* group - so a
     `killpg` aimed at the worker would SIGKILL the API server and everything
     sharing its group. Measured, not reasoned about.
     """
@@ -1149,7 +1149,7 @@ def _slow_setsid_child(conn):
 def _resolves_to(monkeypatch, engine, name, spec):
     """Make `name` resolve to `spec` for this test.
 
-    These tests exercise the invocation lease — spawn, kill, reap, retry —
+    These tests exercise the invocation lease - spawn, kill, reap, retry -
     with bodies that deliberately do not exist, so a real `tool.spec`
     artifact would be refused for naming a handler nothing runs. That
     refusal is correct; it is simply not what is under test here, so
@@ -1217,7 +1217,7 @@ class TestTheWorkerCarriesNoAuthority:
     def test_the_worker_module_imports_no_store_or_model(self):
         """The child's import graph is the cost of every spawn, and its blast
         radius. A worker that imported the service layer would pay for httpx,
-        psycopg and the model clients on every tool call — and would hold the
+        psycopg and the model clients on every tool call - and would hold the
         handles this design exists to keep away from it."""
         from pathlib import Path
 
@@ -1285,7 +1285,7 @@ class TestTheWorkerCarriesNoAuthority:
 
         The spec is passed rather than looked up: every caller resolves the
         descriptor first, and the process registry is no longer a resolution
-        source — it once answered for artifacts that had been deleted.
+        source - it once answered for artifacts that had been deleted.
         """
         engine = runtime.workflow
         assert engine._resolve_worker_tool(
@@ -1318,7 +1318,7 @@ class TestTheWorkerCarriesNoAuthority:
 class TestTheRoundKeepsItsLeaseAndItsOrder:
     """`_run_round_tools` opens a nested `ThreadPoolExecutor` for read-only
     rounds. Both the egress guard and the bound invocation are thread-local, so
-    both must be re-applied inside every pool worker — an unbound thread reads
+    both must be re-applied inside every pool worker - an unbound thread reads
     as the API path and passes every check."""
 
     def test_a_parallel_round_still_holds_the_lease(self, runtime, caller):
@@ -1480,8 +1480,8 @@ class TestReapingIsConfirmedNotAssumed:
     """§18: "reaping is confirmed rather than bounded: a tree that will not
     die fails the node instead of running alongside its successor."
 
-    `Invocation.terminate()` implements exactly that — kill, re-check, refuse
-    at the deadline — and the retry honours its answer. `_serve_invocation`
+    `Invocation.terminate()` implements exactly that - kill, re-check, refuse
+    at the deadline - and the retry honours its answer. `_serve_invocation`
     used to walk around it. The handle joined with a bounded wait and had no
     postcondition, and the registration was dropped whether or not that join
     reaped anything, so the machinery that refuses an unreaped retry had its
@@ -1509,7 +1509,7 @@ class TestReapingIsConfirmedNotAssumed:
     def test_a_draining_tree_is_confirmed_once_it_has_drained(self, runtime):
         """The ordinary case, so the fix cannot be "always refuse".
 
-        The handle does not wait for the group to empty — measured, a group
+        The handle does not wait for the group to empty - measured, a group
         outlives its reaped leader by about a second, which is too much to
         spend on every tool call. It reports, keeps the registration, and
         `Invocation.terminate()` polls to its own deadline. What must not
@@ -1534,7 +1534,7 @@ class TestReapingIsConfirmedNotAssumed:
         `join(timeout)` returns whether or not it reaped anything, so "we
         called join" is not "the process is gone". Checked here with the group
         question out of the way, because otherwise the group answer alone
-        carries the test and this half goes unasserted — which is exactly what
+        carries the test and this half goes unasserted - which is exactly what
         a mutation showed.
         """
         scratch = tmp_path / "scratch"
@@ -1560,7 +1560,7 @@ class TestReapingIsConfirmedNotAssumed:
         """A group that outlives its leader is a tree that is not gone.
 
         The leader can be joined while the group still holds members, so
-        "joined" is not the question — SPEC asks whether anything is left.
+        "joined" is not the question - SPEC asks whether anything is left.
         """
         from liminallm.service import invocation as invocation_module
 
@@ -1592,7 +1592,7 @@ class TestReapingIsConfirmedNotAssumed:
         from tests import hostile_child
 
         engine = runtime.workflow
-        # A body that *fails* — a retry is what the refusal has to stop, and
+        # A body that *fails* - a retry is what the refusal has to stop, and
         # nothing retries a node that succeeded.
         tool = hostile_child.FAILING_WORKER_BODY_TOOL
         _resolves_to(monkeypatch, engine, tool, {"name": tool})
@@ -1647,7 +1647,7 @@ class TestAReapedLeaderStopsBeingAHandle:
     """§18: "a reaped pid is released ... a registration left behind after a
     child is reaped is a standing licence to signal whoever inherits it."
 
-    Retaining the registration while the group drains is right — the retry has
+    Retaining the registration while the group drains is right - the retry has
     to wait for something. What is not right is retaining it as a *pid*. Once
     the leader has been positively reaped that number names nothing, and the
     kernel is free to give it to an unrelated process; `_pid_alive` would then
@@ -1701,7 +1701,7 @@ class TestAReapedLeaderStopsBeingAHandle:
             # From here the leader pid is a number the kernel may reissue, so
             # the kernel is made to answer as it would once it has: the pid
             # exists, and it is in somebody else's process group. That is the
-            # state `_kill` mishandles — the group branch declines and the
+            # state `_kill` mishandles - the group branch declines and the
             # `else` sends SIGKILL to whoever now holds the number.
             stranger_group = leader + 1
 
@@ -1744,7 +1744,7 @@ class TestAReapedLeaderStopsBeingAHandle:
 
         Once the group has drained the tree *is* gone, and the retry must be
         allowed to start. Reading the reaped number as a pid says otherwise
-        the moment the kernel reissues it, and the answer never changes back —
+        the moment the kernel reissues it, and the answer never changes back -
         so the node fails for as long as some unrelated process holds it.
         """
         from liminallm.service import invocation as invocation_module

@@ -6,8 +6,8 @@ path*. This one proves an ordinary turn chooses it.
 
 They are separable, and the gap between them was real: the selector asked for
 attachments or an enabled web tool and knew nothing about MCP, so the exact
-configuration an operator gets after publishing one server — tool-capable
-backend, web off, nothing attached — took the plain-chat workflow and never
+configuration an operator gets after publishing one server - tool-capable
+backend, web off, nothing attached - took the plain-chat workflow and never
 discovered anything.
 
 Driven through `run` and `run_streaming`, which are what the chat routes call.
@@ -114,7 +114,7 @@ class TestAnMCPOnlyTurnReachesTheToolAgent:
         """The selector must not send every turn through the agent.
 
         With nothing attached, web off and no server published, a plain chat
-        is the right answer — the agent path costs a worker process and a
+        is the right answer - the agent path costs a worker process and a
         round of tool offers for nothing.
         """
         selected = engine._turn_needs_tools(_CONVERSATION, None)
@@ -157,7 +157,7 @@ class TestDiscoveryDoesNotHoldTheEventLoop:
     #: The instrument is the longest gap between heartbeat ticks, not the tick
     #: count. Counting ticks over the whole turn measures nothing: a turn does
     #: plenty of other awaiting, so the count reaches any threshold from the
-    #: parts that were never blocked — measured, the first version of these
+    #: parts that were never blocked - measured, the first version of these
     #: tests passed against the defect for exactly that reason. A gap is local
     #: to the stall and cannot be paid for elsewhere.
     TICK = 0.02

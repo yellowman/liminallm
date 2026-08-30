@@ -158,7 +158,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         self.invocations = InvocationRegistry()
         # A capability handler reaches its dependencies through the engine, so
         # the liveness check belongs on the engine's references to them rather
-        # than at each call site — a handler cannot forget what it never had to
+        # than at each call site - a handler cannot forget what it never had to
         # remember. Threads with nothing bound (every API request) pass
         # straight through. See service/invocation.py.
         self.store = LeasedProxy(store)
@@ -183,7 +183,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             total_timeout=settings.tool_fetch_timeout if settings else 30.0,
             # Tool handlers that call the model (every LLM tool) open sockets
             # inside the network guard. Without the provider host here, an
-            # empty TOOL_NETWORK_ALLOWLIST — the default — blocks the model
+            # empty TOOL_NETWORK_ALLOWLIST - the default - blocks the model
             # itself, not just tool fetches.
             infrastructure_hosts=self._model_provider_hosts(),
         )
@@ -191,9 +191,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
         self._shutdown = False
 
     # The tool-node control plane: what happens around a tool call, as
-    # opposed to the call itself. Three execution paths reach it — the
+    # opposed to the call itself. Three execution paths reach it - the
     # blocking executor, its circuit-open branch, and the streaming path that
-    # produces tokens without calling either — and each copy of a decision is
+    # produces tokens without calling either - and each copy of a decision is
     # a place for the paths to disagree about the same graph. They did.
 
     @staticmethod
@@ -211,7 +211,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         """Where a tool node goes next, given how the call finished.
 
         One place, because there were two. `on_error` replaces `next`
-        entirely when the call failed — and the circuit-open path had its own
+        entirely when the call failed - and the circuit-open path had its own
         copy that read `next` and never looked at `on_error`, so a graph
         declaring `tool -> recover` on failure ran `tool -> normal` whenever
         the breaker was open. A failure is a failure however it arose.
@@ -238,8 +238,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         directly: an open breaker did not stop a streamed LLM call at all,
         for the three tools every ordinary chat turn uses (SPEC §18).
 
-        `identity` is the *resolved* breaker identity — the artifact id, or
-        the builtin name when nothing is persisted behind it — never the
+        `identity` is the *resolved* breaker identity - the artifact id, or
+        the builtin name when nothing is persisted behind it - never the
         node's reference spelling. Two reachable specs that happen to share
         a spelling are different tools, and one failing must not cut the
         other off; conversely the implicit default spelling and the explicit
@@ -264,7 +264,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
     ) -> Tuple[Dict[str, Any], List[str]]:
         """A pre-invocation refusal as a node result.
 
-        With `on_error` declared, the refusal takes that edge — through the
+        With `on_error` declared, the refusal takes that edge - through the
         same chooser as every other tool failure, because an earlier shape
         read `next` directly and an open breaker took the success edge into
         nodes that assume outputs the failed node never produced. Without
@@ -295,20 +295,20 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
     ) -> Tuple[Optional[ToolDescriptor], Optional[str], Optional[Dict[str, Any]]]:
         """What one attempt runs under: `(descriptor, breaker identity,
-        refusal)` — the refusal ``None`` when the attempt may proceed.
+        refusal)` - the refusal ``None`` when the attempt may proceed.
 
         Called per attempt, never once per node, and complete: resolution,
         the admission preflight, then the breaker check, in that order on
         both transports. Current canonical state is consulted at execution,
         so a tool retired between attempts refuses the retry rather than
-        running from a captured descriptor — and *everything* the resolved
+        running from a captured descriptor - and *everything* the resolved
         spec must pass is decided against the attempt's own resolution:
         re-resolving without re-preflighting let a retry fall through to a
         privileged spec of the same name and run it on the retired spec's
         clean preflight, which is an authority bypass, not staleness. The
         breaker tripped by attempt N refuses attempt N+1 (SPEC §18.3).
         `tool_preflight` also runs inside `_invoke_tool` as the invocation
-        boundary's own backstop — the authority witnesses pin that; this
+        boundary's own backstop - the authority witnesses pin that; this
         call is what makes the decision per-attempt and pre-breaker.
 
         The store work runs off-loop so the driver's deadline around
@@ -343,8 +343,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         The second half of attempt preparation, and the whole of it for the
         direct endpoint, which is bound to an authorized row and has no name
-        to resolve. One admission order everywhere — the preflight first,
-        then the breaker — so an invalid input is reported as validation on
+        to resolve. One admission order everywhere - the preflight first,
+        then the breaker - so an invalid input is reported as validation on
         every seam rather than as circuit-open on one of them (SPEC §18.3).
         """
         refusal = await asyncio.to_thread(
@@ -504,7 +504,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         # Before the tasks are built, not while they run: a batch this run
         # cannot afford must not begin any of it. Each entry costs one,
-        # including a repeated node id — each occurrence is an execution.
+        # including a repeated node id - each occurrence is an execution.
         if not budget.reserve(len(node_ids)):
             self.logger.warning(
                 "workflow_fanout_refused",
@@ -541,7 +541,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     vars_scope=local_vars,
                     user_id=user_id,
                     tenant_id=tenant_id,
-                    # The workflow's namespace, not the runner's — this is a
+                    # The workflow's namespace, not the runner's - this is a
                     # second descent into node execution, and the easiest
                     # place to lose the scope the outer loop carries.
                     tool_scope=tool_scope,
@@ -589,7 +589,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 if content:
                     merged_content_parts.append(f"[{node_id}]\n{content}")
 
-                # Sum usage — via _merge_usage, which keeps every numeric
+                # Sum usage - via _merge_usage, which keeps every numeric
                 # key. A fixed key list here silently discarded the Responses
                 # API's reasoning_tokens and cached_tokens on parallel nodes.
                 usage = result.get("usage", {})
@@ -1027,8 +1027,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         lookup = str(node.get("tool") or "") or "llm.generic"
 
         # One id for this node execution, stable across its attempts. Each
-        # attempt gets its own worker — attempt two must not inherit attempt
-        # one's process — but the ledger is keyed by this, because killing
+        # attempt gets its own worker - attempt two must not inherit attempt
+        # one's process - but the ledger is keyed by this, because killing
         # attempt one does not recall what it already committed.
         invocation = self.invocations.open(
             uuid.uuid4().hex,
@@ -1044,8 +1044,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
             attempt, in the driver's loop: a node that spells no tool runs
             the default LLM tool; a reference that resolves to nothing, a
             spec this turn's inputs or caller may not pass, and an open
-            breaker — one opened by this node's own previous attempt
-            included — refuse the attempt before anything is spawned, and
+            breaker - one opened by this node's own previous attempt
+            included - refuse the attempt before anything is spawned, and
             the refusal retries nothing. The inputs are computed here and
             handed to the body, so the preflight judges exactly what the
             attempt executes with.
@@ -1120,7 +1120,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         whatever it was doing. Watching it cancels the execution the moment it
         fires: the worker's process tree comes down and every capability racing
         the flag is refused rather than started. The caller cancels the task it
-        gets back — an unattended watcher outlives the turn it belongs to.
+        gets back - an unattended watcher outlives the turn it belongs to.
         """
         if cancel_event is None:
             return None
@@ -1172,8 +1172,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         invocation: Invocation,
     ) -> BlockingNodeAttempt:
         """One blocking attempt over `_execute_node`, for either transport's
-        preparation: a streamed turn whose spec does not stream — or whose
-        backend has not proven it can be stopped — runs exactly the body the
+        preparation: a streamed turn whose spec does not stream - or whose
+        backend has not proven it can be stopped - runs exactly the body the
         blocking transport runs, under the same driver and ledger."""
         return BlockingNodeAttempt(
             partial(
@@ -1209,11 +1209,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
         The one recorder: the attempt driver calls it for both workflow
         transports, and the direct invocation seam calls it for
         `POST /v1/tools/{id}/invoke`. Tool-level failure increments;
-        tool-level success clears; an attempt that proved nothing — refused
-        before it started, or abandoned by its caller — writes nothing. One
+        tool-level success clears; an attempt that proved nothing - refused
+        before it started, or abandoned by its caller - writes nothing. One
         deliberate completion here: an attempt that *started* and then ended
         in a deadline or an escaped exception without a recorded outcome is
-        a failure — a backend hung past every node budget, or a serve that
+        a failure - a backend hung past every node budget, or a serve that
         died without reporting, would otherwise never record an outcome, and
         the breaker could not open for exactly the failure it exists to
         stop. Cancellation takes neither flag, so it still records nothing.
@@ -1263,7 +1263,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         Yields the attempt's stream events as they arrive, then exactly one
         `NodeOutcome`, last. A blocking attempt produces no events, so its loop
-        is this same code with the `async for` doing nothing — which is the
+        is this same code with the `async for` doing nothing - which is the
         point: the retry cap, the backoff, the three-way node deadline and the
         workflow deadline are SPEC §9.2 properties of the node, and a second
         copy of them beside the streaming path is a second chance to disagree.
@@ -1271,7 +1271,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         The breaker ledger is written here, once per attempt, from the
         observation the attempt carries (SPEC §18). Here and not in the
         attempt bodies, because the driver is the one place both transports
-        share and the one place that knows the attempt is over — however it
+        share and the one place that knows the attempt is over - however it
         ended.
         """
         last_error: Optional[Exception] = None
@@ -1321,7 +1321,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # The absolute deadline, fixed before preparation: preparation
             # is part of the attempt and spends its budget. Established
             # after it, a stalled resolution or breaker check handed the
-            # body a fresh clock past the node's own deadline — the same
+            # body a fresh clock past the node's own deadline - the same
             # class as blocking work starting after its budget was gone
             # (§18.3), one seam earlier. A preparation cut off here never
             # `started`, so it records nothing.
@@ -1361,8 +1361,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # authority resolved *now* (SPEC §18.3): a breaker tripped by
                 # the previous attempt refuses this one, and a tool retired
                 # between attempts is a refusal, not a captured descriptor. A
-                # factory may also be plain and synchronous — the direct
-                # attempt shapes in tests are — and a refusal comes back as
+                # factory may also be plain and synchronous - the direct
+                # attempt shapes in tests are - and a refusal comes back as
                 # the refusal result itself, terminal: retrying a refusal is
                 # just waiting.
                 prepared = make_attempt()
@@ -1386,7 +1386,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 attempt_observation = getattr(current, "breaker", None)
                 if attempt_observation is not None:
                     # The exact-authority token: whatever this attempt starts
-                    # — a worker spawn, a stream producer — must present this
+                    # - a worker spawn, a stream producer - must present this
                     # lease, so a stale thread waking after the retry began
                     # cannot join the retry's attempt (SPEC §18.3).
                     attempt_observation.attempt = lease
@@ -1395,7 +1395,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         emitted = True
                     yield event
                 # A blocking attempt runs its body inside `result()`, so the
-                # leftover deadline is its node timeout — and its `events()`
+                # leftover deadline is its node timeout - and its `events()`
                 # is empty, so the leftover is effectively the whole budget.
                 # A streamed attempt's outcome is already computed once its
                 # events have ended; when they consumed the entire budget
@@ -1409,7 +1409,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # collected after the clock has crossed zero. The first
                 # version awaited `result()` unbounded for every attempt
                 # type, and for a blocking attempt that is where the body
-                # starts — so a node whose budget was spent (`timeout_ms: 0`
+                # starts - so a node whose budget was spent (`timeout_ms: 0`
                 # is admissible) began its tool body after its deadline and
                 # ran it with no bound at all.
                 result_budget = deadline - asyncio.get_running_loop().time()
@@ -1479,7 +1479,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 )
 
             finally:
-                # On every way out of the attempt — success, timeout, failure.
+                # On every way out of the attempt - success, timeout, failure.
                 # The lease closes here so `_previous_attempt_is_dead` waits
                 # on a flag somebody actually sets; producer-thread death is
                 # confirmed separately, by `terminate` counting producers.
@@ -1490,7 +1490,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 if lease is not None and not lease.adopted:
                     invocation.end_attempt(lease)
                 # SPEC §18: exactly one breaker outcome per started attempt,
-                # on every way out — including the caller closing this
+                # on every way out - including the caller closing this
                 # generator, where an unset observation records nothing.
                 if current is not None:
                     await self._record_breaker_outcome(
@@ -1526,7 +1526,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
                 # Measured now, not before the attempt. `remaining_ms` above
                 # was read on the way in, and the attempt has been running
-                # since — a node that consumed nearly the whole budget would
+                # since - a node that consumed nearly the whole budget would
                 # otherwise still sleep a full backoff on top of it, and the
                 # workflow would return well after its deadline.
                 remaining_ms = workflow_timeout_ms - (
@@ -1592,7 +1592,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         working directory, its sandbox child and its half-written files. Here
         attempt two may not begin until attempt one has no process left and its
         parent-side serve loop has returned. Killing and reaping block, so they
-        happen in a thread — and the answer is honoured: a tree that will not
+        happen in a thread - and the answer is honoured: a tree that will not
         die stops the retry rather than being run alongside it.
         """
 
@@ -1680,7 +1680,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
     def history_budget(self) -> int:
         """Tokens of history kept verbatim: a share of the prompt budget.
 
-        Compaction keeps the window full of relevant information — on a
+        Compaction keeps the window full of relevant information - on a
         large-window model turns stay verbatim until the window pressures,
         on a small one digestion starts early. The share leaves room for
         system blocks, RAG snippets, attachments, and the new message.
@@ -1869,8 +1869,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         account was deleted restored the erased content for another hour. The
         owner is held for the write; see `PostgresStore.hold_live_user`.
 
-        `user_id` has no default. It may be None — a caller without one is not
-        a principal's turn, and there is no account lifetime to hold — but it
+        `user_id` has no default. It may be None - a caller without one is not
+        a principal's turn, and there is no account lifetime to hold - but it
         has to be passed, because a default is how a call site loses the guard
         without anyone noticing.
         """
@@ -1991,7 +1991,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         """Tool specs visible to everyone, resolved once per process.
 
         Unscoped `list_artifacts` returns global and shared artifacts only, so
-        nothing private lands here — and nothing private may be *added* here
+        nothing private lands here - and nothing private may be *added* here
         either: a caller's spec added here would make one user's private tool
         definition resolvable for every later request in the process. A
         private tool is resolved per request, through `_resolve_tool`.
@@ -2010,10 +2010,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
         The scope is the *workflow's*, never the runner's. This used to scan
         `list_artifacts` for the caller and take the first name match, so a
         shared workflow calling `foo` ran whichever `foo` the runner happened
-        to own — one published workflow, a different capability per person.
+        to own - one published workflow, a different capability per person.
 
-        Provenance comes from the persisted artifact row — `owner_user_id` and
-        the owner's role — never from fields inside `schema`, which is
+        Provenance comes from the persisted artifact row - `owner_user_id` and
+        the owner's role - never from fields inside `schema`, which is
         caller-authored data. A spec claiming `owner_user_id: <an admin>` is
         just a string someone typed.
 
@@ -2213,7 +2213,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # A ToolDescriptor keeps this invocation bound to the artifact the
         # caller was authorized for. Passing a bare schema and re-resolving by
         # name did not: artifact names carry no uniqueness constraint, so the
-        # route could authorize row A and the engine execute row B — including
+        # route could authorize row A and the engine execute row B - including
         # a B that declares `privileged: true` where A did not. Workflow nodes
         # still resolve by name, because a workflow refers to tools by name;
         # an invocation of a specific id stays bound to that id.
@@ -2232,8 +2232,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return {"status": "error", "content": "tool spec missing name"}
         # The same admission and the same ledger as every workflow attempt
         # (SPEC §18.3): preflight then breaker, through the shared admission
-        # — the endpoint is bound to one authorized row, so resolution is
-        # the one step it skips — and a started invocation records exactly
+        # - the endpoint is bound to one authorized row, so resolution is
+        # the one step it skips - and a started invocation records exactly
         # one outcome through the same recorder. Without the check, the
         # direct endpoint was an unmetered way to keep hammering a tool the
         # breaker had already cut off for every workflow of the tenant.
@@ -2288,8 +2288,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         two copies of it had already drifted from what the agent can actually
         offer: they asked about attachments and web, and a published MCP
         server made neither true. The exact configuration an operator gets
-        after publishing one — tool-capable backend, web off, nothing attached
-        — took the plain-chat workflow, so the server was never listed and its
+        after publishing one - tool-capable backend, web off, nothing attached
+        - took the plain-chat workflow, so the server was never listed and its
         tools never existed as far as the turn was concerned.
 
         Persisted state only, deliberately. `servers_for_turn` is a store
@@ -2360,7 +2360,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 candidate.update(art.schema)
             # Ownership travels with the adapter, because the path check that
             # enforces it lives in the backend and was reading fields nothing
-            # put here — it compared an owner it never had against the
+            # put here - it compared an owner it never had against the
             # requesting user, and passed. Set after the schema so a
             # user-authored `owner_user_id` cannot overwrite the artifact's.
             candidate["owner_user_id"] = art.owner_user_id
@@ -2409,7 +2409,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
         # SPEC §5.0.1: the gate activates before it modulates. A zero-gated
         # adapter is absent from the request, so it does not travel to the
-        # backend and does not appear in what the turn reports as applied —
+        # backend and does not appear in what the turn reports as applied -
         # that report is a claim about what shaped the answer. It stays in
         # `gates` and in the routing trace, which record a different fact:
         # the router considered it and assigned it zero.
@@ -2602,7 +2602,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # Off the event loop, for the reason the streaming path is: planning an
         # agent turn lists every configured MCP server, and that listing is a
         # blocking join on whichever thread it runs on. Measured before moving
-        # it — this already ran unbound, so a worker thread changes nothing
+        # it - this already ran unbound, so a worker thread changes nothing
         # about leasing.
         worker_tool, plan, context, preamble = await asyncio.to_thread(
             self._plan_invocation,
@@ -2620,7 +2620,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         limits = self._worker_limits(tool_spec)
         # The breaker observation is not marked here: `started` means the
         # worker actually started, and it is set inside `_serve_invocation`
-        # once the spawn has registered the child — not when this coroutine
+        # once the spawn has registered the child - not when this coroutine
         # schedules the serve into a thread pool it may never leave (SPEC
         # §18.3). The driver writes the ledger from the observation, once.
         try:
@@ -2660,7 +2660,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 invocation_id=invocation.invocation_id,
             )
             # The caller walked away; the tool was not proven unhealthy. No
-            # observation, so nothing is recorded — a cancel habit must not
+            # observation, so nothing is recorded - a cancel habit must not
             # open the tenant's breaker.
             return {
                 "status": "error",
@@ -2678,7 +2678,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         if observation is not None:
             # The raw result, before the postflight: what the *tool* did.
             # A consumer's `output_schema` refusing the node below does not
-            # change this — a healthy tool records a success (SPEC §18).
+            # change this - a healthy tool records a success (SPEC §18).
             observation.outcome = (
                 "failure"
                 if isinstance(result, dict) and result.get("status") == "error"
@@ -2702,7 +2702,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         failed. `(sanitized, None)` or `(sanitized, refusal)`.
 
         One function on both paths, fed the result in the shape the tool
-        produced — for `llm.generic`, `{content, usage, context_snippets}`.
+        produced - for `llm.generic`, `{content, usage, context_snippets}`.
         SPEC §9.2 validates the tool output, so no caller may validate a
         wrapper of its own instead: streaming validated a reconstruction with
         a `status` key the tool never emitted, and a strict schema written
@@ -2740,7 +2740,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
     ) -> Tuple[str, Dict[str, Any], InvocationContext, str]:
         """Everything the worker gets, and everything it does not.
 
-        The plan is plain data — inputs, messages, offered schemas, budgets.
+        The plan is plain data - inputs, messages, offered schemas, budgets.
         The context stays here: user, tenant, conversation, adapters and
         history never cross the pipe, so a worker has no field in which to name
         another tenant's data (§12.2).
@@ -2760,7 +2760,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return worker_tool, plan, context, ""
 
         # The agent loop's prompt is assembled here because assembling it reads
-        # attachments, the digest and the vault — none of which the worker can
+        # attachments, the digest and the vault - none of which the worker can
         # reach. What crosses is the finished message list.
         message = inputs.get("message") or user_message or ""
         attachments = self._conversation_attachments(conversation_id, user_id)
@@ -2807,7 +2807,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         The resolved row's `handler` decides, through the one function
         admission also asks. This checked `tool_name in BODY_NAMES` first, so
         a spec named `notes.search_v1` with handler `llm.generic` ran the
-        notes body — the reference's spelling beat the row that was resolved,
+        notes body - the reference's spelling beat the row that was resolved,
         and admission had approved the other one.
 
         A caller with no spec keeps the literal name, which is how a builtin
@@ -2832,13 +2832,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
     def _worker_scratch(self, invocation: Invocation) -> str:
         """Allocate the empty directory a worker is confined to.
 
-        The worker has no filesystem credentials to make one with — that is the
+        The worker has no filesystem credentials to make one with - that is the
         point of it. Node-local, like the interpreter's, and never under
         `shared_fs_root`.
 
         Allocation only: the caller (`tool_worker.spawn`) transfers the path to
         the invocation under its lock, once the exact attempt is revalidated,
-        so teardown removes it whether the attempt ended or was killed — and a
+        so teardown removes it whether the attempt ended or was killed - and a
         refused spawn deletes the directory itself. Registering it here would
         run the ownership transfer inside allocation's filesystem latency, and
         that latency is what a node deadline must be able to revoke through.
@@ -2875,7 +2875,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         def mark_started() -> None:
             # One attribute write, no-throw by construction: the spawn calls
             # this inside its locked registration, which is the atomic start
-            # point the breaker's `started` means (SPEC §18.3) — a worker
+            # point the breaker's `started` means (SPEC §18.3) - a worker
             # killed during the READY handshake died *started*, and a serve
             # that never spawned never was.
             if observation is not None:
@@ -2888,7 +2888,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             limits=limits,
             # A factory that allocates the scratch directory and returns it,
             # unregistered. The spawn calls it before taking the invocation
-            # lock — filesystem latency here cannot hold a revoke off — then
+            # lock - filesystem latency here cannot hold a revoke off - then
             # transfers ownership under the lock, or deletes it if the attempt
             # is stale.
             scratch=partial(self._worker_scratch, invocation),
@@ -2905,7 +2905,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         finally:
             # Only a confirmed teardown releases the registration. §18 makes a
             # tree that will not die fail the node rather than run beside its
-            # successor, and `Invocation.terminate()` is what enforces that —
+            # successor, and `Invocation.terminate()` is what enforces that -
             # forgetting the worker regardless would delete the evidence one
             # line before the retry consults it.
             if handle.terminate():
@@ -2939,8 +2939,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
     ) -> Dict[str, Any]:
         """Run a builtin whose body still belongs in the parent.
 
-        These bodies are broad reads of the store — prompt assembly, adapter
-        selection, RAG composition — with no model-chosen control flow in them.
+        These bodies are broad reads of the store - prompt assembly, adapter
+        selection, RAG composition - with no model-chosen control flow in them.
         Moving one across the pipe would contain nothing and would hand the
         worker a proxy for every method of the store, which is a worse boundary
         than none. The worker process, its rlimits, the ledger and the liveness
@@ -3042,8 +3042,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         The same validation and the same retriever `llm.generic` uses, because
         it is the same question: what has this user authorized this turn to
         read. The agent path only ever asked it of attachments, so selecting a
-        context and landing on that path — which any of web, an attachment or
-        a published MCP server is enough to do — selected nothing.
+        context and landing on that path - which any of web, an attachment or
+        a published MCP server is enough to do - selected nothing.
 
         The ids come back beside the snippets rather than folded into them:
         an empty retrieval is not an absent context, and `file_search` is
@@ -3209,7 +3209,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         Best-effort in the same sense the notes vault is: a turn must not fail
         because a third party is unreachable, and `discover` already isolates
         one server's failure from the others. The outer guard is for the step
-        before that — reading the artifacts at all.
+        before that - reading the artifacts at all.
 
         An installation with no `mcp.server` artifacts pays one indexed query
         and stops, which is the same price `note_search` pays for asking
@@ -3217,7 +3217,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         A backend that cannot call tools pays nothing at all. The planner
         discards the whole tool list in that case, and unlike the native
-        schemas — which are constants — discovering costs a round trip per
+        schemas - which are constants - discovering costs a round trip per
         configured server before being thrown away.
         """
         if not self.llm.supports_tools:
@@ -3251,7 +3251,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         The remote tools come back separately from their specs because the two
         halves go to different places: the specs are part of the plan the
-        worker reads, and the tools themselves must not be — see
+        worker reads, and the tools themselves must not be - see
         `InvocationContext.mcp_tools`.
 
         `explicit_context_ids` and `grounding` come from
@@ -3284,7 +3284,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             if web_cfg["provider"] not in ("", "none"):
                 tools.append(self.WEB_SEARCH_SCHEMA)
         # Offer history retrieval exactly when the digest is standing in for
-        # turns the model can no longer read — the summary says to call it.
+        # turns the model can no longer read - the summary says to call it.
         older_span, _ = compaction.split_history(
             list(history or []),
             keep_tokens=self.history_budget(),
@@ -3307,7 +3307,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "Cite the file or URL you took each fact from.",
         ]
         # A remote tool's result arrives in the same envelope a fetched page
-        # does, so it needs the same rule stated — otherwise the envelope
+        # does, so it needs the same rule stated - otherwise the envelope
         # appears in the context of a turn that was never told what it means.
         if web_cfg["enabled"] or mcp_tools:
             # Deliberately repeated here, in the web tool descriptions, and in
@@ -3336,7 +3336,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # above the ordinary prompt-budget rules. `_apply_prompt_budget` drops
         # context from the low-priority end before it touches history, so
         # appending grounding to `system_content` and passing `[]` here would
-        # make the selected chunks indivisible — evicting conversation turns
+        # make the selected chunks indivisible - evicting conversation turns
         # to keep them, and failing the whole turn once the system block alone
         # no longer fits.
         kept, history = self._apply_prompt_budget(
@@ -3387,7 +3387,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             invocation.check_live()
         # Capability withdrawal: a turn that read a possible injection loses
         # code execution and web access for the rest of it. See service/taint.py
-        # for why this is enforced here rather than asked of the model — and
+        # for why this is enforced here rather than asked of the model - and
         # note that "here" is the parent, which is the half the injected page
         # never reached.
         if taint.is_withdrawn(name, session):
@@ -3468,7 +3468,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
     #: Read-only tools: they neither record injection taint nor consult it, so
     #: one round's worth can run concurrently. Everything else runs strictly in
-    #: order — a web_fetch that records an injection finding must be able to
+    #: order - a web_fetch that records an injection finding must be able to
     #: withdraw run_python later in the same round, and that ordering only
     #: exists when the calls run one at a time.
     PARALLEL_SAFE_TOOLS = frozenset({"file_search", "history_search", "note_search"})
@@ -3496,7 +3496,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         serving thread does not follow work into a pool, and the socket
         allowlist PERMITS when no policy is set on the connecting thread. The
         invocation is thread-local for the same reason and is re-applied with
-        it, or a parallel round would run unbound — which `LeasedProxy` reads as
+        it, or a parallel round would run unbound - which `LeasedProxy` reads as
         the API path and waves through.
         """
 
@@ -3589,7 +3589,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # Asked about these ids, not about the first page of this user's
         # contexts. `list_contexts` pages at 100 rows in SQL, so authorizing
         # through it dropped a context the request had already validated by
-        # id once the account had a hundred newer ones — the turn succeeded
+        # id once the account had a hundred newer ones - the turn succeeded
         # with no grounding at all.
         #
         # The query also excludes conversations' implicit indexes, which enter
@@ -3725,7 +3725,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         reports includes the per-message wire overhead every chat format
         adds. Summing bare `count()` calls estimates low by a fixed amount
         per message, and `observe()` would then push the character factor up
-        to absorb it — correcting a per-message cost with a per-character
+        to absorb it - correcting a per-message cost with a per-character
         multiplier, which is only right at one history length.
         """
         observer = getattr(self.llm, "observe_usage", None)

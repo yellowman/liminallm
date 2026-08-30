@@ -1,6 +1,6 @@
 """Where a setting is allowed to come from.
 
-Env vars are for secrets and bootstrap — things needed before the database is
+Env vars are for secrets and bootstrap - things needed before the database is
 reachable, or that describe the machine rather than the install. Everything
 else lives in the database, where it is auditable, changeable without a
 restart, and identical across replicas.
@@ -28,7 +28,7 @@ def _matching_lines(pattern: str, *, skip: frozenset[str] = frozenset()) -> list
 
     Both callers below used to shell out to `ripgrep`. It is a binary no lane
     installs, so on the GitHub runner they raised `FileNotFoundError: 'rg'`
-    and passed on every developer machine that happened to have it — the
+    and passed on every developer machine that happened to have it - the
     undeclared-dependency shape again, one level out from a Python package.
 
     Python rather than `grep`, which would only move the problem: its regex
@@ -64,7 +64,7 @@ EXPECTED_ENV_SETTINGS = {
     # Where the data lives on this machine. Needed while the Postgres store
     # is being constructed, so a stored value could not take effect: the store
     # keeps the root it was built with while every service made afterwards
-    # uses the refreshed one — artifact payloads under one tree, file and
+    # uses the refreshed one - artifact payloads under one tree, file and
     # adapter authority under another.
     "shared_fs_root",
     # A property of the schema that was applied, not of the running app;
@@ -131,7 +131,7 @@ class TestOverlay:
         assert merged.extract_reader_plugins == ""
 
     def test_one_bad_value_does_not_discard_the_good_ones(self):
-        """A bad row must not make the instance unbootable — the admin UI that
+        """A bad row must not make the instance unbootable - the admin UI that
         would fix it is served by this process."""
         merged = apply_managed_settings(
             Settings(),
@@ -200,13 +200,13 @@ class TestARetiredSettingIsActuallyDead:
     """Deleting a field from the model must mean dead everywhere.
 
     `apply_managed_settings` already ignored unknown stored keys, so the
-    runtime's settings were safe — but the store handed the raw blob to
+    runtime's settings were safe - but the store handed the raw blob to
     everything else. A database written by an older build that once stored
     `rag_mode` then (a) counted as "an operator configured this instance" and
     refused a first-boot seed, and (b) echoed the deleted key from the admin
     settings API forever, because every write merged the raw blob back.
 
-    The filter is generic — keys not in SYSTEM_SETTINGS_DEFAULTS — so the next
+    The filter is generic - keys not in SYSTEM_SETTINGS_DEFAULTS - so the next
     deletion tranche gets this behaviour for free rather than per-field.
     """
 
@@ -263,7 +263,7 @@ def test_no_stray_env_var_reads_outside_config(monkeypatch):
     A direct getenv elsewhere is a setting that escaped the classification.
     """
     # A *read* is the escaped setting. The sandbox child clears and rewrites
-    # its own environment on the way into confinement — that is the opposite
+    # its own environment on the way into confinement - that is the opposite
     # move, and matching it here would push a security control into an
     # allowlist of exceptions.
     hits = _matching_lines(
@@ -300,7 +300,7 @@ def test_no_setting_default_is_restated_outside_config():
     True, and history_budget_fraction was clamped in code to bounds the field
     did not state.
     """
-    # getattr with a third argument — the fallback is the problem, not the
+    # getattr with a third argument - the fallback is the problem, not the
     # dynamic lookup.
     hits = _matching_lines(r"getattr\((self\.|runtime\.)?settings, [^)]+,")
     assert hits == [], "\n".join(hits)

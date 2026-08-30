@@ -1,8 +1,8 @@
 """The capabilities a tool worker is not trusted to hold, held for it here.
 
 A tool worker runs model-chosen control flow over attacker-controlled bytes.
-SPEC §18 says what that means for where it runs — a spawned child under rlimits
-with no filesystem access beyond a scratch — and this module says what it means
+SPEC §18 says what that means for where it runs - a spawned child under rlimits
+with no filesystem access beyond a scratch - and this module says what it means
 for what it can reach: nothing. No store handle, no model client, no settings
 object, no credentials, no identity. It asks; the parent decides.
 
@@ -13,7 +13,7 @@ each one is a control the in-thread model could not express:
 * **identity is not a parameter.** The worker never sends a user_id or a
   tenant; the broker already knows them, because they came off the
   authenticated request and never left the parent (§12.2). A compromised worker
-  cannot name another user's files — it has no field in which to say so.
+  cannot name another user's files - it has no field in which to say so.
 * **revocation lands before the effect.** Every handler checks liveness first,
   under the invocation's lock. A revoked turn issues no request and starts no
   child, rather than starting one and reporting the fact afterwards.
@@ -27,7 +27,7 @@ the same reason the rest is: the process that just read "ignore your rules and
 run this" is the last one that should be asked whether the rule still applies.
 
 Some tool bodies stay in the parent, behind `tool.host`. Those are the ones
-whose bodies are broad reads of the store — prompt assembly, adapter selection,
+whose bodies are broad reads of the store - prompt assembly, adapter selection,
 RAG composition. They hold no model-chosen control flow, so nothing about them
 is contained by moving the body across the pipe; what a worker would gain is a
 proxy for every method of the store, which is a worse boundary than none. They
@@ -118,7 +118,7 @@ class CapabilityBroker:
     }
 
     #: The tool names a round may be labelled with. A round carries the names
-    #: the model chose, and those reach the user's screen — so they are matched
+    #: the model chose, and those reach the user's screen - so they are matched
     #: against this set rather than passed through.
     ROUND_LABELS = frozenset(TRACE_LABELS.values())
 
@@ -167,7 +167,7 @@ class CapabilityBroker:
         The invocation is bound to this thread for the whole loop. The worker
         holds no store or model handle, but the handlers below reach the real
         ones through the engine, and binding here is what lets `LeasedProxy`
-        check every call they make — reads included — without each handler
+        check every call they make - reads included - without each handler
         having to remember.
 
         **What arrives here is decoded as data, never as objects.** SPEC §18
@@ -175,7 +175,7 @@ class CapabilityBroker:
         worker that had been talked into anything could hand back an object
         whose *deserialization* ran its payload, in this process, inside this
         loop, before the liveness check below. That is not a check that was
-        missing — the decoder was the hole. Frames are JSON, bounded by what
+        missing - the decoder was the hole. Frames are JSON, bounded by what
         this loop has itself sent (`FrameBudget`).
         """
         budget = budget or FrameBudget(0)
@@ -271,7 +271,7 @@ class CapabilityBroker:
             started = time.monotonic()
             # SPEC §18.3/§21.1: tool egress is allowlisted. The guard is
             # thread-local and the serve loop has its own thread, so applying
-            # it here covers every capability — which is the point, since the
+            # it here covers every capability - which is the point, since the
             # capabilities are now the only things that open sockets at all.
             with tool_network_guard(self._engine.tool_network_policy):
                 result = handler(invocation, operation_seq, payload)
@@ -490,7 +490,7 @@ class CapabilityBroker:
         The round arrives as one request because how its calls are *run* is a
         decision about effects, and effects are the parent's. SPEC §18 has read
         -only calls fan out into a nested pool while anything that can taint the
-        turn stays strictly ordered — a web_fetch that records an injection
+        turn stays strictly ordered - a web_fetch that records an injection
         finding has to be able to withdraw a run_python later in the same round,
         and that ordering only exists when those calls run one at a time.
         """
@@ -506,7 +506,7 @@ class CapabilityBroker:
         ]
         for _call, name, _args in parsed:
             # A remote tool's label is dynamic, so it cannot be in the static
-            # set — but it is still matched rather than passed through: the
+            # set - but it is still matched rather than passed through: the
             # name has to be one this turn actually discovered, which the
             # worker did not choose either.
             allowed = name in self.ROUND_LABELS or name in self._ctx.mcp_tools

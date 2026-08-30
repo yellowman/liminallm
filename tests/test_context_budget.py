@@ -289,7 +289,7 @@ def test_the_estimator_does_not_undercount_cjk():
     from liminallm.service.tokenizer_utils import estimate_token_count
 
     cjk = "这是一段中文文本用来测试分词计数" * 5
-    # An estimator billing CJK at ~4 chars/token undercounts by ~4x — the
+    # An estimator billing CJK at ~4 chars/token undercounts by ~4x - the
     # dangerous direction for a number that gates budgets. There were two
     # estimators once, and only one had the CJK split; this pins the split
     # onto the single survivor every caller now shares.
@@ -685,7 +685,7 @@ def test_budget_split_keeps_what_fits_not_a_count():
     msgs = [
         SimpleNamespace(role="user", content="word " * 100, seq=i) for i in range(50)
     ]
-    # Big budget: everything stays verbatim — no digestion while the window
+    # Big budget: everything stays verbatim - no digestion while the window
     # is empty, even at 50 turns.
     older, recent = compaction.split_history(
         msgs, keep_tokens=100_000, count=_count_words
@@ -833,7 +833,7 @@ def test_semantic_recall_finds_meaning_without_shared_words():
                         seq=i, meta={})
         for i in range(20)
     ]
-    # The relevant turn shares NO words with the query — only meaning.
+    # The relevant turn shares NO words with the query - only meaning.
     older[6] = SimpleNamespace(
         role="assistant",
         content="agreed, we'll run Postgres with connection pooling",
@@ -869,7 +869,7 @@ def test_hash_embeddings_never_pollute_the_score():
     hashed = EmbeddingsService("hash", encoder=deterministic_embedding)  # semantic=False
     older = [SimpleNamespace(role="user", content=f"turn {i}", seq=i, meta={})
              for i in range(10)]
-    # Must behave identically to embeddings=None — hash cosine is noise.
+    # Must behave identically to embeddings=None - hash cosine is noise.
     with_hash = compaction.rank_turns(older, "turn 3", embeddings=hashed)
     without = compaction.rank_turns(older, "turn 3", embeddings=None)
     assert with_hash == without
@@ -889,7 +889,7 @@ def test_semantic_rerank_is_cost_bounded(monkeypatch):
         older, "weather", budget_tokens=500, count=_count_words,
         embeddings=Counting(),
     )
-    # 1 query embed + at most SEMANTIC_RERANK_CANDIDATES turn embeds — never 200.
+    # 1 query embed + at most SEMANTIC_RERANK_CANDIDATES turn embeds - never 200.
     assert calls["n"] <= compaction.SEMANTIC_RERANK_CANDIDATES + 1
 
 
@@ -1013,8 +1013,8 @@ def test_the_schema_refuses_a_chunk_of_the_wrong_dimension(store):
 
     knowledge_chunk.embedding is VECTOR(:embedding_dim) NOT NULL, so every
     stored vector has the same width and none is absent. That is a stronger
-    guarantee than a runtime check, and it is what makes a truncated cosine —
-    a number that looks like a similarity but is not — unreachable rather than
+    guarantee than a runtime check, and it is what makes a truncated cosine -
+    a number that looks like a similarity but is not - unreachable rather than
     merely unlikely.
     """
     import psycopg

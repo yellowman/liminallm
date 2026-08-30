@@ -5,7 +5,7 @@ reference in a fresh interpreter, which is exactly how a real child would
 return them.
 
 Nothing here is exotic. `__reduce__` is the documented pickle protocol, and
-`Connection.recv()` runs it — the point of these fixtures is that a hostile
+`Connection.recv()` runs it - the point of these fixtures is that a hostile
 child needs no exploit, only the ability to return an object.
 """
 
@@ -21,7 +21,7 @@ MARKER_ENV = "LIMINALLM_PWNED_MARKER"
 
 
 def record_execution() -> str:
-    """The 'malicious' operation. Deliberately harmless — it writes its pid."""
+    """The 'malicious' operation. Deliberately harmless - it writes its pid."""
     marker = os.environ.get(MARKER_ENV)
     if marker:
         Path(marker).write_text(str(os.getpid()))
@@ -53,7 +53,7 @@ def raises_evil() -> None:
 def spawns_a_survivor() -> dict:
     """Start a long-lived grandchild, report its pid, then block forever.
 
-    Models the parser grandchildren §19.5 describes — `pdftoppm`, tesseract —
+    Models the parser grandchildren §19.5 describes - `pdftoppm`, tesseract -
     which the wall-clock kill has to reach.
     """
     import subprocess
@@ -99,7 +99,7 @@ def body_that_leaves_a_helper_behind(_broker, _tool, _plan) -> dict:
     `fork`, not `exec`, and the reason is worth recording: measured, a
     confined worker cannot exec anything at all here. `confine` binds the
     realpaths of the runtime, which on a merged-`/usr` system are `/usr/lib`
-    and `/usr/lib64`, so the new root has no `/lib64` — and `python3`'s ELF
+    and `/usr/lib64`, so the new root has no `/lib64` - and `python3`'s ELF
     interpreter is `/lib64/ld-linux-x86-64.so.2`. `execve` finds the file and
     the kernel then fails on the loader, which surfaces as `FileNotFoundError`
     for a path that exists. `fork` needs none of that, and the child it makes
@@ -123,7 +123,7 @@ def body_that_leaves_a_helper_behind(_broker, _tool, _plan) -> dict:
     }
 
 
-#: Same, for a body that fails — a retry only happens after one does.
+#: Same, for a body that fails - a retry only happens after one does.
 FAILING_WORKER_BODY_TOOL = "test.fails_leaving_a_helper_v1"
 
 
@@ -140,8 +140,8 @@ def register_worker_body() -> None:
     registration made in the parent does not survive the spawn. What does
     survive is an import: `multiprocessing` pickles a function by reference,
     so putting `body_that_leaves_a_helper_behind` in the plan makes the child
-    import this module while unpickling its arguments — before `_worker_main`
-    runs — and this line is the side effect that matters.
+    import this module while unpickling its arguments - before `_worker_main`
+    runs - and this line is the side effect that matters.
     """
     from liminallm.service import tool_worker
 

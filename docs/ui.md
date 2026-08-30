@@ -1,7 +1,7 @@
 # frontend layout and styling
 
 Implementation detail behind SPEC §17. The SPEC states the frontend's
-behavioral contract — thin client, no domain intelligence, tenant from the
+behavioral contract - thin client, no domain intelligence, tenant from the
 site, streaming and cancellation semantics. This file records the current
 layout, styling, and client implementation patterns. The frontend source
 (`frontend/`) is authoritative where this file lags.
@@ -22,7 +22,7 @@ layout, styling, and client implementation patterns. The frontend source
 - paginated conversation list sorted by `updated_at`.
 - client-side filter by title or conversation ID.
 - highlight on the currently loaded conversation.
-- conversations with `source: "responses"` carry a small "api" tag —
+- conversations with `source: "responses"` carry a small "api" tag -
   agent-created threads sit beside native ones, visibly distinct.
 - a new-conversation button resets chat state.
 - endpoints: `GET /v1/conversations`, `GET /v1/conversations/{id}`,
@@ -53,7 +53,7 @@ layout, styling, and client implementation patterns. The frontend source
 - turn rail: a right-hand rail of tick marks, one per turn, labeled with a
   model-written description. Hover or focus expands the bars into a
   selector; moving away collapses them. Conversation titles are
-  model-written too — never raw uuids.
+  model-written too - never raw uuids.
 
 ## context manager
 
@@ -111,7 +111,7 @@ layout, styling, and client implementation patterns. The frontend source
 ## client API patterns
 
 - request headers: `Authorization: Bearer`, `Idempotency-Key`
-  (auto-generated UUID). No tenant header — the tenant is derived
+  (auto-generated UUID). No tenant header - the tenant is derived
   server-side from the host (SPEC §12.2); the client never sends one.
 - envelope handling: parse `{ status, data, error }`; error text from
   `error.message` or `detail`.

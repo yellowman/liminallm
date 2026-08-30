@@ -7,7 +7,7 @@ through ``tenant_domains``. An empty map means one tenant for the whole
 install; once any mapping exists, an unlisted host is refused rather than
 served the default tenant, because otherwise any DNS name pointed at the box
 reaches it. ``Host`` is client-supplied, so ``X-Forwarded-Host`` is believed
-only when ``trust_forwarded_host`` says a proxy sets it — that flag is the
+only when ``trust_forwarded_host`` says a proxy sets it - that flag is the
 entire trust boundary on the site half.
 
 *The account* comes from the authenticated session, never from the request
@@ -22,7 +22,7 @@ a forged ``Host`` reaches nothing the caller could not already reach.
 
 No host is exempt. An earlier version let ``localhost`` and the test client's
 ``testserver`` through to the default tenant on the theory that a probe
-arrives by address rather than by site name — but probes do not authenticate
+arrives by address rather than by site name - but probes do not authenticate
 and never ask for a tenant, while that exemption let anyone who could reach
 the port name their own tenant. An operator who wants a bare hostname served
 lists it like any other.
@@ -68,7 +68,7 @@ def host_of(headers, settings) -> str:
 
 
 def tenant_for_host(host: str, settings) -> str:
-    """The tenant serving ``host`` — the site half of the decision.
+    """The tenant serving ``host`` - the site half of the decision.
 
     Unlisted hosts are refused once any mapping exists, with no exemption for
     bare addresses: serving them the default tenant would mean any DNS name
@@ -92,7 +92,7 @@ def user_belongs_to_site(user_tenant: Optional[str], site_tenant: Optional[str])
     """The account half: does this session belong on the site it arrived at?
 
     A blank on either side is a mismatch, not a pass. Skipping the comparison
-    when one value is missing is how the comparison goes missing — and the
+    when one value is missing is how the comparison goes missing - and the
     caller that has nothing to compare is exactly the one that resolved no
     site, which is the case that must not be trusted.
     """

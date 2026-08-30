@@ -13,7 +13,7 @@ this file keeps only what a future editor needs before weakening a rule.
 resolve to `default_tenant_id` even with a `tenant_domains` mapping
 configured, on the theory that a probe arrives by address rather than by
 site name. But `Host` is chosen by whoever can reach the port, so anyone
-reaching the service directly named the default tenant — and with
+reaching the service directly named the default tenant - and with
 `allow_signup` on, registered an account there. Probes do not authenticate
 and never resolve a tenant, so nothing legitimate depended on the
 exemption. An operator who wants a bare hostname served lists it like any
@@ -27,15 +27,15 @@ someone is, not where they belong: signing in with Google at globex used to
 mint acme's tokens, while the password path refused exactly that. The
 check (`tenancy.user_belongs_to_site`, surfaced as
 `AuthService._site_matches`) is one method with every entry point calling
-it — password login, OAuth completion, refresh, and every authenticated
-request — because the copy that gets missed on the next edit is an
+it - password login, OAuth completion, refresh, and every authenticated
+request - because the copy that gets missed on the next edit is an
 authorization hole.
 
 ## one host normalizer
 
 The request path and the `tenant_domains` validator normalized hostnames
-separately and disagreed on bracketed IPv6 — settings split at the first
-colon, requests kept the brackets — which made `::1` impossible to map and,
+separately and disagreed on bracketed IPv6 - settings split at the first
+colon, requests kept the brackets - which made `::1` impossible to map and,
 once bare addresses stopped being exempt, impossible to reach. One
 normalizer, shared by both, and a bare IPv6 literal canonicalizes to the
 bracketed spelling the wire uses.
@@ -43,7 +43,7 @@ bracketed spelling the wire uses.
 ## `default_tenant_id` refuses to be blank
 
 A blank site tenant matches no account under the two-halves rule, so
-clearing it in the console would 401 every user — including the admin who
+clearing it in the console would 401 every user - including the admin who
 would have to set it back, since that route authenticates too. The field
 refuses (`min_length=1`) instead.
 
@@ -54,7 +54,7 @@ R6). These are the Key Uri Format defaults, so an authenticator app assumes
 them whatever the `otpauth://` URI omits. The server once verified SHA-256
 while every app computed SHA-1, so enrolment could never complete and
 nothing said why. The URI now states `algorithm`, `digits` and `period`
-explicitly rather than relying on the defaults holding — and the server
+explicitly rather than relying on the defaults holding - and the server
 verifies the same thing its own QR code promises.
 
 ## identity tokens name accounts, not addresses
@@ -62,7 +62,7 @@ verifies the same thing its own QR code promises.
 A password-reset token that recorded the email address followed the address
 to whoever held it next: delete the account that asked for a reset,
 register the same address, and the token resolved to the new account.
-Nothing in the flow looked unusual — the attacker held a token their own
+Nothing in the flow looked unusual - the attacker held a token their own
 account was legitimately issued. Tokens record `user.id`; ids are never
 reused, so the token expires with the account. Issuance runs inside the
 account's lifetime guard, and consumption is a single atomic take
@@ -74,7 +74,7 @@ Full record: docs/ISSUES.md tranche 2H.1.
 Refresh credentials stay out of JS-visible storage: the server sets
 `refresh_token` and `session_id` as HttpOnly cookies, with a non-HttpOnly
 `csrf_token` beside them. WebSockets authenticate with exactly one of
-`access_token` or `session_id` in the first frame — both at once is refused
+`access_token` or `session_id` in the first frame - both at once is refused
 (`fresh_session_required`, close 4401), because a socket presenting two
 credentials of different ages is how a rotated-out session sneaks back in.
 The socket's tenant comes from the host it was opened against, like every

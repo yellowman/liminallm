@@ -4,7 +4,7 @@
  *
  * Load order (script defer preserves it): common.js (escapeHtml) ->
  * markdown.js -> the page driver (chat.js or share.js). The share page used
- * to pull in all of chat.js for renderMarkdown — and still broke, because
+ * to pull in all of chat.js for renderMarkdown - and still broke, because
  * renderMarkdown calls escapeHtml from common.js, which share.html never
  * loaded: every assistant bubble died on a ReferenceError.
  */
@@ -21,7 +21,7 @@ const MSG_COPY_BUTTON_HTML =
   '</button>';
 
 // =============================================================================
-// Markdown renderer — GitHub-flavored subset, dependency-free, escape-first.
+// Markdown renderer - GitHub-flavored subset, dependency-free, escape-first.
 // The input is HTML-escaped FIRST, then markdown constructs are rewritten into
 // a fixed set of safe tags, so message content can never inject markup.
 // =============================================================================
@@ -89,7 +89,7 @@ const renderCodeBlock = (code, lang) => (
 );
 
 // A URL we are willing to put in an href. The regexes below already require
-// an http(s) scheme, so javascript: never matches — this adds the checks a
+// an http(s) scheme, so javascript: never matches - this adds the checks a
 // pattern can't express: no quotes/brackets/backticks/whitespace, no control
 // characters, and it must actually parse as a URL. (Merged from the web-UI
 // polish branch, which centralized this more rigorously than the inline

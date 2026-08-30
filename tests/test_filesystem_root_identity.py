@@ -3,7 +3,7 @@
 `shared_fs_root` was a database-managed setting, and that is not something a
 database can decide. `Runtime` must construct `PostgresStore` before it can
 read managed settings at all, so the store is handed the shipped default while
-every service built afterwards uses whatever Postgres says — and an admin edit
+every service built afterwards uses whatever Postgres says - and an admin edit
 changes the second without the first.
 
 That is the split-root condition a harness test already forbids under test.
@@ -24,7 +24,7 @@ from liminallm.service.runtime import get_runtime
 def test_shared_fs_root_comes_from_the_environment():
     """It is needed before the database is readable, so it cannot live there.
 
-    `env_field` is reserved for secrets and for bootstrap — anything needed
+    `env_field` is reserved for secrets and for bootstrap - anything needed
     before Postgres is reachable, or that describes the machine rather than
     the install. A filesystem mount is both.
     """
@@ -73,7 +73,7 @@ def test_instance_settings_json_cannot_seed_it_either():
 
     assert "shared_fs_root" not in SYSTEM_SETTINGS_DEFAULTS, (
         "shared_fs_root is still a database-managed default, so "
-        "INSTANCE_SETTINGS_JSON can seed it into the settings table — the "
+        "INSTANCE_SETTINGS_JSON can seed it into the settings table - the "
         "same split root by another route"
     )
 

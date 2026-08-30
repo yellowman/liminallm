@@ -14,7 +14,7 @@ The bug these exist for: the interpreter ran as the service uid with an
 ordinary filesystem view, so `open("/srv/liminallm/users/<someone-else>/…")`
 worked. `os.chdir()` is not confinement, and unix permissions cannot help when
 the service owns every user's files. Each test therefore reads through the
-real `run_python_sandboxed` rather than testing the backend directly — the
+real `run_python_sandboxed` rather than testing the backend directly - the
 question is what the tool exposes, not what the mechanism intends.
 """
 
@@ -39,7 +39,7 @@ def test_a_lane_that_requires_confinement_actually_gets_it(tmp_path):
 
     `requires_backend` above silences every test in this file when the
     platform has no backend. That is right on a laptop and wrong in CI, and
-    the difference is not academic — Ubuntu 24.04 turned on
+    the difference is not academic - Ubuntu 24.04 turned on
     `kernel.apparmor_restrict_unprivileged_userns`, which lets `unshare`
     succeed and then refuses the identity mapping inside the namespace, so
     confinement stopped working on the hosted runners. Left alone, teaching
@@ -56,7 +56,7 @@ def test_a_lane_that_requires_confinement_actually_gets_it(tmp_path):
 
     assert confine.backend_name() is not None, (
         "LIMINALLM_REQUIRE_CONFINEMENT is set, but no confinement backend is "
-        "available — every test in this file would skip and the lane would "
+        "available - every test in this file would skip and the lane would "
         "still be green. On Ubuntu 24.04 check "
         "kernel.apparmor_restrict_unprivileged_userns."
     )
@@ -112,7 +112,7 @@ class TestWhatItCannotSee:
 
     def test_another_users_files_are_absent(self, staged, elsewhere):
         """The one that matters. The service uid owns this file, so nothing
-        about permissions stops the read — the path has to not exist."""
+        about permissions stops the read - the path has to not exist."""
         result = _run(_probe(str(elsewhere["other_user"])), staged)
         assert result["ok"], result["stderr"]
         assert "SECRET-BELONGING-TO-USER-B" not in result["stdout"]
@@ -192,7 +192,7 @@ class TestTheViewIsNotOnlyTheFilesystem:
 
     def test_the_network_is_unreachable_below_the_import_denial(self, staged):
         """`_BlockedImportFinder` refuses `socket`; it did not refuse
-        `_socket`, and an import denylist cannot be the wall anyway — an
+        `_socket`, and an import denylist cannot be the wall anyway - an
         already-loaded module can hand out the same primitive. Proven against
         a listener in this process, so it needs no internet."""
         import socket as _sock
@@ -236,7 +236,7 @@ class TestTheViewIsNotOnlyTheFilesystem:
 class TestStagedInputsAreReadOnly:
     """SPEC §18 says inputs are read-only and the workdir is read-write.
 
-    Both were read-write. The originals are safe — the workdir holds copies —
+    Both were read-write. The originals are safe - the workdir holds copies -
     but run 1 of a session could rewrite `input.csv` and run 2 would read the
     forgery as the user's attachment, which is the provenance the contract
     exists to state.
@@ -303,7 +303,7 @@ class TestWhatItCanSee:
 
     def test_the_language_runtime_still_works(self, staged):
         """Confinement that breaks `import csv` would just make the tool
-        useless — the runtime is read-only, not absent. Imported *after*
+        useless - the runtime is read-only, not absent. Imported *after*
         confinement, so it exercises the mounted runtime rather than a module
         the child had already loaded."""
         code = (
@@ -333,7 +333,7 @@ class TestTheOtherLayersStillHold:
 
 class TestTheAvailabilityCheckIsSafeToAskAnywhere:
     """It is called from the API process, which has JAX loaded and threads
-    running. The first version answered by forking and unsharing in a child —
+    running. The first version answered by forking and unsharing in a child -
     a correct answer obtained a dangerous way: a fork there can leave the
     child deadlocked on a lock held by a thread it did not inherit, which the
     interpreter warns about. It reads /proc now, and the authoritative check
@@ -359,7 +359,7 @@ class TestTheAvailabilityCheckIsSafeToAskAnywhere:
 
 class TestTheNativeWarmupListIsReal:
     """`pledge` without `prot_exec` denies new executable mappings, which is
-    what `dlopen` needs — so a C extension not already resident when the
+    what `dlopen` needs - so a C extension not already resident when the
     promise drops can never be imported. The child is spawned, so it starts
     with none of them. They are loaded up front instead of granting the
     promise.

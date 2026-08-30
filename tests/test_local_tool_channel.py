@@ -1,9 +1,9 @@
 """The local backend's tool channel: a contract, enforced where it counts.
 
-A raw checkpoint has no second wire, so the channel is advertise-then-parse —
+A raw checkpoint has no second wire, so the channel is advertise-then-parse -
 and the property that makes a provider's tool channel unforgeable by documents
 is reproduced in one line of the backend: only MODEL OUTPUT is parsed for
-call blocks. Input text — a chunk, a fetched page, a pasted document — can
+call blocks. Input text - a chunk, a fetched page, a pasted document - can
 spell the tag, but it lands in input, and only the model writes to the
 output stream.
 

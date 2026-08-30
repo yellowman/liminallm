@@ -2,7 +2,7 @@
  * The Notes vault tab: editor, wiki-links, backlinks, graph, witness runs,
  * and the vault-wide sweep.
  *
- * Definitions only — chat.js calls initNotes() at DOMContentLoaded.
+ * Definitions only - chat.js calls initNotes() at DOMContentLoaded.
  */
 
 // =============================================================================
@@ -33,7 +33,7 @@ const notesApi = async (path, options = {}) => {
 };
 
 // [[Title]] → clickable wikilink. Runs on rendered (already-escaped) HTML;
-// code blocks are left alone — [[x]] in code is code.
+// code blocks are left alone - [[x]] in code is code.
 const linkifyWikiLinks = (html) =>
   html.split(/(<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>)/g)
     .map((seg, i) => (i % 2 ? seg : seg.replace(/\[\[([^\[\]\n]{1,200})\]\]/g, (_m, title) =>
@@ -197,7 +197,7 @@ const witnessSummaryText = (report, checked) => {
   if (report.evolutions) parts.push(`${report.evolutions} position${report.evolutions > 1 ? 's' : ''} that moved`);
   return parts.length
     ? `Compared ${checked} pairs of thoughts: ${parts.join(', ')}.`
-    : `Compared ${checked} pairs of thoughts — your thinking holds together.`;
+    : `Compared ${checked} pairs of thoughts - your thinking holds together.`;
 };
 
 const witnessRowHtml = (f, noteId, title, daysApart) => {

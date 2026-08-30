@@ -2,9 +2,9 @@
 
 Deleting an account is one lifetime boundary, not a list of deletions. The
 store's cascade takes the rows; everything the account owned on disk stayed
-behind — `/users/<id>` holds its uploaded files and its content-addressed
+behind - `/users/<id>` holds its uploaded files and its content-addressed
 attachment generations, `/.archive-staging/<id>` holds whole-tree extraction
-work — because nothing on either side of the transaction was responsible for
+work - because nothing on either side of the transaction was responsible for
 it.
 
 Removing the bytes inside the request has the failure the artifact sweep
@@ -27,7 +27,7 @@ their own schedules, and each measures age from something on disk:
 conversations reference; once the rows are gone that mark set is empty, so
 every generation the account ever made looks unreferenced and is judged by the
 blob's own mtime, which is weeks old. The deletion's own grace period is
-undercut by whichever cleanup pass runs next — often within the same minute.
+undercut by whichever cleanup pass runs next - often within the same minute.
 
 Hence the rule these three now obey: while a retirement is pending for a user,
 none of them touches that user at all. The account's lifetime outranks every
@@ -134,7 +134,7 @@ def sweep_user_namespaces(
                     shutil.rmtree(directory)
                     logger.info("user_namespace_reclaimed", path=str(directory))
             except OSError as exc:
-                # Left in the queue, so the next sweep tries again — and so the
+                # Left in the queue, so the next sweep tries again - and so the
                 # subordinate sweeps keep skipping this user until there is
                 # nothing left of them to skip.
                 logger.warning(

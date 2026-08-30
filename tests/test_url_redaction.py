@@ -3,7 +3,7 @@
 Same shape as the harness's `?db=` defect (docs/ISSUES.md, 2I.1 carry-over):
 both drivers accept connection keywords in the query string, so
 `redis://host/0?password=x` and `postgresql://host/db?password=x` carry the
-secret outside the userinfo — measured, both drivers honour it — and a mask
+secret outside the userinfo - measured, both drivers honour it - and a mask
 that rewrites only the netloc publishes it to the log line it exists to
 protect.
 """
@@ -37,7 +37,7 @@ class TestTheUserinfoSpelling:
 
 class TestTheQuerySpelling:
     def test_a_query_password_is_masked(self):
-        """redis-py and libpq both read `?password=` — measured."""
+        """redis-py and libpq both read `?password=` - measured."""
         for url in (
             "redis://cache.example.com:6379/0?password=hunter2",
             "postgresql://app@db.example.com:5432/prod?password=hunter2",
@@ -69,7 +69,7 @@ class TestTheQuerySpelling:
         """Exact output, because "the secret is gone" was already true.
 
         `urlencode` percent-encodes by default, so every masked query value
-        came out as `%2A%2A%2A` — safe, and unreadable in the log line this
+        came out as `%2A%2A%2A` - safe, and unreadable in the log line this
         function exists to produce. `*` is not special in a query string.
         Asserted as an exact string rather than a substring, since a
         substring check passes on the encoded form too.

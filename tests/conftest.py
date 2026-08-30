@@ -9,7 +9,7 @@ from pathlib import Path
 # A throwaway root for everything this run writes: artifact payloads,
 # adapters, uploaded files, lock files. `shared_fs_root` is environment-only
 # (see config.env_field), so setting it here before any import genuinely takes
-# effect — for a while it did not, because the field was database-managed and
+# effect - for a while it did not, because the field was database-managed and
 # this line was inert, and the suite wrote into /srv/liminallm, which is where
 # a real install keeps its data.
 #
@@ -30,7 +30,7 @@ run_id()
 os.environ.setdefault("TEST_MODE", "true")
 # Tests run against a real Postgres. See tests/harness.py: the in-memory
 # store used to double the storage layer, so every storage feature was written
-# twice and verified once — and the untested half was the one production runs.
+# twice and verified once - and the untested half was the one production runs.
 os.environ.setdefault("EMBEDDING_VECTOR_DIM", "64")  # matches the hash encoder
 os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
 import pytest  # noqa: E402
@@ -57,7 +57,7 @@ from tests.harness import (  # noqa: E402
 # redis-server. A second, synchronous implementation used to exist for the
 # suite alone; it drifted eight methods behind and broke the attachment agent
 # the moment Redis was present. Running without Redis has the same shape of
-# problem one layer down — rate limits, idempotency, the session cache and the
+# problem one layer down - rate limits, idempotency, the session cache and the
 # concurrency slots all take their fallback path, so the code production runs
 # is the code the suite does not.
 _REDIS = None
@@ -77,7 +77,7 @@ def _provision(worker: str) -> None:
     Called from `pytest_configure`, and not from module import, because of one
     measured fact: under xdist the controller imports this file but never
     imports a test module. Provisioning at import gave the controller a
-    Postgres cluster and a redis-server it had no use for — and worse, a
+    Postgres cluster and a redis-server it had no use for - and worse, a
     connection pool on the database the workers were about to clone, which
     `CREATE DATABASE ... TEMPLATE` refuses while any session holds it.
 
@@ -90,7 +90,7 @@ def _provision(worker: str) -> None:
     # redis-server. A second, synchronous implementation used to exist for the
     # suite alone; it drifted eight methods behind and broke the attachment
     # agent the moment Redis was present. Running without Redis has the same
-    # shape of problem one layer down — rate limits, idempotency, the session
+    # shape of problem one layer down - rate limits, idempotency, the session
     # cache and the concurrency slots all take their fallback path, so the code
     # production runs is the code the suite does not.
     redis_url = os.environ.get("TEST_REDIS_URL")
@@ -109,7 +109,7 @@ def _provision(worker: str) -> None:
         else:
             # Serial, against somebody's Redis. This run leases nothing, so
             # nothing else was recording that the database it is about to use
-            # is spoken for — and an xdist run starting alongside it would
+            # is spoken for - and an xdist run starting alongside it would
             # lease that very number and flush it before every test. One
             # terminal running `make test` and another running the parallel
             # lane is an ordinary pair.
@@ -127,13 +127,13 @@ def _provision(worker: str) -> None:
             _OWNED_REDIS_DB = True
         else:
             # No redis-server here. The suite still runs on the documented
-            # fallback, which is what a Redis outage does in production — but
+            # fallback, which is what a Redis outage does in production - but
             # say so, because a green run then means less than it looks like.
             _REDIS = None
             print("redis-server not found: running on the in-process fallback")
     if redis_url:
         # redis_url is a database-managed setting with no environment variable
-        # of its own, so exporting REDIS_URL does nothing — which is what
+        # of its own, so exporting REDIS_URL does nothing - which is what
         # conftest used to do, and why the suite ran on the fallback while
         # looking configured. Move the *default* instead of storing a value:
         # seeding through INSTANCE_SETTINGS_JSON would spend the instance's one
@@ -160,7 +160,7 @@ def _provision(worker: str) -> None:
         os.environ["DATABASE_URL"] = _PG.start()
     elif worker:
         # Shared server. Each worker gets a database of its own, because the
-        # per-test TRUNCATE below assumes exclusive ownership — four workers
+        # per-test TRUNCATE below assumes exclusive ownership - four workers
         # truncating one database is not flakiness, it is every test deleting
         # every other test's rows.
         _WORKER_DB = create_worker_database(
@@ -180,7 +180,7 @@ def _provision(worker: str) -> None:
     # schema step still succeeds, conftest then builds the whole schema from
     # scratch on the empty database it left behind, and the suite goes green
     # over a deploy command that does nothing. A scratch cluster this file
-    # started has no such ambiguity — nothing else could have prepared it — so
+    # started has no such ambiguity - nothing else could have prepared it - so
     # it still applies the schema itself.
     #
     # A worker database is already in the right state either way:
@@ -206,9 +206,9 @@ from liminallm.service.runtime import (  # noqa: E402
 
 # One store per process. The runtime is rebuilt before and after every test,
 # and building one used to construct a connection pool and re-verify the whole
-# schema each time — measured at about a quarter of the suite's wall clock.
-# What per-test state the store does carry — its in-memory session cache, and
-# the bootstrap artifacts TRUNCATE removes — is restored by
+# schema each time - measured at about a quarter of the suite's wall clock.
+# What per-test state the store does carry - its in-memory session cache, and
+# the bootstrap artifacts TRUNCATE removes - is restored by
 # `reset_shared_store` below, which costs a fraction of rebuilding it.
 #
 # Created in `_provision`, not here, so the xdist controller does not open a
@@ -264,7 +264,7 @@ def admin_headers(client):
 def _flush_owned_redis() -> None:
     """Empty this process's Redis database between tests.
 
-    Only when we own it — a scratch server we started, or the numbered
+    Only when we own it - a scratch server we started, or the numbered
     database derived for this worker. An externally supplied base database in
     a serial run is not ours to empty, and flushing it is the Redis-side
     version of four workers truncating one Postgres.
@@ -282,7 +282,7 @@ def _flush_owned_redis() -> None:
         if not reserve_base_database(_REDIS_BASE):
             raise RuntimeError(
                 f"Redis database {redis_database_index(_REDIS_BASE)} is no "
-                "longer reserved for this run — another run has leased it and "
+                "longer reserved for this run - another run has leased it and "
                 "is emptying it between its own tests. Re-run; if this "
                 "repeats, the two runs need different databases."
             )
@@ -333,7 +333,7 @@ def _truncate_all() -> None:
 
     One database serves this process; this is what makes tests independent of
     each other without a cluster per test. Under xdist that database belongs
-    to one worker — see `_provision` — because this statement assumes nothing
+    to one worker - see `_provision` - because this statement assumes nothing
     else is looking at it.
 
     That assumption holds in every lane but one. The browser lane runs a real
@@ -341,21 +341,21 @@ def _truncate_all() -> None:
     pool of its own, so a request still in flight holds ACCESS SHARE on some
     tables while this wants ACCESS EXCLUSIVE on all of them. Two sessions
     taking locks across many tables in different orders is a deadlock, and
-    Postgres resolves it by killing one of them — which was `DeadlockDetected`
+    Postgres resolves it by killing one of them - which was `DeadlockDetected`
     at fixture setup in CI, failing a test that had not started.
 
     Reproduced deliberately rather than inferred: a reader holding one table
     and reaching for a second, against a TRUNCATE holding the second and
     reaching for the first, deadlocks every time. Either side can be the
-    victim — the probe lost the reader, CI lost this — so it has to survive
+    victim - the probe lost the reader, CI lost this - so it has to survive
     being it. Postgres documents a deadlock as transient and the caller's job
     to retry. The ordering below narrows the window but cannot close it,
     because the other session picks its own order.
 
     The retry was measured, not assumed, and it has a limit worth knowing.
-    Against *transient* contention — one request finishing, which is what this
-    lane produces — 40 of 40 truncates failed without it and 0 of 40 with it.
-    Against *saturated* contention — six readers looping continuously — 51 of
+    Against *transient* contention - one request finishing, which is what this
+    lane produces - 40 of 40 truncates failed without it and 0 of 40 with it.
+    Against *saturated* contention - six readers looping continuously - 51 of
     60 failed either way, because a retry lands in the same steady state and
     the attempts stop being independent. So this survives a request that
     overlaps the wipe, and will not survive a lane that keeps a database busy
@@ -419,14 +419,14 @@ def pytest_configure(config):
     # with different words is how two descriptions of one marker drift.
 
     # The xdist controller imports this file and then never imports a test
-    # module — measured — so it has no use for a database, a Redis or a store,
+    # module - measured - so it has no use for a database, a Redis or a store,
     # and holding a pool on the database its workers are about to clone would
     # stop them cloning it. `workerinput` is xdist's own answer to "am I a
     # worker"; `dist` is its answer to "is this run parallel at all".
     #
     # The worker id comes from `config`, not from the environment variable it
-    # was set in. A serial pytest launched from inside a worker — which the
-    # harness's own tests do — inherits `PYTEST_XDIST_WORKER` and would
+    # was set in. A serial pytest launched from inside a worker - which the
+    # harness's own tests do - inherits `PYTEST_XDIST_WORKER` and would
     # otherwise provision itself as a worker of a run it is not part of.
     is_worker = hasattr(config, "workerinput")
     is_controller = not is_worker and config.getoption("dist", "no") != "no"

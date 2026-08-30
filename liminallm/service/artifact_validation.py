@@ -23,8 +23,8 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
                         "id": {"type": "string", "minLength": 1},
                         # SPEC §9 writes this as an enum and names exactly
                         # these four. Accepting any string meant `_execute_node`
-                        # — which runs anything it does not recognise as a
-                        # tool call — silently invoked a node typed `"swich"`.
+                        # - which runs anything it does not recognise as a
+                        # tool call - silently invoked a node typed `"swich"`.
                         "type": {
                             "enum": ["tool_call", "switch", "parallel", "end"]
                         },
@@ -42,7 +42,7 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
                                     # executor appends `branch["next"]` as a
                                     # single value and never flattens a list,
                                     # so advertising an array here promised
-                                    # something execution does not do —
+                                    # something execution does not do -
                                     # SPEC §9 gives fan-out to `parallel`.
                                     "next": {"type": "string", "minLength": 1},
                                 },
@@ -113,7 +113,7 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
             "kind": {"const": "adapter.lora"},
             # Pass C: mode is the one execution vocabulary. The old spellings
             # were normalized by the schema.sql repair; refusing them here is
-            # what keeps them normalized — delete runtime compatibility
+            # what keeps them normalized - delete runtime compatibility
             # without this and the old formats are simply created again
             # tomorrow.
             "mode": {"enum": ["local", "remote", "prompt", "hybrid"]},
@@ -144,7 +144,7 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
     },
     # SPEC §6.1 policy.routing / §8.1. The workflow engine already reads these
     # (list_artifacts(type_filter="policy")) and §13.4 documents the type on the
-    # list endpoint — but there was no schema here, so validate_artifact refused
+    # list endpoint - but there was no schema here, so validate_artifact refused
     # "unknown artifact type" and POST /v1/artifacts could not create one.
     # Routing-as-data had no way to get its data in.
     "policy": {

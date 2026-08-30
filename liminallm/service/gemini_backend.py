@@ -2,14 +2,14 @@
 
 The OpenAI-compat shim (`/v1beta/openai`) stays available as
 model_backend=gemini; this backend (model_backend=gemini_native) speaks the
-native API — generateContent / streamGenerateContent?alt=sse — for the
+native API - generateContent / streamGenerateContent?alt=sse - for the
 capabilities the shim flattens: thoughtsTokenCount and cachedContentTokenCount
 in usageMetadata (the same rich keys the Responses path keeps), and native
 function calling.
 
 The internal message shape stays chat-completions format, exactly as with the
-Responses path: a structured history — system prompt, turns, assistant
-tool_calls, role:"tool" results — converts to native `contents` here, so a
+Responses path: a structured history - system prompt, turns, assistant
+tool_calls, role:"tool" results - converts to native `contents` here, so a
 conversation resumes mid-history on this provider the same as on any other.
 """
 
@@ -47,7 +47,7 @@ THOUGHT_SIGNATURE_PLACEHOLDER = "context_engineering_is_the_way_to_go"
 
 # model_reasoning_effort -> generationConfig.thinkingConfig.thinkingLevel.
 # The native vocabulary is the setting's own, so low/medium/high pass through.
-# "none" is not an accepted level — sending it is a 400 — and "minimal" is the
+# "none" is not an accepted level - sending it is a 400 - and "minimal" is the
 # floor the API does accept: it answers with zero thought tokens. Verified
 # live against gemini-flash-latest (minimal: no thoughtsTokenCount at all;
 # low: 87; medium: 164; high: 145 against an unconfigured 158).
@@ -128,7 +128,7 @@ def to_contents(messages: List[dict]) -> Tuple[Optional[dict], List[dict]]:
     Structured resume is the whole point: system prompts hoist into
     systemInstruction, assistant tool_calls become model functionCall parts,
     role:"tool" results become user functionResponse parts, and consecutive
-    same-role entries merge — Gemini expects alternating roles, and the
+    same-role entries merge - Gemini expects alternating roles, and the
     injected adapter-guidance system blocks plus tool results otherwise
     produce runs the API rejects.
     """
@@ -188,7 +188,7 @@ def to_contents(messages: List[dict]) -> Tuple[Optional[dict], List[dict]]:
 
 
 def usage_dict(payload: dict) -> Dict[str, int]:
-    """usageMetadata mapped to the internal keys plus the rich ones —
+    """usageMetadata mapped to the internal keys plus the rich ones -
     thoughtsTokenCount and cachedContentTokenCount ride as reasoning_tokens
     and cached_tokens, summing across agent rounds like every provider's."""
     meta = payload.get("usageMetadata") or {}
@@ -307,7 +307,7 @@ class GeminiBackend:
         """The client streams go through: a pool that keeps nothing idle.
 
         Streaming's abort handle arms on the `connect_tcp.complete` trace
-        event, and a pooled keep-alive connection skips it — measured: the
+        event, and a pooled keep-alive connection skips it - measured: the
         context-window probe's GET on `_http()` left an idle connection,
         the streaming POST was satisfied on that same socket, and the
         handle never armed, so the abort chain built on `armed` collapsed.
@@ -335,7 +335,7 @@ class GeminiBackend:
 
         It reports; it does not materialize. SPEC §5.0.1 gives prompt
         materialization to LLMService, which every path into a backend passes
-        through — this method used to extract the text and `_request_body`
+        through - this method used to extract the text and `_request_body`
         prepended a second guidance block on top of the one already there.
         Weight-bearing modes cannot reach a hosted Gemini model and are
         dropped with their ids logged.
@@ -347,7 +347,7 @@ class GeminiBackend:
         )
 
         applied: List[str] = []
-        # §5.0.1: `g == 0` is absent, not dropped — it was never requested.
+        # §5.0.1: `g == 0` is absent, not dropped - it was never requested.
         for adapter in active_adapters(adapters):
             adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
             mode = get_adapter_mode(adapter)
@@ -400,7 +400,7 @@ class GeminiBackend:
 
         A model older than thinking rejects the field outright. Since the
         admin set one effort for whichever backend is serving, dropping it for
-        this process — loudly — beats failing every request.
+        this process - loudly - beats failing every request.
         """
         if status != 400 or "thinking" not in (text or "").lower():
             return False
@@ -497,7 +497,7 @@ class GeminiBackend:
 
     #: The stream below attaches its response's socket to the abort handle,
     #: so a read blocked mid-stream can be interrupted from another thread.
-    #: Declared only because that handle exists — see
+    #: Declared only because that handle exists - see
     #: `ModelBackend.generate_stream`.
     supports_stream_cancel = True
 
@@ -532,7 +532,7 @@ class GeminiBackend:
             # then removed from the body for good.
             for attempt in (1, 2):
                 # Through the streaming client, whose pool keeps nothing
-                # idle — see `_http_stream`. The trace hands the abort
+                # idle - see `_http_stream`. The trace hands the abort
                 # handle its socket before the request is written, so a
                 # provider that stalls pre-headers is still interruptible.
                 with self._http_stream().stream(
@@ -548,7 +548,7 @@ class GeminiBackend:
                     resp.raise_for_status()
                     # After status handling, before any token: an error
                     # response never streams, so the fail-closed rule guards
-                    # exactly the thing it exists for — producing tokens
+                    # exactly the thing it exists for - producing tokens
                     # through a stream whose interrupt is not in hand.
                     refusal = _arm_or_refuse(abort_handle, resp)
                     if refusal is not None:

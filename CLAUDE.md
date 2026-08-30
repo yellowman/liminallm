@@ -10,7 +10,7 @@ come from the process around it.
 
 ### I. Read before you write
 
-Read the files you are about to touch — read, not skim. Copy the patterns that
+Read the files you are about to touch - read, not skim. Copy the patterns that
 already exist. Check the imports to see what the project actually depends on,
 so you do not reach for `axios` where everything is `fetch`. When you cannot
 find a pattern, ask rather than guess.
@@ -37,7 +37,7 @@ and prefer structure over volume.
 ### IV. Surgical changes
 
 Keep the diff as small as the task allows. Do not touch what you were not
-asked to touch, match the existing style, and do not reformat — a formatter
+asked to touch, match the existing style, and do not reformat - a formatter
 pass buries the three lines that matter inside three hundred that do not. The
 test is whether you can justify every changed line by the task. If a line is
 there because "while I was in there", revert it.
@@ -66,7 +66,7 @@ have a backend. Prefer the real class with a test backend over a hand-made
 stand-in.
 
 **Grep the class when you fix the instance.** A reported bug is one sighting of
-a shape. Before calling it fixed, search for the same shape elsewhere — the
+a shape. Before calling it fixed, search for the same shape elsewhere - the
 other retrieval path, the second copy of the list, the unclosed form of the tag
 you just handled. Fixes that stop at the reported line leave siblings behind.
 
@@ -87,7 +87,7 @@ preparation.
 
 When something breaks, investigate; do not guess. Read the whole error and the
 stack trace. Reproduce the problem before you change anything, and change one
-thing at a time. Do not paper over an unexpected null with a null check — find
+thing at a time. Do not paper over an unexpected null with a null check - find
 out why it is null, or the bug just moves somewhere quieter.
 
 ### VIII. Dependencies
@@ -108,10 +108,10 @@ should work" does not.
 
 Four patterns recur often enough to name:
 
-* **Kitchen sink** — restructuring half the codebase while you are in there.
-* **Wrong abstraction** — abstracting before the second or third copy exists.
-* **Optimistic path** — the happy path handled and the 500 ignored.
-* **Runaway refactor** — a fix that cascades across files.
+* **Kitchen sink** - restructuring half the codebase while you are in there.
+* **Wrong abstraction** - abstracting before the second or third copy exists.
+* **Optimistic path** - the happy path handled and the 500 ignored.
+* **Runaway refactor** - a fix that cascades across files.
 
 Catch yourself in any of these and the right move is to stop, not to push
 through.
@@ -137,7 +137,7 @@ implemented in each language or framework.
 
 ### Prompt budget
 
-Model-facing prompt text is paid on every call — keep the wording tight. But
+Model-facing prompt text is paid on every call - keep the wording tight. But
 this app exists to make weak local models perform well, and weak models drop a
 rule stated once: safety-critical rules (the untrusted-data and injection rule
 especially) are deliberately repeated across the system prompt, the tool
@@ -149,7 +149,7 @@ No boilerplate; no copyright language.
 Pick the smallest lane that covers what changed.
 
 * **Normal change:** `make test-fast-xdist`. The default and usually the only
-  run — about two minutes.
+  run - about two minutes.
 * **The change touches a slow-marked subsystem:** `make test-xdist`, which is
   the same lane with nothing deselected. The slow set is not a separate lane
   and needs no separate one: the per-worker Postgres, Redis database and
@@ -157,17 +157,17 @@ Pick the smallest lane that covers what changed.
   a marker.
 * **Full serial suite (`make test`):** only when the thing under test is
   inherently about single-process or global behaviour, or when a broad harness
-  change could alter serial semantics. Not as a release gate — `test-xdist`
-  covers the same tests — and not every commit.
+  change could alter serial semantics. Not as a release gate - `test-xdist`
+  covers the same tests - and not every commit.
 
 Parallelism buys more on the slow set than on the fast one, because what makes
 a test slow is usually waiting. Measured on a 4-core box: the 110 slow-marked
 tests alone take 5m37s serially and 1m43s at `-n 4`, and the whole non-browser
-suite — 2,814 tests — takes 3m37s. Running the fast lane and then the full one
+suite - 2,814 tests - takes 3m37s. Running the fast lane and then the full one
 as a routine pair still buys nothing, but the full one is now cheap enough to
 be the local gate whenever there is any doubt, and it is what `make qa` runs.
 CI is a separate signal and runs the same selection serially on each supported
-Python version — a green lane here does not answer whether the suite passes on
+Python version - a green lane here does not answer whether the suite passes on
 an interpreter this machine does not have.
 
 `pytest tests/ -m slow --collect-only -q` lists the slow set and which files
@@ -178,7 +178,7 @@ needs a Chromium binary the dev extra does not install.
 
 The owner has authorized multi-agent orchestration for code review. Run every
 review as a fan-out of finders across distinct angles, then verify each finding
-with **independent adversarial verifiers** before reporting it — one that must
+with **independent adversarial verifiers** before reporting it - one that must
 reproduce the failure by running code, one that argues the finding is wrong and
 defaults to rejecting it when uncertain. A finding survives only if both agree.
 

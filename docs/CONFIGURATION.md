@@ -20,7 +20,7 @@ matching admin setting is blank, and `INSTANCE_SETTINGS_JSON` seeds managed
 settings on first boot.
 
 Nothing else is read from the environment. A variable that is not in that
-list — `MODEL_BACKEND`, `REDIS_URL`, `SMTP_HOST` — is ignored.
+list - `MODEL_BACKEND`, `REDIS_URL`, `SMTP_HOST` - is ignored.
 
 ```bash
 # Example
@@ -67,7 +67,7 @@ system, cannot be changed without a redeploy, and is invisible to the console
 that claims to manage it. Restarting the application to change an SMTP
 password is the wrong answer.
 
-**Environment** — five variables, and only the first is configuration:
+**Environment** - five variables, and only the first is configuration:
 
 | Variable | Why it cannot live in the database |
 |---|---|
@@ -75,17 +75,17 @@ password is the wrong answer.
 | `BUILD_SHA` | Stamped by the build; provenance, not a setting |
 | `TEST_MODE` | The harness tells the process it is a test before anything else, and it must not be flippable from a web form |
 | `EMBEDDING_VECTOR_DIM` | A property of the schema that was applied; `scripts/migrate.sh` needs the same value |
-| `EXTRACT_READER_PLUGINS` | Imports Python modules — settable from the console would mean remote code execution |
+| `EXTRACT_READER_PLUGINS` | Imports Python modules - settable from the console would mean remote code execution |
 
-**Database** — everything else, declared with `managed_field` and edited from
+**Database** - everything else, declared with `managed_field` and edited from
 the admin console.
 
-**Database, write-only** — credentials, declared with `secret_field`: the SMTP
+**Database, write-only** - credentials, declared with `secret_field`: the SMTP
 password, provider API keys, OAuth client secrets, and the JWT signing key.
 Stored like any other setting so they can be rotated from the console, but
 redacted from every read: `GET /admin/settings` returns them empty, the schema
 endpoint reports only whether one is set, and a blank field on save means "not
-retyped", never "erase it". The signing key generates itself on first boot —
+retyped", never "erase it". The signing key generates itself on first boot -
 which also fixed a quieter problem, since it used to be generated per process
 into a file, so a replica that could not read that file rejected tokens the
 others had issued.
@@ -100,7 +100,7 @@ plain attributes off `runtime.settings`; they do not merge dicts and they do
 not query the database per request. The settings watcher re-runs the overlay
 when another worker writes a change, so an edit reaches every replica within
 `settings_watch_interval_seconds`. Services that capture configuration at
-construction — the mailer and the voice service — are rebuilt, because handing
+construction - the mailer and the voice service - are rebuilt, because handing
 them a new settings object would not change the mail they send.
 
 Nothing seeds the defaults into the database. A stored value means an admin
@@ -174,7 +174,7 @@ and dropped, and a malformed value never blocks boot.
 
    `admin=True` puts it in the admin UI and flows its default into
    `SYSTEM_SETTINGS_DEFAULTS` automatically. Do not also write the default into
-   that dict — the whole point is that there is one value. A setting with no
+   that dict - the whole point is that there is one value. A setting with no
    env var (an operational limit tuned only from the UI) goes in
    `_ADMIN_ONLY_DEFAULTS` instead.
 
@@ -221,7 +221,7 @@ def get_rate_limit():
 
 ### Declare a secret as a secret, not as an ordinary setting
 `secret_field` stores the value in the database like any other managed
-setting — so an operator can rotate a key without a redeploy — but redacts it
+setting - so an operator can rotate a key without a redeploy - but redacts it
 from every read path: `GET /admin/settings` returns an empty string and the
 console renders a write-only control.
 
@@ -235,5 +235,5 @@ openai_api_key: str = secret_field(description="... Write-only.")
 
 Bootstrap secrets are the exception: `DATABASE_URL` is needed before the
 database can be read, so it stays outside it. `jwt_secret` is not one of
-them — it is generated on first boot and stored in `instance_config` like
+them - it is generated on first boot and stored in `instance_config` like
 any other secret; a `JWT_SECRET` environment variable reaches nothing.

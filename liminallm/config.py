@@ -122,7 +122,7 @@ BACKEND_ADAPTER_COMPATIBILITY: dict[str, set[str]] = {
     # Hosted model APIs with no adapter-id parameter: prompt injection always
     # applies, and hybrid is defined as falling back to prompt when no local
     # weights are present, so it applies too. Without an entry here these fall
-    # to the PROMPT-only default and hybrid adapters are silently dropped —
+    # to the PROMPT-only default and hybrid adapters are silently dropped -
     # the same adapter keeps working on openai, which is the confusing part.
     "xai": {AdapterMode.PROMPT, AdapterMode.HYBRID},
     "grok": {AdapterMode.PROMPT, AdapterMode.HYBRID},
@@ -392,7 +392,7 @@ def _require_non_blank(value: str) -> str:
     """A length bound is not a blankness bound.
 
     ``min_length=1`` accepts "   ", and a whitespace tenant matches no account
-    under the both-halves rule — so an admin who typed spaces into the console
+    under the both-halves rule - so an admin who typed spaces into the console
     locked every user out, including themselves, which is the exact failure
     the bound was added to prevent.
     """
@@ -400,7 +400,7 @@ def _require_non_blank(value: str) -> str:
     if not stripped:
         raise ValueError("must not be blank")
     # Stripped, not just checked. " acme " passes a blankness test and then
-    # matches no account, which is the same lockout by a quieter route — and
+    # matches no account, which is the same lockout by a quieter route - and
     # the tenant_domains validator already strips its values, so leaving this
     # one raw made the two halves of a tenant normalize differently.
     return stripped
@@ -411,8 +411,8 @@ def env_field(default: Any, env: str, **kwargs):
 
     Reserved for two cases, and no others:
 
-    * secrets — API keys, client secrets, the JWT signing key;
-    * bootstrap — anything needed before the database is reachable, or that
+    * secrets - API keys, client secrets, the JWT signing key;
+    * bootstrap - anything needed before the database is reachable, or that
       describes the machine rather than the install (where the data lives, how
       wide the vector column is, whether this is a test process).
 
@@ -431,8 +431,8 @@ def env_field(default: Any, env: str, **kwargs):
 def secret_field(default: Any = "", **kwargs):
     """A managed setting whose value is never read back out.
 
-    Stored in the database like any other managed setting — an operator can
-    rotate an SMTP password without a redeploy — but it is redacted from every
+    Stored in the database like any other managed setting - an operator can
+    rotate an SMTP password without a redeploy - but it is redacted from every
     read path: GET /admin/settings returns it as an empty string, and the
     console renders a write-only control that submits only when the operator
     types something.
@@ -444,7 +444,7 @@ def secret_field(default: Any = "", **kwargs):
 
     Not for bootstrap secrets. DATABASE_URL is needed before the database can
     be read at all, so it stays env_field. jwt_secret is not a bootstrap
-    secret — it is generated on first boot and stored like any other secret
+    secret - it is generated on first boot and stored like any other secret
     here; a JWT_SECRET environment variable reaches nothing.
     """
     extra = kwargs.pop("json_schema_extra", {}) or {}
@@ -462,7 +462,7 @@ def managed_field(default: Any, **kwargs):
     running system.
 
     The default written here is the shipped default, and it is written exactly
-    once — SYSTEM_SETTINGS_DEFAULTS is derived from these fields. For
+    once - SYSTEM_SETTINGS_DEFAULTS is derived from these fields. For
     declarative deploys, INSTANCE_SETTINGS_JSON seeds them on first boot.
     """
     extra = kwargs.pop("json_schema_extra", {}) or {}
@@ -484,7 +484,7 @@ class Settings(BaseModel):
         ),
     )
     # Environment-only, not database-managed. `Runtime` has to construct the
-    # Postgres store — and hand it this root — before it can read a single
+    # Postgres store - and hand it this root - before it can read a single
     # managed setting, so a stored value would move the root for every service
     # built afterwards while the store went on writing where it started:
     # artifact payloads under one tree, file and adapter authority under
@@ -581,7 +581,7 @@ class Settings(BaseModel):
         description=(
             "How the SMTP connection is encrypted. starttls: connect in the "
             "clear and upgrade (usually port 587). ssl: encrypted from the "
-            "first byte (usually port 465). none: no encryption — for a relay "
+            "first byte (usually port 465). none: no encryption - for a relay "
             "on this machine only, and refused if a username is set, because "
             "the password would cross the wire in the clear."
         ),
@@ -667,7 +667,7 @@ class Settings(BaseModel):
         le=0.9,
         description=(
             "Share of the history budget spent recalling older turns picked "
-            "by relevance to the current message — the window is assembled, "
+            "by relevance to the current message - the window is assembled, "
             "not just a recency prefix. 0 disables recall."
         ),
     )
@@ -677,7 +677,7 @@ class Settings(BaseModel):
         description=(
             "Dimension of the pgvector embedding column. MUST match the "
             "configured encoder (1536 for text-embedding-3-small, 64 for the "
-            "hash fallback) — pgvector cannot index a dimensionless column. "
+            "hash fallback) - pgvector cannot index a dimensionless column. "
             "Read by scripts/migrate.sh; changing it requires re-running "
             "migrations and re-embedding."
         ),
@@ -776,7 +776,7 @@ class Settings(BaseModel):
         False,
         description=(
             "TEST ONLY: permit fetching private/loopback addresses. Disables "
-            "SSRF protection — never enable in production."
+            "SSRF protection - never enable in production."
         ),
     )
     enable_mfa: bool = managed_field(
@@ -809,7 +809,7 @@ class Settings(BaseModel):
     default_tenant_id: Annotated[str, AfterValidator(_require_non_blank)] = managed_field(
         "public",
         min_length=1,
-        description="Tenant for an install that serves one site, i.e. one with tenant_domains empty. Once any domain is mapped, an unlisted host is refused rather than served this tenant. Cannot be blank: a blank site tenant matches no account, so clearing it would lock every user out — including the admin who would have to set it back.",
+        description="Tenant for an install that serves one site, i.e. one with tenant_domains empty. Once any domain is mapped, an unlisted host is refused rather than served this tenant. Cannot be blank: a blank site tenant matches no account, so clearing it would lock every user out - including the admin who would have to set it back.",
     )
     tenant_domains: dict[str, str] = managed_field(
         {},
@@ -824,7 +824,7 @@ class Settings(BaseModel):
         False,
         description=(
             "Read the visited hostname from X-Forwarded-Host instead of Host. "
-            "Turn this on only when a reverse proxy you control sets it — "
+            "Turn this on only when a reverse proxy you control sets it - "
             "otherwise a client can name its own tenant."
         ),
     )
@@ -917,13 +917,13 @@ class Settings(BaseModel):
 
 
     # ------------------------------------------------------------------
-    # Operational limits. Managed like everything else — an operator tunes
+    # Operational limits. Managed like everything else - an operator tunes
     # these from the admin UI while the instance is running, which is exactly
     # when you find out a rate limit is wrong.
     # ------------------------------------------------------------------
     # Session & concurrency
     # Device-specific windows (SPEC §18: 7d web, 1d mobile). Read by auth.py,
-    # which used to carry its own copy of these defaults — a fourth declaration
+    # which used to carry its own copy of these defaults - a fourth declaration
     # site, for four keys the admin API would then reject as unknown.
     # Session windows. A one-minute floor: a zero would log everyone out on
     # arrival, and there is no reading of "0 minutes" that anyone wants.
@@ -975,7 +975,7 @@ class Settings(BaseModel):
         description="Rate limits are multiplied by this for enterprise users",
     )
     # Rate limits. 0 means unlimited, which is why these floor at 0 rather
-    # than 1 — an operator turning one off is a legitimate choice.
+    # than 1 - an operator turning one off is a legitimate choice.
     chat_rate_limit_per_minute: int = managed_field(
         60, ge=0,
         description="Chat requests allowed per window. 0 disables the limit.",
@@ -1115,7 +1115,7 @@ class Settings(BaseModel):
         # agrees with it most of the time. They disagreed on bracketed IPv6:
         # this stripped at the first colon, so "[::1]" stored the key "[" and
         # "::1" stored nothing at all, while normalize_host produced "[::1]".
-        # A loopback-over-IPv6 host was therefore impossible to map — and once
+        # A loopback-over-IPv6 host was therefore impossible to map - and once
         # unlisted hosts stopped being exempt, impossible to reach.
         from liminallm.service.tenancy import normalize_host
 
@@ -1187,7 +1187,7 @@ class Settings(BaseModel):
 
         Only fields declared with env_field are read from the environment. A
         managed_field has no env var by design, and must not acquire one by
-        accident through a name-matching fallback — that would resurrect the
+        accident through a name-matching fallback - that would resurrect the
         per-container configuration this split exists to remove. Managed values
         come from the database; see Runtime.effective_settings.
         """
@@ -1384,8 +1384,8 @@ def managed_settings_schema() -> list[dict]:
     """Describe every managed setting well enough to render a form for it.
 
     The admin console builds itself from this. It used to hand-mirror the
-    field list — every setting written out twice in JavaScript plus a block of
-    HTML — which is why thirty settings had no control at all and one that had
+    field list - every setting written out twice in JavaScript plus a block of
+    HTML - which is why thirty settings had no control at all and one that had
     since become env-only was still being posted, failing every save.
     """
     described: list[dict] = []
@@ -1449,9 +1449,9 @@ def _field_adapter(name: str) -> TypeAdapter:
     parts: list[Any] = [field.annotation, *field.metadata]
     # The field's own validators, which the raw annotation does not carry.
     # Without them this pass judged a field by its declared type alone, so a
-    # setting whose validator accepts a friendlier form — tenant_domains as
+    # setting whose validator accepts a friendlier form - tenant_domains as
     # typed JSON, cors_allow_origins and tool_network_allowlist as a
-    # comma-separated list — was rejected before the friendlier form was ever
+    # comma-separated list - was rejected before the friendlier form was ever
     # parsed. Those three were simply not settable from the console.
     for dec in Settings.__pydantic_decorators__.field_validators.values():
         if name not in dec.info.fields:
@@ -1470,7 +1470,7 @@ def validate_managed_settings(patch: dict, current: dict | None = None) -> dict[
     Returns {field: message} for whatever failed, empty when the patch is
     good. Types, bounds and allowed values are declared once, on the fields;
     re-stating them in the API is how the two end up disagreeing, and the one
-    that would be wrong is the API — the model is what the code runs against.
+    that would be wrong is the API - the model is what the code runs against.
 
     Two passes. Per-field first, so the response names every bad field rather
     than only the first. Then the patch applied to the current settings as a
@@ -1514,7 +1514,7 @@ def apply_managed_settings(base: Settings, stored: dict) -> Settings:
     `stored.get("x", <default written out a third time>)`.
 
     Values that fail validation are dropped with a warning rather than taking
-    the process down — a bad row in instance_config must not make the instance
+    the process down - a bad row in instance_config must not make the instance
     unbootable, since the admin UI that would fix it is served by this process.
     """
     if not stored:

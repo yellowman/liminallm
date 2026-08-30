@@ -2,9 +2,9 @@
 
 The same graph as the non-streaming path, run so that partial output reaches
 the user as it is produced. That difference is not cosmetic: a stream has
-failure modes the batch path does not — cancellation mid-token, a node failing
+failure modes the batch path does not - cancellation mid-token, a node failing
 after output has already been sent, tool traces that must arrive before the
-tokens they explain — and they are easier to get right, and to review, in a
+tokens they explain - and they are easier to get right, and to review, in a
 file about nothing else.
 
 This is a mixin, not a standalone service. Streaming *is* the engine's
@@ -12,7 +12,7 @@ execution path: it drives node retries, adapter selection, the prompt budget
 and the conversation cache, all of which are the engine's own. Splitting it
 into free functions would mean threading the engine through every call, which
 is this with extra steps. The split here buys a readable file, not decoupling
-— WorkflowEngine remains the single object at runtime.
+- WorkflowEngine remains the single object at runtime.
 """
 
 from __future__ import annotations
@@ -115,7 +115,7 @@ class WorkflowStreamingMixin:
         # Before `node_map`, for the reason `run` checks there: this path
         # carried its own copy of the repair semantics, so an invalid row
         # failed closed in blocking chat and silently ran a different graph
-        # here. Same rule, this path's vocabulary — blocking raises, streaming
+        # here. Same rule, this path's vocabulary - blocking raises, streaming
         # emits and stops before a token or a trace reaches anyone.
         problems = graph_problems(workflow_schema)
         if problems:
@@ -153,7 +153,7 @@ class WorkflowStreamingMixin:
         visited_nodes: Dict[str, int] = {}
         max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
         # One budget for the whole run, shared with the fan-out this loop
-        # dispatches — `_execute_parallel_nodes` is the same method the
+        # dispatches - `_execute_parallel_nodes` is the same method the
         # blocking path calls, and its children were free to both.
         budget = ExecutionBudget(max_steps)
         exhausted: Optional[str] = None
@@ -194,11 +194,11 @@ class WorkflowStreamingMixin:
             # Every tool_call node goes through the attempt driver; whether
             # it streams is the *preparation's* decision, made per attempt
             # from the same resolution the admission uses. A resolver out
-            # here decided the transport before any node deadline existed —
+            # here decided the transport before any node deadline existed -
             # a stalled lookup ran on free wall clock, on the event loop,
-            # and then handed the body a fresh budget — and its answer froze
+            # and then handed the body a fresh budget - and its answer froze
             # across retries. A non-streamable spec, or a backend that has
-            # not proven it can be stopped (undeclared means no — see
+            # not proven it can be stopped (undeclared means no - see
             # `LLMService.stream_is_cancellable`), runs the blocking body
             # under the same driver: the deadline is enforced, the retry
             # waits for the previous attempt to be confirmed dead, and the
@@ -207,13 +207,13 @@ class WorkflowStreamingMixin:
             # as `llm.generic` runs in the parent's serve thread, so a
             # generation past its deadline is reported failed at the
             # deadline while the body runs on as bounded, authorityless
-            # work — the retry is then refused until it returns, not run
+            # work - the retry is then refused until it returns, not run
             # beside it.
             if node_type == "tool_call":
                 # No admission decision is made here. Resolution, the
                 # preflight and the breaker check all run in the attempt
                 # driver's per-attempt preparation, exactly as the blocking
-                # path runs them — against the spec each attempt actually
+                # path runs them - against the spec each attempt actually
                 # resolves. This branch used to preflight once, out here,
                 # against the dispatch descriptor: every retry then
                 # re-resolved but inherited that first verdict, so a retry
@@ -328,7 +328,7 @@ class WorkflowStreamingMixin:
 
                 if node_outcome is not None and not saw_done:
                     # A blocking-bodied attempt: no client events carried its
-                    # data, so the outcome does — the same bookkeeping the
+                    # data, so the outcome does - the same bookkeeping the
                     # non-tool branch below applies to its results.
                     result = node_outcome.result
                     self._append_trace(
@@ -528,7 +528,7 @@ class WorkflowStreamingMixin:
     #: Node failures the client is entitled to see by name. A schema the tool
     #: declared and its own answer failed is not a server fault, and neither is
     #: a refusal: reporting both as `server_error` tells the caller to retry
-    #: something that will fail identically. Anything else stays generic — an
+    #: something that will fail identically. Anything else stays generic - an
     #: error string from a backend is not a code, and the streamed graph errors
     #: already use this vocabulary (`validation_error` for a bad graph).
     REFUSAL_CODES = frozenset({"validation_error", "forbidden"})
@@ -558,7 +558,7 @@ class WorkflowStreamingMixin:
         """A streamed node, under the node contract the blocking path obeys.
 
         The same driver, the same retry cap, the same three-way deadline and
-        the same logical execution — only the attempt body differs. Yields the
+        the same logical execution - only the attempt body differs. Yields the
         node's stream events, then one `NodeOutcome`, last.
         """
         from liminallm.service.workflow import (
@@ -584,7 +584,7 @@ class WorkflowStreamingMixin:
         lookup = str(tool_name or "") or "llm.generic"
 
         async def make_attempt():
-            """One attempt's authority, body and *transport*, prepared now —
+            """One attempt's authority, body and *transport*, prepared now -
             the same per-attempt rule as the blocking path (SPEC §18.3):
             resolution, the admission preflight and the breaker check run
             fresh for every attempt, through the same helper, so a tool
@@ -593,7 +593,7 @@ class WorkflowStreamingMixin:
             tripped by attempt one refuses attempt two. The transport
             decision reads this same resolution: deciding it out in the
             dispatch took a resolver call before the attempt's deadline
-            existed — free wall clock, on the event loop — and froze the
+            existed - free wall clock, on the event loop - and froze the
             answer across retries.
             """
             # The inputs the preflight judges, computed as `_execute_node`
@@ -638,7 +638,7 @@ class WorkflowStreamingMixin:
 
             # The postflight is the blocking path's own, applied to the
             # canonical completed result the streaming implementation hands
-            # over — one transformation boundary, not merely a shared
+            # over - one transformation boundary, not merely a shared
             # predicate, so one schema cannot pass one transport and fail
             # the other, and what proceeds downstream is the sanitized
             # object on both. The schema's *presence* additionally decides
@@ -697,7 +697,7 @@ class WorkflowStreamingMixin:
                         yield item
         finally:
             # Reached on success, failure, timeout and cancellation alike, and
-            # also when the caller closes this generator early — a client that
+            # also when the caller closes this generator early - a client that
             # disconnects mid-stream. Killing and reaping block, so off the
             # loop, exactly as the blocking path does it.
             await asyncio.to_thread(invocation.close)
@@ -755,7 +755,7 @@ class WorkflowStreamingMixin:
         # serving waited on this one's tokens, and a node past its `timeout_ms`
         # could not be stopped because nothing was watching the clock. The pump
         # owns the iterator on a thread of its own and is registered on the
-        # execution, so one revoke reaches it — see `StreamPump`. The breaker
+        # execution, so one revoke reaches it - see `StreamPump`. The breaker
         # `started` mark lives inside the pump gate: the provider call is the
         # tool's work beginning, and everything above is planning.
         async for event in self._pumped(
@@ -774,7 +774,7 @@ class WorkflowStreamingMixin:
             degraded_fallback=degraded_fallback,
         ):
             if event.get("event") == "message_done":
-                # The grounding this node retrieved, on the node's answer —
+                # The grounding this node retrieved, on the node's answer -
                 # the same key the blocking `llm.generic` result carries. The
                 # backend cannot put it there: it never saw the retrieval.
                 # Without it the streamed turn reported no context, and an
@@ -782,7 +782,7 @@ class WorkflowStreamingMixin:
                 # different object per transport.
                 data = dict(event.get("data") or {})
                 data.setdefault("context_snippets", list(context_snippets))
-                # The canonical completed result, as its own event — exactly
+                # The canonical completed result, as its own event - exactly
                 # the keys blocking `llm.generic` returns. The handler names
                 # its result's fields; `StreamedNodeAttempt` consumes this
                 # and refuses to reconstruct one from the client event.
@@ -811,7 +811,7 @@ class WorkflowStreamingMixin:
 
         The registration is the whole of the stop. `asyncio.wait_for` around
         this generator cancels the await inside it and nothing else, so what
-        actually stops the thread is the execution being revoked — on the node
+        actually stops the thread is the execution being revoked - on the node
         timeout, on a cancel, before a retry, and on the way out. Stopping the
         pump here as well was a second route to the same stop, and mutation
         found it: with two, removing either changed nothing that any test
@@ -822,7 +822,7 @@ class WorkflowStreamingMixin:
         invocation's lock, the exact attempt must still be live, and only
         then does the producer start, get registered, and mark the breaker's
         `started`. A cancel that landed during preparation therefore never
-        starts the provider — the gate refuses and acknowledges instead —
+        starts the provider - the gate refuses and acknowledges instead -
         and a revoke that lands after the gate finds a registered producer
         its sweep can stop.
 
@@ -830,8 +830,8 @@ class WorkflowStreamingMixin:
         invocation: the attachment agent's plain-answer path, which runs only
         after the agent revoked its own failed serve to take the worker down
         (SPEC §18.3). That revoke is a degradation, not the caller walking
-        away, so the fallback gate refuses a *cancelled* invocation — the
-        caller's own stop — rather than a revoked one. Every other producer
+        away, so the fallback gate refuses a *cancelled* invocation - the
+        caller's own stop - rather than a revoked one. Every other producer
         refuses a revoked attempt.
         """
         pump: Optional[StreamPump] = None
@@ -856,7 +856,7 @@ class WorkflowStreamingMixin:
             yield event
         if pump.interrupted:
             # The stop landed while the producer was blocked mid-read, so the
-            # sentinel arrived with no event to check the flag against — and
+            # sentinel arrived with no event to check the flag against - and
             # a stream cut short must not read as a natural end: the agent
             # body would complete its partial as a normal answer, and the
             # caller's own cancel would record a breaker success (SPEC §18.3).
@@ -898,12 +898,12 @@ class WorkflowStreamingMixin:
 
         # Off the event loop. Assembling the prompt now includes listing every
         # configured MCP server, and `mcp_client.run_sync` answers an
-        # already-running loop by starting a thread and joining it — a join
+        # already-running loop by starting a thread and joining it - a join
         # on the loop thread blocks every other request the worker is serving.
         #
         # Honest about the evidence: this path did not reproduce the stall.
         # Reverted, its worst loop gap across a 1.0s listing was 0.021s, while
-        # the blocking path's was 1.10s — so this call already reaches a
+        # the blocking path's was 1.10s - so this call already reaches a
         # worker thread by some route, and there is no test that fails without
         # this line. It stays because a synchronous network call in an
         # `async def` is a stall waiting for a caller to change, not because a
@@ -943,13 +943,13 @@ class WorkflowStreamingMixin:
         # would append a second answer to the same bubble.
         emitted_tokens = False
 
-        # Everything above is planning — attachments, grounding, agent
-        # context — and a deadline spent there proves nothing about the
+        # Everything above is planning - attachments, grounding, agent
+        # context - and a deadline spent there proves nothing about the
         # tool. `started` is marked inside `_serve_invocation`, once the
         # worker is actually spawned and registered (SPEC §18.3).
         try:
             # The tool rounds run in the worker, exactly as they do on the
-            # batch path — a second copy of the agent loop here is a second
+            # batch path - a second copy of the agent loop here is a second
             # copy of its defects. `stream_final` stops the worker once the
             # tools are done and hands back the conversation it built; the
             # final turn offers no tools, so there is no model-chosen control
@@ -1010,7 +1010,7 @@ class WorkflowStreamingMixin:
                 result.get("injection_findings") or []
             )
 
-            # Final turn: no tools offered, so the model must answer — streamed.
+            # Final turn: no tools offered, so the model must answer - streamed.
             # Through the same pump as the plain node: `to_thread` moved the
             # *call* off the loop and then iterated the result on it, which is
             # where the tokens actually arrive.
@@ -1056,7 +1056,7 @@ class WorkflowStreamingMixin:
             # below keeps (SPEC §18.3). Sticky in the observation, so the
             # partial or fallback `tool_result` further down cannot rewrite
             # five provider deaths into a clean bill of health. A revoked
-            # lease stays unrecorded — that is the caller abandoning the
+            # lease stays unrecorded - that is the caller abandoning the
             # attempt, not the tool failing.
             if observation is not None and not isinstance(exc, LeaseRevoked):
                 observation.outcome = "failure"
@@ -1106,8 +1106,8 @@ class WorkflowStreamingMixin:
                 yield event
             return
 
-        # The canonical completed result — the same six keys the worker's
-        # agent loop returns on the blocking path — as its own event for
+        # The canonical completed result - the same six keys the worker's
+        # agent loop returns on the blocking path - as its own event for
         # `StreamedNodeAttempt`, then the client's `message_done`. The
         # handler names its result's fields; the attempt must not.
         completed = {

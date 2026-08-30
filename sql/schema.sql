@@ -166,18 +166,18 @@ ALTER TABLE artifact_version
 -- a foreign key cannot see visibility. Both guesses are wrong in a way that
 -- destroys something:
 --
---   CASCADE  — what this was — removes every artifact the account published.
+--   CASCADE  - what this was - removes every artifact the account published.
 --              A global MCP server, its versions and its config-patch history
 --              vanish because a person left, which SPEC §12.3 says is a change
 --              only config ops may make.
---   SET NULL — the first correction, and wrong in the other direction: a
+--   SET NULL - the first correction, and wrong in the other direction: a
 --              *private* artifact survives the deletion of the account that
 --              owned it, unattributed, with its payload still on disk. §2.1
 --              says an account's private artifacts go with it.
 --
 -- So the key refuses instead. `delete_user` is the path that knows the rule:
 -- inside one transaction it deletes the private rows, detaches the published
--- ones, and only then removes the account — by which point nothing references
+-- ones, and only then removes the account - by which point nothing references
 -- it and RESTRICT has nothing to refuse. Measured: `delete_user` completes
 -- unchanged against this constraint.
 --
@@ -278,7 +278,7 @@ USING ivfflat (embedding) WITH (lists = 100);
 -- column. Stored rather than computed per query: the WHERE clause is served
 -- by the index either way, but ts_rank in the ORDER BY has to tokenize every
 -- matching row, and on a large context that was the dominant cost of the
--- channel — paid on every grounded chat turn.
+-- channel - paid on every grounded chat turn.
 ALTER TABLE knowledge_chunk
   ADD COLUMN IF NOT EXISTS content_tsv tsvector
   GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;
@@ -289,7 +289,7 @@ CREATE INDEX IF NOT EXISTS knowledge_chunk_fs_path_idx ON knowledge_chunk (fs_pa
 -- Late interaction (SPEC §2.5): several vectors per chunk, compared at query
 -- time by MaxSim. A pooled chunk vector has to average everything the chunk
 -- says into one point; these keep the parts separate. Same encoder and so the
--- same width as knowledge_chunk.embedding — a segment vector is only ever
+-- same width as knowledge_chunk.embedding - a segment vector is only ever
 -- compared against a query vector from the same encoder.
 CREATE TABLE IF NOT EXISTS knowledge_chunk_vector (
   id              BIGSERIAL PRIMARY KEY,
@@ -357,7 +357,7 @@ ON ingest_job (context_id, fs_path) WHERE status = 'queued';
 --
 -- Asked by shape, not by name. The guard used to look for a constraint called
 -- `conversation_active_context_id_fkey` in information_schema, which lists
--- every constraint type — so anything of that name, a CHECK included,
+-- every constraint type - so anything of that name, a CHECK included,
 -- convinced it the work was done and the foreign key was never created. The
 -- column then held arbitrary UUIDs, and deleting a context left every
 -- conversation bound to it pointing at a row that no longer exists.
@@ -585,7 +585,7 @@ CREATE INDEX IF NOT EXISTS idx_sweep_report_user_created
 -- One conversation, one implicit attachment context (SPEC §19.5 scopes an
 -- attachment to the chat that received it; §22 puts Postgres across
 -- replicas). Identity used to be "the first row a 500-row listing matched",
--- and creation was an unconditional INSERT — so two first attachments racing
+-- and creation was an unconditional INSERT - so two first attachments racing
 -- produced two hidden contexts, and a later lookup found only one of them
 -- while the other kept chunks nothing could reach.
 --
@@ -623,8 +623,8 @@ BEGIN
       AND id <> split_part(winner.oldest, '|', 2)::uuid;
 
     -- Moving the rows is not enough. Both contexts could hold the *same*
-    -- generation — two concurrent first attachments of one file, where the
-    -- second was a disk dedupe hit into a context that was nonetheless new —
+    -- generation - two concurrent first attachments of one file, where the
+    -- second was a disk dedupe hit into a context that was nonetheless new -
     -- and the merge bypasses replace_chunks_for_path, which is what normally
     -- keeps one fs_path meaning one complete current generation. Duplicate
     -- copies also spend candidate slots that belong to other attachments.
@@ -674,8 +674,8 @@ WHERE kc.conversation_id IS NULL
   );
 
 -- What the previous deletion path left behind. An implicit context whose
--- conversation is gone is unreachable — every lookup goes through the
--- conversation — while its chunks still hold the text of files attached to
+-- conversation is gone is unreachable - every lookup goes through the
+-- conversation - while its chunks still hold the text of files attached to
 -- that chat and still spend candidate slots belonging to other attachments.
 -- Chunks and segment vectors cascade with the context rows.
 DELETE FROM knowledge_context kc
@@ -689,7 +689,7 @@ WHERE kc.conversation_id IS NULL
 --
 -- Deliberately not a partial index. PostgreSQL treats NULLs as distinct in a
 -- unique index, so this already permits any number of ordinary contexts while
--- admitting one row per conversation — and a predicate here would be one more
+-- admitting one row per conversation - and a predicate here would be one more
 -- thing that has to be verified and can be substituted. `WHERE conversation_id
 -- IS NULL` is unique, single-keyed, on the right column, and constrains none
 -- of the rows this exists to constrain.
@@ -712,7 +712,7 @@ CREATE INDEX IF NOT EXISTS knowledge_context_owner_ordinary_idx
 -- Reclamation is therefore delayed, and this is what it is delayed *from*.
 --
 -- The first attempt took the delay from the payload directory's mtime, which
--- is the time of the last write rather than of the deletion — an adapter
+-- is the time of the last write rather than of the deletion - an adapter
 -- trained a week ago and deleted a moment ago was a week old by that measure
 -- and collected immediately. Written in the same transaction as the artifact
 -- delete, this row means exactly "the capability stopped existing at T": it
@@ -738,8 +738,8 @@ CREATE INDEX IF NOT EXISTS artifact_payload_retirement_due_idx
 -- sweep would eventually have found them; exchanging it for exactness made
 -- every unenrolled deletion permanent.
 --
--- A trigger applies the rule to every path there is — the artifact route, user
--- deletion, an FK cascade, a future maintenance statement — without any of
+-- A trigger applies the rule to every path there is - the artifact route, user
+-- deletion, an FK cascade, a future maintenance statement - without any of
 -- them having to remember.
 CREATE OR REPLACE FUNCTION artifact_retire_payload_fn() RETURNS TRIGGER AS $$
 BEGIN
@@ -778,8 +778,8 @@ CREATE TRIGGER artifact_retire_payload
 -- the transaction. Its bytes do not: `/users/<id>` holds uploaded files and
 -- content-addressed attachment generations, and `.archive-staging/<id>` holds
 -- whole-tree extraction work. Removing those inside the request has the same
--- shape of failure as an artifact payload — a turn that resolved a generation
--- a moment earlier reads a filesystem where it is gone — so reclamation is
+-- shape of failure as an artifact payload - a turn that resolved a generation
+-- a moment earlier reads a filesystem where it is gone - so reclamation is
 -- delayed, and this row is what it is delayed from.
 --
 -- It also outranks the collectors that live inside that namespace. Three of
@@ -800,7 +800,7 @@ CREATE INDEX IF NOT EXISTS user_namespace_retirement_due_idx
 
 -- Enrolment belongs to the table, for the reason it does above: the rule has
 -- to hold for every way an account can stop existing, not only for the admin
--- route that exists today. There is deliberately no foreign key — the row is
+-- route that exists today. There is deliberately no foreign key - the row is
 -- written by the delete of the row it names, so a reference would refuse it.
 CREATE OR REPLACE FUNCTION app_user_retire_namespace_fn() RETURNS TRIGGER AS $$
 BEGIN
@@ -846,7 +846,7 @@ $$ LANGUAGE sql IMMUTABLE;
 
 -- Pass C data repair: every adapter carries an explicit mode; the legacy
 -- spellings collapse into their canonical fields. The CASE reproduces the
--- deleted runtime inference exactly — backend/provider chains, prompt-alias
+-- deleted runtime inference exactly - backend/provider chains, prompt-alias
 -- precedence (the extractor's order: prompt_instructions, behavior_prompt,
 -- system_prompt, instructions, prompt_template; strings only, blank means
 -- absent, results stripped), truthiness of prompt fields for the
@@ -926,8 +926,8 @@ DECLARE bad_count integer;
 BEGIN
   -- Every row typed 'adapter', not only those still claiming
   -- kind='adapter.lora'. Scoping this to the kind meant the one corruption
-  -- the pre-C.2 write-path bypass actually produced — an adapter row
-  -- rewritten as another kind, with `type` untouched — was the single shape
+  -- the pre-C.2 write-path bypass actually produced - an adapter row
+  -- rewritten as another kind, with `type` untouched - was the single shape
   -- the migration could not see.
   SELECT count(*) INTO bad_count
   FROM artifact

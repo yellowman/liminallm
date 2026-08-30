@@ -29,7 +29,7 @@ class TestAdapterChecksumValidation:
         This used to be built with ``__new__`` and hand-set attributes, which
         made it a record of what the test believed the backend held. It fell
         over the moment the class gained state (the KV prefix cache and its
-        lock) — the exact failure mode a real construction cannot have.
+        lock) - the exact failure mode a real construction cannot have.
         """
         from liminallm.service.model_backend import LocalJaxLoRABackend
 
@@ -275,7 +275,7 @@ class TestAdapterChecksumValidation:
         """A cache hit serves without re-verifying the checksum.
 
         This used to hand-write the cache key, which encoded the internal key
-        format into the test — and broke when the key became
+        format into the test - and broke when the key became
         (adapter_id, version) as SPEC §5.3 declares. It now warms the cache
         through the real load path and proves the hit by rewriting the file
         with content that would fail verification: if the second call read

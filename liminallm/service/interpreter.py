@@ -1,7 +1,7 @@
 """Sandboxed Python interpreter for model-written code.
 
 The model calls this to parse, unzip, and compute over a conversation's
-attachments — the same job ChatGPT's code interpreter does. Each call gets a
+attachments - the same job ChatGPT's code interpreter does. Each call gets a
 fresh working directory containing *copies* of the attachments, so code can
 never damage the originals.
 
@@ -13,7 +13,7 @@ Containment, outermost first:
    shared filesystem root, other users' files, service configuration and every
    other host path are absent from its view, not merely unreadable. This is
    the boundary that matters, because the service uid owns every user's files
-   — a same-uid process with an ordinary filesystem view can read all of them
+   - a same-uid process with an ordinary filesystem view can read all of them
    by naming an absolute path, whatever the working directory is.
 3. Network egress is blocked: an empty-allowlist policy trips the socket guard,
    and the networking/process modules are blocked at import.
@@ -23,7 +23,7 @@ Containment, outermost first:
 
 There is no unconfined fallback. On a platform with no confinement backend
 this tool refuses to run at all (``ConfinementUnavailable``), because the
-alternative — the same-uid unrestricted process this used to be — is what
+alternative - the same-uid unrestricted process this used to be - is what
 (2) exists to remove. (3) and (4) remain best-effort defense in depth around
 it rather than the wall itself.
 """
@@ -85,7 +85,7 @@ class _BlockedImportFinder:
 def _harden_child(workdir: str, confine_root: str = "") -> str:
     """Confine the sandbox child and drop its escape hatches.
 
-    Returns the workdir's name after confinement — the Linux backend re-roots
+    Returns the workdir's name after confinement - the Linux backend re-roots
     the process, so the path passed in stops existing. Confinement happens
     first: everything after it is defense in depth, and a failure to establish
     it must stop the call rather than soften it.
@@ -189,7 +189,7 @@ def prepare_workdir(session_root: str, sources: list[tuple[str, str]]) -> str:
 
     Each source pairs the name the conversation knows a file by with the
     object holding its bytes. The two used to be one basename, resolved
-    against `/users/{u}/files` here — which meant the caller checked one
+    against `/users/{u}/files` here - which meant the caller checked one
     generation and this copied whatever that name held by the time it ran.
     The bytes now come from the caller's already-resolved generation, and
     only the display name comes from the record.
@@ -236,8 +236,8 @@ def _link_unused(dest: Path, name: str, complete: Path) -> Optional[str]:
 
     Linking rather than creating-then-filling, because a name that exists is
     a name that can be listed, downloaded and ingested. Claiming it first
-    published an empty file and then a growing one — measured, a reader found
-    65536 bytes of an artifact that was 300000 — and a copy that failed
+    published an empty file and then a growing one - measured, a reader found
+    65536 bytes of an artifact that was 300000 - and a copy that failed
     partway left the truncated remains behind under a name the tool reported
     publishing nothing about. `complete` is already whole here, so the name
     appears with every byte behind it or does not appear at all.
@@ -269,7 +269,7 @@ def open_produced_file(workdir: str, name: str) -> Optional[int]:
     """Open a file model-written code produced, following no link out of it.
 
     The child that chose this name runs confined (§21.2); this process does
-    not. A pathname is not a capability the child has to hold — it cannot open
+    not. A pathname is not a capability the child has to hold - it cannot open
     `/etc/passwd`, because its root was pivoted away, but creating a link with
     that target costs it nothing and does not need the target to exist on its
     side. Measured before this existed: a link named `result.txt` had the
@@ -284,7 +284,7 @@ def open_produced_file(workdir: str, name: str) -> Optional[int]:
 
     `O_NONBLOCK` is why the open itself is safe to attempt. `O_NOFOLLOW`
     refuses a link but says nothing about a fifo, and opening one for reading
-    waits for a writer — measured, `os.open` on a fifo never returned, which
+    waits for a writer - measured, `os.open` on a fifo never returned, which
     would park this thread of the API process for as long as the child cared
     to leave the fifo there. Non-blocking, the open returns and `fstat`
     answers; on a regular file the flag does nothing.
@@ -294,7 +294,7 @@ def open_produced_file(workdir: str, name: str) -> Optional[int]:
     sandbox result is the child's to choose: `execute_python` builds
     `created_files` from process-local state after running the code, so the
     code can change what that state reports. Measured, real sandboxed Python
-    returned `[{'name': '/etc/passwd', 'size': 1}]` — and
+    returned `[{'name': '/etc/passwd', 'size': 1}]` - and
     `os.path.join(workdir, "/etc/passwd")` is `/etc/passwd`, because an
     absolute second argument discards the first. Publication rejects a name
     holding a separator, but the identity hash runs first, so by then the
@@ -305,7 +305,7 @@ def open_produced_file(workdir: str, name: str) -> Optional[int]:
     reopens both counterexamples, while removing the absolute-path test
     changes nothing, because on POSIX every absolute path contains a
     separator. Passing an absolute name to `openat` would ignore the directory
-    descriptor as surely as `os.path.join` ignores the directory — no form of
+    descriptor as surely as `os.path.join` ignores the directory - no form of
     resolution substitutes for checking the name.
 
     The descriptor is still how the name is resolved, so containment is
@@ -369,7 +369,7 @@ def publish_artifacts(
     interpreter put files into the user's area that /files/upload would reject.
     """
     # Publication is a durable operation on the user's persistent area, and
-    # it reaches it directly rather than through the store — so the leased
+    # it reaches it directly rather than through the store - so the leased
     # proxies never see it and a revoked invocation could still leave a file
     # behind. The check is here, at the copy, rather than at a caller: this
     # function is what actually writes.

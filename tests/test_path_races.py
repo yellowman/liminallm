@@ -5,7 +5,7 @@ asks what the filesystem says afterwards. The interleavings are forced rather
 than hoped for: a race that reproduces one run in fifty is a race that passes
 CI, so each one gates a real request at the exact point the window opens.
 
-The invariant is not "no two requests may touch one name" — that would be a
+The invariant is not "no two requests may touch one name" - that would be a
 policy the SPEC does not state. It is that whatever survives describes *one*
 generation: the bytes on disk, the chunks in the index, and the checksum in
 the manifest are three records of the same upload, or they are lying about
@@ -149,7 +149,7 @@ class TestOneNameLeavesOneGeneration:
             f"manifest={str(recorded)[:12]}"
         )
 
-        # And the bytes that survived are the bytes that got indexed — the
+        # And the bytes that survived are the bytes that got indexed - the
         # failure this catches is an upload indexing *someone else's* generation
         # under its own provenance. Read straight out of the store rather than
         # through `retrieve`: what is indexed is the question, and what a
@@ -172,7 +172,7 @@ class TestOneManifestHoldsEveryName:
     uploads of *different* names take different locks, run concurrently, and
     each does a read-modify-write of the same JSON. The later write is built
     from a copy taken before the earlier one landed, so the earlier entry
-    disappears — and the next upload of that name finds no prior checksum,
+    disappears - and the next upload of that name finds no prior checksum,
     fails to deduplicate, and re-ingests a file that never changed.
 
     Found by mutation: moving the manifest read back outside the lock did not
@@ -247,8 +247,8 @@ class TestReingestingAPathReplacesItsChunks:
 
     Ingestion appended, so after two uploads of one name the index held both
     generations and a search could return, as the contents of `notes.md`, text
-    that file had not held since the first upload. No interleaving reaches it —
-    two sequential uploads are enough — which is why it sits here rather than
+    that file had not held since the first upload. No interleaving reaches it -
+    two sequential uploads are enough - which is why it sits here rather than
     among the races.
 
     `replace_chunks_for_path` is the narrow answer: within one context, a
@@ -273,7 +273,7 @@ class TestReingestingAPathReplacesItsChunks:
     def test_an_empty_generation_replaces_the_last_one(self, client):
         """The `ingest_text` branch, driven at the service rather than the route.
 
-        Measured: a whitespace-only upload does not reach it — `extract_text`
+        Measured: a whitespace-only upload does not reach it - `extract_text`
         strips and refuses, so the route arrives by the refusal path below.
         This branch is reachable through the ingestion API itself, and the two
         have to agree, or "no text this time" means one thing when the
@@ -391,7 +391,7 @@ class TestAConversationDescribesTheFileThatSurvived:
         written at all, which is the gap between releasing the publication
         lock and describing what was published. `merge` pauses *inside*
         `record_attachment`, after it has read the attachment list and before
-        it writes the edited copy back — a different bug in the same line of
+        it writes the edited copy back - a different bug in the same line of
         code, and one no file lock can reach because the state is in Postgres.
 
         Neither is reachable by luck: the first request wins the sprint from
@@ -451,7 +451,7 @@ class TestAConversationDescribesTheFileThatSurvived:
         self, client, monkeypatch
     ):
         """Small then large, concurrently. Whichever generation survives on
-        disk, the conversation must describe *that* one — a record written
+        disk, the conversation must describe *that* one - a record written
         after the lock was released can be the loser's."""
         from liminallm.service.attachments import INLINE_MAX_BYTES
 
@@ -496,7 +496,7 @@ class TestAConversationDescribesTheFileThatSurvived:
     def test_concurrent_attachment_records_all_survive(self, client):
         """The list is one JSON value holding every attachment.
 
-        Editing it means read, change one entry, write the whole thing back —
+        Editing it means read, change one entry, write the whole thing back -
         and two writers that both read before either wrote each store their
         own copy, so one addition disappears. Driven straight at
         `record_attachment` with a barrier rather than through the route,
@@ -574,7 +574,7 @@ class TestOneDestinationHasOnePublisher:
     """Two archives, one destination.
 
     `bundle.zip` and `bundle.tar.gz` both extract to `bundle/`, so the
-    conflict is not two requests for one archive — it is two *different*
+    conflict is not two requests for one archive - it is two *different*
     requests whose only shared state is where they land. The route checked
     `dest_path.exists()` in the API process and started the sandbox much
     later; inside, extraction does `mkdir(exist_ok=True)` and, on failure,
@@ -698,7 +698,7 @@ class TestTheParentOpensOnlyWhatTheChildProduced:
     output does not run under that confinement.
 
     A pathname is not a capability the child has to hold. `run_python` pivots
-    the child's root away, so it cannot open `/etc/passwd` — but creating a
+    the child's root away, so it cannot open `/etc/passwd` - but creating a
     *link* with that target costs it nothing and needs no target to exist on
     its side. The parent then resolves that link in its own namespace and
     copies what it finds into the caller's file area. The authorized object
@@ -782,7 +782,7 @@ class TestTheParentOpensOnlyWhatTheChildProduced:
 
     def test_the_publication_identity_does_not_read_through_a_link(self, tmp_path):
         """The identity hash opens the same child-named paths, so it is the
-        same defect one function earlier — and a hash of `/etc/passwd` is a
+        same defect one function earlier - and a hash of `/etc/passwd` is a
         read of `/etc/passwd` whether or not anything is published."""
         import hashlib
         import os
@@ -802,7 +802,7 @@ class TestTheParentOpensOnlyWhatTheChildProduced:
     def test_a_fabricated_absolute_name_is_never_opened(self, client, tmp_path):
         """The whole sandbox result is attacker-controlled, names included.
 
-        `os.path.join(workdir, "/etc/passwd")` is `/etc/passwd` — an absolute
+        `os.path.join(workdir, "/etc/passwd")` is `/etc/passwd` - an absolute
         second argument discards the first. Publication rejects names holding
         a separator, but the identity hash runs before publication, so the
         read has already happened by the time that check is reached.
@@ -904,7 +904,7 @@ class TestTheParentOpensOnlyWhatTheChildProduced:
     ):
         """`O_NOFOLLOW` refuses a link and says nothing about a fifo, and
         opening one for reading waits for a writer. Measured, `os.open` on a
-        fifo never returned — which parks a thread of the API process for as
+        fifo never returned - which parks a thread of the API process for as
         long as the child leaves it there. The test has its own clock because
         the failure mode is a hang, not a wrong answer."""
         import os
@@ -933,7 +933,7 @@ class TestTheParentOpensOnlyWhatTheChildProduced:
         """Defence in depth, stated as such: no writer under `files/` can
         plant a link today, which is why this plants one by hand. The write
         side deserves the same treatment as the read side because it is the
-        same mistake — trusting a name to still mean the object it meant."""
+        same mistake - trusting a name to still mean the object it meant."""
         import os
 
         workdir, dest = tmp_path / "w", tmp_path / "d"
@@ -957,7 +957,7 @@ class TestInterpreterPublicationDoesNotClobber:
     and replaces that path's indexed generation. `publish_artifacts` writes
     into the same directory with `O_CREAT|O_TRUNC`, takes no lock, and updates
     neither. So an interpreter artifact could replace an uploaded file while
-    the manifest and the index went on describing the file it replaced — and
+    the manifest and the index went on describing the file it replaced - and
     the next upload of those same bytes then saw a dedupe hit and returned
     success without restoring them.
 
@@ -1019,7 +1019,7 @@ class TestAnAuthorizedSourceBoundsItsDescendants:
     `add_context_source` authorizes the source correctly and then hands
     `ingest_path` the *shared root* as its allowed base, which throws that
     narrower authority away. `ingest_path` validates only the starting path,
-    then globs descendants and calls `is_file()` on each — and `is_file()`
+    then globs descendants and calls `is_file()` on each - and `is_file()`
     follows a link. So a link inside an authorized directory reads whatever it
     points at, including another user's files and paths outside the shared
     root entirely.
@@ -1108,7 +1108,7 @@ class TestAnAuthorizedSourceBoundsItsDescendants:
 
     def test_a_hardlink_is_refused_though_no_path_reveals_it(self, client):
         """A hardlink *is* the file it points at. Nothing in the path says so,
-        so neither the link test nor resolved containment can refuse it —
+        so neither the link test nor resolved containment can refuse it -
         measured, both accepted one. The archive extractor already skips
         hardlinked members for the same reason."""
         import os
@@ -1358,7 +1358,7 @@ class TestDeleteJoinsTheSameProtocol:
         `outer/dir/inner.zip` publishes into `outer/dir/inner` while a
         recursive `DELETE outer` targets an ancestor. Locking the exact
         destination on one side and the exact target on the other gives two
-        different keys, and the delete walks straight through — removing
+        different keys, and the delete walks straight through - removing
         files the child already wrote, while later members recreate the
         ancestry with `mkdir(parents=True, exist_ok=True)`, so both requests
         report success over a partial tree.
@@ -1587,7 +1587,7 @@ class TestExtractionOwnsItsDestinationUntilItIsIndexed:
         # The count the extraction committed, not what is in the index now:
         # a delete that runs after a finished extraction is a correct
         # ordering, and it removes that tree's chunks along with its files.
-        # What the delete must not be able to do is cut the indexing short —
+        # What the delete must not be able to do is cut the indexing short -
         # `ingest_path` catches per-file errors and returns the count it
         # managed, so a tree removed mid-walk reports success over a partial
         # count or none at all.
@@ -1602,7 +1602,7 @@ async def _asgi_request(request, *, at_first_block=None):
 
     starlette's `TestClient` runs the app to completion and only then hands
     back a response, so nothing it returns is still being produced and no
-    interleaving can be placed inside one — measured, `iter_bytes()` yielded
+    interleaving can be placed inside one - measured, `iter_bytes()` yielded
     the whole 512 KiB in a single block. Driving the ASGI app directly gives
     back the real blocks, and `at_first_block` is awaited between two of
     them, so a second real request runs while the body is half sent.
@@ -1667,7 +1667,7 @@ class TestADownloadReadsOneGeneration:
     Between the route's existence check and the first byte read there is a
     window, and two ordinary requests reach into it. An upload of the same
     name rewrote the file in place, so a download already in progress read
-    the head of one generation and the tail of another — measured, 512 KiB
+    the head of one generation and the tail of another - measured, 512 KiB
     of bytes that were never a file. A delete in the same window left the
     response headers already sent and then failed to open anything.
 
@@ -1748,7 +1748,7 @@ class TestADownloadReadsOneGeneration:
 
         The window is held inside the route, where it is a single point
         rather than something to aim at. The delete is a real request, run
-        from another thread on its own event loop — the download's loop is
+        from another thread on its own event loop - the download's loop is
         blocked while it is paused, which is what a second worker or a second
         replica looks like from here.
         """
@@ -1804,8 +1804,8 @@ class TestADownloadReadsOneGeneration:
 class TestAListingToleratesADisappearance:
     """`GET /files` is observational, and a name it saw may already be gone.
 
-    The route asked `is_file()` and then `stat()` — two questions about one
-    name — and caught only `PermissionError`. A delete between them raised
+    The route asked `is_file()` and then `stat()` - two questions about one
+    name - and caught only `PermissionError`. A delete between them raised
     `FileNotFoundError` out of the route, so an unrelated user listing their
     files got an internal failure because someone deleted a file.
     """

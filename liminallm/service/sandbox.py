@@ -326,7 +326,7 @@ class ToolNetworkPolicy:
     proxy_url: Optional[str] = None
     connect_timeout: float = 10.0
     total_timeout: float = 30.0
-    # Hosts the service itself must reach to function — the configured model
+    # Hosts the service itself must reach to function - the configured model
     # provider, above all. These are infrastructure, not tool fetch targets:
     # they are connectable (so provider calls inside a tool handler work) but
     # never appear in `allowlist`, so a tool cannot fetch from them.
@@ -634,8 +634,8 @@ def ensure_scratch_dir(config: SandboxConfig) -> Path:
 
 
 # A `check_privileged_access(..., artifact_owner_id=...)` helper used to live
-# here. It named the SPEC §18 rule — `privileged:true` requires an *admin-owned
-# artifact* — accepted the owner id, and then checked only the caller's role.
+# here. It named the SPEC §18 rule - `privileged:true` requires an *admin-owned
+# artifact* - accepted the owner id, and then checked only the caller's role.
 # Nothing in the service called it, so the rule it claimed to enforce was
 # enforced nowhere. The two halves now sit where each can actually be answered:
 # `get_tool_sandbox_config` asks about the caller, and `WorkflowEngine`'s
@@ -679,7 +679,7 @@ def sandbox_open(
 #: The child names a type and the parent decides whether that name means
 #: anything, from this fixed vocabulary plus whatever the caller adds. Nothing
 #: is imported, resolved, or evaluated from the child's string, and every entry
-#: here is constructible from a single message — an unknown or unconstructible
+#: here is constructible from a single message - an unknown or unconstructible
 #: name becomes a `SandboxError` carrying the name as text.
 _RECONSTRUCTABLE_ERRORS: dict[str, type[BaseException]] = {
     cls.__name__: cls
@@ -733,7 +733,7 @@ def _sandbox_entry(conn, func, args, kwargs, config, max_result_bytes) -> None:
 
     Nothing leaves here except JSON. Exceptions used to be sent as objects so
     a caller could catch its own type, which meant the *parent* unpickled a
-    class the child chose — the decode ran the payload before any check. The
+    class the child chose - the decode ran the payload before any check. The
     type now crosses as a name and the parent rebuilds it from a vocabulary
     the parent owns (`_rebuild_error`).
     """
@@ -751,7 +751,7 @@ def _sandbox_entry(conn, func, args, kwargs, config, max_result_bytes) -> None:
         return
 
     # An error frame is bounded by construction and the parent reads with at
-    # least this much, so a failure is always reportable — even to a caller
+    # least this much, so a failure is always reportable - even to a caller
     # whose results are smaller than the report of one.
     error_bytes = max(max_result_bytes, ERROR_FRAME_BYTES)
     try:
@@ -766,7 +766,7 @@ def _sandbox_entry(conn, func, args, kwargs, config, max_result_bytes) -> None:
             max_bytes=error_bytes if not frame.get("ok") else max_result_bytes,
         )
     except WireError as exc:
-        # The result did not fit, or was not data. Say which — the parent's
+        # The result did not fit, or was not data. Say which - the parent's
         # own `recv_bytes` cap would otherwise report this as a dead child.
         try:
             send_frame(conn, {"ok": False, "error": error_payload(exc)}, max_bytes=error_bytes)
@@ -782,7 +782,7 @@ def _terminate_tree(proc, *, group: bool) -> None:
     """Kill the child and, when it leads one, everything in its group.
 
     The group goes first and the reap second, in that order. A parser spawns
-    grandchildren — `pdftoppm`, tesseract — which are not this process's
+    grandchildren - `pdftoppm`, tesseract - which are not this process's
     children and survive the child that started them; the group is the only
     handle on them, and it stops naming anything once the leader has been
     reaped and its pid recycled.
@@ -820,7 +820,7 @@ def run_in_sandbox(
 
     The rlimits (memory hard cap, CPU seconds, max file size, no core dumps)
     are applied inside a spawned child so the API process itself is never
-    constrained — applying them in-process would permanently cripple the
+    constrained - applying them in-process would permanently cripple the
     server, which is why the old in-process variant was unusable. A
     wall-clock timeout backstops the CPU rlimit, and the overrun kill reaches
     the child's whole process group, not just the pid it started.
@@ -829,7 +829,7 @@ def run_in_sandbox(
     compromisable"), so what comes back is JSON, never a pickle. ``func`` and
     its arguments still travel *out* by pickle, which is safe in the direction
     that matters: the parent chooses them. Coming back, ``func`` must return
-    data — JSON has no tuple, so one returns as a list, and an object returns
+    data - JSON has no tuple, so one returns as a list, and an object returns
     as a `SandboxError` rather than as itself.
 
     Args:
@@ -841,15 +841,15 @@ def run_in_sandbox(
         on_child: Called with (pid, reap) as soon as the child exists, so the
                  invocation that asked for it can kill it. This child is the
                  *parent's* child, not the worker's, so killing the worker
-                 never reaches it — registering it is what makes the tree
+                 never reaches it - registering it is what makes the tree
                  reachable (SPEC §18). It may return a callable, which is
                  invoked once the child has been reaped: a pid outlives the
                  process only as a number, and the kernel reuses it, so a
                  registration left behind is authority over whoever gets it
                  next.
         max_result_bytes: Largest encoded result this caller can legitimately
-                 receive. Derive it from the caller's own budgets — only the
-                 caller knows what its results can weigh — because without a
+                 receive. Derive it from the caller's own budgets - only the
+                 caller knows what its results can weigh - because without a
                  cap a child can turn its permitted memory into the parent's.
         error_types: Extra ``{name: class}`` the parent will rebuild a failure
                  into, for callers that translate specific failures. The
@@ -886,7 +886,7 @@ def run_in_sandbox(
     wall_timeout = timeout if timeout is not None else cfg.max_cpu_seconds + 15
     # One deadline for the whole call, handshake included. The wait for the
     # child to announce itself is start-up time, which this budget has always
-    # covered — giving the handshake a budget of its own would let a caller
+    # covered - giving the handshake a budget of its own would let a caller
     # asking for three seconds wait for a minute.
     deadline = time.monotonic() + wall_timeout
     leads_group = False
@@ -928,7 +928,7 @@ def _await_ready(parent_conn, proc, deadline: float) -> bool:
     """Wait for the child's first frame; True when it leads its own group.
 
     `Process.start()` returns before the child has run a line, so the parent
-    cannot know the child's process group at that moment — and a `killpg`
+    cannot know the child's process group at that moment - and a `killpg`
     aimed at a pid that has not yet called `setsid` reaches the group the
     child was *born* into, which is this server's. Asking the child is what
     makes the group safe to signal, and the answer only counts when all three

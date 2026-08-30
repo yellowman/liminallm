@@ -1,7 +1,7 @@
 """The only format a process we do not trust may speak to us in.
 
 Two boundaries in this codebase declare the child hostile. SPEC §18 makes the
-tool worker the untrusted half of the broker boundary — it runs model-chosen
+tool worker the untrusted half of the broker boundary - it runs model-chosen
 control flow over attacker-controlled bytes. §19.5 puts parsers in a disposable
 child because "assume the parsers are compromisable".
 
@@ -11,7 +11,7 @@ trust: unpickling executes `__reduce__`, so the dangerous operation runs **in
 the parent**, during decoding, before any check the parent might make. Measured
 before this module existed: a sandbox child returning an object with a hostile
 `__reduce__` had its callback run in the API process. That is not a bug in a
-check — it is the absence of a boundary, because the decoder was the hole.
+check - it is the absence of a boundary, because the decoder was the hole.
 
 So the wire format is JSON over `send_bytes`/`recv_bytes`: data with no
 callable in its grammar, and no way to name a type. Errors cross as
@@ -111,7 +111,7 @@ def recv_frame(conn: Any, *, max_bytes: Optional[int] = DEFAULT_MAX_FRAME_BYTES)
 
     `recv_bytes(maxlength)` refuses an oversized message rather than reading it,
     which is the point: the cap is applied before the bytes are ours. The
-    connection is unusable afterwards, which is correct — a peer that sent one
+    connection is unusable afterwards, which is correct - a peer that sent one
     has nothing further to say that we would believe.
 
     `max_bytes=None` reads unbounded, and is for the one case where the peer is
@@ -120,7 +120,7 @@ def recv_frame(conn: Any, *, max_bytes: Optional[int] = DEFAULT_MAX_FRAME_BYTES)
 
     `EOFError` passes through rather than becoming a `WireError`. A peer that
     closed is not a peer that misbehaved, and every caller here says something
-    different about the two — "the worker died" against "the worker sent
+    different about the two - "the worker died" against "the worker sent
     something we will not decode".
     """
     try:

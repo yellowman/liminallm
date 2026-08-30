@@ -10,7 +10,7 @@ deletion must treat them differently:
 
 * a **directory** source such as `files/` says "this context covers whatever
   is in here". Deleting one file inside it does not make that false, and the
-  row must survive — if the name reappears, the context covers it again;
+  row must survive - if the name reappears, the context covers it again;
 * an **exact-file** source says "this context covers this file". Deleting the
   file makes that a claim about something that no longer exists, so the row
   goes with it.
@@ -21,7 +21,7 @@ coverage. So the distinction is the design, not an implementation detail.
 
 Then there is the queue. A re-index job for a path that has just been deleted
 must not be able to put its chunks back, and "must not" has to hold against a
-job already *running* — past its own generation check, inside the extract and
+job already *running* - past its own generation check, inside the extract and
 embed, about to commit. Only the publication lock can order those two, which
 is why deletion takes the same one an upload does.
 """
@@ -121,7 +121,7 @@ class TestDeletionLeavesNoDescription:
 
         Removing it because a child was deleted would collapse coverage of
         every other file in that directory, and of every file later added to
-        it — a deletion of one name silently un-indexing the rest.
+        it - a deletion of one name silently un-indexing the rest.
         """
         runtime = get_runtime()
         user_id, headers = _account(client)
@@ -218,7 +218,7 @@ class TestDeletionSerializesAgainstTheQueue:
     deleted file is still retrievable.
 
     So they must not overlap, and the only thing that can arrange it is the
-    publication lock they are both required to take — on the *same* key.
+    publication lock they are both required to take - on the *same* key.
     """
 
     def _gated_worker(self, runtime, monkeypatch):
@@ -287,7 +287,7 @@ class TestDeletionSerializesAgainstTheQueue:
     def test_a_file_inside_a_tree_uses_the_same_key_the_tree_delete_uses(
         self, client, monkeypatch
     ):
-        """The key is the tree, not the file — on both sides.
+        """The key is the tree, not the file - on both sides.
 
         `namespace_key` locks a name's *first component* precisely so that a
         recursive delete of `bundle` and a mutation of `bundle/inner.md` meet.
@@ -355,8 +355,8 @@ class TestDeletingATreeReachesInsideIt:
     The nested case above proves the lock key and that descendant *chunks* go.
     It says nothing about descendant source rows or descendant jobs, because
     its source names the tree itself and its job runs to completion before the
-    deletion proceeds. So a future narrowing of either predicate — subtree
-    match quietly becoming exact match — would leave `bundle/inner.md`'s own
+    deletion proceeds. So a future narrowing of either predicate - subtree
+    match quietly becoming exact match - would leave `bundle/inner.md`'s own
     source row and its queued job behind while every other case here still
     passes.
 
@@ -421,7 +421,7 @@ class TestTheLockKeyIsAnchoredNotGuessed:
     `users/x/files/`, and looking upward for the nearest thing shaped like one
     finds the archive's copy rather than the real root. The worker then locks
     a namespace inside the tree while a delete of the tree locks the tree, and
-    the race this tranche closed is open again — reachable by unpacking an
+    the race this tranche closed is open again - reachable by unpacking an
     archive that happens to mirror the layout.
 
     So the root is not searched for. It is given.
@@ -492,8 +492,8 @@ class TestASupersededJobStaysSuperseded:
     """Standing aside must not revive a row somebody else has closed.
 
     A worker marks a job `running` when it claims it, and only then goes for
-    the publication lock. A deletion holding that lock supersedes the job — it
-    is entitled to, the path is going away — and the worker then times out and
+    the publication lock. A deletion holding that lock supersedes the job - it
+    is entitled to, the path is going away - and the worker then times out and
     hands the job back. If handing back is an overwrite rather than a
     transition, it writes `queued` over `superseded` and the deletion's
     cancellation is undone by a worker that never touched the path.
@@ -502,7 +502,7 @@ class TestASupersededJobStaysSuperseded:
     this does not by itself restore deleted chunks. What it does is make the
     delete's guarantee false: if the same name with the same bytes reappears
     before that job runs, it ingests into a context whose exact source row the
-    deletion already removed — derived state recreating itself with no
+    deletion already removed - derived state recreating itself with no
     authority behind it.
     """
 
@@ -547,7 +547,7 @@ class TestASupersededJobStaysSuperseded:
     def test_a_failing_worker_cannot_requeue_a_cancelled_job_either(self, client):
         """The same rule on the failure path, not only the contention one.
 
-        The deletion does its bookkeeping first and unlinks last — deliberately,
+        The deletion does its bookkeeping first and unlinks last - deliberately,
         so a half-failed delete leaves "nothing was deleted" rather than "the
         file is gone and still retrievable". That ordering leaves a real window
         where a job is already superseded and the file is still on disk, so a

@@ -1,6 +1,6 @@
 """The big modules' dark regions that are real logic, not JAX internals.
 
-voice.py talks to a real HTTP API — driven here through httpx.MockTransport,
+voice.py talks to a real HTTP API - driven here through httpx.MockTransport,
 so the request narrative (multipart shape, error taxonomy, file placement) is
 exercised without a network. The /voice file route is the authorization check
 on synthesized audio. _sweep_tmp_dirs is SPEC §18's scratch cleanup. The
@@ -136,7 +136,7 @@ async def test_an_unwritable_fs_root_reports_storage_failure(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# GET /voice/{user_id}/{filename} — who may fetch synthesized audio
+# GET /voice/{user_id}/{filename} - who may fetch synthesized audio
 # ---------------------------------------------------------------------------
 
 
@@ -209,9 +209,9 @@ def test_the_shared_pool_is_readable_by_any_authenticated_user(client, voice_use
     assert resp.content == b"ID3-shared-audio"
 
 
-# Fixed uuids, not `uuid.uuid4()`. What matters about these two is the shape —
+# Fixed uuids, not `uuid.uuid4()`. What matters about these two is the shape -
 # a well-formed id with the wrong extension, and one with a null byte spliced
-# in — and generating them at collection time made the test's own name random.
+# in - and generating them at collection time made the test's own name random.
 # A test whose id changes every run cannot be re-run from a failure report, and
 # under xdist the workers collect different names and refuse to run at all.
 @pytest.mark.parametrize("name", ["..%2F..%2Fetc%2Fpasswd", "clip.mp3", "no-extension",
@@ -236,7 +236,7 @@ def test_a_missing_file_is_a_404_not_an_error(client, voice_user):
 
 
 # ---------------------------------------------------------------------------
-# _sweep_tmp_dirs — SPEC §18 scratch cleanup
+# _sweep_tmp_dirs - SPEC §18 scratch cleanup
 # ---------------------------------------------------------------------------
 
 
@@ -303,7 +303,7 @@ def test_a_user_without_a_tmp_dir_is_skipped(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# docx/odt extraction — attacker-supplied zip members
+# docx/odt extraction - attacker-supplied zip members
 # ---------------------------------------------------------------------------
 
 _DOCX_XML = """<?xml version="1.0"?>

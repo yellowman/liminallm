@@ -1,7 +1,7 @@
 """A signed download URL is a capability, and these are its edges.
 
 SPEC §18: "downloads use signed URLs with 10m expiry and content-disposition
-set to prevent inline execution". A signature alone satisfies none of that —
+set to prevent inline execution". A signature alone satisfies none of that -
 what matters is which object the token names, whether the name can be changed
 after signing, whether expiry is checked when the token is *used* rather than
 when it was made, and whether the bytes come back in a form a browser will save
@@ -11,7 +11,7 @@ One structural fact shapes all of it, and is asserted below rather than assumed:
 redemption depends on `get_user`, so this is not a bearer token. It cannot be
 handed to a browser without the session, and it cannot be replayed by a second
 account. That makes several of the classic signed-URL attacks impossible by
-construction — and the tests say which ones, so a later change that drops the
+construction - and the tests say which ones, so a later change that drops the
 dependency fails here instead of silently turning the URL into a bearer grant.
 """
 
@@ -181,7 +181,7 @@ class TestRedemptionResolvesOwnershipAgain:
         self, client, runtime
     ):
         """A token is not a licence to skip `safe_join`. Signed by the server,
-        so the signature is genuine — the path still has to be the caller's."""
+        so the signature is genuine - the path still has to be the caller's."""
         owner, owner_headers = _account(client, runtime)
         victim, victim_headers = _account(client, runtime)
         _upload(client, victim_headers, "private.md", b"not yours\n")
@@ -201,7 +201,7 @@ class TestRedemptionResolvesOwnershipAgain:
 def _place(runtime, user, name: str, body: bytes = b"payload\n") -> None:
     """Put a file in a user's area directly.
 
-    Upload sanitizes its filenames, so a hostile name cannot arrive that way —
+    Upload sanitizes its filenames, so a hostile name cannot arrive that way -
     but `interpreter.publish_artifacts` refuses only `/` and a leading dot, and
     `.txt` is an allowed extension, so model-written code can produce one. The
     model's choices are attacker-influenced the moment it has read a page.
@@ -223,7 +223,7 @@ def _disposition_filename(header: str):
 class TestTheResponseIsSavedNotExecuted:
     def test_the_disposition_is_attachment(self, client, runtime):
         """An html file is the case that matters, and uploads refuse that
-        extension — so it is placed directly, as published code could."""
+        extension - so it is placed directly, as published code could."""
         user, headers = _account(client, runtime)
         _place(runtime, user, "page.html", b"<script>alert(1)</script>")
         resp = _redeem(client, headers, _mint(client, headers, "page.html"))

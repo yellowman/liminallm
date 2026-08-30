@@ -239,7 +239,7 @@ class AuthResponse(BaseModel):
 class LoginRequest(BaseModel):
     # No tenant_id: the tenant comes from the hostname the login arrived at.
     # This field used to be accepted and then silently discarded by the route,
-    # which is worse than the raising validators below — it looked like it worked.
+    # which is worse than the raising validators below - it looked like it worked.
     email: str
     password: str
     mfa_code: Optional[str] = Field(default=None, max_length=10)
@@ -480,8 +480,8 @@ class ArtifactRequest(_SchemaPayload):
     type: str = Field(..., max_length=64)
     name: str = Field(..., max_length=256)
     description: Optional[str] = Field("", max_length=4096)
-    #: Who this artifact is for. `private` — the default, and what every
-    #: caller that omits the field keeps getting — is the owner's own. The
+    #: Who this artifact is for. `private` - the default, and what every
+    #: caller that omits the field keeps getting - is the owner's own. The
     #: other two publish, and the route admits them only for an admin: a
     #: globally visible `tool` or `mcp` artifact is a capability of every
     #: turn in the installation, not a preference of the account that wrote
@@ -506,7 +506,7 @@ class ArtifactPatchRequest(BaseModel):
 
     Paths address the artifact's **schema document**, not a wrapper around it:
     a workflow's entrypoint is `/entrypoint`, not `/schema/entrypoint`. This
-    example used to say `/schema/foo`, which named a key *inside* the schema —
+    example used to say `/schema/foo`, which named a key *inside* the schema -
     the engine created it, reported success, and left the value the caller
     meant to change alone. Patch traversal no longer invents missing parents,
     so that spelling is now refused rather than silently misapplied.
@@ -537,8 +537,8 @@ class ArtifactPatchRequest(BaseModel):
 
         Operation shape is checked here, against the patch engine's own
         predicate, so a malformed op is refused before the route reaches the
-        store. The engine checks again when it applies — it is the boundary
-        every caller crosses — but by then this route has already decided to
+        store. The engine checks again when it applies - it is the boundary
+        every caller crosses - but by then this route has already decided to
         write a version, and a half-formed op that the engine skipped in
         silence used to get one.
         """
@@ -705,7 +705,7 @@ class ConversationSummary(BaseModel):
     # Sharing state (SPEC §18): conversations are private by default.
     public: bool = False
     #: "chat" for the native surface, "responses" when an agent made it via
-    #: the served Responses API — the UI badges the latter.
+    #: the served Responses API - the UI badges the latter.
     source: str = "chat"
 
 
@@ -714,7 +714,7 @@ class ConversationUpdateRequest(BaseModel):
 
     Deliberately two. `meta` carries the public-share flag and the attachment
     records, and `active_context_id` names a knowledge context whose ownership
-    is checked where contexts are chosen — so accepting either here would let
+    is checked where contexts are chosen - so accepting either here would let
     a rename request publish a chat, rewrite its attachment list, or point it
     at a context the caller does not own. Sharing has its own endpoint that
     says what it does.

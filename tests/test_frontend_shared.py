@@ -4,7 +4,7 @@ chat.js and admin.js had four byte-identical helpers copy-pasted between them,
 and the copies had already drifted where it mattered: the console's request
 layer treated 429 as a fatal error instead of backing off, and never refreshed
 an expired token on 401, so an admin session failed where a chat session
-recovered. Same failure mode as the in-memory store and the synchronous cache —
+recovered. Same failure mode as the in-memory store and the synchronous cache -
 two implementations, one of them not the one you were looking at.
 """
 

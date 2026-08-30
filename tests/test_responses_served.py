@@ -3,7 +3,7 @@
 Two shape rules carry this surface, so the tests read at the wire level:
 success bodies are the bare Responses object (never the Envelope), error
 bodies are OpenAI's ``{"error": {...}}`` (never ours). Everything behind the
-shape — conversations, ownership, context binding — is the same chat turn
+shape - conversations, ownership, context binding - is the same chat turn
 ``/v1/chat`` runs, so continuity is asserted through the native routes.
 """
 
@@ -19,7 +19,7 @@ def _respond(client, headers, body):
 def _assert_openai_error(resp, *, status, param=None):
     assert resp.status_code == status, resp.text
     body = resp.json()
-    # The whole body is the error object's envelope — nothing of ours beside it.
+    # The whole body is the error object's envelope - nothing of ours beside it.
     assert set(body) == {"error"}
     error = body["error"]
     assert error["message"]
@@ -368,7 +368,7 @@ class TestResponsesStreaming:
 
         async def boom(*args, **kwargs):
             raise RuntimeError("secret internals: db=10.0.0.7")
-            yield  # pragma: no cover — makes this an async generator
+            yield  # pragma: no cover - makes this an async generator
 
         monkeypatch.setattr(get_runtime().workflow, "run_streaming", boom)
         resp = client.post(
@@ -408,7 +408,7 @@ class TestResponsesStreaming:
 
 class TestResponsesUpstreamParity:
     """What an upstream parent's Responses API would serve, ours serves too:
-    usage details, server-side tool items, and provenance — without faking
+    usage details, server-side tool items, and provenance - without faking
     what it cannot honestly provide (citation anchors, file ids)."""
 
     def test_usage_details_and_local_tokenizer_total(
@@ -417,7 +417,7 @@ class TestResponsesUpstreamParity:
         from liminallm.service.runtime import get_runtime
 
         async def run(*args, **kwargs):
-            # The local-tokenizer shape: real parts, no total — plus the
+            # The local-tokenizer shape: real parts, no total - plus the
             # detail keys the compat layer carries through from upstream.
             return {
                 "content": "counted",
@@ -460,7 +460,7 @@ class TestResponsesUpstreamParity:
         ).json()
 
         # file_search is a dialect-native item; note_search is not dressed up
-        # as one — it stays in the extension's full trace.
+        # as one - it stays in the extension's full trace.
         assert [o["type"] for o in body["output"]] == ["file_search_call", "message"]
         assert body["output"][0]["status"] == "completed"
         assert body["output"][0]["queries"] == ["cabinet"]
@@ -586,7 +586,7 @@ class TestResponsesUpstreamParity:
 
 class TestResponsesWireShapeUnderFailure:
     """The shape rule holds even when FastAPI or the kernel would answer
-    in its own vocabulary — the exact leaks a review probe reproduced."""
+    in its own vocabulary - the exact leaks a review probe reproduced."""
 
     def test_array_body_is_openai_shaped_not_fastapi_422(self, client, auth_headers):
         resp = client.post("/v1/responses", headers=auth_headers, json=[])
@@ -661,7 +661,7 @@ class TestTheWireIsTheDialectsOwnTypes:
     SPEC §16 exists so an agent framework can change only its base URL, and
     says wire shapes are OpenAI's both ways. A test that transcribes what we
     believe those shapes are proves we were consistent with ourselves, so
-    these validate against the installed SDK's generated types instead —
+    these validate against the installed SDK's generated types instead -
     built from OpenAI's OpenAPI schema, and the thing a caller's client
     actually is.
 
@@ -729,7 +729,7 @@ class TestTheWireIsTheDialectsOwnTypes:
         """Required on both, and the SDK's own accumulator reads it.
 
         There are no token logprobs on this surface, so the honest wire value
-        is the empty list — the same answer already given for `annotations`
+        is the empty list - the same answer already given for `annotations`
         and the zero-valued usage detail objects: the typed shape is present,
         and empty because the information does not exist.
         """
@@ -830,7 +830,7 @@ class TestEveryStreamedEventValidatesAsItsDialectType:
     omissions in one surface is reason to check the whole surface, not the
     parts we already suspected. `ResponseStreamEvent` is the dialect's own
     discriminated union over every server event, so each payload is handed to
-    it whole — measured to reject an unknown `type`, a missing required field,
+    it whole - measured to reject an unknown `type`, a missing required field,
     and an invalid nested item, so it is an arbiter rather than a formality.
     """
 
@@ -933,7 +933,7 @@ class TestEveryStreamedEventValidatesAsItsDialectType:
         An empty required query is honest while the information does not
         exist. What must hold is that each intermediate object is itself
         valid, and that the finished response carries the query the run
-        actually used — measured, both item types reported an empty one for a
+        actually used - measured, both item types reported an empty one for a
         run whose trace named it, because the item was built when the trace
         event opened it and never revisited.
         """

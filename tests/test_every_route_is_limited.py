@@ -2,7 +2,7 @@
 
 The check exists because the preamble was six lines repeated fifty-seven
 times, and a paragraph that long is one a new endpoint gets written without.
-Nothing failed loudly when that happened — the endpoint was simply unlimited,
+Nothing failed loudly when that happened - the endpoint was simply unlimited,
 which looks exactly like an endpoint that works.
 """
 
