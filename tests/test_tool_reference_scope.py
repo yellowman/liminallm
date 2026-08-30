@@ -2179,7 +2179,7 @@ def _keepalive_then_stall_server(first_json: bytes):
     srv.setsockopt(socketmod.SOL_SOCKET, socketmod.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", 0))
     srv.listen(5)
-    connections: List[int] = []
+    connections: list[int] = []
 
     def read_request(conn) -> bool:
         data = b""
@@ -2215,6 +2215,12 @@ def _keepalive_then_stall_server(first_json: bytes):
         except OSError:
             pass
 
+    # `connections` is appended here and nowhere else, so a reader in the
+    # test thread cannot tell "not yet accepted" from "accepted but this
+    # thread has not been scheduled". The event closes that gap: a caller
+    # that needs the second socket waits for this rather than for a clock.
+    second_accepted = threading.Event()
+
     def loop():
         idx = 0
         while True:
@@ -2224,10 +2230,12 @@ def _keepalive_then_stall_server(first_json: bytes):
                 return
             idx += 1
             connections.append(idx)
+            if idx == 2:
+                second_accepted.set()
             threading.Thread(target=handle, args=(conn, idx), daemon=True).start()
 
     threading.Thread(target=loop, daemon=True).start()
-    return srv, srv.getsockname()[1], connections
+    return srv, srv.getsockname()[1], connections, second_accepted
 
 
 class TestAWarmedPoolCannotDisarmTheStream:
@@ -2257,7 +2265,7 @@ class TestAWarmedPoolCannotDisarmTheStream:
         from liminallm.service.workflow import WorkflowEngine
 
         rt = get_runtime()
-        srv, port, connections = _keepalive_then_stall_server(
+        srv, port, connections, _second = _keepalive_then_stall_server(
             b'{"name": "models/gemini-test", "inputTokenLimit": 8192}'
         )
         try:
@@ -2318,7 +2326,9 @@ class TestAWarmedPoolCannotDisarmTheStream:
             _stream_handle,
         )
 
-        srv, port, connections = _keepalive_then_stall_server(b'{"ok": true}')
+        srv, port, connections, second_accepted = _keepalive_then_stall_server(
+            b'{"ok": true}'
+        )
         try:
             client = ArmingClient(timeout=5.0)
             client.get(f"http://127.0.0.1:{port}/warm")
@@ -2348,18 +2358,36 @@ class TestAWarmedPoolCannotDisarmTheStream:
 
                 _time.sleep(0.02)
             try:
-                assert len(connections) == 2, (
-                    f"the streaming request was satisfied on the warmed "
-                    f"pooled connection: server saw {connections}"
-                )
+                # The client's own answer first, because it is the subject:
+                # a fresh connection fires `connect_tcp.complete` and arms
+                # the handle, a pooled one does not.
                 assert handle.armed, (
                     "no connect event fired for the streaming request, so "
                     "the abort handle never armed"
                 )
+                # Then the server's, waited for rather than sampled. The
+                # connect completes on the client as soon as the kernel
+                # accepts it, which is before the accept loop is scheduled
+                # to append: measured over 40 runs, `armed` came first every
+                # time, by up to 6ms. Reading `connections` at this point
+                # asked the server a question only the client could answer
+                # yet, and the 20ms poll above is what usually hid it.
+                assert second_accepted.wait(3), (
+                    "the client opened a fresh streaming connection but the "
+                    f"server never accepted a second socket: saw {connections}"
+                )
+                assert connections[:2] == [1, 2], (
+                    f"the streaming request was satisfied on the warmed "
+                    f"pooled connection: server saw {connections}"
+                )
             finally:
                 handle.abort()
-                done.wait(3.0)
                 client.close()
+                t.join(3)
+            assert not t.is_alive(), (
+                "the streaming request outlived the test and still holds a "
+                "socket to a server about to close"
+            )
         finally:
             srv.close()
 
@@ -2373,7 +2401,9 @@ class TestTheStreamingPoolKeepsNothingIdle:
     def test_a_second_request_on_the_stream_client_connects_fresh(self):
         from liminallm.service.gemini_backend import GeminiBackend
 
-        srv, port, connections = _keepalive_then_stall_server(b'{"ok": true}')
+        srv, port, connections, second_accepted = _keepalive_then_stall_server(
+            b'{"ok": true}'
+        )
         try:
             backend = GeminiBackend(
                 "gemini-test", api_key="k",
@@ -2383,7 +2413,15 @@ class TestTheStreamingPoolKeepsNothingIdle:
             client.get(f"http://127.0.0.1:{port}/one")
             assert connections == [1]
             client.get(f"http://127.0.0.1:{port}/two")
-            assert len(connections) == 2, (
+            # This one returned, so the server has already answered on the
+            # second socket and the append has happened. Waiting on the event
+            # anyway keeps both readers of `connections` synchronized the same
+            # way, rather than one of them relying on that being true.
+            assert second_accepted.wait(3), (
+                f"the streaming client kept its first connection idle and "
+                f"reused it: server saw {connections}"
+            )
+            assert connections[:2] == [1, 2], (
                 f"the streaming client kept its first connection idle and "
                 f"reused it: server saw {connections}"
             )
@@ -2587,8 +2625,8 @@ class TestABlockingBodyNeverStartsAfterItsDeadline:
         `timeout_ms`) cannot make this witness pass while the driver stays
         wrong. The attempt is blocking-shaped: empty events, a body that
         only runs inside `result()` and records that it started."""
-        from liminallm.service.workflow import WorkflowEngine
         from liminallm.service.node_attempt import NodeOutcome
+        from liminallm.service.workflow import WorkflowEngine
 
         rt = get_runtime()
         engine = WorkflowEngine(store, rt.llm, rt.router, rt.rag, cache=rt.cache)
