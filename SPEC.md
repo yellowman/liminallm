@@ -1272,6 +1272,18 @@ shared:    different answer + different conversation + different person
    or changed its cluster turn an already-authorized job back into a live
    query.
 
+   **the adapter's role is durable too.** persona and skill share one
+   `adapter.lora` schema, so `adapter_role` says which is which: a
+   `"persona"` may train from live preference history, a `"skill"` requires
+   a pinned job. reading skillhood from `cluster_id` alone is the same
+   mistake one object over - that key is not required by the schema, so an
+   ordinary artifact edit could drop it and hand a skill the persona path.
+   a cluster-bound adapter carrying no explicit role is a skill, and
+   acquires the durable role on its next write or ladder revisit,
+   whichever comes first. once set, the role cannot be removed or changed
+   by any writer; the cluster binding may still change or go, because
+   reclustering is ordinary.
+
    **exactness holds through preparation, not only resolution.** resolving
    twenty events and then building nineteen examples, or tokenizing
    eighteen of those, is the same failure one stage later: the run trains

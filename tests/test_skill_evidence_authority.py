@@ -838,3 +838,62 @@ class TestSkillhoodIsDurableNotInferred:
             assert "adapter_role" in str(caught.value)
 
         assert store.get_artifact(adapter_id).schema["adapter_role"] == "skill"
+
+    def test_a_skill_from_before_the_role_existed_cannot_shed_it(
+        self, tmp_path
+    ):
+        """The upgrade window: cluster-bound, and no role written yet.
+
+        Every skill that existed before the role did looks like this until
+        the ladder next revisits it. The immutability check only guarded a
+        role that was already present, so during that window the ordinary
+        edit path could drop `cluster_id` and leave nothing at all to say
+        the adapter had ever been a skill.
+
+        The write is allowed - reclustering may legitimately change or
+        clear the binding - but it canonicalizes on the way past, so what
+        it leaves behind is a skill with no cluster rather than a persona.
+        """
+        store = get_test_store()
+        owner = _user(store, "legacy")
+        cluster = _cluster(store, user_id=owner.id)
+        _seed(store, owner, cluster.id, conversations=6, per_conversation=1)
+        legacy = store.create_artifact(
+            type_="adapter",
+            name=f"legacy_skill_{uuid.uuid4().hex[:6]}",
+            schema={
+                "kind": "adapter.lora", "base_model": "jax-base",
+                "mode": "prompt", "scope": "per-user", "current_version": 0,
+                "rank": 4, "layers": [0], "matrices": ["attn_q"],
+                "cluster_id": cluster.id,
+            },
+            description="a skill written by an older version",
+            owner_user_id=owner.id,
+            visibility="private",
+        )
+        assert "adapter_role" not in legacy.schema, "the fixture is not legacy"
+
+        edited = store.update_private_artifact(
+            legacy.id,
+            lambda locked: {k: v for k, v in locked.items() if k != "cluster_id"},
+            owner_user_id=owner.id,
+            version_author=owner.id,
+        )
+        assert edited is not None
+        assert "cluster_id" not in edited.schema
+        assert edited.schema.get("adapter_role") == "skill", (
+            "dropping the cluster binding erased the last trace of "
+            "skillhood; this adapter now trains as a persona"
+        )
+
+        training = TrainingService(store, str(tmp_path))
+        with pytest.raises(ConstraintViolation, match="pinned job"):
+            training.train_from_preferences(owner.id, adapter_id=legacy.id)
+
+        live = store.create_training_job(owner.id, legacy.id)
+        assert live.preference_event_ids is None, "the fixture job is not live"
+        with pytest.raises(ConstraintViolation, match="pinned job"):
+            training.train_from_preferences(
+                owner.id, adapter_id=legacy.id, job_id=live.id
+            )
+        assert store.get_artifact(legacy.id).schema.get("current_version", 0) == 0

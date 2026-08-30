@@ -3596,21 +3596,31 @@ class PostgresStore:
             # (SPEC §5.5.3). Enforced here rather than in the route because
             # every writer - the route, config ops, the training service -
             # arrives through this one method, and the previous value is
-            # only knowable from the locked row.
-            previous_role = previous.get("adapter_role")
-            if (
-                row["type"] == "adapter"
-                and previous_role
-                and schema.get("adapter_role") != previous_role
-            ):
-                raise ConstraintViolation(
-                    "adapter_role is immutable",
-                    {
-                        "artifact_id": artifact_id,
-                        "adapter_role": previous_role,
-                        "requested": schema.get("adapter_role"),
-                    },
-                )
+            # only knowable from the locked row. After validation, which is
+            # what guarantees `schema` is an object here; the one value this
+            # block writes is itself a legal role.
+            if row["type"] == "adapter":
+                previous_role = previous.get("adapter_role")
+                if previous_role is None and previous.get("cluster_id"):
+                    # A skill written before the role existed. Canonicalize
+                    # it here rather than waiting for the ladder to revisit
+                    # it: until the role is on the row, this same edit could
+                    # drop `cluster_id` and leave nothing to say the adapter
+                    # had ever been a skill. The binding may still change or
+                    # go - reclustering is ordinary - but what the write
+                    # leaves behind is a skill without a cluster, never a
+                    # persona.
+                    previous_role = "skill"
+                    schema.setdefault("adapter_role", "skill")
+                if previous_role and schema.get("adapter_role") != previous_role:
+                    raise ConstraintViolation(
+                        "adapter_role is immutable",
+                        {
+                            "artifact_id": artifact_id,
+                            "adapter_role": previous_role,
+                            "requested": schema.get("adapter_role"),
+                        },
+                    )
             # The row's own audience, taken from the locked row rather than
             # from the caller: a private workflow may name its owner's private
             # tool, and the same edit on a shared one may not.
