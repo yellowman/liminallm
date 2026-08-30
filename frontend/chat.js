@@ -246,7 +246,7 @@ const chatForm = $('chat-form');
 const statusEl = $('status');
 const errorEl = $('error-banner');
 const sessionIndicator = $('session-indicator');
-const adminWarning = $('admin-warning');
+const approvePatches = $('approve-patches');
 const conversationLabel = $('conversation-label');
 const adminLink = $('admin-link');
 const authSubmit = $('auth-submit');
@@ -365,9 +365,9 @@ const updateAuthUI = () => {
   if (settingUserId) settingUserId.textContent = state.userId || '-';
   if (settingRole) settingRole.textContent = state.role || '-';
   if (settingTenant) settingTenant.textContent = state.tenantId || 'global';
-  // The session id lives in an HttpOnly cookie this page cannot read
-  // (SPEC §17.10), so there is nothing here to show.
-  if (settingSessionId) settingSessionId.textContent = 'held in a secure cookie';
+  // The session id lives in an HttpOnly cookie (SPEC §17.10), so this row
+  // states that fact rather than showing an id it cannot read.
+  if (settingSessionId) settingSessionId.textContent = 'Not readable by this page';
 };
 
 // =============================================================================
@@ -398,6 +398,17 @@ const initTabs = () => {
         else if (tabId === 'artifacts-tab') fetchArtifacts();
         else if (tabId === 'tools-tab') refreshToolsAndWorkflows();
         else if (tabId === 'insights-tab') fetchInsights();
+        else if (tabId === 'settings-tab') {
+          // These read-only fields are fetched once at start-up, so a
+          // request that failed then would otherwise sit on screen for the
+          // rest of the session. Opening the tab is the retry.
+          // fetchUserSettings is deliberately not here: it writes into the
+          // preference selects, and reloading them would discard an edit
+          // the user had not saved before switching tabs.
+          fetchEmailVerificationStatus();
+          fetchMfaStatus();
+          loadApiKeys();
+        }
       }
     });
   });
@@ -2542,6 +2553,12 @@ const handleExportDrafts = () => {
 
 let pendingMfaSecret = null;
 
+/** True while a section is on screen, and false when it does not exist. */
+const isSectionOpen = (id) => {
+  const el = $(id);
+  return !!el && !el.classList.contains('hidden');
+};
+
 const fetchMfaStatus = async () => {
   const statusEl = $('setting-mfa-status');
   const enableBtn = $('mfa-enable-btn');
@@ -2565,9 +2582,19 @@ const fetchMfaStatus = async () => {
       statusEl.style.color = enabled ? '#0a7' : 'inherit';
     }
 
-    // Show/hide appropriate buttons
-    if (enableBtn) enableBtn.classList.toggle('hidden', enabled);
-    if (disableBtn) disableBtn.classList.toggle('hidden', !enabled);
+    // Show/hide appropriate buttons, unless a flow already owns one. Each
+    // section hides its own entry point while it is open — startMfaSetup
+    // hides Enable, showMfaDisable hides Disable — so re-deriving these
+    // from `enabled` would put a second entry point on screen beside a
+    // live interaction, and let a second request start while the first
+    // secret and code are still displayed. The status text above is
+    // read-only and always refreshes.
+    if (enableBtn && !isSectionOpen('mfa-setup-section')) {
+      enableBtn.classList.toggle('hidden', enabled);
+    }
+    if (disableBtn && !isSectionOpen('mfa-disable-section')) {
+      disableBtn.classList.toggle('hidden', !enabled);
+    }
   } catch (err) {
     if (statusEl) statusEl.textContent = 'Unable to check';
   }

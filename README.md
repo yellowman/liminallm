@@ -19,6 +19,68 @@ the code is just the glue. everything interesting lives as data.
 
 ---
 
+## screens
+
+the ui is one chat surface with a workspace beside it, plus a separate admin
+console. each image below was captured from a running instance driven through
+a real browser: a real server, a real postgres and redis, and a live model
+answering the questions shown.
+
+**sign in.** email and password, with the access token held in session storage
+and the refresh token in an http-only cookie the page cannot read.
+
+![Sign-in screen with email and password fields.](docs/screenshots/01-sign-in.png)
+
+**chat.** conversations are listed on the left and titled from their first
+exchange. the thread keeps context across turns, so a follow-up that names
+nobody is still answered about the same subject. the row above the thread
+selects a knowledge context or a workflow for the next message.
+
+![Chat screen showing a two-turn conversation. The answer cites its sources, and a follow-up question is answered from the conversation context.](docs/screenshots/02-chat.png)
+
+**notes.** a searchable vault. selecting a note opens it for editing, and
+sweep and graph operate across the whole set.
+
+![Notes screen with a note list on the left and the selected note open in an editor.](docs/screenshots/03-notes.png)
+
+**contexts.** knowledge contexts group uploaded sources for retrieval. a
+conversation can be pointed at one from the chat screen.
+
+![Contexts screen listing a knowledge context with its name and description.](docs/screenshots/04-contexts.png)
+
+**files.** uploads are attached to a context, or kept private when no context
+is given. the same screen browses everything already uploaded.
+
+![Files screen with the upload form and the list of uploaded files.](docs/screenshots/05-files.png)
+
+**artifacts.** workflows, policies, adapters, and tools are all artifacts.
+they are filterable by type and visibility, and versioned.
+
+![Artifacts screen with type and visibility filters above a table of artifacts.](docs/screenshots/06-artifacts.png)
+
+**tools.** the registered tool specifications a workflow can call, with
+workflow configuration beside them.
+
+![Tools screen listing registered tool specifications and workflows.](docs/screenshots/07-tools.png)
+
+**insights.** preference events are summarized here, so you can see what your
+feedback has shaped and which adapters it reached.
+
+![Insights screen summarizing preference events by total, positive, negative, and neutral.](docs/screenshots/08-insights.png)
+
+**settings.** account and session details, including the role and tenant the
+current session carries.
+
+![Settings screen showing session information and account preferences.](docs/screenshots/09-settings.png)
+
+**admin console.** a separate page at `/admin`, guarded by the `admin` role.
+it reviews configuration patch proposals, administers tenant users, and
+inspects database objects.
+
+![Admin console showing the patch proposal form and the patch review controls.](docs/screenshots/10-admin.png)
+
+---
+
 ## what it does (conceptually)
 
 ### feedback loop (at a glance)
