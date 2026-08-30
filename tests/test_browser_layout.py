@@ -246,7 +246,7 @@ class TestThePaneAppearsWhereNavigationAlreadyExisted:
             assert state["pane"] == 0, "the toggle left the pane on screen"
             assert state["rail"] > 0, (
                 "hiding the list also took away the way back to the other "
-                "sections; that is the shift-click case, not the plain one"
+                "sections; that is the rail's own control, not this one"
             )
         finally:
             context.close()
@@ -580,8 +580,9 @@ class TestThePaneCannotTrapAPhone:
 
 
 class TestTheRailCollapsesInTheOpen:
-    """Hiding the rail was a shift-click: undiscoverable, and forgotten on
-    reload because only the pane's state was stored."""
+    """The rail once hid only through a modifier gesture on the pane's
+    toggle: undiscoverable, and forgotten on reload because only the pane's
+    state was stored. It has its own control and its own memory now."""
 
     def test_the_rail_has_a_control_and_a_way_back(self, browser, server):
         context, page = _signed_in_page(browser, server, DESKTOP)
@@ -627,9 +628,9 @@ class TestTheTwoCollapsesAreIndependent:
     """Two controls, two stored keys, and so two geometries.
 
     Hiding the rail used to collapse the pane with it. That was right while
-    hiding the rail was a shift-click meaning "distraction-free"; it is
-    wrong now that the rail has its own control, because hiding 48px of
-    navigation silently took away 240px of conversation list as well.
+    one control meant both; it is wrong now that the rail has its own,
+    because hiding 48px of navigation silently took away 240px of
+    conversation list as well.
     """
 
     def _bands(self, page):
@@ -776,6 +777,119 @@ class TestProseKeepsAMeasureTheWorkspaceDoesNot:
             )
             assert seen["table"] > seen["prose"] + 50, (
                 "a table is held to the prose measure"
+            )
+        finally:
+            context.close()
+
+
+class TestTheResponsiveDefaultIsNotAChoice:
+    """A width decides the default; only a click decides a preference.
+
+    Initialisation used to write the responsive default through the
+    remembering path, which turned "this is what a phone opens with" into
+    "this is what the reader wants everywhere". A first visit on a desktop
+    stored `paneHidden=0` and the same browser on a phone then opened the
+    overlay on top of the thread; a first visit on a phone stored `1` and
+    the desktop came back with no conversation list.
+
+    Every other test here builds a fresh `BrowserContext` per viewport, so
+    `localStorage` never survives the transition and none of them can see
+    this. These reuse one context across both shapes, which is what a person
+    with one browser actually does.
+    """
+
+    PANE_KEY = "liminal.paneHidden"
+
+    def _signed_in_context(self, browser, server, viewport):
+        """Like `_signed_in_page`, but the caller keeps the context."""
+        import httpx
+
+        email = f"pref_{uuid.uuid4().hex[:8]}@example.com"
+        resp = httpx.post(
+            f"{server.base_url}/v1/auth/signup",
+            json={"email": email, "password": PASSWORD},
+            timeout=30,
+        )
+        assert resp.status_code == 201, resp.text
+        context = browser.new_context(viewport=viewport)
+        page = context.new_page()
+        page.goto(f"{server.base_url}/", wait_until="domcontentloaded")
+        page.fill("#email", email)
+        page.fill("#password", PASSWORD)
+        page.click("#auth-form button[type=submit]")
+        page.wait_for_function(
+            "() => !!sessionStorage.getItem('liminal.accessToken')", timeout=30000
+        )
+        page.wait_for_selector("#main-tabs", state="visible")
+        page.wait_for_timeout(700)
+        return context, page
+
+    def _pane_width(self, page):
+        return page.evaluate(
+            "() => document.querySelector('.context-pane')"
+            ".getBoundingClientRect().width"
+        )
+
+    def _stored(self, page):
+        return page.evaluate(
+            "(k) => localStorage.getItem(k)", self.PANE_KEY
+        )
+
+    def _reload_at(self, page, viewport, server):
+        page.set_viewport_size(viewport)
+        page.goto(f"{server.base_url}/", wait_until="domcontentloaded")
+        page.wait_for_selector("#main-tabs", state="visible")
+        page.wait_for_timeout(700)
+
+    def test_a_desktop_first_visit_does_not_decide_for_the_phone(
+        self, browser, server
+    ):
+        context, page = self._signed_in_context(browser, server, DESKTOP)
+        try:
+            assert self._pane_width(page) > 100, "the desktop default is open"
+            assert self._stored(page) is None, (
+                "opening on a desktop recorded a pane preference the reader "
+                "never expressed"
+            )
+            self._reload_at(page, PHONE, server)
+            assert self._pane_width(page) == 0, (
+                "the phone opened the overlay on top of the thread, because "
+                "the desktop visit had stored its default as a choice"
+            )
+        finally:
+            context.close()
+
+    def test_a_phone_first_visit_does_not_decide_for_the_desktop(
+        self, browser, server
+    ):
+        context, page = self._signed_in_context(browser, server, PHONE)
+        try:
+            assert self._pane_width(page) == 0, "the phone default is hidden"
+            assert self._stored(page) is None, (
+                "opening on a phone recorded a pane preference the reader "
+                "never expressed"
+            )
+            self._reload_at(page, DESKTOP, server)
+            assert self._pane_width(page) > 100, (
+                "the desktop came back with no conversation list, because "
+                "the phone visit had stored its default as a choice"
+            )
+        finally:
+            context.close()
+
+    def test_an_actual_choice_does_persist(self, browser, server):
+        """The other half: the fix must not stop preferences working."""
+        context, page = self._signed_in_context(browser, server, DESKTOP)
+        try:
+            page.click("#pane-toggle")
+            page.wait_for_timeout(200)
+            assert self._pane_width(page) == 0
+            assert self._stored(page) == "1", (
+                "clicking the toggle did not record the choice"
+            )
+            self._reload_at(page, DESKTOP, server)
+            assert self._pane_width(page) == 0, (
+                "the reader hid the pane and it came back on reload"
             )
         finally:
             context.close()

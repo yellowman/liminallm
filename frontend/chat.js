@@ -273,8 +273,10 @@ const topbarTitle = $('topbar-title');
 
 //: What the reader has chosen to hide, remembered per browser. Two keys
 //: because they are two controls: the pane's toggle in the bar, and the
-//: rail's own at the foot of the rail. A modifier gesture that hid the rail
-//: was not discoverable and did not survive a reload.
+//: rail's own at the foot of the rail. Only a click on one of those writes
+//: here: the responsive default below is a default, not a choice, and
+//: recording it would make a phone's first visit decide what a desktop
+//: shows later.
 const PANE_HIDDEN_KEY = 'liminal.paneHidden';
 const RAIL_HIDDEN_KEY = 'liminal.railHidden';
 
@@ -403,13 +405,7 @@ const updateAuthUI = () => {
 // Tab navigation
 // =============================================================================
 
-/**
- * Hide or show the contextual pane, and remember the choice.
- *
- * `Shift`-click hides the rail as well, which is the distraction-free case.
- * It is deliberately the secondary gesture: losing the list is common, and
- * losing the way back to Notes and Files is not.
- */
+/** Store a shell preference, or carry on without one. */
 const remember = (key, value) => {
   try {
     localStorage.setItem(key, value ? '1' : '0');
@@ -486,7 +482,17 @@ const initPaneToggle = () => {
   const stored = recall(PANE_HIDDEN_KEY);
   // Below 900px the pane is an overlay over the workspace, so opening on it
   // would cover the thing the reader came for. Only until they say otherwise.
-  setPaneHidden(stored === null ? paneIsOverlay() : stored === '1');
+  //
+  // `remembered: false` because this applies a preference, it does not make
+  // one. Writing the responsive default here turned it into a choice that
+  // then outranked the default everywhere else: a first visit on a desktop
+  // stored "open" and the same browser on a phone opened the overlay over
+  // the thread; a first visit on a phone stored "hidden" and the desktop
+  // came back with no conversation list.
+  setPaneHidden(
+    stored === null ? paneIsOverlay() : stored === '1',
+    { remembered: false },
+  );
   setRailHidden(recall(RAIL_HIDDEN_KEY) === '1');
 
   paneToggle?.addEventListener('click', () => {
