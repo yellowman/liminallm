@@ -437,11 +437,20 @@ const setPaneHidden = (hidden, { remembered = true } = {}) => {
   if (remembered) remember(PANE_HIDDEN_KEY, hidden);
 };
 
-/** Hide or show the rail. Its own control, and its own memory. */
-const setRailHidden = (hidden) => {
+/**
+ * Hide or show the rail. Its own control, and its own memory.
+ *
+ * `remembered` mirrors `setPaneHidden`: applying a stored state is not
+ * making one. The rail's default does not depend on the viewport today, so
+ * writing it on load was invisible rather than wrong - but the two halves of
+ * one storage contract should not have different rules, and the day the rail
+ * gains a responsive default is the day that asymmetry becomes the pane bug
+ * again.
+ */
+const setRailHidden = (hidden, { remembered = true } = {}) => {
   if (!appShell) return;
   appShell.classList.toggle('rail-hidden', hidden);
-  remember(RAIL_HIDDEN_KEY, hidden);
+  if (remembered) remember(RAIL_HIDDEN_KEY, hidden);
 };
 
 /**
@@ -493,7 +502,10 @@ const initPaneToggle = () => {
     stored === null ? paneIsOverlay() : stored === '1',
     { remembered: false },
   );
-  setRailHidden(recall(RAIL_HIDDEN_KEY) === '1');
+  setRailHidden(
+    recall(RAIL_HIDDEN_KEY) === '1',
+    { remembered: false },
+  );
 
   paneToggle?.addEventListener('click', () => {
     setPaneHidden(!appShell?.classList.contains('pane-hidden'));

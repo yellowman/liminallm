@@ -799,6 +799,7 @@ class TestTheResponsiveDefaultIsNotAChoice:
     """
 
     PANE_KEY = "liminal.paneHidden"
+    RAIL_KEY = "liminal.railHidden"
 
     def _signed_in_context(self, browser, server, viewport):
         """Like `_signed_in_page`, but the caller keeps the context."""
@@ -830,15 +831,21 @@ class TestTheResponsiveDefaultIsNotAChoice:
             ".getBoundingClientRect().width"
         )
 
-    def _stored(self, page):
+    def _stored(self, page, key=None):
         return page.evaluate(
-            "(k) => localStorage.getItem(k)", self.PANE_KEY
+            "(k) => localStorage.getItem(k)", key or self.PANE_KEY
         )
 
     def _reload_at(self, page, viewport, server):
+        # Waits for the shell to have chosen a section, not for the rail to
+        # be visible: a reader who hid the rail reloads into a page where it
+        # is legitimately absent, and waiting for it there can only time out.
         page.set_viewport_size(viewport)
         page.goto(f"{server.base_url}/", wait_until="domcontentloaded")
-        page.wait_for_selector("#main-tabs", state="visible")
+        page.wait_for_function(
+            "() => !!document.querySelector('.app-shell[data-section]')",
+            timeout=30000,
+        )
         page.wait_for_timeout(700)
 
     def test_a_desktop_first_visit_does_not_decide_for_the_phone(
@@ -891,5 +898,48 @@ class TestTheResponsiveDefaultIsNotAChoice:
             assert self._pane_width(page) == 0, (
                 "the reader hid the pane and it came back on reload"
             )
+        finally:
+            context.close()
+
+    def test_an_untouched_load_stores_no_shell_preference_at_all(
+        self, browser, server
+    ):
+        """Both halves of one contract, not one of them.
+
+        The rail's default does not depend on the viewport, so writing it on
+        load produced no visible bug - it just meant the two keys followed
+        different rules, and the pane's version of that rule was the defect
+        above.
+        """
+        context, page = self._signed_in_context(browser, server, DESKTOP)
+        try:
+            assert self._stored(page, self.PANE_KEY) is None
+            assert self._stored(page, self.RAIL_KEY) is None, (
+                "an untouched load recorded a rail preference the reader "
+                "never expressed"
+            )
+        finally:
+            context.close()
+
+    def test_the_rail_remembers_a_real_choice_both_ways(self, browser, server):
+        context, page = self._signed_in_context(browser, server, DESKTOP)
+        try:
+            page.click("#rail-toggle")
+            page.wait_for_timeout(200)
+            assert self._stored(page, self.RAIL_KEY) == "1"
+            self._reload_at(page, DESKTOP, server)
+            assert page.evaluate(
+                "() => document.querySelector('.app-rail')"
+                ".getBoundingClientRect().width"
+            ) == 0, "the reader hid the rail and it came back on reload"
+
+            page.click("#rail-restore")
+            page.wait_for_timeout(200)
+            assert self._stored(page, self.RAIL_KEY) == "0"
+            self._reload_at(page, DESKTOP, server)
+            assert page.evaluate(
+                "() => document.querySelector('.app-rail')"
+                ".getBoundingClientRect().width"
+            ) > 0, "the reader restored the rail and it vanished on reload"
         finally:
             context.close()
