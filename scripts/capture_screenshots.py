@@ -135,22 +135,35 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def configure_env(args: argparse.Namespace, scratch: pathlib.Path) -> None:
-    """Point the runtime at throwaway state and choose the answering backend."""
+def configure_paths(scratch: pathlib.Path) -> None:
+    """Point the filesystem-shaped settings at throwaway state.
+
+    These are read while the modules below are imported, so they are set
+    before any of them is.
+    """
     fs_root = scratch / "fs"
     fs_root.mkdir(parents=True, exist_ok=True)
     os.environ["SHARED_FS_ROOT"] = str(fs_root)
     os.environ["TEST_MODE"] = "true"
     os.environ.setdefault("EMBEDDING_VECTOR_DIM", "64")
 
+
+def instance_settings(args: argparse.Namespace, redis_url: str) -> dict:
+    """The managed settings this capture runs under.
+
+    `redis_url` is a database-managed setting with a `localhost:6379`
+    default and no environment variable behind it, so the scratch Redis has
+    to be named here. Exporting `REDIS_URL` does nothing: the runtime never
+    reads it, and a capture that relied on it would quietly use whichever
+    Redis happened to be listening on the developer's own machine.
+    """
+    settings = {"redis_url": redis_url}
     if not args.live:
         # Deterministic and offline: canned answers, no credential, no
         # network. The images are for checking the pipeline, not for the
         # README.
-        os.environ["INSTANCE_SETTINGS_JSON"] = json.dumps(
-            {"model_backend": "stub"}
-        )
-        return
+        settings["model_backend"] = "stub"
+        return settings
 
     # The credential comes from the environment and is never echoed.
     if not os.environ.get("GEMINI_API_KEY"):
@@ -158,9 +171,33 @@ def configure_env(args: argparse.Namespace, scratch: pathlib.Path) -> None:
             "--live needs GEMINI_API_KEY in the environment. Run without "
             "--live to capture with the stub backend instead."
         )
-    os.environ["INSTANCE_SETTINGS_JSON"] = json.dumps(
-        {"model_backend": "gemini_native", "model_path": args.model}
-    )
+    settings["model_backend"] = "gemini_native"
+    settings["model_path"] = args.model
+    return settings
+
+
+def assert_isolated(redis_url: str) -> None:
+    """Refuse to run against anything but the Redis this script started.
+
+    A tool that regenerates documentation must not reach a service it does
+    not own, and `TEST_MODE` would otherwise let it proceed with no cache at
+    all rather than say so.
+    """
+    from liminallm.service.runtime import get_runtime
+
+    runtime = get_runtime()
+    actual = runtime.settings.redis_url
+    if actual != redis_url:
+        raise SystemExit(
+            f"the runtime resolved Redis at {actual}, not the scratch "
+            f"instance at {redis_url}; refusing to touch a service this "
+            "script does not own"
+        )
+    if runtime.cache is None:
+        raise SystemExit(
+            "the runtime has no Redis cache, so the scratch instance was "
+            "never reached"
+        )
 
 
 def unwrap(resp) -> dict:
@@ -322,23 +359,36 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
 
     with tempfile.TemporaryDirectory(prefix="liminallm-shots-") as tmp:
-        configure_env(args, pathlib.Path(tmp))
-
-        from tests.harness import ScratchPostgres, ScratchRedis, apply_schema
-
-        postgres = ScratchPostgres()
-        os.environ["DATABASE_URL"] = postgres.start()
-        redis = ScratchRedis()
-        os.environ["REDIS_URL"] = redis.start()
-        apply_schema(os.environ["DATABASE_URL"], embedding_dim=64)
+        configure_paths(pathlib.Path(tmp))
 
         import httpx
 
         from tests.browser import LiveServer
+        from tests.harness import ScratchPostgres, ScratchRedis, apply_schema
 
-        server = LiveServer().start()
-        client = httpx.Client(base_url=server.base_url, timeout=120.0)
+        # Every start() below has its stop() in the finally, including a
+        # failure part way through capture: this script owns two server
+        # processes and a Postgres data directory of its own, and leaving
+        # them behind is what makes a second run pick up a first run's mess.
+        postgres = ScratchPostgres()
+        redis = ScratchRedis()
+        server = None
+        client = None
         try:
+            database_url = postgres.start()
+            redis_url = redis.start()
+            os.environ["DATABASE_URL"] = database_url
+            # Read when the runtime first boots, which the server start
+            # below triggers.
+            os.environ["INSTANCE_SETTINGS_JSON"] = json.dumps(
+                instance_settings(args, redis_url)
+            )
+            apply_schema(database_url, embedding_dim=64)
+
+            server = LiveServer().start()
+            assert_isolated(redis_url)
+
+            client = httpx.Client(base_url=server.base_url, timeout=120.0)
             client.post(
                 "/v1/auth/signup", json={"email": EMAIL, "password": PASSWORD}
             )
@@ -346,8 +396,12 @@ def main(argv: list[str]) -> int:
             print(f"serving {server.base_url} with the {mode}", flush=True)
             shots = capture(args, server.base_url, client)
         finally:
-            client.close()
-            server.stop()
+            if client is not None:
+                client.close()
+            if server is not None:
+                server.stop()
+            redis.stop()
+            postgres.stop()
 
     print(f"\n{len(shots)} screenshots in {args.out}")
     if not args.live:
