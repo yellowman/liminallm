@@ -194,3 +194,148 @@ class TestTheSettingsTabRecoversFromAFailedLoad:
             )
         finally:
             context.close()
+
+
+def _totp(secret: str) -> str:
+    """The current RFC 6238 code for a base32 secret.
+
+    Six lines of the standard library, so enrolling for real in a test
+    costs no dependency.
+    """
+    import base64
+    import hashlib
+    import hmac
+    import struct
+    import time
+
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    digest = hmac.new(
+        key, struct.pack(">Q", int(time.time()) // 30), hashlib.sha1
+    ).digest()
+    offset = digest[-1] & 0x0F
+    code = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return f"{code % 1_000_000:06d}"
+
+
+def _sign_in(browser, server, prefix):
+    """A fresh account on the Settings tab, with MFA status loaded."""
+    import httpx
+
+    email = f"{prefix}_{uuid.uuid4().hex[:8]}@example.com"
+    resp = httpx.post(
+        f"{server.base_url}/v1/auth/signup",
+        json={"email": email, "password": PASSWORD},
+        timeout=30,
+    )
+    assert resp.status_code == 201, resp.text
+
+    context = browser.new_context(viewport={"width": 1440, "height": 900})
+    page = context.new_page()
+    page.goto(f"{server.base_url}/", wait_until="domcontentloaded")
+    page.fill("#email", email)
+    page.fill("#password", PASSWORD)
+    page.click("#auth-form button[type=submit]")
+    page.wait_for_function(
+        "() => !!sessionStorage.getItem('liminal.accessToken')", timeout=30000
+    )
+    page.wait_for_selector("#main-tabs", state="visible")
+    page.click("#main-tabs .tab-btn[data-tab='settings-tab']")
+    page.wait_for_selector("#settings-tab.active", state="visible")
+    return context, page
+
+
+def _revisit_settings(page):
+    """Leave Settings and come back, waiting for the MFA reload to land."""
+    page.click("#main-tabs .tab-btn[data-tab='chat-tab']")
+    page.wait_for_selector("#chat-tab.active", state="visible")
+    with page.expect_response(lambda r: "/auth/mfa/status" in r.url):
+        page.click("#main-tabs .tab-btn[data-tab='settings-tab']")
+    page.wait_for_selector("#settings-tab.active", state="visible")
+    page.wait_for_timeout(500)
+
+
+class TestReloadingDoesNotDisturbAnMfaInteraction:
+    """The reload may refresh what MFA *is*, never what the user is doing.
+
+    Both MFA flows take ownership of their entry-point button for as long
+    as their section is open: starting enrollment hides Enable MFA, and
+    opening the disable form hides Disable MFA. Re-deriving those buttons
+    from the server's `enabled` flag puts a second entry point back on
+    screen beside a live interaction, which invites a second setup request
+    while the first secret and code are still displayed.
+    """
+
+    def test_enrollment_survives_leaving_the_tab(self, browser, server):
+        context, page = _sign_in(browser, server, "mfa")
+        try:
+            page.wait_for_selector("#mfa-enable-btn:not(.hidden)", timeout=15000)
+            page.click("#mfa-enable-btn")
+            page.wait_for_selector("#mfa-setup-section:not(.hidden)", timeout=15000)
+
+            secret = (page.text_content("#mfa-secret-display") or "").strip()
+            assert secret and secret != "N/A", (
+                f"no enrollment secret was displayed ({secret!r}), so this "
+                "test never reproduced the state it is about"
+            )
+            page.fill("#mfa-setup-code", "123456")
+
+            _revisit_settings(page)
+
+            assert page.is_visible("#mfa-setup-section"), (
+                "the enrollment section closed on its own"
+            )
+            assert page.is_hidden("#mfa-enable-btn"), (
+                "Enable MFA came back while an enrollment was still open, so "
+                "a second setup request can be started beside the first "
+                "secret and code"
+            )
+            assert (page.text_content("#mfa-secret-display") or "").strip() == (
+                secret
+            ), "the displayed enrollment secret changed"
+            assert page.input_value("#mfa-setup-code") == "123456", (
+                "the typed setup code was cleared"
+            )
+        finally:
+            context.close()
+
+    def test_the_disable_form_survives_leaving_the_tab(self, browser, server):
+        """The same defect, mirrored, on the other MFA flow.
+
+        Reaching it needs MFA actually enabled, so the test enrols for
+        real. The code is computed here from the displayed secret rather
+        than through a package: TOTP is a few lines of the standard
+        library, and this is not worth a dependency.
+        """
+        context, page = _sign_in(browser, server, "mfadis")
+        try:
+            page.wait_for_selector("#mfa-enable-btn:not(.hidden)", timeout=15000)
+            page.click("#mfa-enable-btn")
+            page.wait_for_selector("#mfa-setup-section:not(.hidden)", timeout=15000)
+            secret = (page.text_content("#mfa-secret-display") or "").strip()
+            assert secret and secret != "N/A", f"no secret displayed: {secret!r}"
+
+            page.fill("#mfa-setup-code", _totp(secret))
+            page.click("#mfa-verify-btn")
+
+            # Enrolment done: the disable entry point is the visible one.
+            page.wait_for_selector(
+                "#mfa-show-disable-btn:not(.hidden)", timeout=15000
+            )
+            page.click("#mfa-show-disable-btn")
+            page.wait_for_selector("#mfa-disable-section:not(.hidden)", timeout=15000)
+            page.fill("#mfa-disable-code", "654321")
+
+            _revisit_settings(page)
+
+            assert page.is_visible("#mfa-disable-section"), (
+                "the disable form closed on its own"
+            )
+            assert page.is_hidden("#mfa-show-disable-btn"), (
+                "Disable MFA came back while the disable form was already "
+                "open, so a second one can be started beside the first"
+            )
+            assert page.input_value("#mfa-disable-code") == "654321", (
+                "the typed disable code was cleared"
+            )
+        finally:
+            context.close()

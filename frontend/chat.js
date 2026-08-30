@@ -2553,6 +2553,12 @@ const handleExportDrafts = () => {
 
 let pendingMfaSecret = null;
 
+/** True while a section is on screen, and false when it does not exist. */
+const isSectionOpen = (id) => {
+  const el = $(id);
+  return !!el && !el.classList.contains('hidden');
+};
+
 const fetchMfaStatus = async () => {
   const statusEl = $('setting-mfa-status');
   const enableBtn = $('mfa-enable-btn');
@@ -2576,9 +2582,19 @@ const fetchMfaStatus = async () => {
       statusEl.style.color = enabled ? '#0a7' : 'inherit';
     }
 
-    // Show/hide appropriate buttons
-    if (enableBtn) enableBtn.classList.toggle('hidden', enabled);
-    if (disableBtn) disableBtn.classList.toggle('hidden', !enabled);
+    // Show/hide appropriate buttons, unless a flow already owns one. Each
+    // section hides its own entry point while it is open — startMfaSetup
+    // hides Enable, showMfaDisable hides Disable — so re-deriving these
+    // from `enabled` would put a second entry point on screen beside a
+    // live interaction, and let a second request start while the first
+    // secret and code are still displayed. The status text above is
+    // read-only and always refreshes.
+    if (enableBtn && !isSectionOpen('mfa-setup-section')) {
+      enableBtn.classList.toggle('hidden', enabled);
+    }
+    if (disableBtn && !isSectionOpen('mfa-disable-section')) {
+      disableBtn.classList.toggle('hidden', !enabled);
+    }
   } catch (err) {
     if (statusEl) statusEl.textContent = 'Unable to check';
   }
