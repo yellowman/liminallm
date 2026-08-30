@@ -22,7 +22,10 @@ wheels/
 
 # Virtual environments
 .env
-.venv
+# Per-interpreter environments too: CI runs the suite on three Python
+# versions, so reproducing a version-specific failure needs a venv beside
+# the default one.
+.venv*
 env/
 venv/
 ENV/
