@@ -17,11 +17,22 @@ pytestmark = pytest.mark.slow
 
 
 
-def _seed_user_with_events(store, email, cluster_id, n_events, corrected="use tabs"):
-    user = store.create_user(email=f"{uuid.uuid4().hex[:8]}_{email}")
-    convo = store.create_conversation(user.id, title="t")
+def _seed_user_with_events(
+    store, email, cluster_id, n_events, corrected="use tabs", conversations=1, user=None
+):
+    """`n_events` rated answers, spread over `conversations` threads.
+
+    The spread matters to the weights gate (SPEC §5.5): ratings confined to
+    one thread are one episode rated repeatedly, which does not earn
+    weights however many rows it writes.
+    """
+    user = user or store.create_user(email=f"{uuid.uuid4().hex[:8]}_{email}")
+    threads = [
+        store.create_conversation(user.id, title="t") for _ in range(max(conversations, 1))
+    ]
     events = []
     for i in range(n_events):
+        convo = threads[i % len(threads)]
         prompt_msg = store.append_message(convo.id, "user", "user", f"question {i}")
         reply = store.append_message(convo.id, "assistant", "assistant", f"answer {i}")
         _ = prompt_msg
@@ -75,8 +86,15 @@ class TestPromptFirstLadder:
         store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
-        cluster = _make_cluster(store)
-        _seed_user_with_events(store, "a@t.local", cluster.id, 8)
+        # A *personal* skill: one owner's own cluster. Spread across threads,
+        # because the count alone no longer earns weights, and owned by that
+        # user, because a cluster with no `user_id` is the shared kind and
+        # shared weights need several contributors (SPEC §5.5).
+        owner = store.create_user(email=f"{uuid.uuid4().hex[:8]}_a@t.local")
+        cluster = _make_cluster(store, user_id=owner.id)
+        _seed_user_with_events(
+            store, "a@t.local", cluster.id, 8, conversations=8, user=owner
+        )
 
         promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=8)
 
@@ -89,8 +107,14 @@ class TestPromptFirstLadder:
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
-        _seed_user_with_events(store, "a@t.local", cluster.id, 3)
-        heavy_user, _ = _seed_user_with_events(store, "b@t.local", cluster.id, 5)
+        # Three contributors, because a shared skill is served to people who
+        # never rated anything for it (SPEC §5.5). `heavy_user` still has the
+        # most events, which is what decides ownership.
+        _seed_user_with_events(store, "a@t.local", cluster.id, 3, conversations=3)
+        heavy_user, _ = _seed_user_with_events(
+            store, "b@t.local", cluster.id, 5, conversations=5
+        )
+        _seed_user_with_events(store, "c@t.local", cluster.id, 3, conversations=3)
 
         promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=8)
 

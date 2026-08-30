@@ -35,8 +35,10 @@ code and the docs under `docs/` say how it is currently implemented.
     but is never required at inference time.
 - **deep, evolving user-specific behavior** via:
   - per-user persona adapters (small, low-stakes: tone and format)
-  - per-skill LoRA adapters trained on **pooled** cluster data (§7.3) - a
-    single user's feedback is too sparse to train weights on
+  - per-skill LoRA adapters (§7.3), in two kinds that differ in scope
+    rather than in capability: a **personal** skill trains from one user's
+    repeated evidence and stays private to them, and a **shared** skill
+    pools several users' evidence and is served across the tenant
   - the adapter ladder (§5.5): every skill is born as a prompt, and only
     earns weights when the data justifies it and the eval gate passes
   - natural, emergent domains & skills from usage
@@ -1154,13 +1156,13 @@ every skill adapter climbs the same ladder; the rungs are data thresholds and
 eval gates, not human ceremony:
 
 ```
-cluster qualifies          pooled events ≥ threshold      eval gate passes
+cluster qualifies          independent evidence           eval gate passes
       │                              │                          │
       ▼                              ▼                          ▼
  mode: prompt      ──────▶   training job enqueued   ──────▶  mode: hybrid
- (instructions from          (data pooled across              (trained weights,
-  cluster label +             the whole cluster)               prompt kept as
-  positive exemplars)                                          portable fallback)
+ (instructions from          (personal: one user's            (trained weights,
+  cluster label +             own history; shared:             prompt kept as
+  positive exemplars)         pooled across 3+ users)          portable fallback)
 ```
 
 1. **born as a prompt.** when a cluster qualifies (§7.3), its skill adapter
@@ -1169,10 +1171,29 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
    immediately useful on every backend, free to create.
    `lifecycle: { "stage": "prompt", "weights_min_events": N }` records the
    next rung.
-2. **weights when the data earns them.** once the cluster has pooled at
-   least `weights_min_events` positive events (default 20), a training job
-   is enqueued. skill data pools **across all contributors to the cluster**
-   (tenant-scoped); persona adapters remain strictly per-user.
+2. **weights when the evidence earns them.** a raw count is not evidence:
+   twenty ratings inside one conversation are one episode rated
+   repeatedly, while twenty across unrelated work are a behaviour that
+   kept working. a training job is enqueued only once the cluster's
+   positive events clear all of:
+   - `positive_events >= weights_min_events` (default 20), AND
+   - `messages >= weights_min_events` - counted over **distinct** rated
+     answers, so re-rating one reply cannot reach the bar alone, AND
+   - `conversations >= 5`.
+
+   a **shared** skill additionally requires `users >= 3`, because its
+   weights are served to people who never contributed evidence for them. a
+   **personal** skill carries no user requirement on purpose: a one-person
+   install that cannot train a skill can never learn one at all. it trains
+   from that user's own history and stays `visibility: private`,
+   `scope: "per-user"`; a shared skill is `visibility: shared`,
+   `scope: "tenant"`, owned by its most frequent contributor.
+
+   the measured counts are recorded at
+   `lifecycle.evidence: { positive_events, conversations, messages, users }`
+   so a skill that stayed on the prompt rung says why. persona adapters are
+   a third thing and remain strictly per-user: they carry tone and format,
+   not a learned task behaviour.
 3. **graduation is gated** through §5.4.6; a failed or skipped gate leaves
    the adapter on the prompt rung; nothing regresses. the rules that make
    the ladder safe (histories in docs/decisions/adapter-resolution.md):
@@ -1475,7 +1496,13 @@ then a skill adapter is created **on the prompt rung of the ladder (§5.5)**:
   "mode": "prompt",
   "scope": "global",
   "prompt_instructions": "Skill: <label>.\n<description>\nExamples of responses users rated highly:\n- ...",
-  "lifecycle": { "stage": "prompt", "weights_min_events": 20 },
+  "lifecycle": {
+    "stage": "prompt",
+    "weights_min_events": 20,
+    "evidence": {
+      "positive_events": 20, "conversations": 1, "messages": 20, "users": 1
+    }
+  },
   "rank": 4,
   "layers": [0,1,2],
   "matrices": ["attn_q"],
