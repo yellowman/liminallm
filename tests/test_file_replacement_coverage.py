@@ -41,6 +41,8 @@ import time
 import uuid
 from pathlib import Path
 
+import pytest
+
 from liminallm.api import routes
 from liminallm.service import ingest_queue
 from liminallm.service.fs import PathLockTimeout, path_lock, publication_key
@@ -885,18 +887,67 @@ class TestTheProducerIsAlsoAWriter:
             daemon=True,
         )
         worker.start()
-        assert extracted.wait(30), "the worker never reached the write"
+        replaced = None
+        # Everything between starting a thread and reaping it belongs inside
+        # this boundary, including the assertions. A background thread left
+        # running unwinds through the store while the fixture is already
+        # tearing it down, and the request dies of `PoolClosed` in a daemon
+        # thread - a second failure, owned by nobody, reported against
+        # whatever ran next. That is what this test used to produce, so its
+        # own failure paths must not produce it either: the mutation that
+        # proves the ownership check below is exactly a failure path.
+        try:
+            assert extracted.wait(30), "the worker never reached the write"
 
-        # The replacement, through the ordinary endpoint, while that write is
-        # still in flight.
-        replaced = threading.Thread(
-            target=lambda: _upload(client, headers, "report.md", SECOND), daemon=True
-        )
-        replaced.start()
-        replaced.join(30)
-        may_write.set()
-        worker.join(30)
+            # The worker is inside the gate, so it owns the publication lock.
+            # Said out loud, because everything after it depends on it: the
+            # block the replacement is about to hit has to be a real one.
+            with pytest.raises(PathLockTimeout):
+                with _publication_lock(runtime, path, timeout=0.05):
+                    pass
+
+            # The replacement announces its arrival at that same lock, through
+            # the route's own reference to it. Inferring arrival from elapsed
+            # time would only ever mean "has not finished yet": on a slow
+            # enough box the lock could be gone and the request still be
+            # running, and the serialization this test exists to check would
+            # go unnoticed.
+            key = publication_key(_root(runtime), path)
+            at_lock = threading.Event()
+            route_path_lock = routes.path_lock
+
+            @contextlib.contextmanager
+            def announcing_path_lock(fs_root, lock_key, **kwargs):
+                if lock_key == key:
+                    at_lock.set()
+                with route_path_lock(fs_root, lock_key, **kwargs):
+                    yield
+
+            monkeypatch.setattr(routes, "path_lock", announcing_path_lock)
+
+            # The replacement, through the ordinary endpoint, while that write
+            # is still in flight.
+            replaced = threading.Thread(
+                target=lambda: _upload(client, headers, "report.md", SECOND),
+                daemon=True,
+            )
+            replaced.start()
+            assert at_lock.wait(30), (
+                "the replacement never reached the publication lock, so it "
+                "was never in flight across the worker's write and this test "
+                "proved nothing"
+            )
+        finally:
+            may_write.set()
+            if replaced is not None:
+                replaced.join(30)
+            worker.join(30)
+
         assert not worker.is_alive()
+        assert replaced is not None and not replaced.is_alive(), (
+            "the replacement upload never finished; it holds a connection "
+            "from a pool the fixture is about to close"
+        )
 
         monkeypatch.setattr(runtime.rag, "ingest_text", real_ingest_text)
         indexed = _text_for(runtime, context_id, "report.md")
