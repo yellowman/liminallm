@@ -438,10 +438,18 @@ class TrainingService:
         # enqueue on the way. The worker already owns the correct path, so
         # this refuses rather than re-deriving the gate here. A persona
         # adapter is not cluster-bound and is unaffected.
-        if adapter_schema_now.get("cluster_id") and job is None:
+        # A *pinned* job, not merely a job. A live job against a
+        # cluster-bound adapter would pass a jobless check, leave
+        # `pinned_job` False, and run the live cluster query - the same
+        # bypass one step along. An empty list is pinned and falls through
+        # to the pinned-invalid refusal below, which is the right answer
+        # for it.
+        if adapter_schema_now.get("cluster_id") and (
+            job is None or job.preference_event_ids is None
+        ):
             raise ConstraintViolation(
-                "skill training requires a queued job",
-                {"adapter_id": adapter.id},
+                "skill training requires a pinned job",
+                {"adapter_id": adapter.id, "job_id": job.id if job else None},
             )
         # SPEC §7.3: skill adapters (cluster-bound, not owned by a single user)
         # pool positive events across every contributor to the cluster; a

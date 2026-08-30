@@ -235,7 +235,7 @@ class TestSkillTrainingOnlyArrivesThroughItsJob:
         assert [j for j in store.list_training_jobs()
                 if j.adapter_id == adapter_id] == []
 
-        with pytest.raises(ConstraintViolation, match="queued job"):
+        with pytest.raises(ConstraintViolation, match="pinned job"):
             training.train_from_preferences(owner.id, adapter_id=adapter_id)
 
         assert [j for j in store.list_training_jobs()
@@ -272,6 +272,40 @@ class TestSkillTrainingOnlyArrivesThroughItsJob:
         assert training.train_from_preferences(
             owner.id, adapter_id=adapter.id
         ) is not None
+
+
+    def test_a_live_job_does_not_let_a_skill_train(self, tmp_path):
+        """A job is not the authority; a *pinned* job is.
+
+        Refusing only when no job exists left the door ajar: a live job
+        against a cluster-bound adapter passes the jobless guard, resolves
+        `pinned_job` to False, and runs the live cluster query - training a
+        skill whose gate never authorized weights. Persona jobs may be
+        live; skill jobs may not.
+        """
+        store = get_test_store()
+        owner = _user(store, "solo")
+        cluster = _cluster(store, user_id=owner.id)
+        _seed(store, owner, cluster.id, conversations=6, per_conversation=1)
+        training = TrainingService(store, str(tmp_path))
+        adapter_id = SemanticClusterer(
+            store, llm=None, training=training
+        ).promote_skill_adapters(min_size=5)[0]
+        assert [j for j in store.list_training_jobs()
+                if j.adapter_id == adapter_id] == [], "the fixture earned weights"
+
+        live = store.create_training_job(owner.id, adapter_id)
+        assert live.preference_event_ids is None
+
+        with pytest.raises(ConstraintViolation, match="pinned job"):
+            training.train_from_preferences(
+                owner.id, adapter_id=adapter_id, job_id=live.id
+            )
+
+        adapter = store.get_artifact(adapter_id)
+        assert adapter.schema.get("current_version", 0) == 0
+        assert adapter.schema["mode"] == "prompt"
+        assert store.get_training_job(live.id).dataset_path is None
 
 
 class TestAJobOnlyAuthorizesItsOwnAdapter:
@@ -357,6 +391,89 @@ class TestPinnedEvidenceStaysInsideOneTenant:
         assert evidence["users"] == 3, (
             "the recorded contributor count included another tenant's users"
         )
+
+
+class TestTheRevisitRungIsTenantScopedToo:
+    """Birth and revisit must apply the same authority.
+
+    Scoping only the creation path leaves the defect alive one rung up: a
+    shared adapter born in one tenant is later re-measured against the
+    whole cluster, so another tenant's evidence inflates its counts, pushes
+    it over the weights bar, and lands in its pinned set. The resolver
+    refuses that run, but the gate has already recorded weights as earned
+    on evidence the adapter may never lawfully train on.
+
+    An existing shared adapter's authority is the tenant it already
+    records, not one recomputed from whoever contributes next.
+    """
+
+    def _tenant_user(self, store, tenant, cluster_id, threads, secret="s"):
+        user = store.create_user(
+            email=f"{uuid.uuid4().hex[:8]}@{tenant}.test", tenant_id=tenant
+        )
+        for _ in range(threads):
+            convo = store.create_conversation(user.id, title="t")
+            store.append_message(convo.id, "user", "user", "q")
+            reply = store.append_message(convo.id, "assistant", "assistant", secret)
+            store.record_preference_event(
+                user.id, convo.id, reply.id, "positive",
+                corrected_text=secret, context_embedding=[0.1] * 64,
+                cluster_id=cluster_id, context_text=secret,
+            )
+        return user
+
+    def test_foreign_evidence_cannot_graduate_an_existing_shared_skill(
+        self, tmp_path
+    ):
+        store = get_test_store()
+        cluster = _cluster(store)  # shared
+        training = TrainingService(store, str(tmp_path))
+        clusterer = SemanticClusterer(store, llm=None, training=training)
+
+        # Pass 1: two acme contributors, enough for the prompt rung only.
+        self._tenant_user(store, "acme", cluster.id, 3)
+        self._tenant_user(store, "acme", cluster.id, 3)
+        adapter_id = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=12, weights_min_messages=12
+        )[0]
+        assert store.get_artifact(adapter_id).schema["tenant_id"] == "acme"
+        assert [j for j in store.list_training_jobs()
+                if j.adapter_id == adapter_id] == []
+
+        # A different tenant piles into the same cluster - enough that the
+        # whole cluster clears the bar while acme alone still does not.
+        for _ in range(3):
+            self._tenant_user(store, "initech", cluster.id, 4)
+
+        # Pass 2: revisit. Must stay on the prompt rung.
+        clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=12, weights_min_messages=12
+        )
+        evidence = store.get_artifact(adapter_id).schema["lifecycle"]["evidence"]
+        assert evidence["users"] == 2, (
+            f"the revisit counted {evidence['users']} contributors; another "
+            "tenant's users were measured into this adapter's evidence"
+        )
+        assert [j for j in store.list_training_jobs()
+                if j.adapter_id == adapter_id] == [], (
+            "another tenant's evidence pushed this skill over the weights bar"
+        )
+
+        # Pass 3: acme itself earns it.
+        for _ in range(3):
+            self._tenant_user(store, "acme", cluster.id, 4)
+        clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=12, weights_min_messages=12
+        )
+
+        jobs = [j for j in store.list_training_jobs()
+                if j.adapter_id == adapter_id]
+        assert len(jobs) == 1, "acme's own evidence did not earn the weights rung"
+        tenants = {
+            store.get_user(store.get_preference_event(e).user_id).tenant_id
+            for e in jobs[0].preference_event_ids
+        }
+        assert tenants == {"acme"}, f"the job pinned evidence from {tenants}"
 
 
 class TestThePinnedDistinctionRoundTripsThroughStorage:

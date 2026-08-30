@@ -592,6 +592,21 @@ class SemanticClusterer:
         # rung asks for spread in time instead of in people.
         return evidence["span_hours"] >= min_span_hours
 
+    def _positive_in_tenant(self, cluster_id: str, tenant_id: str):
+        """A cluster's positive events, inside one tenant.
+
+        One place, because birth and revisit have to apply the same
+        authority: scoping only the creation path left the same defect
+        alive on the second rung.
+        """
+        return [
+            e
+            for e in self.store.list_preference_events(
+                cluster_id=cluster_id, tenant_id=tenant_id
+            )
+            if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0
+        ]
+
     def _maybe_enqueue_weights(
         self,
         adapter,
@@ -780,11 +795,29 @@ class SemanticClusterer:
         # Skipping it made the weights rung unreachable for every skill
         # that did not cross both bars in a single pass.
         existing = self.store.adapter_for_cluster(cluster.id)
+        shared = not cluster.user_id
         if existing is not None:
+            # Scope before measuring, on both rungs. An existing shared
+            # adapter's authority is the tenant it already records - not one
+            # recomputed from whoever has contributed since - so another
+            # tenant piling into the same cluster cannot inflate this
+            # adapter's evidence or land in its pinned set.
+            if shared:
+                existing_tenant = (existing.schema or {}).get("tenant_id")
+                if not existing_tenant:
+                    self.logger.warning(
+                        "shared_skill_adapter_without_tenant",
+                        cluster_id=cluster.id,
+                        adapter_id=existing.id,
+                    )
+                    return
+                positive = self._positive_in_tenant(cluster.id, existing_tenant)
+                if not positive:
+                    return
             self._revisit_skill_adapter(
                 existing,
                 positive,
-                shared=not cluster.user_id,
+                shared=shared,
                 weights_min_events=weights_min_events,
                 weights_min_messages=weights_min_messages,
                 weights_min_conversations=weights_min_conversations,
@@ -812,7 +845,6 @@ class SemanticClusterer:
         if not owner_id:
             self.logger.warning("skill_promotion_no_owner", cluster_id=cluster.id)
             return
-        shared = not cluster.user_id
         evidence = self._evidence(positive)
         # SPEC §5.5.1: even the cheap rung needs more than one voice when
         # what it produces is delivered to people who never contributed.
@@ -837,14 +869,7 @@ class SemanticClusterer:
             # name evidence the run is then not authorized to train on -
             # which the resolver correctly refuses, but only after the gate
             # already claimed the skill had earned its weights.
-            scoped = self.store.list_preference_events(
-                cluster_id=cluster.id, tenant_id=tenant_id
-            )
-            positive = [
-                e
-                for e in scoped
-                if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0
-            ]
+            positive = self._positive_in_tenant(cluster.id, tenant_id)
             evidence = self._evidence(positive)
             if not positive:
                 self.logger.warning(
