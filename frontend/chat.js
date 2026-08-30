@@ -365,9 +365,9 @@ const updateAuthUI = () => {
   if (settingUserId) settingUserId.textContent = state.userId || '-';
   if (settingRole) settingRole.textContent = state.role || '-';
   if (settingTenant) settingTenant.textContent = state.tenantId || 'global';
-  // The session id lives in an HttpOnly cookie this page cannot read
-  // (SPEC §17.10), so there is nothing here to show.
-  if (settingSessionId) settingSessionId.textContent = 'held in a secure cookie';
+  // The session id lives in an HttpOnly cookie (SPEC §17.10), so this row
+  // states that fact rather than showing an id it cannot read.
+  if (settingSessionId) settingSessionId.textContent = 'Not readable by this page';
 };
 
 // =============================================================================
@@ -398,6 +398,17 @@ const initTabs = () => {
         else if (tabId === 'artifacts-tab') fetchArtifacts();
         else if (tabId === 'tools-tab') refreshToolsAndWorkflows();
         else if (tabId === 'insights-tab') fetchInsights();
+        else if (tabId === 'settings-tab') {
+          // These read-only fields are fetched once at start-up, so a
+          // request that failed then would otherwise sit on screen for the
+          // rest of the session. Opening the tab is the retry.
+          // fetchUserSettings is deliberately not here: it writes into the
+          // preference selects, and reloading them would discard an edit
+          // the user had not saved before switching tabs.
+          fetchEmailVerificationStatus();
+          fetchMfaStatus();
+          loadApiKeys();
+        }
       }
     });
   });

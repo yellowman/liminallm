@@ -130,6 +130,20 @@ class TestEveryStartedServiceIsStopped:
             def stop(self):
                 stopped.append("server")
 
+        class FakeResponse:
+            """The API answers in an envelope, and the script reads it.
+
+            `main` takes the access token out of the login response, so a
+            double that returns nothing would fail there instead of in
+            `capture`, and this test would stop being about teardown.
+            """
+
+            def __init__(self, data):
+                self._data = data
+
+            def json(self):
+                return {"status": "ok", "data": self._data, "error": None}
+
         class FakeClient:
             """Stands in for the seeding client: no socket, and it records
             that the script closed it."""
@@ -138,7 +152,12 @@ class TestEveryStartedServiceIsStopped:
                 pass
 
             def post(self, *_args, **_kwargs):
-                return None
+                return FakeResponse({"access_token": "seed-token"})
+
+            def get(self, *_args, **_kwargs):
+                # No id, so seeding stops before the role promotion: that
+                # step reaches the runtime, which this test never boots.
+                return FakeResponse({})
 
             def close(self):
                 stopped.append("client")
@@ -167,6 +186,73 @@ class TestEveryStartedServiceIsStopped:
         assert "postgres" in stopped, "the scratch Postgres was left running"
         assert "server" in stopped, "the app server was left running"
         assert "client" in stopped, "the seeding client was left open"
+
+
+class TestTheWorkspaceIsSeededBeforeTheBrowserSignsIn:
+    def test_seeding_runs_first(self, script, monkeypatch, tmp_path):
+        """Order is the whole point, not an implementation detail.
+
+        Seeding ends by promoting the demo account to admin, and a role
+        change invalidates the access token minted before it. Seeding while
+        the browser holds a session therefore breaks that session in the
+        middle of the capture: the page recovers by refreshing, but requests
+        already in flight fail, and a panel that loads once keeps showing
+        the failure. The README carried such a screenshot.
+        """
+        monkeypatch.setattr(script.os, "environ", dict(script.os.environ))
+        order: list[str] = []
+
+        class Fake:
+            def start(self):
+                return "redis://127.0.0.1:1/0"
+
+            def stop(self):
+                pass
+
+        class FakeServer:
+            base_url = "http://127.0.0.1:1"
+
+            def start(self):
+                return self
+
+            def stop(self):
+                pass
+
+        class FakeClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def post(self, *_args, **_kwargs):
+                return None
+
+            def close(self):
+                pass
+
+        import httpx
+
+        import tests.browser as browser_mod
+        import tests.harness as harness_mod
+
+        monkeypatch.setattr(httpx, "Client", FakeClient)
+        monkeypatch.setattr(harness_mod, "ScratchPostgres", Fake)
+        monkeypatch.setattr(harness_mod, "ScratchRedis", Fake)
+        monkeypatch.setattr(harness_mod, "apply_schema", lambda *a, **k: None)
+        monkeypatch.setattr(browser_mod, "LiveServer", FakeServer)
+        monkeypatch.setattr(script, "assert_isolated", lambda url: None)
+        monkeypatch.setattr(script, "unwrap", lambda resp: {"access_token": "t"})
+        monkeypatch.setattr(
+            script, "seed", lambda *a, **k: order.append("seed")
+        )
+        monkeypatch.setattr(
+            script, "capture", lambda *a, **k: order.append("capture") or []
+        )
+
+        script.main(["--out", str(tmp_path)])
+
+        assert order == ["seed", "capture"], (
+            f"expected seeding before the browser runs, got {order}; "
+            "seeding afterwards invalidates the session the browser holds"
+        )
 
 
 class TestTheIsolationCheckRefusesAForeignRedis:

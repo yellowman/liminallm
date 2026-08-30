@@ -235,7 +235,7 @@ def seed(client, token: str) -> None:
         get_runtime().store.update_user_role(user_id, "admin")
 
 
-def capture(args: argparse.Namespace, base: str, client) -> list[pathlib.Path]:
+def capture(args: argparse.Namespace, base: str) -> list[pathlib.Path]:
     from playwright.sync_api import sync_playwright
 
     from tests.browser import chromium_executable
@@ -308,13 +308,9 @@ def capture(args: argparse.Namespace, base: str, client) -> list[pathlib.Path]:
         )
         page.wait_for_selector("#main-tabs", state="visible")
 
-        # Seed with the credential the app itself holds, then reload so the
-        # SPA renders the seeded workspace.
-        seed(client, page.evaluate(
-            "() => sessionStorage.getItem('liminal.accessToken')"
-        ))
-        page.reload(wait_until="domcontentloaded")
-        page.wait_for_selector("#main-tabs", state="visible")
+        # The workspace was seeded before this sign-in, so the token the page
+        # is holding already carries the admin role and the start-up requests
+        # already see every note, file and context.
         time.sleep(1.5)
 
         ask(FIRST_THREAD)
@@ -392,9 +388,30 @@ def main(argv: list[str]) -> int:
             client.post(
                 "/v1/auth/signup", json={"email": EMAIL, "password": PASSWORD}
             )
+            # Seed before the browser signs in, never after. The workspace
+            # ends with a promotion to admin, and a role change invalidates
+            # the access token minted before it. Seeding against a token the
+            # browser is also holding therefore breaks that browser session
+            # mid-capture: the page recovers by refreshing, but the requests
+            # already in flight fail, and whatever they were filling in stays
+            # broken on screen. That is how "Unable to check" reached the
+            # README.
+            login = client.post(
+                "/v1/auth/login", json={"email": EMAIL, "password": PASSWORD}
+            )
+            token = unwrap(login).get("access_token")
+            if not token:
+                # Seeding with no credential would be refused on every call
+                # and still finish, leaving a capture of empty screens that
+                # looks deliberate.
+                raise SystemExit(
+                    f"could not sign in as the demo account "
+                    f"(HTTP {login.status_code}); nothing was captured"
+                )
+            seed(client, token)
             mode = f"live ({args.model})" if args.live else "stub backend"
             print(f"serving {server.base_url} with the {mode}", flush=True)
-            shots = capture(args, server.base_url, client)
+            shots = capture(args, server.base_url)
         finally:
             if client is not None:
                 client.close()
