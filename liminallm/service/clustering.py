@@ -22,17 +22,29 @@ from liminallm.storage.models import (
     SemanticCluster,
 )
 
-# SPEC §5.5/§7.3: weights are earned by independent evidence, not by a raw
-# count. Twenty ratings inside one conversation are one episode rated
-# repeatedly; twenty across unrelated work are a behaviour that kept working.
-# Only the second is worth baking into weights, because the prompt rung is
-# cheap and reversible and weights are neither.
+# SPEC §5.5: weights are earned by independent evidence, not by a raw count.
+# The two scopes prove independence differently, and that is what separates
+# them rather than a different event count:
+#
+#   personal:  different answer + different conversation + different time
+#   shared:    different answer + different conversation + different person
+#
+# These decide whether behaviour enters weights, so they are promotion
+# authority; SPEC §5.5 step 2 is normative and these are its defaults.
+SKILL_WEIGHTS_MIN_MESSAGES = 20
 SKILL_WEIGHTS_MIN_CONVERSATIONS = 5
-# A shared skill is served to people who never contributed evidence for it,
-# so it has to show that several users independently benefited. A personal
-# skill carries no such requirement on purpose: a single-user install that
-# cannot train a skill can never learn one at all.
+# A personal skill has only one source of independence, so its evidence must
+# not all come from one sitting. Deliberately short: personalization that
+# waits a week is artificial delay rather than rigour.
+PERSONAL_MIN_SPAN_HOURS = 48
+# A shared prompt skill is delivered to people who never contributed to it,
+# so even the cheap rung needs more than one voice.
+SHARED_PROMPT_MIN_USERS = 2
 SHARED_SKILL_MIN_USERS = 3
+# "Appeared once" is not a demonstration: counting bare appearances lets
+# 18/1/1 pass, and the adapter is then judged on one person's evidence.
+SHARED_MIN_EVENTS_PER_USER = 2
+SHARED_MIN_CONVERSATIONS_PER_USER = 2
 
 
 class SemanticClusterer:
@@ -496,47 +508,174 @@ class SemanticClusterer:
         return "\n".join(lines)
 
     @staticmethod
-    def _evidence(positive: Sequence[PreferenceEvent]) -> Dict[str, int]:
+    def _evidence(
+        positive: Sequence[PreferenceEvent],
+        *,
+        min_events_per_user: int = SHARED_MIN_EVENTS_PER_USER,
+        min_conversations_per_user: int = SHARED_MIN_CONVERSATIONS_PER_USER,
+    ) -> Dict[str, object]:
         """What a cluster's positive events independently attest to.
 
         Counted over distinct ids rather than rows: re-rating one answer
-        writes several events and is still one piece of evidence.
+        writes several events and is still one piece of evidence. A
+        *qualifying* contributor is one who demonstrated the behaviour
+        rather than merely appearing in the cluster.
         """
+        per_user_messages: Dict[str, set] = {}
+        per_user_conversations: Dict[str, set] = {}
+        for event in positive:
+            per_user_messages.setdefault(event.user_id, set()).add(event.message_id)
+            per_user_conversations.setdefault(event.user_id, set()).add(
+                event.conversation_id
+            )
+        qualifying = [
+            user_id
+            for user_id, messages in per_user_messages.items()
+            if len(messages) >= min_events_per_user
+            and len(per_user_conversations[user_id]) >= min_conversations_per_user
+        ]
+        stamps = sorted(e.created_at for e in positive if e.created_at)
+        first, last = (stamps[0], stamps[-1]) if stamps else (None, None)
+        span_hours = (last - first).total_seconds() / 3600.0 if stamps else 0.0
         return {
             "positive_events": len(positive),
             "conversations": len({e.conversation_id for e in positive}),
             "messages": len({e.message_id for e in positive}),
-            "users": len({e.user_id for e in positive}),
+            "users": len(per_user_messages),
+            "qualifying_contributors": len(qualifying),
+            "first_event_at": first.isoformat() if first else None,
+            "last_event_at": last.isoformat() if last else None,
+            "span_hours": round(span_hours, 2),
         }
 
     @staticmethod
     def _weights_earned(
-        evidence: Dict[str, int],
+        evidence: Dict[str, object],
         *,
         shared: bool,
         min_events: int,
+        min_messages: int,
         min_conversations: int,
         min_users: int,
+        min_span_hours: float,
     ) -> bool:
-        """Whether this evidence justifies leaving the prompt rung.
+        """Whether this evidence justifies leaving the prompt rung (§5.5.2).
 
-        The message bar is `min_events` rather than a constant of its own:
-        it says the positive events must land on that many *distinct*
-        answers, so lowering the event threshold cannot leave an
-        unreachable message threshold behind it.
+        Both scopes need distinct answers across distinct conversations.
+        Beyond that they diverge: a personal skill substitutes time for the
+        contributors it cannot have, and a shared skill substitutes
+        contributors for the time it does not need.
         """
         if evidence["positive_events"] < min_events:
             return False
-        if evidence["messages"] < min_events:
+        if evidence["messages"] < min_messages:
             return False
         if evidence["conversations"] < min_conversations:
             return False
-        # Only shared skills carry a user requirement. Applying it to a
-        # personal skill would make a one-person install permanently
-        # incapable of learning one.
-        if shared and evidence["users"] < min_users:
+        if shared:
+            # Qualifying contributors, not bare appearances.
+            return evidence["qualifying_contributors"] >= min_users
+        # A one-person install must still be able to learn, so the personal
+        # rung asks for spread in time instead of in people.
+        return evidence["span_hours"] >= min_span_hours
+
+    def _maybe_enqueue_weights(
+        self,
+        adapter,
+        positive: Sequence[PreferenceEvent],
+        evidence: Dict[str, object],
+        *,
+        owner_id: str,
+        shared: bool,
+        weights_min_events: int,
+        weights_min_messages: int,
+        weights_min_conversations: int,
+        shared_min_users: int,
+        personal_min_span_hours: float,
+    ) -> bool:
+        """Queue weights training if the evidence has earned it.
+
+        Idempotent per adapter: a pass that finds an existing job queues
+        nothing, so re-running clustering cannot fan out duplicate jobs for
+        one skill. Whether *further* evidence should retrain an adapter that
+        already trained is a separate policy question (§5.5.4 demotion), not
+        something this decides.
+        """
+        if not self.training or not owner_id:
             return False
+        earned = self._weights_earned(
+            evidence,
+            shared=shared,
+            min_events=weights_min_events,
+            min_messages=weights_min_messages,
+            min_conversations=weights_min_conversations,
+            min_users=shared_min_users,
+            min_span_hours=personal_min_span_hours,
+        )
+        if not earned:
+            self.logger.info(
+                "skill_stays_on_prompt_rung",
+                adapter_id=adapter.id,
+                shared=shared,
+                **evidence,
+            )
+            return False
+        if any(j.adapter_id == adapter.id for j in self.store.list_training_jobs()):
+            return False
+        self.store.create_training_job(
+            user_id=owner_id,
+            adapter_id=adapter.id,
+            # The evidence that crossed the bar is the evidence the run
+            # trains on (SPEC §5.5.3).
+            preference_event_ids=[e.id for e in positive],
+        )
+        self.logger.info(
+            "skill_weights_enqueued", adapter_id=adapter.id, shared=shared, **evidence
+        )
         return True
+
+    def _revisit_skill_adapter(
+        self,
+        adapter,
+        positive: Sequence[PreferenceEvent],
+        *,
+        shared: bool,
+        weights_min_events: int,
+        weights_min_messages: int,
+        weights_min_conversations: int,
+        shared_min_users: int,
+        personal_min_span_hours: float,
+    ) -> None:
+        """Re-measure a cluster that already has an adapter.
+
+        The second half of the ladder. Without it a skill discovered at five
+        events keeps its prompt rung forever, because the pass that would
+        notice its twentieth skips the cluster for already being bound.
+        """
+        evidence = self._evidence(positive)
+
+        def build(current: dict) -> dict:
+            # Read-modify-write under the row lock, so a concurrent edit to
+            # another part of the schema is not lost behind this one.
+            updated = dict(current or {})
+            lifecycle = dict(updated.get("lifecycle") or {})
+            lifecycle["evidence"] = evidence
+            updated["lifecycle"] = lifecycle
+            return updated
+
+        refreshed = self.store.update_artifact(adapter.id, build)
+        self._maybe_enqueue_weights(
+            refreshed or adapter,
+            positive,
+            evidence,
+            owner_id=adapter.owner_user_id,
+            shared=shared,
+            weights_min_events=weights_min_events,
+            weights_min_messages=weights_min_messages,
+            weights_min_conversations=weights_min_conversations,
+            shared_min_users=shared_min_users,
+            personal_min_span_hours=personal_min_span_hours,
+        )
 
     def promote_skill_adapters(
         self,
@@ -544,7 +683,10 @@ class SemanticClusterer:
         min_size: int = 5,
         positive_ratio: float = 0.7,
         weights_min_events: int = 20,
+        weights_min_messages: int = SKILL_WEIGHTS_MIN_MESSAGES,
         weights_min_conversations: int = SKILL_WEIGHTS_MIN_CONVERSATIONS,
+        personal_min_span_hours: float = PERSONAL_MIN_SPAN_HOURS,
+        shared_prompt_min_users: int = SHARED_PROMPT_MIN_USERS,
         shared_min_users: int = SHARED_SKILL_MIN_USERS,
     ) -> List[str]:
         """Create skill adapters from qualifying clusters (SPEC §7.3).
@@ -562,13 +704,9 @@ class SemanticClusterer:
         """
         promoted: List[str] = []
         clusters = self.store.list_semantic_clusters()
-        adapters = self.store.list_artifacts(type_filter="adapter")  # type: ignore[arg-type]
-        bound_clusters = {
-            a.schema.get("cluster_id") for a in adapters if isinstance(a.schema, dict)
-        }
         for cluster in clusters:
             events = self.store.list_preference_events(cluster_id=cluster.id)
-            if len(events) < min_size or cluster.id in bound_clusters:
+            if len(events) < min_size:
                 continue
             positive = [
                 e
@@ -577,6 +715,24 @@ class SemanticClusterer:
             ]
             ratio = len(positive) / len(events) if events else 0.0
             if ratio < positive_ratio:
+                continue
+            # The cluster's existing adapter, not merely whether it has one:
+            # a skill is normally discovered long before it earns weights, so
+            # a bound cluster is revisited rather than skipped (SPEC §5.5).
+            # Skipping it made the weights rung unreachable for every skill
+            # that did not cross both bars in a single pass.
+            existing = self.store.adapter_for_cluster(cluster.id)
+            if existing is not None:
+                self._revisit_skill_adapter(
+                    existing,
+                    positive,
+                    shared=not cluster.user_id,
+                    weights_min_events=weights_min_events,
+                    weights_min_messages=weights_min_messages,
+                    weights_min_conversations=weights_min_conversations,
+                    shared_min_users=shared_min_users,
+                    personal_min_span_hours=personal_min_span_hours,
+                )
                 continue
             # Tenant scoping (CLAUDE.md): a cluster-wide skill adapter is
             # trained on several users' events, so it must stay inside the
@@ -600,6 +756,18 @@ class SemanticClusterer:
                 continue
             shared = not cluster.user_id
             evidence = self._evidence(positive)
+            # SPEC §5.5.1: even the cheap rung needs more than one voice when
+            # what it produces is delivered to people who never contributed.
+            # Nothing here crosses a tenant boundary; the point is that one
+            # person's evidence must not change everyone else's behaviour.
+            if shared and evidence["users"] < shared_prompt_min_users:
+                self.logger.info(
+                    "shared_skill_needs_more_contributors",
+                    cluster_id=cluster.id,
+                    users=evidence["users"],
+                    required=shared_prompt_min_users,
+                )
+                continue
             visibility = "private" if cluster.user_id else "shared"
             owner = self.store.get_user(owner_id)
             tenant_id = owner.tenant_id if owner else None
@@ -653,30 +821,21 @@ class SemanticClusterer:
                 owner_user_id=owner_id,
                 visibility=visibility,
             )
-            # Weights rung: enqueue training only once the cluster has pooled
-            # enough positive events to be worth training on. Global skill
-            # adapters use the most frequent contributor as the job's nominal
-            # owner; the training service pools cluster-wide regardless.
-            earned = self._weights_earned(
+            # Weights rung: the same decision a later pass makes, so it lives
+            # in one place. A cluster that clears both bars at once graduates
+            # immediately; the usual case is that it does not, and the next
+            # pass revisits it.
+            self._maybe_enqueue_weights(
+                adapter,
+                positive,
                 evidence,
+                owner_id=owner_id,
                 shared=shared,
-                min_events=weights_min_events,
-                min_conversations=weights_min_conversations,
-                min_users=shared_min_users,
+                weights_min_events=weights_min_events,
+                weights_min_messages=weights_min_messages,
+                weights_min_conversations=weights_min_conversations,
+                shared_min_users=shared_min_users,
+                personal_min_span_hours=personal_min_span_hours,
             )
-            if self.training and earned:
-                if owner_id:
-                    self.store.create_training_job(
-                        user_id=owner_id,
-                        adapter_id=adapter.id,
-                        preference_event_ids=[e.id for e in positive],
-                    )
-            elif self.training:
-                self.logger.info(
-                    "skill_stays_on_prompt_rung",
-                    cluster_id=cluster.id,
-                    shared=shared,
-                    **evidence,
-                )
             promoted.append(adapter.id)
         return promoted

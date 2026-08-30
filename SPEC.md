@@ -1165,36 +1165,89 @@ cluster qualifies          independent evidence           eval gate passes
   positive exemplars)         pooled across 3+ users)          portable fallback)
 ```
 
+the question every rung answers is: **have we seen this behaviour succeed
+independently enough that baking it in is justified?** the two scopes prove
+independence differently, and that - not a different event count - is what
+separates them:
+
+```
+personal:  different answer + different conversation + different time
+shared:    different answer + different conversation + different person
+```
+
 1. **born as a prompt.** when a cluster qualifies (§7.3), its skill adapter
    is created with `mode: "prompt"` and instructions composed from the
    cluster label, description, and up to 3 highly-rated exemplars -
    immediately useful on every backend, free to create.
-   `lifecycle: { "stage": "prompt", "weights_min_events": N }` records the
-   next rung.
+
+   a **personal** cluster (one with a `user_id`) needs only that user's
+   evidence, and its adapter is `visibility: private`, `scope: "per-user"`.
+   a **shared** cluster (no `user_id`) is delivered to people who never
+   contributed to it, so the prompt rung itself requires
+   `users >= shared_prompt_min_users` (default 2). one contributor is not
+   evidence that anyone else benefits. a one-person install loses nothing:
+   it gets private personal prompt skills, and has no reason to create a
+   tenant-shared skill until a second person exists.
+
 2. **weights when the evidence earns them.** a raw count is not evidence:
    twenty ratings inside one conversation are one episode rated
-   repeatedly, while twenty across unrelated work are a behaviour that
-   kept working. a training job is enqueued only once the cluster's
-   positive events clear all of:
+   repeatedly. these thresholds decide whether behaviour enters weights,
+   so they are promotion authority rather than tuning knobs, and they are
+   normative here. both scopes require:
+
    - `positive_events >= weights_min_events` (default 20), AND
-   - `messages >= weights_min_events` - counted over **distinct** rated
-     answers, so re-rating one reply cannot reach the bar alone, AND
-   - `conversations >= 5`.
+   - `messages >= weights_min_messages` (default 20), counted over
+     **distinct** rated answers, so re-rating one reply cannot reach the
+     bar alone, AND
+   - `conversations >= weights_min_conversations` (default 5).
 
-   a **shared** skill additionally requires `users >= 3`, because its
-   weights are served to people who never contributed evidence for them. a
-   **personal** skill carries no user requirement on purpose: a one-person
-   install that cannot train a skill can never learn one at all. it trains
-   from that user's own history and stays `visibility: private`,
-   `scope: "per-user"`; a shared skill is `visibility: shared`,
-   `scope: "tenant"`, owned by its most frequent contributor.
+   a **personal** skill additionally requires
+   `span_hours >= personal_min_span_hours` (default 48): its evidence has
+   only one source of independence, so it must not all come from one
+   sitting. the bound is deliberately short - personalization that waits a
+   week is artificial delay, not rigour.
 
-   the measured counts are recorded at
-   `lifecycle.evidence: { positive_events, conversations, messages, users }`
-   so a skill that stayed on the prompt rung says why. persona adapters are
-   a third thing and remain strictly per-user: they carry tone and format,
-   not a learned task behaviour.
-3. **graduation is gated** through §5.4.6; a failed or skipped gate leaves
+   a **shared** skill instead requires
+   `qualifying_contributors >= shared_min_users` (default 3), where a
+   qualifying contributor is a user with at least
+   `shared_min_events_per_user` (default 2) distinct rated answers across
+   at least `shared_min_conversations_per_user` (default 2) conversations.
+   counting bare appearances would let 18/1/1 pass, and a tenant-wide
+   adapter would then be judged on evidence that is essentially one
+   person's.
+
+   a shared skill is `visibility: shared`, `scope: "tenant"`, owned by its
+   most frequent contributor. persona adapters are a third thing and stay
+   strictly per-user: they carry tone and format, not a learned task
+   behaviour.
+
+   **the ladder is revisited, not decided once.** a skill is normally
+   discovered long before it has earned weights, so every clustering pass
+   recomputes the evidence for clusters that already have an adapter,
+   refreshes `lifecycle.evidence`, and enqueues training if the bar is now
+   cleared. enqueueing is idempotent per adapter: a pass that finds an
+   existing job queues nothing.
+
+   the measured evidence is recorded at `lifecycle.evidence`:
+   `{ positive_events, conversations, messages, users,
+   qualifying_contributors, first_event_at, last_event_at, span_hours }`,
+   so a skill that stayed on the prompt rung says why, and so the
+   thresholds above can later be chosen from real distributions rather
+   than guessed again.
+
+   semantic variation is deliberately **not** gated on. a legitimately
+   narrow skill has low variance by nature, so "more spread is better" is
+   not universally true, and dispersion in this repo's embedding space
+   would need its own census before it could be promotion authority.
+
+3. **the job's evidence is what gets trained.** the training job records
+   the exact `preference_event_ids` whose evidence crossed the bar, and
+   those events - filtered by the tenant scoping in §12, never widened by
+   it - are what is tokenized, split into train/holdout and evaluated.
+   re-deriving the set at training time let the two ends disagree about
+   what counts as positive, so a run could train on fewer examples than
+   the evidence that justified it.
+4. **graduation is gated** through §5.4.6; a failed or skipped gate leaves
    the adapter on the prompt rung; nothing regresses. the rules that make
    the ladder safe (histories in docs/decisions/adapter-resolution.md):
    - **two independent locks make "before graduation" unservable**, because
@@ -1237,7 +1290,7 @@ cluster qualifies          independent evidence           eval gate passes
      injecting both gives the model the weights *and* the instructions
      they were distilled from - an input the eval gate never scored. a
      hybrid with nothing promoted keeps its prompt locally.
-4. **demotion mirrors promotion.** pruning (§7.4) can push an adapter back
+5. **demotion mirrors promotion.** pruning (§7.4) can push an adapter back
    down the ladder (disable weights, keep prompt) via the same ConfigOps
    pipeline.
 

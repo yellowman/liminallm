@@ -44,14 +44,32 @@ def _rate(store, user, convo_id, message_id, cluster_id):
     )
 
 
-def _seed(store, user, cluster_id, *, conversations: int, per_conversation: int):
-    """`conversations` threads, each with `per_conversation` rated answers."""
+def _seed(
+    store, user, cluster_id, *, conversations: int, per_conversation: int, age_hours=0.0
+):
+    """`conversations` threads, each with `per_conversation` rated answers.
+
+    `age_hours` moves the ratings into the past. A personal skill has to
+    show its evidence did not all arrive in one sitting (SPEC §5.5.2), and
+    `record_preference_event` writes `now`.
+    """
+    recorded = []
     for _ in range(conversations):
         convo = store.create_conversation(user.id, title="t")
         for i in range(per_conversation):
             store.append_message(convo.id, "user", "user", f"question {i}")
             reply = store.append_message(convo.id, "assistant", "assistant", f"a {i}")
-            _rate(store, user, convo.id, reply.id, cluster_id)
+            recorded.append(_rate(store, user, convo.id, reply.id, cluster_id).id)
+    if age_hours:
+        import psycopg
+
+        with psycopg.connect(store.dsn, autocommit=True) as conn:
+            conn.execute(
+                "UPDATE preference_event SET created_at = created_at - "
+                "make_interval(hours => %s) WHERE id = ANY(%s)",
+                (age_hours, recorded),
+            )
+    return recorded
 
 
 def _cluster(store, *, user_id=None):
@@ -93,11 +111,17 @@ class TestAPersonalSkillNeedsIndependentEvidence:
         )
 
     def test_evidence_spread_across_conversations_earns_weights(self, tmp_path):
-        """The single-user install has to be able to learn."""
+        """The single-user install has to be able to learn.
+
+        Spread over days as well as threads: a personal skill proves
+        independence through time, since it has no second contributor.
+        """
         store = get_test_store()
         owner = _user(store, "solo")
         cluster = _cluster(store, user_id=owner.id)
-        _seed(store, owner, cluster.id, conversations=7, per_conversation=3)
+        _seed(store, owner, cluster.id, conversations=4, per_conversation=3,
+              age_hours=96)
+        _seed(store, owner, cluster.id, conversations=3, per_conversation=3)
 
         promoted = _clusterer(store, tmp_path).promote_skill_adapters(min_size=5)
 

@@ -3019,6 +3019,27 @@ class PostgresStore:
             ).fetchone()
         return self._artifact_from_row(row) if row else None
 
+    def adapter_for_cluster(self, cluster_id: str) -> Optional[Artifact]:
+        """The adapter already bound to a semantic cluster, if any.
+
+        Deliberately unscoped by visibility. This answers the clusterer's
+        own bookkeeping question - "does this cluster already have an
+        adapter" - rather than showing anyone a listing. `list_artifacts`
+        is the user-facing query and correctly drops private rows when it
+        has no identity to scope them by, so using it here meant a personal
+        skill adapter was invisible to the pass that created it and every
+        later pass minted another one for the same cluster.
+        """
+        if not cluster_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifact WHERE type = 'adapter' "
+                "AND schema->>'cluster_id' = %s ORDER BY created_at LIMIT 1",
+                (cluster_id,),
+            ).fetchone()
+        return self._artifact_from_row(row) if row else None
+
     def artifacts_for_paths(self, paths: Sequence[str]) -> List[Artifact]:
         """Artifacts whose `fs_path` is exactly one of `paths`.
 

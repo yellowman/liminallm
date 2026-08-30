@@ -317,6 +317,63 @@ class TrainingService:
         )
         return self.store.get_artifact(adapter.id) or adapter
 
+    def events_for_job(self, job) -> List:
+        """The events a job named, in the order it named them.
+
+        Exposed because "what will this job train on" is a question worth
+        being able to ask without running the job.
+        """
+        found = []
+        for event_id in job.preference_event_ids or []:
+            event = self.store.get_preference_event(event_id)
+            if event is not None:
+                found.append(event)
+        return found
+
+    def _scoped_events(
+        self,
+        job_id: Optional[str],
+        *,
+        user_id: Optional[str],
+        cluster_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> List:
+        """The dataset for this run, and where its authority comes from.
+
+        SPEC §5.5.3: when the job named its evidence, that evidence is what
+        trains. Re-deriving the set here asked for `feedback` alone while the
+        promotion gate also counts a positive `score`, so the two ends could
+        disagree and a run would be fitted to fewer examples than the
+        evidence that justified it.
+
+        The scope query is still the authorization boundary - it is what
+        keeps pooling inside one tenant - so the job's ids may only *narrow*
+        it, never widen it. A named event outside the scope is dropped, not
+        trained on.
+        """
+        scope_query = dict(
+            user_id=user_id, cluster_id=cluster_id, tenant_id=tenant_id
+        )
+        job = self.store.get_training_job(job_id) if job_id else None
+        named = list(job.preference_event_ids or []) if job else []
+        if not named:
+            return self.store.list_preference_events(
+                feedback=POSITIVE_FEEDBACK_VALUES, **scope_query
+            )
+        # No feedback filter: the gate's predicate is broader than this one,
+        # and the ids already encode which events it accepted.
+        allowed = {e.id: e for e in self.store.list_preference_events(**scope_query)}
+        selected = [allowed[event_id] for event_id in named if event_id in allowed]
+        dropped = len(named) - len(selected)
+        if dropped:
+            logger.warning(
+                "training_job_evidence_out_of_scope",
+                job_id=job_id,
+                dropped=dropped,
+                kept=len(selected),
+            )
+        return selected
+
     def train_from_preferences(
         self,
         user_id: str,
@@ -351,9 +408,9 @@ class TrainingService:
         adapter_schema_now = adapter.schema or {}
         adapter_cluster = adapter_schema_now.get("cluster_id") or cluster_id
         # SPEC §7.3: skill adapters (cluster-bound, not owned by a single user)
-        # pool positive events across every contributor to the cluster - one
-        # user's thumbs are too sparse to train weights on. Persona adapters
-        # stay strictly per-user.
+        # pool positive events across every contributor to the cluster; a
+        # personal skill trains from its one owner's history instead, and
+        # persona adapters stay strictly per-user.
         # Pooling is decided by scope, not ownership: tenant-scoped skill
         # adapters carry a nominal owner for visibility purposes.
         pooled_skill = bool(adapter_cluster) and (
@@ -374,17 +431,18 @@ class TrainingService:
                     "cannot resolve tenant for pooled training",
                     {"user_id": user_id, "adapter_id": adapter.id},
                 )
-            events = self.store.list_preference_events(
+            events = self._scoped_events(
+                job_id,
                 user_id=None,
-                feedback=POSITIVE_FEEDBACK_VALUES,
                 cluster_id=adapter_cluster,
                 tenant_id=tenant_id,
             )
         else:
-            events = self.store.list_preference_events(
+            events = self._scoped_events(
+                job_id,
                 user_id=user_id,
-                feedback=POSITIVE_FEEDBACK_VALUES,
                 cluster_id=cluster_id,
+                tenant_id=None,
             )
         if not events:
             return None

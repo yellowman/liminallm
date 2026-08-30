@@ -51,6 +51,23 @@ def _seed_user_with_events(
     return user, events
 
 
+def _personal_cluster(store, email, n_events, *, conversations=1, corrected="use tabs"):
+    """A user, a cluster they own, and their rated answers.
+
+    Most of these tests are about the personal rung. A cluster with no
+    `user_id` is the *shared* kind, and since SPEC §5.5.1 a shared skill
+    needs two contributors before it exists at all - so seeding one from a
+    single user now correctly produces nothing.
+    """
+    owner = store.create_user(email=f"{uuid.uuid4().hex[:8]}_{email}")
+    cluster = _make_cluster(store, user_id=owner.id)
+    _, events = _seed_user_with_events(
+        store, email, cluster.id, n_events,
+        corrected=corrected, conversations=conversations, user=owner,
+    )
+    return owner, cluster, events
+
+
 def _make_cluster(store, *, user_id=None, size=10):
     return store.upsert_semantic_cluster(
         user_id=user_id,
@@ -66,8 +83,7 @@ class TestPromptFirstLadder:
         store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
-        cluster = _make_cluster(store)
-        _seed_user_with_events(store, "a@t.local", cluster.id, 6)
+        _personal_cluster(store, "a@t.local", 6)
 
         promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=20)
 
@@ -86,17 +102,15 @@ class TestPromptFirstLadder:
         store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
-        # A *personal* skill: one owner's own cluster. Spread across threads,
-        # because the count alone no longer earns weights, and owned by that
-        # user, because a cluster with no `user_id` is the shared kind and
-        # shared weights need several contributors (SPEC §5.5).
-        owner = store.create_user(email=f"{uuid.uuid4().hex[:8]}_a@t.local")
-        cluster = _make_cluster(store, user_id=owner.id)
-        _seed_user_with_events(
-            store, "a@t.local", cluster.id, 8, conversations=8, user=owner
-        )
+        # A *personal* skill: one owner's own cluster, spread across threads.
+        _personal_cluster(store, "a@t.local", 8, conversations=8)
 
-        promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=8)
+        # `personal_min_span_hours=0` because this test is about the count
+        # bar, not the time bar; the span rule has its own witnesses.
+        promoted = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=8, weights_min_messages=8,
+            personal_min_span_hours=0,
+        )
 
         adapter_id = promoted[0]
         jobs = [j for j in store.list_training_jobs() if j.adapter_id == adapter_id]
@@ -116,7 +130,11 @@ class TestPromptFirstLadder:
         )
         _seed_user_with_events(store, "c@t.local", cluster.id, 3, conversations=3)
 
-        promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=8)
+        # The message bar is its own knob (SPEC §5.5.2), so a test that
+        # lowers the event bar has to lower it too or nothing can clear it.
+        promoted = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=8, weights_min_messages=8
+        )
 
         adapter = store.get_artifact(promoted[0])
         # A cluster spanning several users is owned by its top contributor and
@@ -247,9 +265,11 @@ class TestEvalGate:
         store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
-        cluster = _make_cluster(store, user_id=None)
-        user, _ = _seed_user_with_events(store, "a@t.local", cluster.id, 10)
-        promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=10)
+        user, _, _ = _personal_cluster(store, "a@t.local", 10, conversations=10)
+        promoted = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=10, weights_min_messages=10,
+            personal_min_span_hours=0,
+        )
         adapter_id = promoted[0]
 
         result = training.train_from_preferences(user.id, adapter_id=adapter_id)

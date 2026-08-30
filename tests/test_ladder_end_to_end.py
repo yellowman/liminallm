@@ -45,10 +45,12 @@ def checkpoint(tmp_path_factory):
     return _build_checkpoint(tmp_path_factory.mktemp("ladder_model"))
 
 
-def _seed_events(store, cluster_id, count=10):
-    user = store.create_user(email=f"ladder_{uuid.uuid4().hex[:8]}@t.local")
-    convo = store.create_conversation(user.id, title="t")
+def _seed_events(store, cluster_id, count=10, user=None):
+    user = user or store.create_user(email=f"ladder_{uuid.uuid4().hex[:8]}@t.local")
     for index in range(count):
+        # One thread each: the weights rung counts distinct conversations,
+        # so a single thread is one episode however often it is rated.
+        convo = store.create_conversation(user.id, title="t")
         store.append_message(convo.id, "user", "user", f"question {index}")
         reply = store.append_message(convo.id, "assistant", "assistant", "answer")
         store.record_preference_event(
@@ -86,10 +88,14 @@ class TestLadderEndToEnd:
             training_module, "EVAL_MIN_RELATIVE_IMPROVEMENT", 1e-9
         )
         store = get_test_store()
+        # A personal skill: the cluster is owned by the user whose evidence
+        # it is. A cluster with no `user_id` is the shared kind and needs
+        # two contributors before it exists at all (SPEC §5.5.1).
+        user = store.create_user(email=f"ladder_{uuid.uuid4().hex[:8]}@t.local")
         cluster = store.upsert_semantic_cluster(
-            user_id=None, centroid=[0.1] * 64, size=10, label="tabs"
+            user_id=user.id, centroid=[0.1] * 64, size=10, label="tabs"
         )
-        user = _seed_events(store, cluster.id)
+        _seed_events(store, cluster.id, user=user)
 
         training = TrainingService(
             store, str(tmp_path), runtime_base_model=str(checkpoint)
@@ -97,7 +103,10 @@ class TestLadderEndToEnd:
         # The skill is BORN on the prompt rung, the way §7.3 creates it -
         # not conjured as an already-trained artifact by the test.
         clusterer = SemanticClusterer(store, llm=None, training=training)
-        born = clusterer.promote_skill_adapters(min_size=5, weights_min_events=10)
+        born = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=10, weights_min_messages=10,
+            personal_min_span_hours=0,
+        )
         assert born, "no skill adapter was created from the qualifying cluster"
         skill = store.get_artifact(born[0])
         assert skill.schema["mode"] == "prompt"
