@@ -332,10 +332,17 @@ def capture(args: argparse.Namespace, base: str) -> list[pathlib.Path]:
         time.sleep(0.8)
         shot("02-chat")
 
+        # Set dressing: these exist so the conversation list is not empty in
+        # every screen after the chat shot. The first thread is the subject
+        # of a screenshot and so is fatal when it fails; one of these is not
+        # worth losing a whole live capture over.
         for question in EXTRA_THREADS:
             page.click("#new-thread")
             time.sleep(1.2)
-            ask([question])
+            try:
+                ask([question])
+            except RuntimeError as exc:
+                print(f"  skipping an extra thread: {exc}", flush=True)
 
         for tab_id, name, pick in TABS:
             page.click(f"#main-tabs .rail-btn[data-tab='{tab_id}']")

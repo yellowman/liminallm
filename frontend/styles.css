@@ -60,7 +60,16 @@ body {
   grid-template-columns: var(--rail-width) 0 1fr;
 }
 
-.app-shell.rail-hidden,
+/* Two controls, two geometries. Hiding 48px of navigation must not also
+   take away 240px of conversation list: that coupling was right while
+   hiding the rail was a modifier gesture meaning "distraction-free", and
+   wrong the moment the rail got a control of its own. */
+.app-shell.rail-hidden {
+  grid-template-columns: 0 var(--pane-width) 1fr;
+}
+
+.app-shell.rail-hidden.no-pane,
+.app-shell.rail-hidden.pane-hidden,
 .app-shell.signed-out {
   grid-template-columns: 0 0 1fr;
 }
@@ -82,7 +91,10 @@ body {
    Insights and Settings offering to hide a list that is not there, and the
    click still wrote the remembered preference - so an idle click on Files
    took Chat's conversations away later. */
-.app-shell.no-pane .pane-toggle {
+/* By id. `.pane-toggle` is the shape three buttons share - this one, the
+   rail's restore, and the overflow menu - so hiding by class took the menu
+   with it, and with it the only way to sign out of these sections. */
+.app-shell.no-pane #pane-toggle {
   display: none;
 }
 
@@ -1027,6 +1039,14 @@ button.minor:hover {
   flex-direction: column;
   gap: 4px;
   max-width: 78%;
+}
+
+/* A reading measure for prose only. The workspace is wide because code
+   blocks, tables and tool output earn the width; a paragraph set across
+   1400px does not. `:where` keeps the selector at zero specificity, so a
+   single element can still override it. */
+.message.assistant .bubble > :where(p, h1, h2, h3, h4, ul, ol, blockquote) {
+  max-width: 88ch;
 }
 
 .message.user {
@@ -2716,6 +2736,18 @@ button.minor:hover {
   .app-shell.no-pane,
   .app-shell.pane-hidden {
     grid-template-columns: var(--rail-width) 0 1fr;
+  }
+
+  /* The pane is an overlay here, so its track is zero either way. */
+  .app-shell.rail-hidden {
+    grid-template-columns: 0 0 1fr;
+  }
+
+  /* And the overlay is offset by the rail, so it stops being offset when
+     the rail is gone rather than leaving a strip of dead ground. */
+  .app-shell.rail-hidden .context-pane {
+    left: 0;
+    width: 100vw;
   }
 
   /* Signed out the rail has nowhere to go, at this width as at any other.

@@ -192,16 +192,40 @@ class TestThePaneAppearsWhereNavigationAlreadyExisted:
                 assert width == 0, (
                     f"{tab} shows a {width}px pane with nothing in it"
                 )
-                # And no control offering to hide it. The click also wrote
-                # the remembered preference, so an idle click on Files took
-                # Chat's conversations away on the next visit.
-                toggle = page.evaluate(
-                    "() => document.querySelector('.pane-toggle')"
-                    ".getBoundingClientRect().width"
+                # By id. `.pane-toggle` is a shape three buttons share -
+                # the pane's, the rail's restore, and the overflow menu -
+                # and `querySelector` returns the first in document order,
+                # which is the restore button. Asking that way measured a
+                # button that is hidden anyway and proved nothing.
+                seen = page.evaluate(
+                    """() => {
+                        const w = id => {
+                            const el = document.getElementById(id);
+                            return el ? el.getBoundingClientRect().width : 0;
+                        };
+                        return {
+                            toggle: w('pane-toggle'),
+                            menu: w('bar-menu-btn'),
+                        };
+                    }"""
                 )
-                assert toggle == 0, (
-                    f"{tab} offers to hide a list it does not have"
+                assert seen["toggle"] == 0, (
+                    f"{tab} offers to hide a list it does not have, and the "
+                    "click writes the remembered preference, so it takes "
+                    "Chat's conversations away later"
                 )
+                assert seen["menu"] > 0, (
+                    f"{tab} lost its overflow menu: the rule hiding the pane "
+                    "button matched every button sharing its class"
+                )
+                page.click("#bar-menu-btn")
+                page.wait_for_timeout(150)
+                assert page.evaluate(
+                    "() => document.getElementById('logout')"
+                    ".getBoundingClientRect().width > 0"
+                ), f"there is no way to sign out from {tab}"
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(100)
         finally:
             context.close()
 
@@ -595,5 +619,163 @@ class TestTheRailCollapsesInTheOpen:
                 "() => document.querySelector('.app-rail')"
                 ".getBoundingClientRect().width === 0"
             ), "the rail came back on reload; the choice was not remembered"
+        finally:
+            context.close()
+
+
+class TestTheTwoCollapsesAreIndependent:
+    """Two controls, two stored keys, and so two geometries.
+
+    Hiding the rail used to collapse the pane with it. That was right while
+    hiding the rail was a shift-click meaning "distraction-free"; it is
+    wrong now that the rail has its own control, because hiding 48px of
+    navigation silently took away 240px of conversation list as well.
+    """
+
+    def _bands(self, page):
+        return page.evaluate(
+            """() => ({
+                rail: Math.round(document.querySelector('.app-rail')
+                    .getBoundingClientRect().width),
+                pane: Math.round(document.querySelector('.context-pane')
+                    .getBoundingClientRect().width),
+            })"""
+        )
+
+    def test_hiding_the_rail_keeps_the_pane(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click("#rail-toggle")
+            page.wait_for_timeout(250)
+            seen = self._bands(page)
+            assert seen["rail"] == 0, "the rail's control did not hide it"
+            assert seen["pane"] > 100, (
+                "hiding the rail took the conversation list with it; they "
+                f"are separate controls, and the pane is {seen['pane']}px"
+            )
+        finally:
+            context.close()
+
+    def test_hiding_the_pane_keeps_the_rail(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click("#pane-toggle")
+            page.wait_for_timeout(250)
+            seen = self._bands(page)
+            assert seen["pane"] == 0
+            assert seen["rail"] > 0, "hiding the list took the rail with it"
+        finally:
+            context.close()
+
+    def test_both_can_be_hidden_at_once(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click("#pane-toggle")
+            page.wait_for_timeout(150)
+            page.click("#rail-toggle")
+            page.wait_for_timeout(250)
+            assert self._bands(page) == {"rail": 0, "pane": 0}
+        finally:
+            context.close()
+
+    def test_a_phone_overlay_takes_the_width_the_rail_gave_up(
+        self, browser, server
+    ):
+        """The overlay is offset by the rail, so it must stop being offset
+        when the rail is gone, or it leaves a 48px strip of dead ground."""
+        context, page = _signed_in_page(browser, server, PHONE)
+        try:
+            page.click("#rail-toggle")
+            page.wait_for_timeout(200)
+            page.click("#pane-toggle")
+            page.wait_for_timeout(300)
+            box = page.evaluate(
+                """() => {
+                    const r = document.querySelector('.context-pane')
+                        .getBoundingClientRect();
+                    return {left: Math.round(r.left), width: Math.round(r.width)};
+                }"""
+            )
+            assert box["left"] == 0, (
+                f"the overlay starts {box['left']}px in, holding a gap for a "
+                "rail that is not there"
+            )
+            assert box["width"] >= PHONE["width"] - 1, (
+                f"the overlay is {box['width']}px of a {PHONE['width']}px "
+                "viewport it now has to itself"
+            )
+        finally:
+            context.close()
+
+
+class TestProseKeepsAMeasureTheWorkspaceDoesNot:
+    """The wide workspace earns its width on code, tables and tool output.
+
+    Ordinary prose does not: a paragraph set across 1400px is unpleasant to
+    read however welcome the space is for a diff. So the measure is on the
+    prose children of an answer, not on the panel or the bubble, and `pre`
+    and `table` are deliberately left alone.
+
+    The markup here is the template `renderMessage` writes (chat.js), so the
+    rule is exercised against the shape the app actually produces rather
+    than against a shape this test invented.
+    """
+
+    LONG = "Prose that has to wrap somewhere. " * 40
+
+    def test_paragraphs_are_measured_and_code_is_not(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.evaluate(
+                """(long) => {
+                    const list = document.getElementById('messages');
+                    list.innerHTML = `
+                      <div class="message assistant">
+                        <div class="content">
+                          <div class="bubble">
+                            <p id="probe-p">${long}</p>
+                            <pre id="probe-pre"><code>${long}</code></pre>
+                            <table id="probe-table"><tbody><tr><td>${long}</td></tr></tbody></table>
+                          </div>
+                        </div>
+                      </div>`;
+                }""",
+                self.LONG,
+            )
+            page.wait_for_timeout(200)
+            seen = page.evaluate(
+                """() => {
+                    const w = id => document.getElementById(id)
+                        .getBoundingClientRect().width;
+                    // A real ch in the paragraph's own font, measured
+                    // rather than guessed from the em: the ratio differs
+                    // per face, and the bound is in characters.
+                    const probe = document.getElementById('probe-p');
+                    const ruler = document.createElement('span');
+                    ruler.style.cssText =
+                        'position:absolute;visibility:hidden;width:100ch';
+                    probe.appendChild(ruler);
+                    const ch = ruler.getBoundingClientRect().width / 100;
+                    ruler.remove();
+                    return {
+                        prose: w('probe-p'),
+                        pre: w('probe-pre'),
+                        table: w('probe-table'),
+                        ch,
+                    };
+                }"""
+            )
+            measure = seen["prose"] / seen["ch"]
+            assert measure <= 92, (
+                f"a paragraph runs about {measure:.0f} characters "
+                f"({seen['prose']:.0f}px); the measure is meant to be 88ch"
+            )
+            assert seen["pre"] > seen["prose"] + 50, (
+                f"code is held to the prose measure ({seen['pre']:.0f}px vs "
+                f"{seen['prose']:.0f}px); the width is the point of a code block"
+            )
+            assert seen["table"] > seen["prose"] + 50, (
+                "a table is held to the prose measure"
+            )
         finally:
             context.close()
