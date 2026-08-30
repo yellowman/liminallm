@@ -1014,3 +1014,174 @@ class TestEveryPageThatWearsTheShellGetsAPageToFill:
             assert overflow <= 0, f"{path} is {overflow}px wider than its viewport"
         finally:
             context.close()
+
+
+class TestTheOverlayGetsOutOfTheWayForEveryChoice:
+    """A pane control that opens something must not then cover it.
+
+    The dismissal rule was an enumerated list of row classes, and Notes has
+    two controls that are not rows: a search hit, and the button that starts
+    a new note. Both open the editor, neither was listed, so on a phone the
+    workspace changed underneath an overlay still sitting on top of it.
+
+    Marked semantically now - `[data-pane-dismiss]` - so a control added
+    later says what it does instead of needing this list edited.
+    """
+
+    def _account(self, server):
+        import httpx
+
+        email = f"pane_{uuid.uuid4().hex[:8]}@example.com"
+        resp = httpx.post(
+            f"{server.base_url}/v1/auth/signup",
+            json={"email": email, "password": PASSWORD},
+            timeout=30,
+        )
+        assert resp.status_code == 201, resp.text
+        token = resp.json()["data"]["access_token"]
+        return email, token
+
+    def _phone_notes_page(self, browser, server, email):
+        """Signed in, on Notes, at a width where the pane is an overlay."""
+        context = browser.new_context(viewport=PHONE)
+        page = context.new_page()
+        page.goto(f"{server.base_url}/", wait_until="domcontentloaded")
+        page.fill("#email", email)
+        page.fill("#password", PASSWORD)
+        page.click("#auth-form button[type=submit]")
+        page.wait_for_function(
+            "() => !!sessionStorage.getItem('liminal.accessToken')", timeout=30000
+        )
+        page.wait_for_selector("#main-tabs", state="visible")
+        page.click('.rail-btn[data-tab="notes-tab"]')
+        page.wait_for_timeout(500)
+        # The overlay starts closed at this width, so open it: dismissal is
+        # only observable on a pane that is showing.
+        page.click("#pane-toggle")
+        page.wait_for_timeout(300)
+        assert self._pane_width(page) > 0, "the pane did not open to be dismissed"
+        return context, page
+
+    def _pane_width(self, page):
+        return page.evaluate(
+            "() => document.querySelector('.context-pane')"
+            ".getBoundingClientRect().width"
+        )
+
+    def test_choosing_a_search_hit_dismisses_the_overlay(self, browser, server):
+        import httpx
+
+        email, token = self._account(server)
+        title = f"Kestrel{uuid.uuid4().hex[:6]}"
+        created = httpx.post(
+            f"{server.base_url}/v1/notes",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"title": title, "content": "A note to find by searching."},
+            timeout=30,
+        )
+        assert created.status_code in (200, 201), created.text
+
+        context, page = self._phone_notes_page(browser, server, email)
+        try:
+            page.fill("#note-search-input", title)
+            page.wait_for_selector(".note-search-hit", timeout=15000)
+            page.click(".note-search-hit")
+            page.wait_for_timeout(400)
+
+            assert self._pane_width(page) == 0, (
+                "the search hit opened the note behind an overlay still "
+                "covering it"
+            )
+            assert page.is_visible("#note-editor"), "the note did not open"
+        finally:
+            context.close()
+
+    def test_starting_a_new_note_dismisses_the_overlay(self, browser, server):
+        email, _ = self._account(server)
+        context, page = self._phone_notes_page(browser, server, email)
+        try:
+            page.click("#note-new-btn")
+            page.wait_for_timeout(400)
+            assert self._pane_width(page) == 0, (
+                "the new-note button opened the editor behind an overlay "
+                "still covering it"
+            )
+            assert page.is_visible("#note-editor"), "the editor did not open"
+        finally:
+            context.close()
+
+
+class TestTheDefaultFollowsTheWidthWhileItIsStillTheDefault:
+    """The responsive default is a function of the width, so crossing the
+    breakpoint has to reapply it.
+
+    It was decided once at load. Narrowing a desktop window past 900px turned
+    the open pane into an overlay on top of the workspace instead of the
+    hidden default; widening a narrow one left the conversation list hidden
+    on a screen with room for it.
+
+    `TestTheResponsiveDefaultIsNotAChoice` gets close and cannot see this: it
+    reloads at each width, so it measures initialisation twice rather than a
+    live crossing. These resize without navigating.
+    """
+
+    PANE_KEY = "liminal.paneHidden"
+
+    def _stored(self, page):
+        return page.evaluate("(k) => localStorage.getItem(k)", self.PANE_KEY)
+
+    def _pane_width(self, page):
+        return page.evaluate(
+            "() => document.querySelector('.context-pane')"
+            ".getBoundingClientRect().width"
+        )
+
+    def _resize(self, page, viewport):
+        page.set_viewport_size(viewport)
+        page.wait_for_timeout(400)
+
+    def test_crossing_the_breakpoint_reapplies_the_default(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            assert self._pane_width(page) > 100, "the desktop default is open"
+            assert self._stored(page) is None
+
+            self._resize(page, PHONE)
+            assert self._pane_width(page) == 0, (
+                "narrowing past 900px left the pane showing, so it became an "
+                "overlay on top of the workspace instead of the phone default"
+            )
+            assert self._stored(page) is None, (
+                "reapplying the default recorded it as a choice"
+            )
+
+            self._resize(page, DESKTOP)
+            assert self._pane_width(page) > 100, (
+                "widening left the conversation list hidden on a screen with "
+                "room for it"
+            )
+            assert self._stored(page) is None
+        finally:
+            context.close()
+
+    def test_a_stored_choice_survives_the_crossing(self, browser, server):
+        """The control. A width may decide a default; it may not overrule a
+        reader who has already said what they want."""
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click("#pane-toggle")
+            page.wait_for_timeout(200)
+            assert self._pane_width(page) == 0
+            assert self._stored(page) == "1"
+
+            self._resize(page, PHONE)
+            assert self._stored(page) == "1", "the crossing rewrote the choice"
+
+            self._resize(page, DESKTOP)
+            assert self._pane_width(page) == 0, (
+                "the reader hid the pane and widening the window brought it "
+                "back"
+            )
+            assert self._stored(page) == "1"
+        finally:
+            context.close()
