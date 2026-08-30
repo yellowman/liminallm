@@ -317,6 +317,10 @@ body {
   align-self: stretch;
   align-items: stretch;
   min-width: 0;
+  /* Never wrap, at any width: the bar is one row tall, so a second line
+     has nowhere to go and lands on top of the bar's own border. What does
+     not fit scrolls inside the nav instead. */
+  flex-wrap: nowrap;
   overflow-x: auto;
   scrollbar-width: none;
 }
@@ -2359,10 +2363,6 @@ button.minor:hover {
   .chat-panel {
     min-height: auto;
   }
-
-  .tab-nav {
-    flex-wrap: wrap;
-  }
 }
 
 @media (max-width: 640px) {
@@ -2380,12 +2380,36 @@ button.minor:hover {
   }
 
   .tab-btn {
-    padding: 8px 10px;
+    padding: 0 10px;
     font-size: 13px;
   }
 
   .message {
     max-width: 100%;
+  }
+
+  /* The controls alone are wider than a phone: a context select, a workflow
+     field and three buttons come to more than 390px before the title gets a
+     pixel. Desktop keeps them on the title's row; here the title takes the
+     first line and the controls scroll along the second, so neither the row
+     nor the page runs past the viewport. */
+  .conversation-header {
+    flex-wrap: wrap;
+  }
+
+  .conversation-header .badge {
+    flex: 1 1 100%;
+  }
+
+  .conversation-header .pill-row {
+    flex: 1 1 100%;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .conversation-header .pill-row::-webkit-scrollbar {
+    display: none;
   }
 }
 
