@@ -46,6 +46,8 @@ HOLDOUT_EVERY_N = 5
 EVAL_MIN_RELATIVE_IMPROVEMENT = 0.01
 # SPEC §7.5: cap teacher-distillation calls per job to bound cost.
 MAX_DISTILL_EXAMPLES = 32
+#: Distinguishes "not looked up yet" from a genuine `None` tenant.
+_UNSET = object()
 
 
 class TrainingService:
@@ -291,6 +293,10 @@ class TrainingService:
         adapter_schema = {
             "kind": "adapter.lora",
             "mode": resolved_mode,
+            # Declared rather than inferred: this is the adapter that may
+            # train from the caller's live preference history, so it says so
+            # (SPEC §5.5.3).
+            "adapter_role": "persona",
             "scope": "per-user",
             "user_id": user_id,
             "base_model": self.runtime_base_model or "jax-base",
@@ -316,6 +322,64 @@ class TrainingService:
             lambda locked: {**locked, "fs_dir": fs_dir} if fs_dir else locked,
         )
         return self.store.get_artifact(adapter.id) or adapter
+
+    def resolve_job_evidence(
+        self,
+        job,
+        *,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> List:
+        """The events a job pinned, all of them or none.
+
+        SPEC §5.5.3. A run is authorized by a specific set of events - the
+        ones whose counts crossed the bar. Training a subset is not a
+        smaller version of that decision, it is a different one nobody
+        made: nineteen of twenty messages, or two of three qualifying
+        contributors, still passes a holdout and still promotes weights,
+        while the recorded evidence claims numbers the run never saw. So
+        any event that fails to resolve refuses the whole run.
+
+        The boundary re-checked here is tenancy (shared) or ownership
+        (personal), because those are what would leak. `cluster_id` is
+        deliberately *not* re-required: reclustering moves events between
+        clusters as ordinary behaviour, so the job's ids are the snapshot
+        of membership and a moved event is still its evidence.
+        """
+        named = list(job.preference_event_ids or [])
+        if not named:
+            # An empty list must not widen back into a fresh query: a job
+            # that pinned nothing has no authorized evidence at all.
+            raise ConstraintViolation(
+                "training job pinned no evidence", {"job_id": job.id}
+            )
+        tenants: dict = {}
+        resolved = []
+        for event_id in named:
+            event = self.store.get_preference_event(event_id)
+            if event is None:
+                raise ConstraintViolation(
+                    "training job evidence no longer resolves",
+                    {"job_id": job.id, "event_id": event_id},
+                )
+            if tenant_id is not None:
+                owner_tenant = tenants.get(event.user_id, _UNSET)
+                if owner_tenant is _UNSET:
+                    owner = self.store.get_user(event.user_id)
+                    owner_tenant = owner.tenant_id if owner else None
+                    tenants[event.user_id] = owner_tenant
+                if owner_tenant != tenant_id:
+                    raise ConstraintViolation(
+                        "training job evidence left its tenant",
+                        {"job_id": job.id, "event_id": event_id},
+                    )
+            elif user_id is not None and event.user_id != user_id:
+                raise ConstraintViolation(
+                    "training job evidence left its owner",
+                    {"job_id": job.id, "event_id": event_id},
+                )
+            resolved.append(event)
+        return resolved
 
     def train_from_preferences(
         self,
@@ -350,13 +414,62 @@ class TrainingService:
         self._apply_adapter_vocab_size(adapter)
         adapter_schema_now = adapter.schema or {}
         adapter_cluster = adapter_schema_now.get("cluster_id") or cluster_id
+        # Pinned or live is a property of the *job*, not of the adapter as it
+        # looks right now. Keying this off `cluster_id` would let a skill
+        # adapter that later lost or changed its cluster turn an
+        # already-created job into a live query - the durable record of what
+        # was authorized must not be re-derivable from mutable state.
+        # A persona job records no evidence and stays live; that is why the
+        # pinned rule does not make persona training unrunnable.
+        job = self.store.get_training_job(job_id) if job_id else None
+        pinned_job = job is not None and job.preference_event_ids is not None
+        # A job authorizes one adapter. `adapter_id` and `job_id` arrive
+        # independently, so nothing forced them to agree: adapter B could be
+        # fitted to job A's pinned evidence, write B's version directory, and
+        # update A's record. Checked before any evidence is resolved or
+        # anything is written.
+        if job is not None and job.adapter_id != adapter.id:
+            raise ConstraintViolation(
+                "training job belongs to another adapter",
+                {"job_id": job.id, "job_adapter": job.adapter_id,
+                 "adapter_id": adapter.id},
+            )
+        # A skill adapter graduates only through the ladder. Invoked
+        # directly it would select live events, train, and record a job
+        # pinned to whatever it happened to pick - so a skill that had
+        # earned nothing beyond its prompt rung could reach weights by a
+        # route §5.5's gate never authorized, bypassing the replica-safe
+        # enqueue on the way. The worker already owns the correct path, so
+        # this refuses rather than re-deriving the gate here. A persona
+        # adapter declares itself one and is unaffected.
+        # A *pinned* job, not merely a job. A live job against a skill
+        # adapter would pass a jobless check, leave `pinned_job` False, and
+        # run the live query - the same bypass one step along. An empty list
+        # is pinned and falls through to the pinned-invalid refusal below,
+        # which is the right answer for it.
+        #
+        # Skillhood is read from the durable role, not inferred from
+        # `cluster_id`. `cluster_id` is not required by the adapter schema
+        # and `additionalProperties` is true, so an ordinary edit could drop
+        # it and leave a valid adapter that no longer looked cluster-bound:
+        # the pinned rule would be skipped and the run would select the
+        # caller's live preference history instead. Either marker is enough
+        # to make an adapter a skill, and the role cannot be edited away.
+        is_skill = adapter_schema_now.get("adapter_role") == "skill" or bool(
+            adapter_schema_now.get("cluster_id")
+        )
+        if is_skill and (job is None or job.preference_event_ids is None):
+            raise ConstraintViolation(
+                "skill training requires a pinned job",
+                {"adapter_id": adapter.id, "job_id": job.id if job else None},
+            )
         # SPEC §7.3: skill adapters (cluster-bound, not owned by a single user)
-        # pool positive events across every contributor to the cluster - one
-        # user's thumbs are too sparse to train weights on. Persona adapters
-        # stay strictly per-user.
+        # pool positive events across every contributor to the cluster; a
+        # personal skill trains from its one owner's history instead, and
+        # persona adapters stay strictly per-user.
         # Pooling is decided by scope, not ownership: tenant-scoped skill
         # adapters carry a nominal owner for visibility purposes.
-        pooled_skill = bool(adapter_cluster) and (
+        pooled_skill = is_skill and (
             adapter_scope == "tenant" or not adapter.owner_user_id
         )
         if pooled_skill:
@@ -374,34 +487,49 @@ class TrainingService:
                     "cannot resolve tenant for pooled training",
                     {"user_id": user_id, "adapter_id": adapter.id},
                 )
-            events = self.store.list_preference_events(
-                user_id=None,
-                feedback=POSITIVE_FEEDBACK_VALUES,
-                cluster_id=adapter_cluster,
-                tenant_id=tenant_id,
+            events = (
+                self.resolve_job_evidence(job, tenant_id=tenant_id)
+                if pinned_job
+                else self.store.list_preference_events(
+                    user_id=None,
+                    feedback=POSITIVE_FEEDBACK_VALUES,
+                    cluster_id=adapter_cluster,
+                    tenant_id=tenant_id,
+                )
             )
         else:
-            events = self.store.list_preference_events(
-                user_id=user_id,
-                feedback=POSITIVE_FEEDBACK_VALUES,
-                cluster_id=cluster_id,
+            events = (
+                self.resolve_job_evidence(job, user_id=user_id)
+                if pinned_job
+                else self.store.list_preference_events(
+                    user_id=user_id,
+                    feedback=POSITIVE_FEEDBACK_VALUES,
+                    cluster_id=cluster_id,
+                )
             )
         if not events:
             return None
         cluster_meta = self._cluster_events(events, user_id)
-        dataset_entries = list(self._build_examples(events))
+        # A pinned job's evidence has to survive preparation intact, not
+        # only resolution: dropping one unusable target here trains on less
+        # than the set that authorized the run and still promotes.
+        dataset_entries = list(self._build_examples(events, strict=pinned_job))
         dataset_entries = self._maybe_distill(dataset_entries)
         # SPEC §5.4: hold out a slice of examples so promotion is gated on
         # measured improvement rather than "training ran without raising".
         train_entries, holdout_entries = self._split_holdout(dataset_entries)
         token_batches = list(
             self._tokenize_batches(
-                train_entries, base_model=adapter.schema.get("base_model")
+                train_entries,
+                base_model=adapter.schema.get("base_model"),
+                strict=pinned_job,
             )
         )
         eval_batches = list(
             self._tokenize_batches(
-                holdout_entries, base_model=adapter.schema.get("base_model")
+                holdout_entries,
+                base_model=adapter.schema.get("base_model"),
+                strict=pinned_job,
             )
         ) if holdout_entries else []
         vocab_size = self._vocab_size()
@@ -1080,7 +1208,19 @@ class TrainingService:
             "holdout_examples": holdout_count,
         }
 
-    def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
+    def _build_examples(
+        self, events: Iterable[PreferenceEvent], *, strict: bool = False
+    ) -> Iterable[dict]:
+        """Training examples from preference events.
+
+        `strict` carries a pinned job's all-or-nothing property past event
+        resolution (SPEC §5.5.3). Resolving twenty events and then building
+        nineteen examples is the same failure one stage later: the run still
+        trains on less than the evidence that authorized it, and still
+        promotes. Deduplication by `(conversation_id, message_id)` is not a
+        loss here - it is the normative normalization, and the pinned set is
+        still the sole source.
+        """
         # Dedupe by (conversation_id, message_id) per SPEC §5.4.3.
         seen: set[tuple[str, str]] = set()
         for event in events:
@@ -1096,6 +1236,14 @@ class TrainingService:
             # turn became training context.
             target_message = self.store.get_message(event.message_id or "")
             if target_message is None:
+                if strict:
+                    raise ConstraintViolation(
+                        "pinned_evidence_target_missing",
+                        {
+                            "conversation_id": event.conversation_id,
+                            "message_id": event.message_id,
+                        },
+                    )
                 logger.warning(
                     "sft_example_dropped_unresolvable_target",
                     conversation_id=event.conversation_id,
@@ -1146,6 +1294,7 @@ class TrainingService:
         batch_size: int = DEFAULT_TRAIN_BATCH_SIZE,
         max_length: int = DEFAULT_MAX_TOKEN_LENGTH,
         base_model: Optional[str] = None,
+        strict: bool = False,
     ) -> Iterator[dict]:
         """
         Convert preference_event-derived examples into padded token batches.
@@ -1218,6 +1367,11 @@ class TrainingService:
                     row.get("target") or "", continuation=True, limit=budget - 1
                 )
                 if not target_tokens:
+                    if strict:
+                        raise ConstraintViolation(
+                            "pinned_evidence_not_tokenizable",
+                            {"reason": "empty_target"},
+                        )
                     logger.warning(
                         "sft_example_without_target_dropped", reason="empty_target"
                     )
@@ -1232,6 +1386,11 @@ class TrainingService:
                     # Nothing to condition on: give the target one token of
                     # ground rather than inventing content.
                     if len(target_tokens) < 2:
+                        if strict:
+                            raise ConstraintViolation(
+                                "pinned_evidence_not_tokenizable",
+                                {"reason": "no_prompt"},
+                            )
                         logger.warning(
                             "sft_example_without_target_dropped", reason="no_prompt"
                         )

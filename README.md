@@ -100,7 +100,7 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
   - per-user persona adapters (lora): small, low-stakes - tone and format
   - skill adapters born from usage: “when problems like this show up, start with this debugging workflow”
   - every skill starts as a **prompt** (instructions distilled from cluster labels + highly-rated exemplars) - useful immediately on any backend
-  - once a cluster pools enough positive feedback **across users**, a jax training job runs; one user’s thumbs are too sparse to train weights on
+  - once a skill cluster accumulates enough **independent** positive evidence, it may graduate from prompt instructions to lora training. personal skills may train from one user's repeated evidence and stay private; shared skills additionally require pooled evidence from several users in the tenant. a raw count is not evidence: twenty thumbs in one long session are one episode rated repeatedly, so the gate counts distinct rated answers and distinct conversations too
   - trained weights only ship if a **holdout eval gate** measures real improvement; a failed gate leaves the skill on the prompt rung. nothing regresses.
   - passing the gate is the *only* thing that makes weights servable: the adapter's promoted version number is the authority, and serving reads exactly that version's weights. a file on disk, a `latest` pointer, the newest directory - none of them mean an adapter graduated.
   - a graduated skill speaks once, not twice: where its weights apply it is carried by them, and where they cannot (an api backend) its prompt carries it instead

@@ -35,8 +35,10 @@ code and the docs under `docs/` say how it is currently implemented.
     but is never required at inference time.
 - **deep, evolving user-specific behavior** via:
   - per-user persona adapters (small, low-stakes: tone and format)
-  - per-skill LoRA adapters trained on **pooled** cluster data (§7.3) - a
-    single user's feedback is too sparse to train weights on
+  - per-skill LoRA adapters (§7.3), in two kinds that differ in scope
+    rather than in capability: a **personal** skill trains from one user's
+    repeated evidence and stays private to them, and a **shared** skill
+    pools several users' evidence and is served across the tenant
   - the adapter ladder (§5.5): every skill is born as a prompt, and only
     earns weights when the data justifies it and the eval gate passes
   - natural, emergent domains & skills from usage
@@ -1154,26 +1156,170 @@ every skill adapter climbs the same ladder; the rungs are data thresholds and
 eval gates, not human ceremony:
 
 ```
-cluster qualifies          pooled events ≥ threshold      eval gate passes
+cluster qualifies          independent evidence           eval gate passes
       │                              │                          │
       ▼                              ▼                          ▼
  mode: prompt      ──────▶   training job enqueued   ──────▶  mode: hybrid
- (instructions from          (data pooled across              (trained weights,
-  cluster label +             the whole cluster)               prompt kept as
-  positive exemplars)                                          portable fallback)
+ (instructions from          (personal: one user's            (trained weights,
+  cluster label +             own history; shared:             prompt kept as
+  positive exemplars)         pooled across 3+ users)          portable fallback)
+```
+
+the question every rung answers is: **have we seen this behaviour succeed
+independently enough that baking it in is justified?** the two scopes prove
+independence differently, and that - not a different event count - is what
+separates them:
+
+```
+personal:  different answer + different conversation + different time
+shared:    different answer + different conversation + different person
 ```
 
 1. **born as a prompt.** when a cluster qualifies (§7.3), its skill adapter
    is created with `mode: "prompt"` and instructions composed from the
    cluster label, description, and up to 3 highly-rated exemplars -
    immediately useful on every backend, free to create.
-   `lifecycle: { "stage": "prompt", "weights_min_events": N }` records the
-   next rung.
-2. **weights when the data earns them.** once the cluster has pooled at
-   least `weights_min_events` positive events (default 20), a training job
-   is enqueued. skill data pools **across all contributors to the cluster**
-   (tenant-scoped); persona adapters remain strictly per-user.
-3. **graduation is gated** through §5.4.6; a failed or skipped gate leaves
+
+   a **personal** cluster (one with a `user_id`) needs only that user's
+   evidence, and its adapter is `visibility: private`, `scope: "per-user"`.
+   a **shared** cluster (no `user_id`) is delivered to people who never
+   contributed to it, so the prompt rung itself requires
+   `users >= shared_prompt_min_users` (default 2). one contributor is not
+   evidence that anyone else benefits. a one-person install loses nothing:
+   it gets private personal prompt skills, and has no reason to create a
+   tenant-shared skill until a second person exists.
+
+2. **weights when the evidence earns them.** a raw count is not evidence:
+   twenty ratings inside one conversation are one episode rated
+   repeatedly. these thresholds decide whether behaviour enters weights,
+   so they are promotion authority rather than tuning knobs, and they are
+   normative here. both scopes require:
+
+   - `positive_events >= weights_min_events` (default 20), AND
+   - `messages >= weights_min_messages` (default 20), counted over
+     **distinct** rated answers, so re-rating one reply cannot reach the
+     bar alone, AND
+   - `conversations >= weights_min_conversations` (default 5).
+
+   a **personal** skill additionally requires
+   `span_hours >= personal_min_span_hours` (default 48): its evidence has
+   only one source of independence, so it must not all come from one
+   sitting. the bound is deliberately short - personalization that waits a
+   week is artificial delay, not rigour.
+
+   a **shared** skill instead requires
+   `qualifying_contributors >= shared_min_users` (default 3), where a
+   qualifying contributor is a user with at least
+   `shared_min_events_per_user` (default 2) distinct rated answers across
+   at least `shared_min_conversations_per_user` (default 2) conversations.
+   counting bare appearances would let 18/1/1 pass, and a tenant-wide
+   adapter would then be judged on evidence that is essentially one
+   person's.
+
+   a shared skill is `visibility: shared`, `scope: "tenant"`, owned by its
+   most frequent contributor. persona adapters are a third thing and stay
+   strictly per-user: they carry tone and format, not a learned task
+   behaviour.
+
+   **the ladder is revisited, not decided once.** a skill is normally
+   discovered long before it has earned weights, so every clustering pass
+   recomputes the evidence for clusters that already have an adapter,
+   refreshes `lifecycle.evidence`, and enqueues training if the bar is now
+   cleared. enqueueing is idempotent per adapter: a pass that finds an
+   existing job queues nothing.
+
+   the measured evidence is recorded at `lifecycle.evidence`:
+   `{ positive_events, conversations, messages, users,
+   qualifying_contributors, first_event_at, last_event_at, span_hours }`,
+   so a skill that stayed on the prompt rung says why, and so the
+   thresholds above can later be chosen from real distributions rather
+   than guessed again.
+
+   semantic variation is deliberately **not** gated on. a legitimately
+   narrow skill has low variance by nature, so "more spread is better" is
+   not universally true, and dispersion in this repo's embedding space
+   would need its own census before it could be promotion authority.
+
+3. **the job's evidence is what gets trained, all of it or none.** the
+   training job records the exact `preference_event_ids` whose evidence
+   crossed the bar, and those are what is tokenized, split into
+   train/holdout and evaluated. re-deriving the set at training time let
+   the two ends disagree about what counts as positive - the gate accepts
+   feedback *or* a positive score, the old query asked for feedback alone.
+
+   resolution is all-or-nothing. training a subset is not a smaller
+   version of the decision that authorized the run, it is a different one
+   nobody made: nineteen of twenty messages, or two of three qualifying
+   contributors, still passes a holdout and still promotes weights while
+   `lifecycle.evidence` claims numbers the run never saw. so any named
+   event that fails to resolve refuses the whole run, and a *skill* job
+   that pinned no evidence trains nothing rather than falling back to a
+   fresh query.
+
+   **pinned or live is durable state on the job**, not something
+   re-derived from the adapter:
+
+   - `preference_event_ids IS NULL` - a **live** job. its evidence is
+     whatever the scoped query returns at run time. persona and background
+     training work this way, having no promotion gate to pin anything.
+   - `preference_event_ids = [...]` - a **pinned** job. exactly those
+     events, or the run refuses.
+   - `preference_event_ids = []` - pinned and invalid. refuse; this is not
+     the same as live, and the two must never collapse to one value.
+
+   a skill job is always created pinned. keying this off the adapter's
+   current `cluster_id` instead would let a skill adapter that later lost
+   or changed its cluster turn an already-authorized job back into a live
+   query.
+
+   **the adapter's role is durable too.** persona and skill share one
+   `adapter.lora` schema, so `adapter_role` says which is which: a
+   `"persona"` may train from live preference history, a `"skill"` requires
+   a pinned job. reading skillhood from `cluster_id` alone is the same
+   mistake one object over - that key is not required by the schema, so an
+   ordinary artifact edit could drop it and hand a skill the persona path.
+   a cluster-bound adapter carrying no explicit role is a skill, and
+   acquires the durable role on its next write or ladder revisit,
+   whichever comes first. once set, the role cannot be removed or changed
+   by any writer; the cluster binding may still change or go, because
+   reclustering is ordinary.
+
+   **exactness holds through preparation, not only resolution.** resolving
+   twenty events and then building nineteen examples, or tokenizing
+   eighteen of those, is the same failure one stage later: the run trains
+   on less than the evidence that authorized it and still promotes. for a
+   pinned job every resolved event must produce an example and every
+   example must produce a supervised token sequence, and any shortfall
+   refuses the run - `pinned_evidence_unresolvable`,
+   `pinned_evidence_target_missing`, `pinned_evidence_not_tokenizable`.
+   deduplication by `(conversation_id, message_id)` is not a shortfall: it
+   is the normative normalization of §5.4.3, and the pinned set remains the
+   sole source. a live job keeps the older behaviour of dropping an
+   unusable example and training the remainder.
+
+   the boundary re-checked at resolution is **tenancy** (shared) or
+   **ownership** (personal), because those are the ones that would leak.
+   `cluster_id` is deliberately *not* re-required: reclustering moves
+   events between clusters as ordinary behaviour, so the job's ids are the
+   snapshot of membership and a reclustered event is still its evidence.
+
+4. **one replica decides.** §22 runs several replicas against one
+   Postgres, so both rung decisions are arbitrated by the database rather
+   than by a process-local read-then-write: creating a cluster's adapter
+   holds an advisory lock on the cluster, and enqueueing holds one on the
+   adapter before checking. `WHERE NOT EXISTS` is **not** sufficient for
+   the second - at READ COMMITTED the subquery takes no lock, so two
+   transactions both see no row and both insert - and a unique index on
+   `adapter_id` would be wrong, because an adapter legitimately trains
+   more than once over its life.
+
+   a cluster found with more than one adapter bound to it is **refused**,
+   not resolved. those rows exist, the pass that created them is fixed
+   above, and they are all live and routable: choosing the oldest would
+   turn historical ambiguity into authority and leave the rest serving
+   quietly. such a cluster is skipped with a warning until an operator
+   reconciles it.
+5. **graduation is gated** through §5.4.6; a failed or skipped gate leaves
    the adapter on the prompt rung; nothing regresses. the rules that make
    the ladder safe (histories in docs/decisions/adapter-resolution.md):
    - **two independent locks make "before graduation" unservable**, because
@@ -1216,7 +1362,7 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
      injecting both gives the model the weights *and* the instructions
      they were distilled from - an input the eval gate never scored. a
      hybrid with nothing promoted keeps its prompt locally.
-4. **demotion mirrors promotion.** pruning (§7.4) can push an adapter back
+6. **demotion mirrors promotion.** pruning (§7.4) can push an adapter back
    down the ladder (disable weights, keep prompt) via the same ConfigOps
    pipeline.
 
@@ -1475,7 +1621,13 @@ then a skill adapter is created **on the prompt rung of the ladder (§5.5)**:
   "mode": "prompt",
   "scope": "global",
   "prompt_instructions": "Skill: <label>.\n<description>\nExamples of responses users rated highly:\n- ...",
-  "lifecycle": { "stage": "prompt", "weights_min_events": 20 },
+  "lifecycle": {
+    "stage": "prompt",
+    "weights_min_events": 20,
+    "evidence": {
+      "positive_events": 20, "conversations": 1, "messages": 20, "users": 1
+    }
+  },
   "rank": 4,
   "layers": [0,1,2],
   "matrices": ["attn_q"],

@@ -17,11 +17,22 @@ pytestmark = pytest.mark.slow
 
 
 
-def _seed_user_with_events(store, email, cluster_id, n_events, corrected="use tabs"):
-    user = store.create_user(email=f"{uuid.uuid4().hex[:8]}_{email}")
-    convo = store.create_conversation(user.id, title="t")
+def _seed_user_with_events(
+    store, email, cluster_id, n_events, corrected="use tabs", conversations=1, user=None
+):
+    """`n_events` rated answers, spread over `conversations` threads.
+
+    The spread matters to the weights gate (SPEC §5.5): ratings confined to
+    one thread are one episode rated repeatedly, which does not earn
+    weights however many rows it writes.
+    """
+    user = user or store.create_user(email=f"{uuid.uuid4().hex[:8]}_{email}")
+    threads = [
+        store.create_conversation(user.id, title="t") for _ in range(max(conversations, 1))
+    ]
     events = []
     for i in range(n_events):
+        convo = threads[i % len(threads)]
         prompt_msg = store.append_message(convo.id, "user", "user", f"question {i}")
         reply = store.append_message(convo.id, "assistant", "assistant", f"answer {i}")
         _ = prompt_msg
@@ -40,6 +51,23 @@ def _seed_user_with_events(store, email, cluster_id, n_events, corrected="use ta
     return user, events
 
 
+def _personal_cluster(store, email, n_events, *, conversations=1, corrected="use tabs"):
+    """A user, a cluster they own, and their rated answers.
+
+    Most of these tests are about the personal rung. A cluster with no
+    `user_id` is the *shared* kind, and since SPEC §5.5.1 a shared skill
+    needs two contributors before it exists at all - so seeding one from a
+    single user now correctly produces nothing.
+    """
+    owner = store.create_user(email=f"{uuid.uuid4().hex[:8]}_{email}")
+    cluster = _make_cluster(store, user_id=owner.id)
+    _, events = _seed_user_with_events(
+        store, email, cluster.id, n_events,
+        corrected=corrected, conversations=conversations, user=owner,
+    )
+    return owner, cluster, events
+
+
 def _make_cluster(store, *, user_id=None, size=10):
     return store.upsert_semantic_cluster(
         user_id=user_id,
@@ -55,8 +83,7 @@ class TestPromptFirstLadder:
         store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
-        cluster = _make_cluster(store)
-        _seed_user_with_events(store, "a@t.local", cluster.id, 6)
+        _personal_cluster(store, "a@t.local", 6)
 
         promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=20)
 
@@ -75,10 +102,15 @@ class TestPromptFirstLadder:
         store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
-        cluster = _make_cluster(store)
-        _seed_user_with_events(store, "a@t.local", cluster.id, 8)
+        # A *personal* skill: one owner's own cluster, spread across threads.
+        _personal_cluster(store, "a@t.local", 8, conversations=8)
 
-        promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=8)
+        # `personal_min_span_hours=0` because this test is about the count
+        # bar, not the time bar; the span rule has its own witnesses.
+        promoted = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=8, weights_min_messages=8,
+            personal_min_span_hours=0,
+        )
 
         adapter_id = promoted[0]
         jobs = [j for j in store.list_training_jobs() if j.adapter_id == adapter_id]
@@ -89,10 +121,20 @@ class TestPromptFirstLadder:
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
-        _seed_user_with_events(store, "a@t.local", cluster.id, 3)
-        heavy_user, _ = _seed_user_with_events(store, "b@t.local", cluster.id, 5)
+        # Three contributors, because a shared skill is served to people who
+        # never rated anything for it (SPEC §5.5). `heavy_user` still has the
+        # most events, which is what decides ownership.
+        _seed_user_with_events(store, "a@t.local", cluster.id, 3, conversations=3)
+        heavy_user, _ = _seed_user_with_events(
+            store, "b@t.local", cluster.id, 5, conversations=5
+        )
+        _seed_user_with_events(store, "c@t.local", cluster.id, 3, conversations=3)
 
-        promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=8)
+        # The message bar is its own knob (SPEC §5.5.2), so a test that
+        # lowers the event bar has to lower it too or nothing can clear it.
+        promoted = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=8, weights_min_messages=8
+        )
 
         adapter = store.get_artifact(promoted[0])
         # A cluster spanning several users is owned by its top contributor and
@@ -112,21 +154,38 @@ class TestPooledTrainingData:
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
-        user_a, _ = _seed_user_with_events(store, "a@t.local", cluster.id, 4)
-        _seed_user_with_events(store, "b@t.local", cluster.id, 4)
-        promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=8)
+        # Three qualifying contributors, so the shared weights rung is
+        # actually earned: a skill only trains through the job its gate
+        # queued (SPEC §5.5.3), so a test that trains one has to clear it.
+        user_a, _ = _seed_user_with_events(
+            store, "a@t.local", cluster.id, 4, conversations=4
+        )
+        _seed_user_with_events(store, "b@t.local", cluster.id, 4, conversations=4)
+        _seed_user_with_events(store, "c@t.local", cluster.id, 4, conversations=4)
+        promoted = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=8, weights_min_messages=8
+        )
         adapter_id = promoted[0]
+        job = [j for j in store.list_training_jobs()
+               if j.adapter_id == adapter_id][0]
 
-        result = training.train_from_preferences(user_a.id, adapter_id=adapter_id)
+        pinned = len(job.preference_event_ids)
+        result = training.train_from_preferences(
+            job.user_id, adapter_id=adapter_id, job_id=job.id
+        )
+        _ = user_a
 
         assert result is not None
         job = store.get_training_job(result["job_id"])
-        # Both users' events flowed into the dataset (deduped per message).
+        # Every contributor's events flowed into the dataset, deduped per
+        # message. Derived from what the job pinned rather than a literal:
+        # the pinned set *is* the dataset now (SPEC §5.5.3).
         assert result["eval_gate"]["holdout_examples"] >= 1
         dataset = open(job.dataset_path).read().strip().splitlines()
-        assert len(dataset) == 8 - result["eval_gate"]["holdout_examples"] or len(
-            dataset
-        ) == 8  # dataset file holds all entries pre-split or post-split count
+        assert len(dataset) in (
+            pinned,
+            pinned - result["eval_gate"]["holdout_examples"],
+        ), f"{len(dataset)} rows from {pinned} pinned events"
 
     def test_persona_adapter_stays_per_user(self, tmp_path):
         store = get_test_store()
@@ -223,12 +282,20 @@ class TestEvalGate:
         store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
-        cluster = _make_cluster(store, user_id=None)
-        user, _ = _seed_user_with_events(store, "a@t.local", cluster.id, 10)
-        promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=10)
+        user, _, _ = _personal_cluster(store, "a@t.local", 10, conversations=10)
+        promoted = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=10, weights_min_messages=10,
+            personal_min_span_hours=0,
+        )
         adapter_id = promoted[0]
+        # A skill trains through the job its gate queued (SPEC §5.5.3); a
+        # direct call is the bypass that route exists to close.
+        job = [j for j in store.list_training_jobs()
+               if j.adapter_id == adapter_id][0]
 
-        result = training.train_from_preferences(user.id, adapter_id=adapter_id)
+        result = training.train_from_preferences(
+            user.id, adapter_id=adapter_id, job_id=job.id
+        )
 
         adapter = store.get_artifact(adapter_id)
         if result["eval_gate"]["promoted"]:
@@ -283,8 +350,10 @@ class TestTenantIsolation:
 
     def _seed_tenant(self, store, email, tenant, cluster_id, n, secret):
         user = store.create_user(email=f"{uuid.uuid4().hex[:8]}_{email}", tenant_id=tenant)
-        convo = store.create_conversation(user.id, title="t")
         for i in range(n):
+            # One thread each: the weights rung counts distinct
+            # conversations, so a single thread is one episode (SPEC §5.5.2).
+            convo = store.create_conversation(user.id, title="t")
             store.append_message(convo.id, "user", "user", f"q{i}")
             reply = store.append_message(convo.id, "assistant", "assistant", secret)
             store.record_preference_event(
@@ -300,12 +369,18 @@ class TestTenantIsolation:
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
         acme = self._seed_tenant(store, "a@acme", "acme", cluster.id, 6, "ACME_SECRET")
+        self._seed_tenant(store, "c@acme", "acme", cluster.id, 4, "ACME_SECRET")
+        self._seed_tenant(store, "d@acme", "acme", cluster.id, 4, "ACME_SECRET")
         self._seed_tenant(store, "b@initech", "initech", cluster.id, 4, "INITECH_SECRET")
 
         adapter_id = clusterer.promote_skill_adapters(
-            min_size=5, weights_min_events=10
+            min_size=5, weights_min_events=10, weights_min_messages=10
         )[0]
-        result = training.train_from_preferences(acme.id, adapter_id=adapter_id)
+        job = [j for j in store.list_training_jobs()
+               if j.adapter_id == adapter_id][0]
+        result = training.train_from_preferences(
+            acme.id, adapter_id=adapter_id, job_id=job.id
+        )
 
         dataset = open(store.get_training_job(result["job_id"]).dataset_path).read()
         assert "ACME_SECRET" in dataset
@@ -316,7 +391,10 @@ class TestTenantIsolation:
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
+        # Two acme contributors: a shared skill needs more than one voice
+        # inside its own tenant before it exists at all (SPEC §5.5.1).
         self._seed_tenant(store, "a@acme", "acme", cluster.id, 6, "ACME_SECRET")
+        self._seed_tenant(store, "c@acme", "acme", cluster.id, 4, "ACME_SECRET")
         outsider = self._seed_tenant(
             store, "b@initech", "initech", cluster.id, 4, "INITECH_SECRET"
         )
