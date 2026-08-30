@@ -16,7 +16,10 @@
     <script defer src="/static/chat.js"></script>
   </head>
   <body>
-    <div class="app-shell">
+    <!-- `banded`: this is the page with a rail and a pane to put in the
+         first two grid tracks. The admin and share pages wear the same shell
+         for its chrome and have one column, so they leave it off. -->
+    <div class="app-shell banded">
       <!-- Three bands, three questions. The rail says where you are, the
            pane says what exists there, the workspace says what you are
            working on. The rail replaced an eight-tab strip: it spends

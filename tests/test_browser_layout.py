@@ -943,3 +943,74 @@ class TestTheResponsiveDefaultIsNotAChoice:
             ) > 0, "the reader restored the rail and it vanished on reload"
         finally:
             context.close()
+
+
+class TestEveryPageThatWearsTheShellGetsAPageToFill:
+    """Three pages use `.app-shell`; only one of them has bands.
+
+    The rail work turned `.app-shell` into `48px 240px 1fr`. The admin console
+    and the shared-conversation page reuse that class for its chrome and have
+    only a bar and one column under it, so their bar landed in the rail's 48px
+    and their entire content in the pane's 240px - on a 1440px screen, beside
+    1200px of nothing.
+
+    Neither page has a rail or a pane to put in those tracks, and neither is
+    reachable from the section navigation the lane's other tests drive, which
+    is why every one of them passed while the console was unusable.
+    """
+
+    #: `.layout` is `max-width: var(--content-max)`, centred. On a page that
+    #: gets the full width that resolves to 1100px; in the pane's track it
+    #: cannot exceed 240.
+    CONTENT_MAX = 1100
+
+    @pytest.mark.parametrize("path", ["/admin", "/share"], ids=["admin", "share"])
+    def test_the_page_gets_the_width_of_the_page(self, browser, server, path):
+        context = browser.new_context(viewport=DESKTOP)
+        page = context.new_page()
+        try:
+            page.goto(f"{server.base_url}{path}", wait_until="domcontentloaded")
+            page.wait_for_selector(".app-shell", state="attached")
+            page.wait_for_timeout(400)
+
+            measured = page.evaluate(
+                """() => {
+                  const box = (sel) => {
+                    const el = document.querySelector(sel);
+                    return el ? Math.round(el.getBoundingClientRect().width) : -1;
+                  };
+                  return {
+                    bar: box('.topbar'),
+                    content: box('main.layout'),
+                    viewport: window.innerWidth,
+                  };
+                }"""
+            )
+
+            assert measured["content"] == self.CONTENT_MAX, (
+                f"{path} rendered its content {measured['content']}px wide on a "
+                f"{measured['viewport']}px page; the pane's track is 240 and "
+                f"the content column is {self.CONTENT_MAX}"
+            )
+            assert measured["bar"] == measured["viewport"], (
+                f"{path} put its bar in {measured['bar']}px; the rail's track "
+                f"is 48 and the bar spans the page"
+            )
+        finally:
+            context.close()
+
+    @pytest.mark.parametrize("path", ["/admin", "/share"], ids=["admin", "share"])
+    def test_the_page_does_not_scroll_sideways(self, browser, server, path):
+        """The other half: filling the width must not overflow it."""
+        context = browser.new_context(viewport=DESKTOP)
+        page = context.new_page()
+        try:
+            page.goto(f"{server.base_url}{path}", wait_until="domcontentloaded")
+            page.wait_for_selector(".app-shell", state="attached")
+            page.wait_for_timeout(400)
+            overflow = page.evaluate(
+                "() => document.documentElement.scrollWidth - window.innerWidth"
+            )
+            assert overflow <= 0, f"{path} is {overflow}px wider than its viewport"
+        finally:
+            context.close()
