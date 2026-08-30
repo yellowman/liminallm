@@ -500,10 +500,12 @@ textarea {
   resize: vertical;
 }
 
-/* Buttons — one size, one shape, everywhere */
+/* Buttons — one size, one shape, everywhere. A link that sits in a button
+   row takes the same shape: it navigates, so it stays an anchor. */
 button.primary,
 button.ghost,
-button.minor {
+button.minor,
+a.ghost {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -515,6 +517,7 @@ button.minor {
   font-weight: 600;
   font-size: 13px;
   cursor: pointer;
+  text-decoration: none;
   transition: background 0.15s ease, border-color 0.15s ease;
   white-space: nowrap;
 }
@@ -535,13 +538,15 @@ button.primary:disabled {
   cursor: not-allowed;
 }
 
-button.ghost {
+button.ghost,
+a.ghost {
   background: var(--panel);
   border-color: var(--border);
   color: var(--text);
 }
 
-button.ghost:hover {
+button.ghost:hover,
+a.ghost:hover {
   background: var(--panel-muted);
   border-color: var(--border-strong);
 }
@@ -1501,7 +1506,6 @@ button.minor:hover {
 #status,
 #admin-error,
 #admin-feedback,
-#admin-warning,
 #error-banner {
   background: var(--panel-muted);
   border: 1px solid var(--border);

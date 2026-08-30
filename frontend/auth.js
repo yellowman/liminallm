@@ -24,20 +24,13 @@ const showAuthForm = (formName) => {
 // Auth management
 // =============================================================================
 
+// An admin gets one extra control in the composer's own button row rather
+// than a banner: the banner said what the row can show, and cost the chat
+// column a line of vertical space on every turn to say it.
 const renderAdminNotice = () => {
-  if (state.role === 'admin') {
-    if (adminWarning) {
-      adminWarning.textContent = 'You are signed in as an admin. Use the Admin link to approve patches.';
-      adminWarning.style.display = 'block';
-    }
-    if (adminLink) adminLink.style.display = 'inline-flex';
-  } else {
-    if (adminWarning) {
-      adminWarning.textContent = '';
-      adminWarning.style.display = 'none';
-    }
-    if (adminLink) adminLink.style.display = 'none';
-  }
+  const isAdmin = state.role === 'admin';
+  if (approvePatches) approvePatches.classList.toggle('hidden', !isAdmin);
+  if (adminLink) adminLink.style.display = isAdmin ? 'inline-flex' : 'none';
   // Show/hide admin settings section based on role
   renderAdminSettingsSection();
 };
