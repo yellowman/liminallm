@@ -592,20 +592,36 @@ class SemanticClusterer:
         # rung asks for spread in time instead of in people.
         return evidence["span_hours"] >= min_span_hours
 
-    def _positive_in_tenant(self, cluster_id: str, tenant_id: str):
-        """A cluster's positive events, inside one tenant.
-
-        One place, because birth and revisit have to apply the same
-        authority: scoping only the creation path left the same defect
-        alive on the second rung.
-        """
+    @staticmethod
+    def _positive(events: Sequence[PreferenceEvent]) -> List[PreferenceEvent]:
         return [
             e
-            for e in self.store.list_preference_events(
-                cluster_id=cluster_id, tenant_id=tenant_id
-            )
+            for e in events
             if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0
         ]
+
+    @staticmethod
+    def _top_contributor(events: Sequence[PreferenceEvent]) -> str | None:
+        counts: dict[str, int] = {}
+        for event in events:
+            counts[event.user_id] = counts.get(event.user_id, 0) + 1
+        return max(counts, key=counts.get) if counts else None
+
+    def _candidate_tenant(self, cluster_id: str) -> str | None:
+        """Which tenant a cluster's skill would belong to.
+
+        A selection, not an eligibility test: the loudest contributor names
+        the tenant, and that tenant's own evidence then has to pass every
+        gate on its own. Reading the whole cluster is what selection is for
+        - it is the only way to know which tenants are present - and nothing
+        it returns can qualify a tenant that has not qualified itself.
+        """
+        positive = self._positive(
+            self.store.list_preference_events(cluster_id=cluster_id)
+        )
+        top = self._top_contributor(positive)
+        owner = self.store.get_user(top) if top else None
+        return owner.tenant_id if owner else None
 
     def _maybe_enqueue_weights(
         self,
@@ -691,6 +707,10 @@ class SemanticClusterer:
             lifecycle = dict(updated.get("lifecycle") or {})
             lifecycle["evidence"] = evidence
             updated["lifecycle"] = lifecycle
+            # Skills created before the role existed are marked the first
+            # time the ladder touches them, so the durable marker needs no
+            # migration.
+            updated.setdefault("adapter_role", "skill")
             return updated
 
         refreshed = self.store.update_artifact(adapter.id, build)
@@ -777,18 +797,16 @@ class SemanticClusterer:
         shared_prompt_min_users: int,
         shared_min_users: int,
     ) -> None:
-        """One cluster's rung decision, under its binding lock."""
-        events = self.store.list_preference_events(cluster_id=cluster.id)
-        if len(events) < min_size:
-            return
-        positive = [
-            e
-            for e in events
-            if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0
-        ]
-        ratio = len(positive) / len(events) if events else 0.0
-        if ratio < positive_ratio:
-            return
+        """One cluster's rung decision, under its binding lock.
+
+        Scope first, then every gate inside it. `min_size` and the positive
+        ratio decide whether a cluster reaches the ladder at all, so
+        computing them over the whole cluster answered a question about a
+        population the adapter will never serve: one tenant's ratings could
+        carry another onto the ladder, and one tenant's rejections could
+        keep another off it. Numerator, denominator and evidence all come
+        from the same authority.
+        """
         # The cluster's existing adapter, not merely whether it has one:
         # a skill is normally discovered long before it earns weights, so
         # a bound cluster is revisited rather than skipped (SPEC §5.5).
@@ -796,24 +814,46 @@ class SemanticClusterer:
         # that did not cross both bars in a single pass.
         existing = self.store.adapter_for_cluster(cluster.id)
         shared = not cluster.user_id
+        if not shared:
+            # A user-owned cluster carries only its owner's events:
+            # `_cluster_preferences` is the only writer of `cluster_id`, and
+            # a user-scoped pass assigns only the events it fetched under
+            # that same scope. There is nothing here to scope away.
+            scope_tenant = None
+        elif existing is not None:
+            # An existing shared adapter's authority is the tenant it
+            # already records - not one recomputed from whoever has
+            # contributed since - so another tenant piling into the same
+            # cluster cannot qualify, inflate or pin this adapter.
+            scope_tenant = (existing.schema or {}).get("tenant_id")
+            if not scope_tenant:
+                self.logger.warning(
+                    "shared_skill_adapter_without_tenant",
+                    cluster_id=cluster.id,
+                    adapter_id=existing.id,
+                )
+                return
+        else:
+            # A cluster spanning tenants yields at most one adapter, so the
+            # tenants this does not select get none from it - the
+            # one-adapter-per-cluster limit, not a judgement about their
+            # evidence.
+            scope_tenant = self._candidate_tenant(cluster.id)
+            if not scope_tenant:
+                self.logger.warning(
+                    "skill_promotion_no_tenant", cluster_id=cluster.id
+                )
+                return
+        events = self.store.list_preference_events(
+            cluster_id=cluster.id, tenant_id=scope_tenant
+        )
+        if len(events) < min_size:
+            return
+        positive = self._positive(events)
+        ratio = len(positive) / len(events) if events else 0.0
+        if ratio < positive_ratio:
+            return
         if existing is not None:
-            # Scope before measuring, on both rungs. An existing shared
-            # adapter's authority is the tenant it already records - not one
-            # recomputed from whoever has contributed since - so another
-            # tenant piling into the same cluster cannot inflate this
-            # adapter's evidence or land in its pinned set.
-            if shared:
-                existing_tenant = (existing.schema or {}).get("tenant_id")
-                if not existing_tenant:
-                    self.logger.warning(
-                        "shared_skill_adapter_without_tenant",
-                        cluster_id=cluster.id,
-                        adapter_id=existing.id,
-                    )
-                    return
-                positive = self._positive_in_tenant(cluster.id, existing_tenant)
-                if not positive:
-                    return
             self._revisit_skill_adapter(
                 existing,
                 positive,
@@ -831,17 +871,7 @@ class SemanticClusterer:
         # tenant through the owner, so a cross-user cluster is owned by its
         # most frequent contributor and shared within that tenant - never
         # "global", which every tenant can see.
-        contributor_counts: dict[str, int] = {}
-        for event in positive:
-            contributor_counts[event.user_id] = (
-                contributor_counts.get(event.user_id, 0) + 1
-            )
-        top_contributor = (
-            max(contributor_counts, key=contributor_counts.get)
-            if contributor_counts
-            else None
-        )
-        owner_id = cluster.user_id or top_contributor
+        owner_id = cluster.user_id or self._top_contributor(positive)
         if not owner_id:
             self.logger.warning("skill_promotion_no_owner", cluster_id=cluster.id)
             return
@@ -854,39 +884,14 @@ class SemanticClusterer:
             self.logger.info(
                 "shared_skill_needs_more_contributors",
                 cluster_id=cluster.id,
+                tenant_id=scope_tenant,
                 users=evidence["users"],
                 required=shared_prompt_min_users,
             )
             return
         visibility = "private" if cluster.user_id else "shared"
         owner = self.store.get_user(owner_id)
-        tenant_id = owner.tenant_id if owner else None
-        if shared and tenant_id:
-            # A cluster can span tenants; the adapter it produces cannot.
-            # Re-measure and pin inside the owner's tenant only. Counting
-            # the whole cluster would let another tenant's contributors
-            # push this one over the qualifying bar, and pinning them would
-            # name evidence the run is then not authorized to train on -
-            # which the resolver correctly refuses, but only after the gate
-            # already claimed the skill had earned its weights.
-            positive = self._positive_in_tenant(cluster.id, tenant_id)
-            evidence = self._evidence(positive)
-            if not positive:
-                self.logger.warning(
-                    "skill_promotion_no_tenant_evidence",
-                    cluster_id=cluster.id,
-                    tenant_id=tenant_id,
-                )
-                return
-            if evidence["users"] < shared_prompt_min_users:
-                self.logger.info(
-                    "shared_skill_needs_more_contributors",
-                    cluster_id=cluster.id,
-                    tenant_id=tenant_id,
-                    users=evidence["users"],
-                    required=shared_prompt_min_users,
-                )
-                return
+        tenant_id = scope_tenant if shared else (owner.tenant_id if owner else None)
         # base_model is required by the adapter schema; source it from the
         # runtime/training base model so promotion validates instead of
         # silently failing.
@@ -898,6 +903,12 @@ class SemanticClusterer:
         schema = {
             "kind": "adapter.lora",
             "base_model": base_model,
+            # Durable, and immutable through the artifact edit path. Skillhood
+            # decides whether training needs a pinned job, so inferring it
+            # from `cluster_id` meant an ordinary edit that dropped that key
+            # turned a skill into a persona and reopened the live path
+            # (SPEC §5.5.3).
+            "adapter_role": "skill",
             # "tenant" scope means pooled across the tenant's contributors;
             # the training service keys its pooling decision on this.
             "scope": "per-user" if cluster.user_id else "tenant",

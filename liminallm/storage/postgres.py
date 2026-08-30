@@ -3577,9 +3577,8 @@ class PostgresStore:
             current_schema = row.get("schema")
             if isinstance(current_schema, str):
                 current_schema = json.loads(current_schema or "{}")
-            schema = build_schema(
-                current_schema if isinstance(current_schema, dict) else {}
-            )
+            previous = current_schema if isinstance(current_schema, dict) else {}
+            schema = build_schema(previous)
             # Against the row's own type, which required reading the row
             # first: choosing the validator from the incoming schema's `kind`
             # let a payload pick which rules it would be judged by, and an
@@ -3591,6 +3590,27 @@ class PostgresStore:
             except ArtifactValidationError as exc:
                 self.logger.warning("artifact_validation_failed", errors=exc.errors)
                 raise
+            # An adapter's role decides whether training may select live
+            # events or must be authorized by a pinned job, so an edit that
+            # removed or flipped it would hand a skill the persona path
+            # (SPEC §5.5.3). Enforced here rather than in the route because
+            # every writer - the route, config ops, the training service -
+            # arrives through this one method, and the previous value is
+            # only knowable from the locked row.
+            previous_role = previous.get("adapter_role")
+            if (
+                row["type"] == "adapter"
+                and previous_role
+                and schema.get("adapter_role") != previous_role
+            ):
+                raise ConstraintViolation(
+                    "adapter_role is immutable",
+                    {
+                        "artifact_id": artifact_id,
+                        "adapter_role": previous_role,
+                        "requested": schema.get("adapter_role"),
+                    },
+                )
             # The row's own audience, taken from the locked row rather than
             # from the caller: a private workflow may name its owner's private
             # tool, and the same edit on a shared one may not.

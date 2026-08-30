@@ -293,6 +293,10 @@ class TrainingService:
         adapter_schema = {
             "kind": "adapter.lora",
             "mode": resolved_mode,
+            # Declared rather than inferred: this is the adapter that may
+            # train from the caller's live preference history, so it says so
+            # (SPEC §5.5.3).
+            "adapter_role": "persona",
             "scope": "per-user",
             "user_id": user_id,
             "base_model": self.runtime_base_model or "jax-base",
@@ -437,16 +441,24 @@ class TrainingService:
         # route §5.5's gate never authorized, bypassing the replica-safe
         # enqueue on the way. The worker already owns the correct path, so
         # this refuses rather than re-deriving the gate here. A persona
-        # adapter is not cluster-bound and is unaffected.
-        # A *pinned* job, not merely a job. A live job against a
-        # cluster-bound adapter would pass a jobless check, leave
-        # `pinned_job` False, and run the live cluster query - the same
-        # bypass one step along. An empty list is pinned and falls through
-        # to the pinned-invalid refusal below, which is the right answer
-        # for it.
-        if adapter_schema_now.get("cluster_id") and (
-            job is None or job.preference_event_ids is None
-        ):
+        # adapter declares itself one and is unaffected.
+        # A *pinned* job, not merely a job. A live job against a skill
+        # adapter would pass a jobless check, leave `pinned_job` False, and
+        # run the live query - the same bypass one step along. An empty list
+        # is pinned and falls through to the pinned-invalid refusal below,
+        # which is the right answer for it.
+        #
+        # Skillhood is read from the durable role, not inferred from
+        # `cluster_id`. `cluster_id` is not required by the adapter schema
+        # and `additionalProperties` is true, so an ordinary edit could drop
+        # it and leave a valid adapter that no longer looked cluster-bound:
+        # the pinned rule would be skipped and the run would select the
+        # caller's live preference history instead. Either marker is enough
+        # to make an adapter a skill, and the role cannot be edited away.
+        is_skill = adapter_schema_now.get("adapter_role") == "skill" or bool(
+            adapter_schema_now.get("cluster_id")
+        )
+        if is_skill and (job is None or job.preference_event_ids is None):
             raise ConstraintViolation(
                 "skill training requires a pinned job",
                 {"adapter_id": adapter.id, "job_id": job.id if job else None},
@@ -457,7 +469,7 @@ class TrainingService:
         # persona adapters stay strictly per-user.
         # Pooling is decided by scope, not ownership: tenant-scoped skill
         # adapters carry a nominal owner for visibility purposes.
-        pooled_skill = bool(adapter_cluster) and (
+        pooled_skill = is_skill and (
             adapter_scope == "tenant" or not adapter.owner_user_id
         )
         if pooled_skill:

@@ -118,6 +118,10 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
             # tomorrow.
             "mode": {"enum": ["local", "remote", "prompt", "hybrid"]},
             "prompt_instructions": {"type": "string"},
+            # Which authority model the adapter trains under: a skill needs a
+            # pinned job, a persona may select live events. Immutable once
+            # set - see `update_artifact`.
+            "adapter_role": {"enum": ["persona", "skill"]},
             "fs_dir": {"type": "string"},
             "remote_model_id": {"type": "string"},
             "remote_adapter_id": {"type": "string"},
