@@ -24,6 +24,8 @@
   --syn-num: #0550ae;
   --syn-com: #6e7781;
   --sidebar-width: 272px;
+  --rail-width: 48px;
+  --pane-width: 240px;
   --topbar-h: 56px;
   --content-max: 1100px;
 }
@@ -42,24 +44,321 @@ body {
   line-height: 1.5;
 }
 
+/* Three bands: rail, contextual pane, workspace. The rail and the pane are
+   each their own grid column so hiding one is a track going to zero, not a
+   reflow of everything beside it. */
 .app-shell {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: var(--rail-width) var(--pane-width) 1fr;
   min-height: 100vh;
 }
 
-.topbar {
+/* No pane for this section, or the reader hid it. Same result, two reasons:
+   `no-pane` is the app's answer, `pane-hidden` is the reader's. */
+.app-shell.no-pane,
+.app-shell.pane-hidden {
+  grid-template-columns: var(--rail-width) 0 1fr;
+}
+
+.app-shell.rail-hidden,
+.app-shell.signed-out {
+  grid-template-columns: 0 0 1fr;
+}
+
+.app-shell.signed-out .context-pane,
+.app-shell.signed-out .topbar .conversation-header,
+.app-shell.signed-out .pane-toggle,
+.app-shell.signed-out #logout {
+  display: none;
+}
+
+.app-shell.no-pane .context-pane,
+.app-shell.pane-hidden .context-pane,
+.app-shell.rail-hidden .app-rail {
+  display: none;
+}
+
+/* Where am I. Icons only: at 48px a label does not fit, so the name arrives
+   on hover and through `aria-label` for anything not looking at pixels. */
+.app-rail {
+  grid-column: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 0 12px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  z-index: 20;
+}
+
+.app-rail.hidden {
+  display: none;
+}
+
+.rail-mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  margin-bottom: 10px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  flex-shrink: 0;
+}
+
+.rail-btn {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 9px;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+  text-decoration: none;
+}
+
+.rail-btn:hover {
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+.rail-btn.active {
+  background: var(--accent-light);
+  color: var(--accent-strong);
+}
+
+.rail-btn.active::before {
+  content: "";
+  position: absolute;
+  left: -8px;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: var(--accent);
+}
+
+.rail-icon {
+  width: 20px;
+  height: 20px;
+  display: block;
+}
+
+/* The label the icon stands in for. Shown on hover rather than never, so the
+   rail is learnable without a legend. */
+.rail-name {
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: var(--text);
+  color: var(--panel);
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+  z-index: 40;
+}
+
+.rail-btn:hover .rail-name,
+.rail-btn:focus-visible .rail-name {
+  opacity: 1;
+}
+
+.rail-gap {
+  flex: 1;
+  min-height: 12px;
+}
+
+/* What exists here. */
+.context-pane {
+  grid-column: 2;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.pane-view {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.pane-view.active {
+  display: flex;
+}
+
+.pane-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 8px;
+  flex-shrink: 0;
   height: var(--topbar-h);
-  padding: 0 20px;
+  padding: 0 8px 0 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.pane-head h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.pane-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.pane-body h3 {
+  margin: 4px 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.pane-body .subtext,
+.pane-body .divider {
+  display: none;
+}
+
+/* Lists written for a full-width panel now live in a 240px column, so
+   nothing inside may claim an intrinsic width wider than the column. */
+.pane-body > *,
+.pane-body .notes-side,
+.pane-body .tools-list,
+.pane-body .workflows-list,
+.pane-body .contexts-list,
+.pane-body .artifacts-list {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.pane-body .table-wrapper {
+  overflow-x: auto;
+}
+
+.pane-body .notes-side-head input[type="search"],
+.pane-body .field,
+.pane-body select,
+.pane-body input {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.pane-body .input-grid {
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+
+/* What am I working on. */
+.workspace {
+  grid-column: 3;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* Contextual only. The eight-tab strip that used to sit here moved to the
+   rail, so this row answers one question: what am I looking at. */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--topbar-h);
+  padding: 0 16px;
   background: var(--panel);
   color: var(--text);
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
   z-index: 10;
+}
+
+/* The bar carries the section's own header. For Chat that is the
+   conversation: its name and its controls, on the row that used to say only
+   "Chat" above a second row saying the same thing again. */
+.app-shell[data-section="chat-tab"] .topbar-title {
+  display: none;
+}
+
+.app-shell:not([data-section="chat-tab"]) .topbar .conversation-header {
+  display: none;
+}
+
+.topbar .conversation-header {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.topbar-title {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-toggle {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+}
+
+.pane-toggle:hover {
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+.pane-toggle svg {
+  width: 18px;
+  height: 18px;
+}
+
+.auth-brand {
+  margin-bottom: 18px;
 }
 
 .brand {
@@ -117,40 +416,6 @@ body {
 }
 
 /* Layout with sidebar */
-.layout-with-sidebar {
-  display: grid;
-  grid-template-columns: var(--sidebar-width) 1fr;
-  flex: 1;
-  min-height: calc(100vh - var(--topbar-h));
-}
-
-/* Sidebar styles */
-.sidebar {
-  background: var(--panel);
-  border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  height: calc(100vh - var(--topbar-h));
-  position: sticky;
-  top: var(--topbar-h);
-}
-
-.sidebar-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 14px 16px;
-  border-bottom: 1px solid var(--border);
-}
-
-.sidebar-header h3 {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-muted);
-}
 
 .icon-btn {
   width: 28px;
@@ -284,11 +549,28 @@ body {
 
 /* Main content area */
 .main-content {
+  flex: 1;
+  min-width: 0;
   padding: 20px 24px 32px;
   overflow-y: auto;
   width: 100%;
   max-width: var(--content-max);
   margin: 0 auto;
+}
+
+/* Chat is the one section whose value is the space itself. Everything else
+   keeps a reading-width cap; the thread takes the workspace, and takes the
+   pane's 240px too the moment the pane is hidden. Two caps used to stack
+   here - 1100px on the content and 860px on the panel - so a 1440px screen
+   spent nearly 300px of the workspace on margin. */
+.app-shell[data-section="chat-tab"] .main-content {
+  max-width: none;
+  padding-left: 16px;
+  padding-right: 16px;
+}
+
+.app-shell[data-section="chat-tab"] .chat-panel {
+  max-width: none;
 }
 
 /* Single-column layout (admin page) - panels toggle visibility, so stack them */
@@ -311,50 +593,6 @@ body {
 /* The nav sits in the top bar and stretches to its full height, so the
    active tab's underline lands on the bar's own bottom border instead of
    floating inside it. The bar supplies the rule; the nav does not. */
-.tab-nav {
-  display: flex;
-  gap: 2px;
-  align-self: stretch;
-  align-items: stretch;
-  min-width: 0;
-  /* Never wrap, at any width: the bar is one row tall, so a second line
-     has nowhere to go and lands on top of the bar's own border. What does
-     not fit scrolls inside the nav instead. */
-  flex-wrap: nowrap;
-  overflow-x: auto;
-  scrollbar-width: none;
-}
-
-.tab-nav::-webkit-scrollbar {
-  display: none;
-}
-
-.tab-btn {
-  display: flex;
-  align-items: center;
-  white-space: nowrap;
-  padding: 0 12px;
-  border: none;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
-  background: transparent;
-  color: var(--text-muted);
-  font-family: var(--font);
-  font-weight: 500;
-  font-size: 13.5px;
-  cursor: pointer;
-  transition: color 0.15s ease, border-color 0.15s ease;
-}
-
-.tab-btn:hover {
-  color: var(--text);
-}
-
-.tab-btn.active {
-  color: var(--text);
-  border-bottom-color: var(--text);
-}
-
 /* Tab Panels */
 .tab-panel {
   display: none;
@@ -2351,12 +2589,36 @@ button.minor:hover {
 }
 
 /* Responsive */
-@media (max-width: 1080px) {
-  .layout-with-sidebar {
-    grid-template-columns: 1fr;
+/* Narrow enough that rail plus pane plus a usable workspace do not all fit:
+   48 + 240 leaves a phone about 100px of chat. The rail stays, because it is
+   the only way back to the other sections; the pane becomes an overlay over
+   the workspace instead of a column beside it. */
+@media (max-width: 900px) {
+  .app-shell,
+  .app-shell.no-pane,
+  .app-shell.pane-hidden {
+    grid-template-columns: var(--rail-width) 0 1fr;
   }
 
-  .sidebar {
+  /* Signed out the rail has nowhere to go, at this width as at any other.
+     Restated here because this block's own rule would otherwise put it
+     back. */
+  .app-shell.signed-out {
+    grid-template-columns: 0 0 1fr;
+  }
+
+  .context-pane {
+    position: fixed;
+    left: var(--rail-width);
+    top: 0;
+    bottom: 0;
+    width: min(300px, calc(100vw - var(--rail-width)));
+    height: 100vh;
+    z-index: 30;
+    box-shadow: 0 0 0 100vmax rgba(16, 20, 28, 0.35);
+  }
+
+  .app-shell.pane-hidden .context-pane {
     display: none;
   }
 
@@ -2377,11 +2639,6 @@ button.minor:hover {
 
   .input-grid {
     grid-template-columns: 1fr;
-  }
-
-  .tab-btn {
-    padding: 0 10px;
-    font-size: 13px;
   }
 
   .message {
@@ -2516,10 +2773,9 @@ button.minor:hover {
 }
 
 .notes-side {
-  width: 264px;
-  flex-shrink: 0;
-  border-right: 1px solid var(--border);
   display: flex;
+  flex: 1;
+  min-height: 0;
   flex-direction: column;
 }
 

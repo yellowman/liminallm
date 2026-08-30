@@ -355,7 +355,7 @@ class TestMfaEnrolsWithoutAReadableSessionId:
 
         # Where a user would go: the Settings tab, then the MFA control that
         # unhides once the app has read the current MFA status.
-        page.click('.tab-btn[data-tab="settings-tab"]')
+        page.click('.rail-btn[data-tab="settings-tab"]')
         page.wait_for_selector("#mfa-enable-btn:not(.hidden)", state="visible", timeout=15000)
         page.click("#mfa-enable-btn")
         page.wait_for_selector("#mfa-setup-section:not(.hidden)", timeout=15000)

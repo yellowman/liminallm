@@ -1,5 +1,5 @@
 /**
- * LiminalLM Chat Frontend
+ * liminallm chat frontend
  * Implements SPEC §17 frontend requirements with tabs, contexts, artifacts, and streaming.
  */
 
@@ -266,6 +266,15 @@ const fileUploadButton = $('upload-file-btn');
 const mainTabs = $('main-tabs');
 const conversationListEl = $('conversation-list');
 const conversationSearchEl = $('conversation-search');
+const appShell = document.querySelector('.app-shell');
+const contextPane = $('context-pane');
+const paneToggle = $('pane-toggle');
+const topbarTitle = $('topbar-title');
+
+//: Whether the contextual pane is hidden, remembered per browser. The rail
+//: stays put: hiding it too is the distraction-free case, and one control
+//: cannot mean both without the common one becoming surprising.
+const PANE_HIDDEN_KEY = 'liminal.paneHidden';
 
 // =============================================================================
 // API helpers
@@ -341,6 +350,10 @@ const updateAuthUI = () => {
   const isAuth = Boolean(state.accessToken);
   if (authPanel) authPanel.classList.toggle('hidden', isAuth);
   if (mainTabs) mainTabs.classList.toggle('hidden', !isAuth);
+  // Signed out there is one thing to do, so the shell shows one thing: no
+  // rail to navigate with, no list of conversations nobody can open, and no
+  // thread controls above a sign-in form.
+  appShell?.classList.toggle('signed-out', !isAuth);
 
   document.querySelectorAll('.tab-panel').forEach((p) => {
     if (isAuth) {
@@ -374,23 +387,94 @@ const updateAuthUI = () => {
 // Tab navigation
 // =============================================================================
 
+/**
+ * Hide or show the contextual pane, and remember the choice.
+ *
+ * `Shift`-click hides the rail as well, which is the distraction-free case.
+ * It is deliberately the secondary gesture: losing the list is common, and
+ * losing the way back to Notes and Files is not.
+ */
+const setPaneHidden = (hidden, { alsoRail = false } = {}) => {
+  if (!appShell) return;
+  appShell.classList.toggle('pane-hidden', hidden);
+  if (!hidden) appShell.classList.remove('rail-hidden');
+  else if (alsoRail) appShell.classList.add('rail-hidden');
+  paneToggle?.setAttribute('aria-expanded', hidden ? 'false' : 'true');
+  if (paneToggle) paneToggle.title = hidden ? 'Show the list' : 'Hide the list';
+  try {
+    localStorage.setItem(PANE_HIDDEN_KEY, hidden ? '1' : '0');
+  } catch {
+    // A browser that refuses storage still gets the toggle, just not the
+    // memory of it.
+  }
+};
+
+const initPaneToggle = () => {
+  let stored = null;
+  try {
+    stored = localStorage.getItem(PANE_HIDDEN_KEY);
+  } catch {
+    stored = null;
+  }
+  // Below 900px the pane is an overlay over the workspace, so opening on it
+  // would cover the thing the reader came for. Only until they say otherwise.
+  const narrow = window.matchMedia('(max-width: 900px)').matches;
+  setPaneHidden(stored === null ? narrow : stored === '1');
+  paneToggle?.addEventListener('click', (event) => {
+    const nowHidden = !appShell?.classList.contains('pane-hidden');
+    setPaneHidden(nowHidden, { alsoRail: event.shiftKey });
+  });
+};
+
+/**
+ * Move to a section: the rail's selection, the pane beside it, and the
+ * workspace all name the same thing.
+ *
+ * A section without a pane collapses the middle band entirely rather than
+ * showing an empty one - Files, Insights and Settings have no list that
+ * drives a detail view, so there is nothing for a pane to hold.
+ */
+const showSection = (tabId) => {
+  if (!mainTabs) return;
+
+  mainTabs.querySelectorAll('.rail-btn').forEach((b) => {
+    const on = b.dataset.tab === tabId;
+    b.classList.toggle('active', on);
+    if (on) b.setAttribute('aria-current', 'true');
+    else b.removeAttribute('aria-current');
+  });
+
+  document.querySelectorAll('.tab-panel').forEach((panel) => {
+    panel.classList.toggle('active', panel.id === tabId);
+  });
+
+  let hasPane = false;
+  document.querySelectorAll('.pane-view').forEach((view) => {
+    const on = view.dataset.pane === tabId;
+    view.classList.toggle('active', on);
+    hasPane = hasPane || on;
+  });
+  appShell?.classList.toggle('no-pane', !hasPane);
+
+  const btn = mainTabs.querySelector(`.rail-btn[data-tab="${tabId}"]`);
+  if (topbarTitle) topbarTitle.textContent = btn?.title || '';
+  // The bar shows the conversation on Chat and the section name elsewhere;
+  // which one is a CSS decision keyed off this.
+  appShell?.setAttribute('data-section', tabId);
+  state.section = tabId;
+};
+
 const initTabs = () => {
   if (!mainTabs) return;
 
-  mainTabs.querySelectorAll('.tab-btn').forEach((btn) => {
+  initPaneToggle();
+
+  mainTabs.querySelectorAll('.rail-btn[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const tabId = btn.dataset.tab;
+      showSection(tabId);
 
-      mainTabs.querySelectorAll('.tab-btn').forEach((b) => {
-        b.classList.toggle('active', b === btn);
-        b.setAttribute('aria-selected', b === btn ? 'true' : 'false');
-      });
-
-      document.querySelectorAll('.tab-panel').forEach((panel) => {
-        panel.classList.toggle('active', panel.id === tabId);
-      });
-
-      // Lazy-load the data behind the tab; login only preloads a subset.
+      // Lazy-load the data behind the section; login only preloads a subset.
       if (state.accessToken) {
         if (tabId === 'notes-tab') fetchNotes();
         else if (tabId === 'contexts-tab') fetchContexts();
@@ -3712,6 +3796,9 @@ const initEventListeners = () => {
 
 const init = async () => {
   initTabs();
+  // The shell starts on Chat, so say so once rather than waiting for the
+  // first click to make the rail, the pane and the title agree.
+  showSection('chat-tab');
   initCollapsibleSections();
   initEventListeners();
   initComposerAttachments();
