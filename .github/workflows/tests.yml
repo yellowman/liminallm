@@ -154,12 +154,32 @@ jobs:
         # serially on these 4-vCPU runners against ~4–5 minutes locally at
         # `-n 4`. Coverage runs on 3.11 only, the one version that uploads
         # it; instrumenting the other two bought nothing and cost 20–40%.
+        #
+        # `--ignore=tests/test_performance.py`, then the same file on its own
+        # below: that file asserts wall-clock latency, and this lane runs four
+        # pytest workers plus their Postgres and Redis on one 4-vCPU runner.
+        # Asserting a sub-100ms p99 while three siblings hammer the same VM
+        # measures the runner, not the endpoint. It failed at
+        # `avg=23.04, p95=139.89, p99=217.57` on a run whose Postgres was
+        # mid-checkpoint over 68,645 sync files - the average was fine and a
+        # quarter of the tail was not, which is what contention looks like.
+        #
+        # The requirement is unchanged; only the environment it is measured in
+        # is. The performance file runs after the functional workers have
+        # exited, so it has the machine to itself, and it still runs on all
+        # three interpreters.
         run: |
           if [ "${{ matrix.python-version }}" = "3.11" ]; then
-            pytest -m 'not browser' -n 4 --dist loadfile -q --tb=short \
-              --cov=liminallm --cov-report=xml --cov-report=term-missing
+            pytest -m 'not browser' --ignore=tests/test_performance.py \
+              -n 4 --dist loadfile -q --tb=short \
+              --cov=liminallm --cov-report=
+            pytest tests/test_performance.py -q --tb=short \
+              --cov=liminallm --cov-append \
+              --cov-report=xml --cov-report=term-missing
           else
-            pytest -m 'not browser' -n 4 --dist loadfile -q --tb=short
+            pytest -m 'not browser' --ignore=tests/test_performance.py \
+              -n 4 --dist loadfile -q --tb=short
+            pytest tests/test_performance.py -q --tb=short
           fi
 
       - name: Upload coverage to Codecov
