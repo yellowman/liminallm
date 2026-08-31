@@ -157,8 +157,17 @@ def _optional_int(value: Any, *, what: str) -> Optional[int]:
     return value
 
 
-def _checked_locator(locator: "EvidenceLocator") -> "EvidenceLocator":
-    """Every field is the type it claims, so the snapshot cannot break."""
+def _checked_locator(locator: Any) -> "EvidenceLocator":
+    """Every field is the type it claims, so the snapshot cannot break.
+
+    The object before its fields: a dict has no `.block_id`, so passing one
+    raised `AttributeError` at the first field access, before any of the
+    checks below could run and say what was wrong.
+    """
+    if not isinstance(locator, EvidenceLocator):
+        raise ProvenanceError(
+            f"locator must be an EvidenceLocator, got {type(locator).__name__}"
+        )
     return EvidenceLocator(
         block_id=_optional_text(locator.block_id, what="locator block_id"),
         chunk_id=_optional_text(locator.chunk_id, what="locator chunk_id"),
@@ -168,6 +177,44 @@ def _checked_locator(locator: "EvidenceLocator") -> "EvidenceLocator":
         start=_optional_int(locator.start, what="locator start"),
         end=_optional_int(locator.end, what="locator end"),
     )
+
+
+def _checked_metadata(metadata: Any) -> Dict[str, Any]:
+    """The bag itself, not only what is inside it.
+
+    `dict(metadata or {})` took a list as an empty bag and recorded a source
+    the caller never described, and let a string fail as a bare `ValueError`
+    raised from inside the dict constructor.
+    """
+    if metadata is None:
+        return {}
+    if not isinstance(metadata, Mapping):
+        raise ProvenanceError(
+            f"source metadata must be a mapping, got {type(metadata).__name__}"
+        )
+    _require_string_keys(metadata)
+    return dict(metadata)
+
+
+def _require_string_keys(value: Any) -> None:
+    """JSON has string keys and no others.
+
+    `json.dumps` renames the rest rather than refusing them, so `{1: "x"}` is
+    read back as `{"1": "x"}` and the metadata a source carries is not the
+    metadata its producer handed over. Checked at every depth, because the
+    rename is exactly as quiet inside a nested bag.
+    """
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ProvenanceError(
+                    "source metadata keys must be strings, got "
+                    f"{type(key).__name__} ({key!r})"
+                )
+            _require_string_keys(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _require_string_keys(item)
 
 
 def _freeze(value: Any) -> Any:
@@ -201,9 +248,14 @@ def _json_safe(value: Any, *, what: str) -> Any:
     Checked when it is registered rather than when it is exported: a bad
     value is then attributable to the producer that supplied it, instead of
     surfacing much later as a failure to serialise the whole turn.
+
+    `allow_nan=False` because Python's encoder writes `NaN` and `Infinity`,
+    which JSON has no literals for. A strict reader at the far end of the API
+    or storage seam rejects the whole snapshot over one of them, long after
+    the producer that supplied it is gone.
     """
     try:
-        encoded = json.dumps(value)
+        encoded = json.dumps(value, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ProvenanceError(f"{what} must be JSON-safe: {exc}") from exc
     if len(encoded.encode("utf-8")) > MAX_METADATA_BYTES:
@@ -298,7 +350,7 @@ class SourceRegistry:
         title: str,
         origin_id: Optional[str] = None,
         locator: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
     ) -> Source:
         """Record a source and return it with its turn-local id.
 
@@ -349,7 +401,7 @@ class SourceRegistry:
 
         # Frozen, and a copy: the caller keeps no handle on the registry's
         # record, and mutating what they passed in afterwards reaches nothing.
-        checked = _json_safe(dict(metadata or {}), what="source metadata")
+        checked = _json_safe(_checked_metadata(metadata), what="source metadata")
         source = Source(
             source_id=f"src_{len(self._sources) + 1}",
             kind=kind,
@@ -380,11 +432,18 @@ class SourceRegistry:
         The same passage at the same place in the same source is one piece of
         evidence however many times it is offered.
         """
+        # Typed first: an unhashable id fails the membership test itself with
+        # a raw `TypeError`, before the check below can report it.
+        source_id = _require_text(source_id, what="source_id")
         if source_id not in self._sources:
             raise ProvenanceError(f"no such source {source_id!r} in this turn")
 
         text = _require_text(text, what="evidence text")
-        where = _checked_locator(locator or EvidenceLocator())
+        # `is None`, not `or`: an empty dict is falsy, and would have been
+        # replaced by an empty locator instead of refused as the wrong type.
+        where = _checked_locator(
+            EvidenceLocator() if locator is None else locator
+        )
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         key = (source_id, json.dumps(asdict(where), sort_keys=True), content_hash)
         existing_id = self._by_evidence.get(key)

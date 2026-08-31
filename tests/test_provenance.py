@@ -9,6 +9,7 @@ will all depend on, and that would be expensive to change once they do.
 from __future__ import annotations
 
 import json
+from types import MappingProxyType
 
 import pytest
 
@@ -423,3 +424,102 @@ class TestTheCommonFieldsAreCheckedNotAnnotated:
                 r.register_source(kind="web", title=bad, locator="https://ex.test/")
         r.register_source(kind="web", title="fine", locator="https://ex.test/")
         assert json.loads(json.dumps(r.snapshot()))
+
+
+class TestTheContainersAreCheckedNotJustTheirContents:
+    """The same rule as the class above, one level out. Field values are
+    validated; the objects that hold them were still taken on trust, so the
+    registry's public write surface had three ways to raise something other
+    than `ProvenanceError` - or to accept a value it should have refused."""
+
+    def test_metadata_must_be_a_mapping(self):
+        """A list is not an empty bag. `dict(metadata or {})` turned `[]`
+        into `{}` and recorded a source the caller did not describe."""
+        r = SourceRegistry()
+        with pytest.raises(ProvenanceError, match="metadata"):
+            r.register_source(
+                kind="web", title="P", locator="https://ex.test/p", metadata=[]
+            )
+
+    def test_a_string_is_not_a_metadata_bag_either(self):
+        """`dict("banana")` raises a bare `ValueError` from deep inside the
+        constructor, which tells the producer nothing about what it got wrong."""
+        r = SourceRegistry()
+        with pytest.raises(ProvenanceError, match="metadata"):
+            r.register_source(
+                kind="web", title="P", locator="https://ex.test/p", metadata="banana"
+            )
+
+    def test_metadata_keys_must_be_strings(self):
+        """JSON has no integer keys. `json.dumps` silently coerces `1` to
+        `"1"`, so the value read back is not the value handed over."""
+        r = SourceRegistry()
+        with pytest.raises(ProvenanceError, match="metadata"):
+            r.register_source(
+                kind="web",
+                title="P",
+                locator="https://ex.test/p",
+                metadata={1: "x"},
+            )
+
+    def test_nested_keys_are_renamed_just_as_quietly(self):
+        """The rename is not a top-level property of the bag."""
+        r = SourceRegistry()
+        with pytest.raises(ProvenanceError, match="metadata"):
+            r.register_source(
+                kind="web",
+                title="P",
+                locator="https://ex.test/p",
+                metadata={"trace": {"ranks": [{2: "second"}]}},
+            )
+
+    def test_any_mapping_is_still_a_metadata_bag(self):
+        """The check is on the protocol, not on `dict`: a producer holding a
+        read-only view of its own metadata can still register with it."""
+        r = SourceRegistry()
+        source = r.register_source(
+            kind="web",
+            title="P",
+            locator="https://ex.test/p",
+            metadata=MappingProxyType({"provider": "brave"}),
+        )
+        assert source.metadata["provider"] == "brave"
+
+    def test_an_evidence_locator_must_be_an_evidence_locator(self):
+        """A dict has no `.block_id`, so the first field check raised
+        `AttributeError` before any of the per-field checks could run."""
+        r = SourceRegistry()
+        r.register_source(kind="file", title="m", origin_id="f1")
+        with pytest.raises(ProvenanceError, match="locator"):
+            r.add_evidence("src_1", text="x", locator={"page": 7})
+
+    def test_an_empty_dict_is_the_wrong_type_too_not_an_empty_locator(self):
+        """The sibling of the case above. `locator or EvidenceLocator()` is
+        falsy for `{}`, so the wrong type was quietly replaced with the right
+        one instead of being refused."""
+        r = SourceRegistry()
+        r.register_source(kind="file", title="m", origin_id="f1")
+        with pytest.raises(ProvenanceError, match="locator"):
+            r.add_evidence("src_1", text="x", locator={})
+
+    def test_a_source_id_must_be_text(self):
+        """An unhashable id fails the membership test itself with a raw
+        `TypeError`, before the "no such source" check can report it."""
+        r = SourceRegistry()
+        with pytest.raises(ProvenanceError, match="source_id"):
+            r.add_evidence([], text="x")
+
+    def test_json_safe_means_json_not_python_s_dialect_of_it(self):
+        """`json.dumps` writes `NaN` and `Infinity` by default. Neither is
+        JSON, so a snapshot carrying one is rejected by any strict reader at
+        the far end of the API or storage seam - long after the producer that
+        supplied it is gone."""
+        r = SourceRegistry()
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(ProvenanceError, match="metadata"):
+                r.register_source(
+                    kind="web",
+                    title="P",
+                    locator="https://ex.test/p",
+                    metadata={"x": bad},
+                )
