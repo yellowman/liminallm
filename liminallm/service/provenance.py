@@ -36,7 +36,9 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Literal, Optional, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, Literal, Mapping, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 #: Where a piece of evidence came from. Deliberately short: a kind exists
 #: only where a producer can state it as a fact.
@@ -49,6 +51,13 @@ from typing import Any, Dict, Literal, Optional, Tuple
 SourceKind = Literal["web", "file", "note", "conversation", "mcp", "unknown"]
 
 _KINDS: Tuple[str, ...] = ("web", "file", "note", "conversation", "mcp", "unknown")
+
+#: A ceiling on the metadata bag, because it crosses worker, API and storage
+#: seams and "bounded" has to be a number rather than a word in a docstring.
+#: Provenance metadata is a handful of short strings and integers; 16 KiB is
+#: already far more room than any of the producers should need, so hitting
+#: this means something is being stored here that belongs elsewhere.
+MAX_METADATA_BYTES = 16 * 1024
 
 
 class ProvenanceError(ValueError):
@@ -76,7 +85,9 @@ class Source:
     title: str
     origin_id: Optional[str] = None
     locator: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    #: Frozen at registration; see `_freeze`. Typed as a mapping because
+    #: it is read like one, but it cannot be written through.
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -117,6 +128,73 @@ class Evidence:
     content_hash: str
 
 
+def _require_text(value: Any, *, what: str) -> str:
+    """Type annotations enforce nothing at runtime.
+
+    Without this the common fields are only as sound as the caller, and a
+    `title=object()` reaches the registry and fails much later as an
+    unserialisable turn.
+    """
+    if not isinstance(value, str):
+        raise ProvenanceError(
+            f"{what} must be a string, got {type(value).__name__}"
+        )
+    return value
+
+
+def _optional_text(value: Any, *, what: str) -> Optional[str]:
+    return None if value is None else _require_text(value, what=what)
+
+
+def _optional_int(value: Any, *, what: str) -> Optional[int]:
+    # `bool` is an `int` in Python and is never a page or an offset.
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProvenanceError(
+            f"{what} must be an integer, got {type(value).__name__}"
+        )
+    return value
+
+
+def _checked_locator(locator: "EvidenceLocator") -> "EvidenceLocator":
+    """Every field is the type it claims, so the snapshot cannot break."""
+    return EvidenceLocator(
+        block_id=_optional_text(locator.block_id, what="locator block_id"),
+        chunk_id=_optional_text(locator.chunk_id, what="locator chunk_id"),
+        chunk_index=_optional_int(locator.chunk_index, what="locator chunk_index"),
+        page=_optional_int(locator.page, what="locator page"),
+        section=_optional_text(locator.section, what="locator section"),
+        start=_optional_int(locator.start, what="locator start"),
+        end=_optional_int(locator.end, what="locator end"),
+    )
+
+
+def _freeze(value: Any) -> Any:
+    """Make a JSON tree that cannot be edited after it is registered.
+
+    A frozen dataclass freezes its own attributes, not what they point at, so
+    a plain dict here would hand every caller a live handle on the registry's
+    authoritative record. These become citation authority: what a stored
+    citation appears to say must not be changeable by whoever holds a
+    reference to the source.
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType({k: _freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(v) for v in value)
+    return value
+
+
+def _plain(value: Any) -> Any:
+    """The inverse, for export: back to the dicts and lists JSON knows."""
+    if isinstance(value, Mapping):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return [_plain(v) for v in value]
+    return value
+
+
 def _json_safe(value: Any, *, what: str) -> Any:
     """Reject anything the snapshot could not round-trip.
 
@@ -125,27 +203,51 @@ def _json_safe(value: Any, *, what: str) -> Any:
     surfacing much later as a failure to serialise the whole turn.
     """
     try:
-        return json.loads(json.dumps(value))
+        encoded = json.dumps(value)
     except (TypeError, ValueError) as exc:
         raise ProvenanceError(f"{what} must be JSON-safe: {exc}") from exc
+    if len(encoded.encode("utf-8")) > MAX_METADATA_BYTES:
+        raise ProvenanceError(
+            f"{what} is too large: {len(encoded)} bytes serialised exceeds "
+            f"the {MAX_METADATA_BYTES} byte ceiling"
+        )
+    return json.loads(encoded)
 
 
 def _canonical_locator(locator: str) -> str:
     """Just enough normalising to match the same locator written twice.
 
-    Scheme and host are case-insensitive per RFC 3986, so those are folded.
-    Nothing else is: stripping a trailing slash or a query string looks
-    tidy and merges pages that are genuinely different, which would attach a
-    citation to the wrong source. Under-merging leaves a duplicate in the
-    list; over-merging misattributes a claim.
+    Scheme and host are case-insensitive per RFC 3986, so those fold and
+    nothing else does. A path, a query string and a fragment are somebody's
+    identifiers - a token, a signature, a base64 id - and folding their case
+    merges two URLs that address different things. Under-merging leaves a
+    duplicate in a list; over-merging attaches a claim to the wrong document,
+    so the safe side is the narrow one.
+
+    Split structurally rather than by hand. Finding the host with
+    `partition("/")` swallowed the whole of `example.com?Token=ABC` when a
+    URL had no path, and lowercased the query with it.
+
+    Anything that is not http(s) is returned byte for byte, including
+    surrounding whitespace: a leading space is a legal character in a
+    filename, so trimming it merges two different files.
     """
-    text = locator.strip()
-    for scheme in ("http://", "https://"):
-        if text[: len(scheme)].lower() == scheme:
-            rest = text[len(scheme):]
-            host, slash, tail = rest.partition("/")
-            return f"{scheme}{host.lower()}{slash}{tail}"
-    return text
+    if locator[:8].lower() not in ("https://",) and not locator[:7].lower() == "http://":
+        return locator
+
+    parts = urlsplit(locator)
+    netloc = parts.netloc
+    # `urlsplit` already lowercases `hostname`; put that back over the host as
+    # it was written, which leaves userinfo, port and IPv6 brackets alone.
+    host = parts.hostname
+    if host:
+        at = netloc.rfind("@") + 1
+        index = netloc.lower().find(host, at)
+        if index != -1:
+            netloc = netloc[:index] + host + netloc[index + len(host):]
+    return urlunsplit(
+        (parts.scheme.lower(), netloc, parts.path, parts.query, parts.fragment)
+    )
 
 
 class SourceRegistry:
@@ -217,40 +319,48 @@ class SourceRegistry:
             raise ProvenanceError(
                 f"unknown source kind {kind!r}; expected one of {', '.join(_KINDS)}"
             )
+        title = _require_text(title, what="title")
+        origin_id = _optional_text(origin_id, what="origin_id")
+        locator = _optional_text(locator, what="locator")
 
-        identity: Optional[Tuple[str, str]] = None
+        # One key per identity, whichever kind of identity it is, so the
+        # checks below cover both. Keeping them apart is how the cross-kind
+        # guard came to protect origins and not locators.
+        key: Optional[str] = None
         if origin_id:
-            identity = (kind, f"origin:{origin_id}")
+            key = f"origin:{origin_id}"
         elif locator:
-            identity = (kind, f"locator:{_canonical_locator(locator)}")
+            key = f"locator:{_canonical_locator(locator)}"
 
-        if identity is not None:
-            existing_id = self._by_identity.get(identity)
+        if key is not None:
+            existing_id = self._by_identity.get((kind, key))
             if existing_id is not None:
                 return self._sources[existing_id]
 
-        # The same identity under a second kind is a producer disagreeing
-        # with itself about what a thing is. Merging them would pick one
-        # silently; refusing says which two claims conflict.
-        if origin_id:
-            for (other_kind, key), source_id in self._by_identity.items():
-                if key == f"origin:{origin_id}" and other_kind != kind:
+            # The same identity under a second kind is a producer disagreeing
+            # with itself about what a thing is. Merging would pick one
+            # silently; refusing names the two claims that conflict.
+            for (other_kind, other_key), source_id in self._by_identity.items():
+                if other_key == key and other_kind != kind:
                     raise ProvenanceError(
-                        f"origin {origin_id!r} is already registered as "
-                        f"{other_kind!r} ({source_id}); it cannot also be {kind!r}"
+                        f"{key} is already registered as {other_kind!r} "
+                        f"({source_id}); it cannot also be {kind!r}"
                     )
 
+        # Frozen, and a copy: the caller keeps no handle on the registry's
+        # record, and mutating what they passed in afterwards reaches nothing.
+        checked = _json_safe(dict(metadata or {}), what="source metadata")
         source = Source(
             source_id=f"src_{len(self._sources) + 1}",
             kind=kind,
             title=title,
             origin_id=origin_id,
             locator=locator,
-            metadata=_json_safe(dict(metadata or {}), what="source metadata"),
+            metadata=_freeze(checked),
         )
         self._sources[source.source_id] = source
-        if identity is not None:
-            self._by_identity[identity] = source.source_id
+        if key is not None:
+            self._by_identity[(kind, key)] = source.source_id
         return source
 
     def add_evidence(
@@ -273,7 +383,8 @@ class SourceRegistry:
         if source_id not in self._sources:
             raise ProvenanceError(f"no such source {source_id!r} in this turn")
 
-        where = locator or EvidenceLocator()
+        text = _require_text(text, what="evidence text")
+        where = _checked_locator(locator or EvidenceLocator())
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         key = (source_id, json.dumps(asdict(where), sort_keys=True), content_hash)
         existing_id = self._by_evidence.get(key)
@@ -301,8 +412,26 @@ class SourceRegistry:
         """
         return {
             "sources": {
-                source_id: asdict(source)
+                source_id: {
+                    "source_id": source.source_id,
+                    "kind": source.kind,
+                    "title": source.title,
+                    "origin_id": source.origin_id,
+                    "locator": source.locator,
+                    # Built by hand rather than by `asdict`, which would carry
+                    # the frozen mappings straight into the export.
+                    "metadata": _plain(source.metadata),
+                }
                 for source_id, source in self._sources.items()
             },
-            "evidence": [asdict(record) for record in self._evidence.values()],
+            "evidence": [
+                {
+                    "evidence_id": record.evidence_id,
+                    "source_id": record.source_id,
+                    "text": record.text,
+                    "locator": asdict(record.locator),
+                    "content_hash": record.content_hash,
+                }
+                for record in self._evidence.values()
+            ],
         }

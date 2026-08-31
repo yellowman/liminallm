@@ -253,3 +253,173 @@ class TestTheSnapshotIsPlainData:
         source = r.register_source(kind="web", title="P", locator="https://ex.test/")
         with pytest.raises(Exception):
             source.title = "tampered"
+
+
+class TestCanonicalisationFoldsOnlyWhatItMay:
+    """The rule is scheme and host, because RFC 3986 makes those
+    case-insensitive. Everything else is somebody's identifier."""
+
+    def test_the_host_folds(self):
+        r = SourceRegistry()
+        a = r.register_source(
+            kind="web", title="P", locator="https://EXAMPLE.test?Token=ABC"
+        )
+        b = r.register_source(
+            kind="web", title="P", locator="https://example.test?Token=ABC"
+        )
+        assert a.source_id == b.source_id
+
+    def test_a_query_string_does_not(self):
+        """A token, a signature, a base64 id: case there is meaning. Folding
+        it merges two URLs that address different things."""
+        r = SourceRegistry()
+        a = r.register_source(
+            kind="web", title="P", locator="https://example.test?Token=ABC"
+        )
+        b = r.register_source(
+            kind="web", title="P", locator="https://example.test?token=abc"
+        )
+        assert a.source_id != b.source_id
+
+    def test_a_fragment_does_not(self):
+        r = SourceRegistry()
+        a = r.register_source(kind="web", title="P", locator="https://ex.test/p#Top")
+        b = r.register_source(kind="web", title="P", locator="https://ex.test/p#top")
+        assert a.source_id != b.source_id
+
+    def test_a_port_and_userinfo_survive(self):
+        r = SourceRegistry()
+        a = r.register_source(kind="web", title="P", locator="https://EX.test:8443/p")
+        b = r.register_source(kind="web", title="P", locator="https://ex.test:8443/p")
+        assert a.source_id == b.source_id, "only the host should fold"
+        c = r.register_source(kind="web", title="P", locator="https://ex.test:9443/p")
+        assert c.source_id != a.source_id, "a port is part of the address"
+
+    def test_a_filesystem_locator_is_taken_byte_for_byte(self):
+        """Leading space is a legal character in a filename, so trimming it
+        merges two different files."""
+        r = SourceRegistry()
+        a = r.register_source(kind="file", title="r", locator=" report.txt")
+        b = r.register_source(kind="file", title="r", locator="report.txt")
+        assert a.source_id != b.source_id
+
+
+class TestOneIdentityIsOneKindWhicheverIdentityItIs:
+    def test_a_locator_identity_fails_closed_across_kinds_too(self):
+        """The guard existed for origin ids only, so a locator-only source
+        could be two kinds at once - and a citation would then be attributed
+        to whichever record the renderer happened to read."""
+        r = SourceRegistry()
+        r.register_source(kind="unknown", title="X", locator="https://ex.test/x")
+        with pytest.raises(ProvenanceError, match="cannot also be"):
+            r.register_source(kind="web", title="X", locator="https://ex.test/x")
+
+
+class TestARegisteredRecordCannotBeEditedAfterwards:
+    """These become citation authority. A caller that can reach into the
+    registry's own record can change what a stored citation appears to say."""
+
+    def test_metadata_is_not_a_handle_on_the_registry(self):
+        r = SourceRegistry()
+        source = r.register_source(
+            kind="file", title="m", origin_id="f1", metadata={"context_id": "ctx_1"}
+        )
+        with pytest.raises(Exception):
+            source.metadata["context_id"] = "somewhere-else"
+        assert r.get_source("src_1").metadata["context_id"] == "ctx_1"
+
+    def test_nor_is_anything_nested_inside_it(self):
+        r = SourceRegistry()
+        source = r.register_source(
+            kind="web",
+            title="P",
+            locator="https://ex.test/p",
+            metadata={"trace": {"provider": "brave"}, "ranks": [1, 2]},
+        )
+        with pytest.raises(Exception):
+            source.metadata["trace"]["provider"] = "forged"
+        with pytest.raises(Exception):
+            source.metadata["ranks"].append(3)
+        assert r.get_source("src_1").metadata["trace"]["provider"] == "brave"
+
+    def test_the_caller_s_own_dict_is_not_kept(self):
+        """Mutating what was passed in must not reach the registry either."""
+        r = SourceRegistry()
+        supplied = {"context_id": "ctx_1"}
+        r.register_source(kind="file", title="m", origin_id="f1", metadata=supplied)
+        supplied["context_id"] = "ctx_2"
+        assert r.get_source("src_1").metadata["context_id"] == "ctx_1"
+
+
+class TestTheMetadataBagIsActuallyBounded:
+    def test_a_source_may_not_carry_an_unbounded_payload(self):
+        """It crosses worker, API and storage seams. `bounded` has to be a
+        number somewhere, not a word in a docstring."""
+        r = SourceRegistry()
+        with pytest.raises(ProvenanceError, match="metadata is too large"):
+            r.register_source(
+                kind="web",
+                title="P",
+                locator="https://ex.test/p",
+                metadata={"page": "x" * 32_768},
+            )
+
+    def test_ordinary_provenance_metadata_fits_easily(self):
+        r = SourceRegistry()
+        source = r.register_source(
+            kind="web",
+            title="P",
+            locator="https://ex.test/p",
+            metadata={
+                "provider": "brave",
+                "search_rank": 3,
+                "retrieved_at": "2026-08-31T00:00:00Z",
+                "final_url": "https://ex.test/p",
+                "published_at": "2026-08-29T00:00:00Z",
+            },
+        )
+        assert source.metadata["provider"] == "brave"
+
+
+class TestTheCommonFieldsAreCheckedNotAnnotated:
+    """A type annotation enforces nothing at runtime, so invariant 7 was only
+    true for callers that already behaved."""
+
+    def test_a_title_must_be_text(self):
+        r = SourceRegistry()
+        with pytest.raises(ProvenanceError, match="title"):
+            r.register_source(kind="web", title=object(), locator="https://ex.test/")
+
+    def test_an_origin_id_must_be_text(self):
+        r = SourceRegistry()
+        with pytest.raises(ProvenanceError, match="origin_id"):
+            r.register_source(kind="file", title="m", origin_id=17)
+
+    def test_a_locator_must_be_text(self):
+        r = SourceRegistry()
+        with pytest.raises(ProvenanceError, match="locator"):
+            r.register_source(kind="web", title="P", locator=b"https://ex.test/")
+
+    def test_evidence_text_must_be_text(self):
+        r = SourceRegistry()
+        r.register_source(kind="file", title="m", origin_id="f1")
+        with pytest.raises(ProvenanceError, match="text"):
+            r.add_evidence("src_1", text=object())
+
+    def test_a_locator_field_must_be_the_type_it_claims(self):
+        r = SourceRegistry()
+        r.register_source(kind="file", title="m", origin_id="f1")
+        with pytest.raises(ProvenanceError, match="chunk_index"):
+            r.add_evidence(
+                "src_1", text="x", locator=EvidenceLocator(chunk_index="ninth")
+            )
+        with pytest.raises(ProvenanceError, match="section"):
+            r.add_evidence("src_1", text="x", locator=EvidenceLocator(section=3))
+
+    def test_a_snapshot_stays_json_safe_whatever_a_caller_tried(self):
+        r = SourceRegistry()
+        for bad in (object(), b"bytes", 17):
+            with pytest.raises(ProvenanceError):
+                r.register_source(kind="web", title=bad, locator="https://ex.test/")
+        r.register_source(kind="web", title="fine", locator="https://ex.test/")
+        assert json.loads(json.dumps(r.snapshot()))
