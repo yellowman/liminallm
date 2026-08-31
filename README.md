@@ -258,7 +258,7 @@ Before QA begins, verify:
 | **Send message** | Create conversation and send via `/v1/chat` |
 | **Admin protected** | Regular user gets 403 on `/v1/admin/settings` |
 | **Admin access** | Admin user gets 200 on `/v1/admin/settings` |
-| **Tests pass** | `./scripts/run_tests.sh` passes on fresh install |
+| **Tests pass** | `make test-fast-xdist` passes on fresh install |
 | **Bootstrap works** | `python scripts/bootstrap_admin.py` creates admin |
 
 Run the automated smoke test:
@@ -284,15 +284,15 @@ Run the automated smoke test:
   - filesystem-backed LoRA adapter training that turns preference events into new adapter versions
   - preference capture with clustering + skill adapter promotion and routing integration
   - hardened auth + multi-tenant isolation: OAuth provider mapping, session revocation on password resets, error envelopes with stable `error.code`, ownership-enforced artifact and conversation access (including workflows/tools), adapter checksum + path validation, and email verification flows
-- MFA with TOTP enrollment (otpauth URL), session gating, and login verification
-- email verification tokens with `/v1/auth/request_email_verification` and `/v1/auth/verify_email`
-- tenant-scoped conversation history enforcement in workflows and tool invocations
-- HMAC-signed JWT access tokens with refresh rotation, tenant-aware sessions, and admin-only config endpoints
-- preference UI and rich routing feedback loop
-- LLM-as-architect auto-patch generation
-- voice interface
-- admin UI for patch approval
-- chat and admin frontends prompt for MFA codes when required and revoke sessions on logout
+  - MFA with TOTP enrollment (otpauth URL), session gating, and login verification
+  - email verification tokens with `/v1/auth/request_email_verification` and `/v1/auth/verify_email`
+  - tenant-scoped conversation history enforcement in workflows and tool invocations
+  - HMAC-signed JWT access tokens with refresh rotation, tenant-aware sessions, and admin-only config endpoints
+  - preference UI and rich routing feedback loop
+  - LLM-as-architect auto-patch generation
+  - voice interface
+  - admin UI for patch approval
+  - chat and admin frontends prompt for MFA codes when required and revoke sessions on logout
 
 ---
 
@@ -305,18 +305,15 @@ Run the automated smoke test:
    - redis
    - filesystem path accessible to the app
  - gpu / tpu for jax model if you expect to train adapters
- - backend selection is single-sourced from the SQL deployment config (editable from the web console when wired); env vars only override if you set them explicitly
+ - backend selection is single-sourced from the SQL deployment config and editable from the admin console; env vars only override if you set them explicitly
   - set `model_backend` to `local_gpu_lora` in the admin console to target the local JAX+LoRA path instead of external API fine-tune IDs; leave the default to use the OpenAI-style plug. The JAX backend (`LocalJaxLoRABackend` in `liminallm/service/model_backend.py`) loads adapters from the filesystem, tokenizes prompts, runs a JAX forward pass, and enforces conservative shapes; it requires a JAX runtime and optionally a Transformers tokenizer for decode parity. Provider keys are admin settings, with `<PROVIDER>_API_KEY` as an environment fallback.
 
 ### frontend (chat + admin)
 
-- A minimal, ChatGPT-style UI now lives in `/frontend` and is served by the FastAPI app at `/` with static assets mounted at `/static/*`.
-- Authenticate with `/v1/auth/login`; the UI stores the issued bearer token/tenant ID locally and uses it for `/v1/chat`, `/v1/conversations`, and other API calls.
+- The chat UI lives in `/frontend` and is served by the FastAPI app at `/`, with static assets mounted at `/static/*`. It is a three-band shell: a 48px rail for sections, a contextual pane listing that section's items, and the workspace beside them.
+- Authenticate with `/v1/auth/login`. The access token is held in session storage and sent as a bearer token; the refresh token and session id are http-only cookies the page cannot read.
 - The admin console is separate at `/admin` and is guarded by the `admin` role (FastAPI enforces the role before serving the HTML). It surfaces config patch proposal/approval flows backed by `/v1/config/*` endpoints, tenant-scoped user administration (list/add/delete, role changes), adapter visibility, and a read-only inspector for database objects.
 
-### tests
-
-- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest`. the suite spins up a throwaway postgres cluster and a throwaway redis (`tests/harness.py`) and applies `sql/schema.sql`, so tests exercise the same store and cache production runs - set `TEST_DATABASE_URL` / `TEST_REDIS_URL` to point at existing services instead.
 
 ### adapters: local LoRA vs remote fine-tune IDs vs prompt-distilled
 
@@ -385,7 +382,7 @@ Run the automated smoke test:
 
    everything else - the model, credentials, rate limits, ttls, cors, smtp,
    the signing key - lives in the database and is edited from the admin
-   console at `/admin.html`, applied to every replica without a restart.
+   console at `/admin`, applied to every replica without a restart.
    changing an smtp password should not require redeploying the app. for
    declarative deploys, seed on first boot with
    `INSTANCE_SETTINGS_JSON='{"model_backend": "stub"}'`.
@@ -437,13 +434,26 @@ MIT
 
 ## testing
 
-See `TESTING.md` for comprehensive testing documentation.
+`TESTING.md` documents the lanes in full. The common ones:
 
 ```bash
-# The suite starts its own throwaway Postgres; no setup needed
-./scripts/run_tests.sh
+make test-fast-xdist   # the default edit-loop lane, about two minutes
+make test-xdist        # every test but the browser lane, in parallel
+make test-browser      # the browser lane; needs a Chromium binary
+```
 
-# Full integration test with Docker
+The suite starts its own throwaway Postgres and Redis (`tests/harness.py`) and
+applies `sql/schema.sql`, so tests exercise the same store and cache the app
+runs against. Set `TEST_DATABASE_URL` / `TEST_REDIS_URL` to point at existing
+services instead.
+
+CI runs the same selection on Python 3.10, 3.11 and 3.12. The wall-clock
+performance tests run in their own serial pass, so four parallel workers are
+not competing with the thing being timed.
+
+For a full integration run against containers:
+
+```bash
 docker compose -f docker-compose.test.yml up --build
 ./scripts/smoke_test.sh
 ```
@@ -465,5 +475,5 @@ Admin endpoints (`/v1/admin/*`, `/v1/config/*`) require admin role.
 
 ## operational hardening
 
-- local rate limits now fall back to in-process counters when Redis is unavailable (TEST_MODE), covering auth and chat flows
+- local rate limits fall back to in-process counters when Redis is unavailable (TEST_MODE), covering auth and chat flows
 - uploads are capped by `max_upload_bytes` to prevent unbounded in-memory reads
