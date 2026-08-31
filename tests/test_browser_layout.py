@@ -1415,6 +1415,152 @@ class TestTheRailIsOneColumnOfEqualIcons:
             context.close()
 
 
+class TestTheNoticesUnderAnAnswer:
+    """The chips under an answer are built from text the answer's sources
+    supplied, so a source gets to write into the page.
+
+    Driven through `renderMessage` itself rather than a hand-built string:
+    the defect is in what that function emits, and a double would only encode
+    my belief about it.
+    """
+
+    #: A citation body that closes a double-quoted attribute and opens
+    #: another. A fetched page can contain exactly this.
+    HOSTILE = 'he said "hi" data-probe="owned'
+
+    def _render(self, page, message):
+        """Render one message with the page's own renderer, into a detached
+        container so nothing else on the page is disturbed."""
+        return page.evaluate(
+            """(m) => {
+              const host = document.createElement('div');
+              host.innerHTML = renderMessage(m);
+              const chip = host.querySelector('.citation-link');
+              return {
+                found: !!chip,
+                title: chip && chip.getAttribute('title'),
+                probe: chip && chip.getAttribute('data-probe'),
+                kind: chip && chip.getAttribute('data-kind'),
+                citation: chip && chip.dataset.citation,
+                chips: host.querySelectorAll('.citation-link').length,
+                more: (host.querySelector('.citation-more') || {}).textContent || '',
+              };
+            }""",
+            message,
+        )
+
+    def _message(self, citations):
+        return {
+            "id": "m1",
+            "role": "assistant",
+            "content": "an answer",
+            "content_struct": {"citations": citations},
+        }
+
+    def test_a_source_cannot_write_attributes_into_the_page(
+        self, browser, server
+    ):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            out = self._render(
+                page,
+                self._message([
+                    {"source_path": "notes/a.txt", "content": self.HOSTILE}
+                ]),
+            )
+            assert out["found"], "no citation chip was rendered"
+            assert out["probe"] is None, (
+                "a citation's own text created an attribute on the chip: the "
+                "excerpt reaches `title` through `escapeHtml`, which by this "
+                "file's own comment leaves quotes alone"
+            )
+            assert self.HOSTILE in (out["title"] or ""), (
+                f"the quotes were not kept as text: {out['title']!r}"
+            )
+            decoded = page.evaluate(
+                "(s) => JSON.parse(s).content", out["citation"]
+            )
+            assert decoded == self.HOSTILE, (
+                f"the citation payload no longer round-trips: {decoded!r}"
+            )
+        finally:
+            context.close()
+
+    def test_an_uploaded_file_is_not_dressed_up_as_a_note(
+        self, browser, server
+    ):
+        """`.md` and `.txt` are ordinary upload types here, so an extension
+        cannot say a source came from the notes vault, and nothing else in
+        the payload says so either."""
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            out = self._render(
+                page,
+                self._message([
+                    {"source_path": "uploads/manual.md", "content": "x"}
+                ]),
+            )
+            assert out["kind"] == "file", (
+                f"an uploaded manual.md rendered as {out['kind']!r}"
+            )
+            web = self._render(
+                page,
+                self._message([
+                    {"source_path": "https://example.com/p", "content": "x"}
+                ]),
+            )
+            assert web["kind"] == "web", (
+                f"an http source rendered as {web['kind']!r}"
+            )
+        finally:
+            context.close()
+
+    def test_a_long_row_stops_and_says_how_many_are_left(
+        self, browser, server
+    ):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            out = self._render(
+                page,
+                self._message([
+                    {"source_path": f"f{i}.pdf", "content": "x"}
+                    for i in range(20)
+                ]),
+            )
+            assert out["chips"] == 20, "every citation should still be present"
+            assert "12 more" in out["more"], (
+                f"the overflow control said {out['more']!r}"
+            )
+        finally:
+            context.close()
+
+    def test_every_tool_gets_an_icon_that_names_itself(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            names = ["web_fetch", "web.fetch_v1", "notes.search_v1", "nonesuch"]
+            out = page.evaluate(
+                """(names) => {
+                  const host = document.createElement('div');
+                  host.innerHTML = toolIconsHtml(names);
+                  return [...host.querySelectorAll('.tool-chip')].map((c) => ({
+                    label: c.getAttribute('aria-label'),
+                    hasSvg: !!c.querySelector('svg'),
+                  }));
+                }""",
+                names,
+            )
+            assert len(out) == len(names), (
+                f"expected an icon per tool, got {len(out)}"
+            )
+            assert all(c["hasSvg"] for c in out), "a tool rendered without an icon"
+            for chip, name in zip(out, names):
+                assert name in chip["label"], (
+                    f"{name} is not named by its icon: {chip['label']!r}"
+                )
+        finally:
+            context.close()
+
+
 class TestTheChatWindowIsTheWindow:
     """Chat is the one section whose value is the space itself.
 

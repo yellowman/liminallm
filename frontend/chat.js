@@ -1125,17 +1125,17 @@ const renderMessage = (m) => {
 const CITATION_ICONS = {
   web: '<circle cx="10" cy="10" r="6.5"/><path d="M3.5 10h13M10 3.5c2.8 3.6 2.8 9.4 0 13' +
        'c-2.8-3.6-2.8-9.4 0-13Z"/>',
-  note: '<path d="M5.25 2.5h5.5L15 6.75v9.75a.75.75 0 0 1-.75.75h-9a.75.75 0 0 1-.75-.75' +
-        'V3.25a.75.75 0 0 1 .75-.75Z"/><path d="M10.5 2.75v4h4.25"/><path d="M7.25 11h5"/>',
   file: '<path d="M4.5 3.25h7L15.5 7v9.75a.75.75 0 0 1-.75.75H4.5a.75.75 0 0 1-.75-.75' +
         'V4a.75.75 0 0 1 .75-.75Z"/><path d="M11.25 3.5V7h3.75"/>',
 };
 
-const citationKind = (path) => {
-  if (/^https?:\/\//i.test(path)) return 'web';
-  if (/\.(md|markdown|txt)$/i.test(path)) return 'note';
-  return 'file';
-};
+//: Two kinds, because two are all the payload supports. An earlier version
+//: read `.md`, `.markdown` and `.txt` as the notes vault, but those are
+//: ordinary upload types in this application, so an attached `manual.md` was
+//: presented to the reader as a note they had written. There is no
+//: `source_type` on a citation to ask, so the chip does not claim one: a
+//: scheme is a fact about the source, an extension is a guess about it.
+const citationKind = (path) => (/^https?:\/\//i.test(path) ? 'web' : 'file');
 
 //: Long enough to recognise, short enough that eight fit on a line.
 const CITATION_LABEL_MAX = 32;
@@ -1177,13 +1177,14 @@ const citationLabel = (path) => {
           const path = c.source_path || c.chunk_id || `Citation ${i + 1}`;
           const label = path.split('/').pop() || path;
           // JSON.stringify escapes internal quotes; only need & and " for double-quoted attr
-          const snippetData = JSON.stringify({
+          // `escapeAttr`, not a second hand-written encoder beside it.
+          const snippetData = escapeAttr(JSON.stringify({
             source_path: c.source_path || '',
             chunk_id: c.chunk_id || '',
             content: c.content || c.snippet || '',
             context_id: c.context_id || '',
             chunk_index: c.chunk_index,
-          }).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+          }));
           // The hover text is the source and a taste of it, which is what a
           // reader wants before deciding to open the whole chunk.
           const excerpt = (c.content || c.snippet || '')
@@ -1191,11 +1192,18 @@ const citationLabel = (path) => {
             .trim()
             .slice(0, 160);
           const hover = excerpt ? `${path}\n\n${excerpt}\u2026` : path;
-          const extra = i >= CITATION_VISIBLE ? ' is-extra" hidden="hidden' : '';
-          return `<span class="citation-link${extra}" title="${escapeHtml(hover)}" data-citation="${snippetData}" tabindex="0" role="button">` +
+          const extra = i >= CITATION_VISIBLE ? ' is-extra' : '';
+          const hide = i >= CITATION_VISIBLE ? ' hidden' : '';
+          const kind = citationKind(path);
+          // `escapeAttr`: the excerpt is a source's own text, and a fetched
+          // page can carry a quote that closes this attribute and opens
+          // others on the element.
+          return `<span class="citation-link${extra}"${hide} data-kind="${kind}" ` +
+            `title="${escapeAttr(hover)}" data-citation="${snippetData}" ` +
+            `tabindex="0" role="button">` +
             `<svg class="citation-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" ` +
             `stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ` +
-            `stroke-linejoin="round">${CITATION_ICONS[citationKind(path)]}</svg>` +
+            `stroke-linejoin="round">${CITATION_ICONS[kind]}</svg>` +
             `<span class="citation-title">${escapeHtml(citationLabel(path))}</span></span>`;
         }).join('')}
         ${citations.length > CITATION_VISIBLE
@@ -2643,9 +2651,9 @@ const renderFilesList = (files, total, hasNext) => {
   if (filesEmptyEl) filesEmptyEl.style.display = 'none';
 
   filesListEl.innerHTML = files.map(file => `
-    <div class="file-item" data-filename="${escapeHtml(file.name)}">
+    <div class="file-item" data-filename="${escapeAttr(file.name)}">
       <div class="file-info">
-        <div class="file-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
+        <div class="file-name" title="${escapeAttr(file.name)}">${escapeHtml(file.name)}</div>
         <div class="file-meta">${formatBytes(file.size)} · ${formatRelativeTime(file.modified_at)}</div>
       </div>
       <div class="file-actions">
