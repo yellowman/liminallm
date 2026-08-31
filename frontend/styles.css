@@ -709,6 +709,68 @@ body {
   max-width: none;
 }
 
+/* The composer sits near the bottom of the screen, because everything under
+   it is chrome the conversation pays for. Measured at 900px tall: the
+   message list had 251px while the strip below the composer had 127px - a
+   divider with 20px margins either side, then a bordered card whose whole
+   collapsed content was one heading and two buttons.
+
+   The feedback buttons moved up into the composer's own row, beside Send,
+   which is where a one-click action on the last answer belongs. What is left
+   below is the control that opens the notes and routing detail, and while
+   that is shut it is a line of text rather than a card. */
+.app-shell[data-section="chat-tab"]:not(.signed-out) #preferences-section.collapsed {
+  margin: 6px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+/* Quiet, because it sits where a line of status text used to and opens a
+   panel rather than doing anything. */
+.prefs-toggle {
+  border: 0;
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.prefs-toggle:hover {
+  color: var(--text);
+}
+
+/* Chat is the one section whose value is the space itself, so its panel is
+   the window rather than a card floating in one. Everywhere else a panel is
+   an object on a grey ground - here that ground was a band above the thread,
+   a band below it, and a rounded border in between, all of it charged to the
+   only column that reads long-form text. */
+.app-shell[data-section="chat-tab"]:not(.signed-out) .main-content {
+  padding: 0;
+  max-width: none;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The chain has to stretch, not just the last link: `height: 100%` cannot
+   resolve through a scroll container whose own height comes from flex, so
+   the panel stayed its content's height and left 290px of ground under it. */
+.app-shell[data-section="chat-tab"]:not(.signed-out) #chat-tab {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-shell[data-section="chat-tab"]:not(.signed-out) .chat-panel {
+  flex: 1;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 10px 20px 0;
+}
+
 /* Single-column layout (admin page) - panels toggle visibility, so stack them */
 .layout {
   display: block;
@@ -1351,6 +1413,9 @@ button.minor:hover {
   padding: 0 2px;
   margin-top: 2px;
   text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   letter-spacing: 0.06em;
 }
 
@@ -1604,7 +1669,10 @@ button.minor:hover {
 
 /* Citation links */
 .citation-link {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 240px;
   background: var(--panel-muted);
   border: 1px solid var(--border);
   color: var(--text-muted);
@@ -3494,4 +3562,52 @@ button.minor:hover {
 .settings-actions button[disabled] {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* The tools a turn used, as icons. `.meta` uppercases its text, which turned
+   a list of internal identifiers into a row of shouted underscores under
+   every answer; a name is still there on hover and for a screen reader. */
+.tool-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  color: var(--text-muted);
+}
+
+.tool-chip svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* A citation chip: what kind of source, then what it is called, clipped so
+   one long filename cannot take the row. */
+.citation-icon {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
+.citation-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Eight is a row; twenty is a wall the answer has to be read around. */
+.citation-more {
+  align-self: center;
+  border: 0;
+  background: none;
+  padding: 1px 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.citation-more:hover {
+  color: var(--text);
 }

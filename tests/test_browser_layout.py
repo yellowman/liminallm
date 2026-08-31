@@ -1413,3 +1413,253 @@ class TestTheRailIsOneColumnOfEqualIcons:
             )
         finally:
             context.close()
+
+
+class TestTheNoticesUnderAnAnswer:
+    """The chips under an answer are built from text the answer's sources
+    supplied, so a source gets to write into the page.
+
+    Driven through `renderMessage` itself rather than a hand-built string:
+    the defect is in what that function emits, and a double would only encode
+    my belief about it.
+    """
+
+    #: A citation body that closes a double-quoted attribute and opens
+    #: another. A fetched page can contain exactly this.
+    HOSTILE = 'he said "hi" data-probe="owned'
+
+    def _render(self, page, message):
+        """Render one message with the page's own renderer, into a detached
+        container so nothing else on the page is disturbed."""
+        return page.evaluate(
+            """(m) => {
+              const host = document.createElement('div');
+              host.innerHTML = renderMessage(m);
+              const chip = host.querySelector('.citation-link');
+              return {
+                found: !!chip,
+                title: chip && chip.getAttribute('title'),
+                probe: chip && chip.getAttribute('data-probe'),
+                kind: chip && chip.getAttribute('data-kind'),
+                citation: chip && chip.dataset.citation,
+                chips: host.querySelectorAll('.citation-link').length,
+                more: (host.querySelector('.citation-more') || {}).textContent || '',
+              };
+            }""",
+            message,
+        )
+
+    def _message(self, citations):
+        return {
+            "id": "m1",
+            "role": "assistant",
+            "content": "an answer",
+            "content_struct": {"citations": citations},
+        }
+
+    def test_a_source_cannot_write_attributes_into_the_page(
+        self, browser, server
+    ):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            out = self._render(
+                page,
+                self._message([
+                    {"source_path": "notes/a.txt", "content": self.HOSTILE}
+                ]),
+            )
+            assert out["found"], "no citation chip was rendered"
+            assert out["probe"] is None, (
+                "a citation's own text created an attribute on the chip: the "
+                "excerpt reaches `title` through `escapeHtml`, which by this "
+                "file's own comment leaves quotes alone"
+            )
+            assert self.HOSTILE in (out["title"] or ""), (
+                f"the quotes were not kept as text: {out['title']!r}"
+            )
+            decoded = page.evaluate(
+                "(s) => JSON.parse(s).content", out["citation"]
+            )
+            assert decoded == self.HOSTILE, (
+                f"the citation payload no longer round-trips: {decoded!r}"
+            )
+        finally:
+            context.close()
+
+    def test_an_uploaded_file_is_not_dressed_up_as_a_note(
+        self, browser, server
+    ):
+        """`.md` and `.txt` are ordinary upload types here, so an extension
+        cannot say a source came from the notes vault, and nothing else in
+        the payload says so either."""
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            out = self._render(
+                page,
+                self._message([
+                    {"source_path": "uploads/manual.md", "content": "x"}
+                ]),
+            )
+            assert out["kind"] == "file", (
+                f"an uploaded manual.md rendered as {out['kind']!r}"
+            )
+            web = self._render(
+                page,
+                self._message([
+                    {"source_path": "https://example.com/p", "content": "x"}
+                ]),
+            )
+            assert web["kind"] == "web", (
+                f"an http source rendered as {web['kind']!r}"
+            )
+        finally:
+            context.close()
+
+    def test_a_long_row_stops_and_says_how_many_are_left(
+        self, browser, server
+    ):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            out = self._render(
+                page,
+                self._message([
+                    {"source_path": f"f{i}.pdf", "content": "x"}
+                    for i in range(20)
+                ]),
+            )
+            assert out["chips"] == 20, "every citation should still be present"
+            assert "12 more" in out["more"], (
+                f"the overflow control said {out['more']!r}"
+            )
+        finally:
+            context.close()
+
+    def test_every_tool_gets_an_icon_that_names_itself(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            names = ["web_fetch", "web.fetch_v1", "notes.search_v1", "nonesuch"]
+            out = page.evaluate(
+                """(names) => {
+                  const host = document.createElement('div');
+                  host.innerHTML = toolIconsHtml(names);
+                  return [...host.querySelectorAll('.tool-chip')].map((c) => ({
+                    label: c.getAttribute('aria-label'),
+                    hasSvg: !!c.querySelector('svg'),
+                  }));
+                }""",
+                names,
+            )
+            assert len(out) == len(names), (
+                f"expected an icon per tool, got {len(out)}"
+            )
+            assert all(c["hasSvg"] for c in out), "a tool rendered without an icon"
+            for chip, name in zip(out, names):
+                assert name in chip["label"], (
+                    f"{name} is not named by its icon: {chip['label']!r}"
+                )
+        finally:
+            context.close()
+
+
+class TestTheChatWindowIsTheWindow:
+    """Chat is the one section whose value is the space itself.
+
+    Everywhere else a panel is an object on a grey ground. Here that ground
+    was a band above the thread and a band below it, and under the composer
+    sat a divider and a bordered card whose whole collapsed content was a
+    heading and two buttons. Measured at 900px tall: 251px of message list,
+    252px of chrome below the composer.
+    """
+
+    def _geometry(self, page):
+        return page.evaluate(
+            """() => {
+              const q = (s) => document.querySelector(s);
+              const bar = q('.topbar');
+              const panel = q('#chat-tab .chat-panel');
+              const form = q('#chat-form');
+              return {
+                greyAbove: Math.round(panel.getBoundingClientRect().top
+                  - bar.getBoundingClientRect().bottom),
+                greyBelow: Math.round(window.innerHeight
+                  - panel.getBoundingClientRect().bottom),
+                belowComposer: Math.round(window.innerHeight
+                  - form.getBoundingClientRect().bottom),
+                messages: Math.round(
+                  q('#messages').getBoundingClientRect().height),
+                overflow: document.documentElement.scrollHeight
+                  - window.innerHeight,
+              };
+            }"""
+        )
+
+    def test_no_ground_shows_above_or_below_the_thread(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            g = self._geometry(page)
+            assert g["greyAbove"] == 0, (
+                f"{g['greyAbove']}px of workspace shows between the bar and "
+                f"the thread"
+            )
+            assert g["greyBelow"] == 0, (
+                f"{g['greyBelow']}px of workspace shows under the thread"
+            )
+            assert g["overflow"] <= 0, (
+                f"filling the height pushed the page {g['overflow']}px taller "
+                f"than the viewport"
+            )
+        finally:
+            context.close()
+
+    def test_the_composer_sits_near_the_bottom(self, browser, server):
+        """What is under it is chrome the conversation pays for."""
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            g = self._geometry(page)
+            assert g["belowComposer"] <= 48, (
+                f"{g['belowComposer']}px sits below the input box; it was 252 "
+                f"when a divider and a bordered card lived there"
+            )
+            assert g["messages"] > 400, (
+                f"the message list is only {g['messages']}px of a "
+                f"{DESKTOP['height']}px screen"
+            )
+        finally:
+            context.close()
+
+    def test_the_composer_carries_the_feedback_and_the_toggle(
+        self, browser, server
+    ):
+        """Both moved out of the band under it: a one-click reaction to the
+        last answer belongs beside Send, and the account id it displaced is
+        on the settings screen, which is where an account detail lives.
+        """
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            found = page.evaluate(
+                """() => ({
+                  thumbsUp: !!document.querySelector('#chat-form #thumbs-up'),
+                  thumbsDown: !!document.querySelector('#chat-form #thumbs-down'),
+                  toggle: !!document.querySelector('#chat-form #preferences-toggle'),
+                  sessionIndicator: !!document.getElementById('session-indicator'),
+                  detailShut: document.getElementById('preferences-section')
+                    .classList.contains('collapsed'),
+                })"""
+            )
+            assert found["thumbsUp"] and found["thumbsDown"], (
+                "the feedback buttons are not in the composer's own row"
+            )
+            assert found["toggle"], "the preferences toggle is not in the composer"
+            assert not found["sessionIndicator"], (
+                "the account id is still printed under the composer"
+            )
+            assert found["detailShut"], "the detail panel opens by default"
+
+            page.click("#preferences-toggle")
+            page.wait_for_timeout(200)
+            assert page.evaluate(
+                "() => !document.getElementById('preferences-section')"
+                ".classList.contains('collapsed')"
+            ), "the toggle no longer opens the detail it names"
+        finally:
+            context.close()
