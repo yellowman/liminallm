@@ -375,7 +375,8 @@
                   <div class="draft-indicator" id="draft-indicator"></div>
                 </div>
                 <div id="chat-actions">
-                  <div class="small" id="session-indicator">Not signed in</div>
+                  <button type="button" class="prefs-toggle" id="preferences-toggle"
+                          aria-expanded="false" aria-controls="preferences-section">Preferences <span class="toggle-icon">+</span></button>
                   <div class="pill-row">
                     <a href="/admin" class="ghost hidden" id="approve-patches">Approve patches</a>
                     <button type="button" class="ghost voice-btn" id="voice-input-btn" aria-label="Voice input" title="Hold to record">
@@ -393,6 +394,8 @@
                         <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
                       </svg>
                     </button>
+                    <button type="button" class="ghost" id="thumbs-up" aria-label="Thumbs up">+1</button>
+                    <button type="button" class="ghost" id="thumbs-down" aria-label="Thumbs down">-1</button>
                     <button type="button" class="ghost" id="new-thread-secondary">Reset</button>
                     <button type="submit" class="primary" id="send-btn">Send</button>
                     <button type="button" class="ghost hidden" id="stop-stream-btn" title="Stop generating">Stop</button>
@@ -400,15 +403,7 @@
                 </div>
               </form>
 
-              <div class="divider"></div>
               <section id="preferences-section" aria-label="Preference feedback" class="panel-section collapsed">
-                <div class="section-header clickable" id="preferences-toggle">
-                  <h3>Preferences <span class="toggle-icon">+</span></h3>
-                  <div class="pill-row">
-                    <button type="button" class="ghost" id="thumbs-up" aria-label="Thumbs up">+1</button>
-                    <button type="button" class="ghost" id="thumbs-down" aria-label="Thumbs down">-1</button>
-                  </div>
-                </div>
                 <div class="section-content">
                   <p class="subtext" id="preference-hint">Send feedback on the latest assistant response.</p>
                   <div class="field textarea-wrap">

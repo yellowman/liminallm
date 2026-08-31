@@ -1413,3 +1413,107 @@ class TestTheRailIsOneColumnOfEqualIcons:
             )
         finally:
             context.close()
+
+
+class TestTheChatWindowIsTheWindow:
+    """Chat is the one section whose value is the space itself.
+
+    Everywhere else a panel is an object on a grey ground. Here that ground
+    was a band above the thread and a band below it, and under the composer
+    sat a divider and a bordered card whose whole collapsed content was a
+    heading and two buttons. Measured at 900px tall: 251px of message list,
+    252px of chrome below the composer.
+    """
+
+    def _geometry(self, page):
+        return page.evaluate(
+            """() => {
+              const q = (s) => document.querySelector(s);
+              const bar = q('.topbar');
+              const panel = q('#chat-tab .chat-panel');
+              const form = q('#chat-form');
+              return {
+                greyAbove: Math.round(panel.getBoundingClientRect().top
+                  - bar.getBoundingClientRect().bottom),
+                greyBelow: Math.round(window.innerHeight
+                  - panel.getBoundingClientRect().bottom),
+                belowComposer: Math.round(window.innerHeight
+                  - form.getBoundingClientRect().bottom),
+                messages: Math.round(
+                  q('#messages').getBoundingClientRect().height),
+                overflow: document.documentElement.scrollHeight
+                  - window.innerHeight,
+              };
+            }"""
+        )
+
+    def test_no_ground_shows_above_or_below_the_thread(self, browser, server):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            g = self._geometry(page)
+            assert g["greyAbove"] == 0, (
+                f"{g['greyAbove']}px of workspace shows between the bar and "
+                f"the thread"
+            )
+            assert g["greyBelow"] == 0, (
+                f"{g['greyBelow']}px of workspace shows under the thread"
+            )
+            assert g["overflow"] <= 0, (
+                f"filling the height pushed the page {g['overflow']}px taller "
+                f"than the viewport"
+            )
+        finally:
+            context.close()
+
+    def test_the_composer_sits_near_the_bottom(self, browser, server):
+        """What is under it is chrome the conversation pays for."""
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            g = self._geometry(page)
+            assert g["belowComposer"] <= 48, (
+                f"{g['belowComposer']}px sits below the input box; it was 252 "
+                f"when a divider and a bordered card lived there"
+            )
+            assert g["messages"] > 400, (
+                f"the message list is only {g['messages']}px of a "
+                f"{DESKTOP['height']}px screen"
+            )
+        finally:
+            context.close()
+
+    def test_the_composer_carries_the_feedback_and_the_toggle(
+        self, browser, server
+    ):
+        """Both moved out of the band under it: a one-click reaction to the
+        last answer belongs beside Send, and the account id it displaced is
+        on the settings screen, which is where an account detail lives.
+        """
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            found = page.evaluate(
+                """() => ({
+                  thumbsUp: !!document.querySelector('#chat-form #thumbs-up'),
+                  thumbsDown: !!document.querySelector('#chat-form #thumbs-down'),
+                  toggle: !!document.querySelector('#chat-form #preferences-toggle'),
+                  sessionIndicator: !!document.getElementById('session-indicator'),
+                  detailShut: document.getElementById('preferences-section')
+                    .classList.contains('collapsed'),
+                })"""
+            )
+            assert found["thumbsUp"] and found["thumbsDown"], (
+                "the feedback buttons are not in the composer's own row"
+            )
+            assert found["toggle"], "the preferences toggle is not in the composer"
+            assert not found["sessionIndicator"], (
+                "the account id is still printed under the composer"
+            )
+            assert found["detailShut"], "the detail panel opens by default"
+
+            page.click("#preferences-toggle")
+            page.wait_for_timeout(200)
+            assert page.evaluate(
+                "() => !document.getElementById('preferences-section')"
+                ".classList.contains('collapsed')"
+            ), "the toggle no longer opens the detail it names"
+        finally:
+            context.close()

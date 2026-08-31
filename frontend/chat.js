@@ -245,7 +245,6 @@ const authPanel = $('auth-panel');
 const chatForm = $('chat-form');
 const statusEl = $('status');
 const errorEl = $('error-banner');
-const sessionIndicator = $('session-indicator');
 const approvePatches = $('approve-patches');
 const conversationLabel = $('conversation-label');
 const adminLink = $('admin-link');
@@ -397,12 +396,6 @@ const updateAuthUI = () => {
       p.classList.add('hidden');
     }
   });
-
-  if (sessionIndicator) {
-    sessionIndicator.textContent = isAuth
-      ? `User: ${state.userId?.slice(0, 8) || 'unknown'}`
-      : 'Not signed in';
-  }
 
   // Update settings
   const settingUserId = $('setting-user-id');
@@ -1124,6 +1117,40 @@ const renderMessage = (m) => {
   if (m.token_count) metaBits.push(`${m.token_count} tokens`);
   if (m.model) metaBits.push(escapeHtml(m.model));
 
+//: A citation names a source, so the chip leads with what kind of source it
+//: is and what it is called. Drawn rather than fetched: a real favicon means
+//: a request to every cited domain from the reader's browser, which hands
+//: those sites the reader's address and the fact that they were cited. These
+//: are also mostly the reader's own files, which have no favicon at all.
+const CITATION_ICONS = {
+  web: '<circle cx="10" cy="10" r="6.5"/><path d="M3.5 10h13M10 3.5c2.8 3.6 2.8 9.4 0 13' +
+       'c-2.8-3.6-2.8-9.4 0-13Z"/>',
+  note: '<path d="M5.25 2.5h5.5L15 6.75v9.75a.75.75 0 0 1-.75.75h-9a.75.75 0 0 1-.75-.75' +
+        'V3.25a.75.75 0 0 1 .75-.75Z"/><path d="M10.5 2.75v4h4.25"/><path d="M7.25 11h5"/>',
+  file: '<path d="M4.5 3.25h7L15.5 7v9.75a.75.75 0 0 1-.75.75H4.5a.75.75 0 0 1-.75-.75' +
+        'V4a.75.75 0 0 1 .75-.75Z"/><path d="M11.25 3.5V7h3.75"/>',
+};
+
+const citationKind = (path) => {
+  if (/^https?:\/\//i.test(path)) return 'web';
+  if (/\.(md|markdown|txt)$/i.test(path)) return 'note';
+  return 'file';
+};
+
+//: Long enough to recognise, short enough that eight fit on a line.
+const CITATION_LABEL_MAX = 32;
+//: After this many the row stops being a list and starts being a wall.
+const CITATION_VISIBLE = 8;
+
+const citationLabel = (path) => {
+  const tail = /^https?:\/\//i.test(path)
+    ? path.replace(/^https?:\/\//i, '').replace(/\/$/, '')
+    : path.split('/').pop() || path;
+  return tail.length > CITATION_LABEL_MAX
+    ? `${tail.slice(0, CITATION_LABEL_MAX - 1)}\u2026`
+    : tail;
+};
+
   // Render citations as clickable links per SPEC §17
   // Note: Uses event delegation via messagesEl click handler (see initEventListeners)
   // Citations can be at content_struct.citations OR extracted from content_struct.segments
@@ -1157,8 +1184,23 @@ const renderMessage = (m) => {
             context_id: c.context_id || '',
             chunk_index: c.chunk_index,
           }).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-          return `<span class="citation-link" title="${escapeHtml(path)}" data-citation="${snippetData}" tabindex="0" role="button">${escapeHtml(label)}</span>`;
+          // The hover text is the source and a taste of it, which is what a
+          // reader wants before deciding to open the whole chunk.
+          const excerpt = (c.content || c.snippet || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 160);
+          const hover = excerpt ? `${path}\n\n${excerpt}\u2026` : path;
+          const extra = i >= CITATION_VISIBLE ? ' is-extra" hidden="hidden' : '';
+          return `<span class="citation-link${extra}" title="${escapeHtml(hover)}" data-citation="${snippetData}" tabindex="0" role="button">` +
+            `<svg class="citation-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" ` +
+            `stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ` +
+            `stroke-linejoin="round">${CITATION_ICONS[citationKind(path)]}</svg>` +
+            `<span class="citation-title">${escapeHtml(citationLabel(path))}</span></span>`;
         }).join('')}
+        ${citations.length > CITATION_VISIBLE
+          ? `<button type="button" class="citation-more">and ${citations.length - CITATION_VISIBLE} more</button>`
+          : ''}
       </div>
     `;
   }
@@ -1212,6 +1254,50 @@ const appendMessage = (role, content, meta = '') => {
   updateEmptyState();
   return wrapper;
 };
+
+//: What each tool did, drawn rather than spelled. The names are internal
+//: identifiers - `web_fetch`, `notes.search_v1` - and a row of shouted
+//: underscores under every answer read like debug output. Matched on the
+//: parts of the name rather than the whole, because the same tool appears as
+//: both `web_fetch` and `web.fetch_v1` depending on the path that called it.
+const TOOL_ICONS = [
+  [/web.*search/, 'searches the web',
+   '<circle cx="9" cy="9" r="5.25"/><path d="m13 13 4 4"/>' +
+   '<path d="M3.75 9h10.5M9 3.75c2.5 2.9 2.5 7.6 0 10.5c-2.5-2.9-2.5-7.6 0-10.5Z"/>'],
+  [/web.*fetch/, 'read a web page',
+   '<circle cx="10" cy="10" r="6.5"/><path d="M3.5 10h13M10 3.5c2.8 3.6 2.8 9.4 0 13' +
+   'c-2.8-3.6-2.8-9.4 0-13Z"/>'],
+  [/note/, 'searched your notes',
+   '<path d="M5.25 2.5h5.5L15 6.75v9.75a.75.75 0 0 1-.75.75h-9a.75.75 0 0 1-.75-.75' +
+   'V3.25a.75.75 0 0 1 .75-.75Z"/><path d="M10.5 2.75v4h4.25"/><path d="M7.25 10h5"/>'],
+  [/file|attach/, 'read the attachments',
+   '<path d="M2.75 5.5a1 1 0 0 1 1-1h3l1.5 2h8a1 1 0 0 1 1 1v7.25a1 1 0 0 1-1 1' +
+   'h-12.5a1 1 0 0 1-1-1Z"/>'],
+  [/python|code|interpreter/, 'ran code',
+   '<path d="M7.25 6.5 3.75 10l3.5 3.5"/><path d="m12.75 6.5 3.5 3.5-3.5 3.5"/>' +
+   '<path d="M11 4.5 9 15.5"/>'],
+  [/agent/, 'used an agent',
+   '<path d="M12.9 3.1a3.6 3.6 0 0 0-4.7 4.7l-5 5a1.2 1.2 0 0 0 0 1.7l1.3 1.3' +
+   'a1.2 1.2 0 0 0 1.7 0l5-5a3.6 3.6 0 0 0 4.7-4.7l-2.3 2.3-2-2Z"/>'],
+];
+
+const TOOL_ICON_FALLBACK =
+  '<circle cx="10" cy="10" r="6.5"/><path d="M10 6.75v3.5M10 13.1h.01"/>';
+
+/** One icon per tool, each naming itself on hover and to a screen reader. */
+const toolIconsHtml = (names) =>
+  names
+    .map((name) => {
+      const match = TOOL_ICONS.find(([pattern]) => pattern.test(name));
+      const [, what, paths] = match || [null, 'used a tool', TOOL_ICON_FALLBACK];
+      const label = `${name} - ${what}`;
+      return `<span class="tool-chip" title="${escapeAttr(label)}" ` +
+        `role="img" aria-label="${escapeAttr(label)}">` +
+        '<svg viewBox="0 0 20 20" aria-hidden="true" fill="none" ' +
+        'stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ' +
+        `stroke-linejoin="round">${paths}</svg></span>`;
+    })
+    .join('');
 
 // Names of the tools the model called for a reply, for the message meta line.
 // A node's extra result keys land under `outputs`, so check both places.
@@ -1280,7 +1366,7 @@ const createStreamingMessage = (role) => {
       if (!frame) frame = requestAnimationFrame(() => render(false));
     },
     /** Finalize the message with optional meta info */
-    finalize(meta = '') {
+    finalize(meta = '', metaHtml = '') {
       if (frame) cancelAnimationFrame(frame);
       render(true);
       wrapper.classList.remove('streaming');
@@ -1290,7 +1376,8 @@ const createStreamingMessage = (role) => {
       actionsEl.className = 'msg-actions';
       actionsEl.innerHTML = MSG_COPY_BUTTON_HTML;
       contentWrap.insertBefore(actionsEl, metaEl);
-      if (meta) metaEl.textContent = meta;
+      if (metaHtml) metaEl.innerHTML = metaHtml;
+      else if (meta) metaEl.textContent = meta;
     },
     /** Show a warning banner above the message meta */
     warn(text) {
@@ -1572,9 +1659,13 @@ const sendMessage = async (event) => {
                   const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
                   const tools = toolNamesFromTrace(messageDoneData.workflow_trace);
                   const bits = [];
-                  if (tools.length) bits.push(`Used: ${tools.join(', ')}`);
                   if (adapters.length) bits.push(`Adapters: ${adapters.join(', ')}`);
-                  streamingMsg.finalize(bits.join(' · '));
+                  const text = bits.map(escapeHtml).join(' · ');
+                  const icons = tools.length ? toolIconsHtml(tools) : '';
+                  streamingMsg.finalize(
+                    '',
+                    icons || text ? `${icons}${icons && text ? ' ' : ''}${text}` : ''
+                  );
                   // A page tried to hijack the model: say so where the user
                   // reads the answer, not just in the server log.
                   const injections = injectionFindingsFromTrace(messageDoneData.workflow_trace);
@@ -3792,6 +3883,14 @@ const initEventListeners = () => {
         }
         return;
       }
+      const more = e.target.closest('.citation-more');
+      if (more) {
+        more.closest('.citations-row')
+          ?.querySelectorAll('.citation-link.is-extra')
+          .forEach((el) => { el.hidden = false; });
+        more.remove();
+        return;
+      }
       const citationLink = e.target.closest('.citation-link');
       if (citationLink) {
         showCitationModal(citationLink);
@@ -3813,6 +3912,15 @@ const initEventListeners = () => {
   conversationSearchEl?.addEventListener('input', debounce(renderConversationList, 150));
 
   // Preferences
+  $('preferences-toggle')?.addEventListener('click', () => {
+    const section = $('preferences-section');
+    if (!section) return;
+    const open = section.classList.toggle('collapsed') === false;
+    $('preferences-toggle').setAttribute('aria-expanded', String(open));
+    const icon = $('preferences-toggle').querySelector('.toggle-icon');
+    if (icon) icon.textContent = open ? '\u2212' : '+';
+  });
+
   $('thumbs-up')?.addEventListener('click', () => sendPreference(true));
   $('thumbs-down')?.addEventListener('click', () => sendPreference(false));
 
