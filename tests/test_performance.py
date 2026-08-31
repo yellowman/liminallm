@@ -67,12 +67,12 @@ class TestEndpointLatency:
         #     p95  min  7.20  median  9.13  max  11.97   1.7x spread
         #     p99  min 11.04  median 13.38  max  46.43   4.2x spread
         #
-        # `p99` here is `sorted(times)[98]` - one order statistic, the
-        # second-slowest of a hundred - so it carries the variance of a
-        # single request rather than of the endpoint. It swings four-fold
-        # with nothing else on the box, and reached 106.21ms in CI on a run
-        # that was already isolated from the parallel workers. 100ms is not
-        # a contract that shape of measurement can keep.
+        # Both tail figures are order statistics; the difference is how
+        # many samples stand behind them. With 100 requests the empirical
+        # p99 is just `sorted(times)[98]` - the second-worst observation -
+        # and it measured four-fold less stable than p95 above. It reached
+        # 106.21ms in CI on a run already isolated from the parallel
+        # workers. 100ms is not a contract that figure can keep here.
         #
         # So the contract sits on the two statistics that hold still, at
         # roughly four times the worst isolated observation, and the tail
