@@ -44,19 +44,29 @@ body {
   line-height: 1.5;
 }
 
+/* One column by default, because three pages wear this class and only one
+   of them has three bands to lay out. The admin console and the shared
+   conversation page take the shell for its chrome - a bar, and a column
+   under it - so a banded default put their bar in the rail's 48px and their
+   whole content in the pane's 240px, beside 1200px of empty page. A page
+   that does not declare bands must not be crushed by them. */
+.app-shell {
+  display: grid;
+  grid-template-columns: 1fr;
+  min-height: 100vh;
+}
+
 /* Three bands: rail, contextual pane, workspace. The rail and the pane are
    each their own grid column so hiding one is a track going to zero, not a
    reflow of everything beside it. */
-.app-shell {
-  display: grid;
+.app-shell.banded {
   grid-template-columns: var(--rail-width) var(--pane-width) 1fr;
-  min-height: 100vh;
 }
 
 /* No pane for this section, or the reader hid it. Same result, two reasons:
    `no-pane` is the app's answer, `pane-hidden` is the reader's. */
-.app-shell.no-pane,
-.app-shell.pane-hidden {
+.app-shell.banded.no-pane,
+.app-shell.banded.pane-hidden {
   grid-template-columns: var(--rail-width) 0 1fr;
 }
 
@@ -64,13 +74,13 @@ body {
    take away 240px of conversation list: that coupling was right while
    hiding the rail was a modifier gesture meaning "distraction-free", and
    wrong the moment the rail got a control of its own. */
-.app-shell.rail-hidden {
+.app-shell.banded.rail-hidden {
   grid-template-columns: 0 var(--pane-width) 1fr;
 }
 
-.app-shell.rail-hidden.no-pane,
-.app-shell.rail-hidden.pane-hidden,
-.app-shell.signed-out {
+.app-shell.banded.rail-hidden.no-pane,
+.app-shell.banded.rail-hidden.pane-hidden,
+.app-shell.banded.signed-out {
   grid-template-columns: 0 0 1fr;
 }
 
@@ -2732,14 +2742,14 @@ button.minor:hover {
    the only way back to the other sections; the pane becomes an overlay over
    the workspace instead of a column beside it. */
 @media (max-width: 900px) {
-  .app-shell,
-  .app-shell.no-pane,
-  .app-shell.pane-hidden {
+  .app-shell.banded,
+  .app-shell.banded.no-pane,
+  .app-shell.banded.pane-hidden {
     grid-template-columns: var(--rail-width) 0 1fr;
   }
 
   /* The pane is an overlay here, so its track is zero either way. */
-  .app-shell.rail-hidden {
+  .app-shell.banded.rail-hidden {
     grid-template-columns: 0 0 1fr;
   }
 
@@ -2753,7 +2763,7 @@ button.minor:hover {
   /* Signed out the rail has nowhere to go, at this width as at any other.
      Restated here because this block's own rule would otherwise put it
      back. */
-  .app-shell.signed-out {
+  .app-shell.banded.signed-out {
     grid-template-columns: 0 0 1fr;
   }
 

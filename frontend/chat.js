@@ -283,16 +283,33 @@ const RAIL_HIDDEN_KEY = 'liminal.railHidden';
 //: Rows in the pane that open something in the workspace. Below 900px the
 //: pane is an overlay on top of that workspace, so choosing one has to
 //: close it or the choice is invisible.
+//: What a click in the pane has to open in the workspace before the overlay
+//: gets out of its way.
+//:
+//: `[data-pane-dismiss]` is the way to say it: a pane control that opens
+//: something in the workspace carries the attribute and needs nothing added
+//: here. The class names below are the rendered list rows, marked where the
+//: templates build them would mean the same statement in seven places.
+//:
+//: Enumerating it was the bug. Notes' search results and its new-note button
+//: both open the editor and neither was listed, so on a phone the workspace
+//: changed behind an overlay still covering it.
 const PANE_ITEM_SELECTOR = [
+  '[data-pane-dismiss]',
   '.conversation-item',
   '.note-item',
+  '.note-search-hit',
   '.context-card',
   '.artifacts-list tr.clickable',
   '.tool-card',
   '.workflow-card',
 ].join(', ');
 
-const paneIsOverlay = () => window.matchMedia('(max-width: 900px)').matches;
+//: Kept rather than queried fresh each time, because the shell has to listen
+//: to this and not only ask it. The stylesheet turns the pane into an overlay
+//: at the same width.
+const paneQuery = window.matchMedia('(max-width: 900px)');
+const paneIsOverlay = () => paneQuery.matches;
 
 // =============================================================================
 // API helpers
@@ -506,6 +523,20 @@ const initPaneToggle = () => {
     recall(RAIL_HIDDEN_KEY) === '1',
     { remembered: false },
   );
+
+  // The default is a function of the width, so it has to be reapplied when
+  // the width crosses. Deciding it once at load meant narrowing a desktop
+  // window turned the open pane into an overlay sitting on top of the
+  // workspace, and widening a narrow one left the conversation list hidden
+  // on a screen with room for it.
+  //
+  // Only where there is no stored choice. Crossing the breakpoint changes
+  // what the default should be; it does not change what the reader asked
+  // for, and `remembered: false` keeps this from becoming a choice either.
+  paneQuery.addEventListener('change', (event) => {
+    if (recall(PANE_HIDDEN_KEY) !== null) return;
+    setPaneHidden(event.matches, { remembered: false });
+  });
 
   paneToggle?.addEventListener('click', () => {
     setPaneHidden(!appShell?.classList.contains('pane-hidden'));
