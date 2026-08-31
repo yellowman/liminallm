@@ -332,10 +332,6 @@ body {
   max-width: 100%;
 }
 
-.pane-body .table-wrapper {
-  overflow-x: auto;
-}
-
 .pane-body .notes-side-head input[type="search"],
 .pane-body .field,
 .pane-body select,
@@ -1997,15 +1993,24 @@ button.minor:hover {
 /* Card lists (contexts, tools, workflows) */
 .contexts-list,
 .tools-list,
-.workflows-list {
+.workflows-list,
+.artifacts-list {
   display: grid;
   gap: 8px;
 }
 
+/* `min-width: 0` because these are grid items, and a grid item defaults to
+   `min-width: auto` - it refuses to shrink below its own min-content width.
+   A monospace name like `code.python_v1` set that floor above the 219px the
+   pane's list track actually has, so every card sat 15px wider than the list
+   holding it and 5px outside the pane. The container was the right width the
+   whole time; the items were not obliged to respect it. */
 .context-card,
 .tool-card,
-.workflow-card {
-  padding: 12px 14px;
+.workflow-card,
+.artifact-card {
+  min-width: 0;
+  padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   cursor: pointer;
@@ -2014,19 +2019,22 @@ button.minor:hover {
 
 .context-card:hover,
 .tool-card:hover,
-.workflow-card:hover {
+.workflow-card:hover,
+.artifact-card:hover {
   border-color: var(--border-strong);
   background: var(--panel-muted);
 }
 
 .context-card.selected,
 .tool-card.selected,
-.workflow-card.selected {
+.workflow-card.selected,
+.artifact-card.selected {
   border-color: var(--accent);
   background: var(--accent-light);
 }
 
-.context-card .name {
+.context-card .name,
+.artifact-card .name {
   font-weight: 600;
   margin-bottom: 2px;
 }
@@ -2037,17 +2045,64 @@ button.minor:hover {
   margin-bottom: 6px;
 }
 
-.context-card .stats {
+/* Wraps between stats, never inside one. In a 240px pane a nowrap row of
+   two label-and-value pairs broke wherever it ran out of room, so a card
+   read "ID:" / "0c3beee3..." / "Created:" / "8/30/2026" down four lines
+   with the labels orphaned from their values. */
+.context-card .stats,
+.artifact-card .stats {
   display: flex;
-  gap: 16px;
+  flex-wrap: wrap;
+  gap: 2px 14px;
   font-size: 12px;
   color: var(--text-muted);
 }
 
-.context-card .stat {
+.context-card .stat,
+.artifact-card .stat {
   display: flex;
   align-items: center;
   gap: 4px;
+  white-space: nowrap;
+}
+
+/* Type and visibility, under the name rather than beside it: at this width
+   a badge next to a name is a badge instead of a name. */
+.artifact-card .badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 4px 0 6px;
+}
+
+/* Names run long - a workflow id, or an artifact falling back to its uuid -
+   and the pane is narrow enough that one long token would push the card
+   wider than its column. */
+.artifact-card .name {
+  overflow-wrap: anywhere;
+}
+
+/* The pane reads a step quieter than the workspace beside it: it is
+   secondary navigation, and it has 219px to say a name in. One step down is
+   a few more characters before the ellipsis on every row, which is the whole
+   point of the column. Meta stays at 11px, matching the conversation list.
+
+   `overflow-wrap` on the names for the same reason as `min-width: 0` above:
+   a dotted tool id or a uuid is one unbreakable word, and an unbreakable
+   word sets a min-content floor no narrow column can meet. */
+.context-pane .tool-name,
+.context-pane .workflow-name,
+.context-pane .context-card .name,
+.context-pane .artifact-card .name {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.context-pane .tool-description,
+.context-pane .workflow-description,
+.context-pane .context-card .description {
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 /* Detail blocks (contexts, tools, workflows, patches) */
@@ -2996,11 +3051,12 @@ button.minor:hover {
   flex: 1;
 }
 
+/* Title on its own line, date under it - the conversation list's shape.
+   Side by side, the date held a full slot at every width while the title
+   took what was left, so in a 240px pane three notes all dated 8/30/2026
+   read "Fear and Loathi...", "The reporter is ...", "Gonzo starts at...":
+   the identifying field truncated to pay for one that never varies. */
 .note-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 8px;
   padding: 8px 10px;
   border-radius: var(--radius-sm);
   cursor: pointer;
@@ -3011,25 +3067,37 @@ button.minor:hover {
 .note-item.contradicted .note-item-title { color: var(--danger); }
 
 .note-item-title {
+  display: block;
   font-weight: 500;
+  font-size: 13px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .note-item-date {
+  display: block;
   font-size: 11px;
   color: var(--text-muted);
-  flex-shrink: 0;
 }
 
+/* Wraps rather than fights for one line. The count and the two buttons were
+   a row that could not fit in 240px, so "3 notes" broke across two lines
+   and the buttons stacked beside it with the gap between them. */
 .notes-side-foot {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
+  gap: 6px;
   padding: 8px 12px;
   border-top: 1px solid var(--border);
   font-size: 12px;
+}
+
+/* "3 notes" is two words and one fact; breaking it in half is neither. */
+#note-count {
+  white-space: nowrap;
 }
 
 .notes-main {

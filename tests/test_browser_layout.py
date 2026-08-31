@@ -1185,3 +1185,92 @@ class TestTheDefaultFollowsTheWidthWhileItIsStillTheDefault:
             assert self._stored(page) == "1"
         finally:
             context.close()
+
+
+class TestAPaneListFitsItsPane:
+    """Nothing in a 240px column may be wider than 240px.
+
+    The lists were written for a full-width panel and moved into the pane
+    without being re-laid out. The overflow was then contained rather than
+    removed - `overflow-x: auto` on the wrapper - which keeps the column the
+    right width and lets the content scroll out of sight inside it. The
+    artifacts list was a five-column table, so what scrolled away was the
+    name: the pane showed VERSION and UPDATED, and the field you pick a row
+    by was off the left edge.
+
+    Measuring the pane proves nothing, because the pane was always 240px.
+    These measure the content against it.
+    """
+
+    #: Panes whose list is populated by the fixtures a fresh account has.
+    #: Chat and Notes start empty for a new signup, so their emptiness is not
+    #: evidence either way; Tools ships a built-in catalogue.
+    POPULATED = ["tools-tab"]
+
+    def _overflow(self, page):
+        """How far the widest thing in the pane sticks out past it."""
+        return page.evaluate(
+            """() => {
+              const pane = document.querySelector('.context-pane');
+              if (!pane) return null;
+              const limit = pane.getBoundingClientRect().width;
+              let worst = 0, culprit = '';
+              for (const el of pane.querySelectorAll('*')) {
+                if (!el.getClientRects().length) continue;
+                const over = el.scrollWidth - limit;
+                if (over > worst) {
+                  worst = over;
+                  culprit = el.className || el.tagName;
+                }
+              }
+              return {over: Math.round(worst), culprit, limit: Math.round(limit)};
+            }"""
+        )
+
+    @pytest.mark.parametrize("tab", WITH_PANE)
+    def test_nothing_in_the_pane_is_wider_than_the_pane(
+        self, browser, server, tab
+    ):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click(f'.rail-btn[data-tab="{tab}"]')
+            page.wait_for_timeout(600)
+            result = self._overflow(page)
+            assert result is not None, "the pane is missing"
+            assert result["over"] <= 1, (
+                f"{tab}: `{result['culprit']}` is {result['over']}px wider "
+                f"than the {result['limit']}px pane, so part of it can only "
+                f"be reached by scrolling sideways"
+            )
+        finally:
+            context.close()
+
+    @pytest.mark.parametrize("tab", POPULATED)
+    def test_a_row_leads_with_its_name(self, browser, server, tab):
+        """The other half. A list that fits but shows the wrong field first
+        would pass the test above and still be useless.
+        """
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click(f'.rail-btn[data-tab="{tab}"]')
+            page.wait_for_selector(".tool-card", timeout=15000)
+            leads = page.evaluate(
+                """() => {
+                  const card = document.querySelector('.tool-card');
+                  const pane = document.querySelector('.context-pane');
+                  const name = card.querySelector('.tool-name');
+                  const p = pane.getBoundingClientRect();
+                  const n = name.getBoundingClientRect();
+                  return {
+                    visible: n.left >= p.left - 1 && n.right <= p.right + 1,
+                    text: name.textContent.trim(),
+                  };
+                }"""
+            )
+            assert leads["visible"], (
+                f"{tab}: the name is outside the pane's own box, so the row "
+                f"cannot be identified without scrolling"
+            )
+            assert leads["text"], "the row has no name to lead with"
+        finally:
+            context.close()
