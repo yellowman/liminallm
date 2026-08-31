@@ -69,7 +69,8 @@ from liminallm.service.node_attempt import (
     NodeOutcome,
     bounded,
 )
-from liminallm.service.rag import RAGService
+from liminallm.service.provenance import SourceRegistry
+from liminallm.service.rag import RAGService, register_retrieved_chunks
 from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import (
     DEFAULT_SANDBOX_CONFIG,
@@ -478,6 +479,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         workflow_start_time: float,
@@ -539,6 +541,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     adapters=adapters,
                     history=history,
                     vars_scope=local_vars,
+                    # Deep-copied vars, shared registry: a child's variables
+                    # are its own, but a source it retrieves is the turn's.
+                    source_registry=source_registry,
                     user_id=user_id,
                     tenant_id=tenant_id,
                     # The workflow's namespace, not the runner's - this is a
@@ -697,6 +702,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         workflow_trace: List[Dict[str, Any]] = []
         max_trace_entries = 500
         context_snippets: List[str] = []
+        # The turn's provenance, created once here and passed by reference to
+        # every node that can retrieve. Not in `vars_scope`, which a parallel
+        # child deep-copies, and not on an `Invocation`, which is one tool
+        # call rather than the turn: either would give a turn several
+        # registries and several `src_1`s meaning different documents.
+        source_registry = SourceRegistry()
         context_seen = set()
         content = ""
         usage: Dict[str, Any] = {}
@@ -764,6 +775,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
+                source_registry=source_registry,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 tool_scope=tool_scope,
@@ -805,6 +817,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         adapters=adapters,
                         history=history,
                         vars_scope=vars_scope,
+                        source_registry=source_registry,
                         user_id=user_id,
                         tenant_id=tenant_id,
                         workflow_start_time=workflow_start_time,
@@ -997,6 +1010,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
@@ -1082,6 +1096,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
+                source_registry=source_registry,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 tool_scope=tool_scope,
@@ -1166,6 +1181,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         tool_scope: ToolResolutionScope,
@@ -1185,6 +1201,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
+                source_registry=source_registry,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 tool_scope=tool_scope,
@@ -2268,6 +2285,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 context_id=context_id,
                 conversation_id=conversation_id,
                 user_message=user_message or inputs.get("message") or "",
+                # Its own, as it owns its own invocation: a direct call has
+                # no workflow turn around it to share one with.
+                source_registry=SourceRegistry(),
                 user_id=user_id,
                 tenant_id=tenant_id,
                 descriptor=descriptor,
@@ -2450,6 +2470,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
@@ -2509,6 +2530,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 context_id,
                 conversation_id,
                 user_message,
+                source_registry=source_registry,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 tool_scope=tool_scope,
@@ -2558,6 +2580,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         conversation_id: Optional[str],
         user_message: str,
         *,
+        source_registry: Optional[SourceRegistry] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         tool_scope: ToolResolutionScope = SYSTEM_SCOPE,
@@ -2615,6 +2638,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             user_message=user_message,
             user_id=user_id,
             tenant_id=tenant_id,
+            source_registry=source_registry,
             tool_spec=tool_spec,
         )
         limits = self._worker_limits(tool_spec)
@@ -2736,6 +2760,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_message: str,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        source_registry: Optional[SourceRegistry] = None,
         tool_spec: Optional[dict] = None,
     ) -> Tuple[str, Dict[str, Any], InvocationContext, str]:
         """Everything the worker gets, and everything it does not.
@@ -2753,6 +2778,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
             adapters=list(adapters or []),
             history=list(history or []),
             user_message=user_message,
+            # By reference: one turn, one registry, whichever node retrieves.
+            source_registry=source_registry,
         )
         plan: Dict[str, Any] = {"inputs": dict(inputs or {}), "message": user_message}
         worker_tool = self._resolve_worker_tool(tool_name, tool_spec)
@@ -2765,7 +2792,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
         message = inputs.get("message") or user_message or ""
         attachments = self._conversation_attachments(conversation_id, user_id)
         explicit_ids, grounding = self._explicit_context_grounding(
-            message, context_id, user_id=user_id, tenant_id=tenant_id
+            message,
+            context_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            source_registry=source_registry,
         )
         messages, tools, preamble, mcp_tools, grounded = self._build_agent_context(
             message,
@@ -2961,6 +2992,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             context.user_message,
             context.user_id,
             context.tenant_id,
+            source_registry=context.source_registry,
         )
 
     def _builtin_tool_handlers(
@@ -3036,6 +3068,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        source_registry: Optional[SourceRegistry] = None,
     ) -> Tuple[List[str], List[str]]:
         """What a named knowledge context contributes to an agent turn.
 
@@ -3059,6 +3092,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         chunks = self.rag.retrieve(
             allowed, message, user_id=user_id, tenant_id=tenant_id
         )
+        if source_registry is not None:
+            register_retrieved_chunks(source_registry, chunks)
         return list(allowed), [chunk.content for chunk in chunks]
 
     def _run_file_search(
@@ -3654,6 +3689,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_message: str,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        *,
+        source_registry: Optional[SourceRegistry] = None,
     ) -> Dict[str, Any]:
         message = (
             inputs.get("message") or inputs.get("prompt") or inputs.get("text") or ""
@@ -3674,6 +3711,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         ctx_chunks = self.rag.retrieve(
             allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
         )
+        if source_registry is not None:
+            register_retrieved_chunks(source_registry, ctx_chunks)
         context_snippets = [c.content for c in ctx_chunks]
         # The digest of turns older than the window rides in front of the
         # retrieved context, so it survives pruning longest.
@@ -3754,6 +3793,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_message: str,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        *,
+        source_registry: Optional[SourceRegistry] = None,
     ) -> Dict[str, Any]:
         question = inputs.get("question") or inputs.get("message") or ""
         ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
@@ -3764,6 +3805,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         chunks = self.rag.retrieve(
             allowed_ctx_ids, question, user_id=user_id, tenant_id=tenant_id
         )
+        if source_registry is not None:
+            register_retrieved_chunks(source_registry, chunks)
         snippets = [c.content for c in chunks]
         try:
             resp = self.llm.generate(
@@ -3797,6 +3840,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_message: str,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        *,
+        source_registry: Optional[SourceRegistry] = None,
     ) -> Dict[str, Any]:
         message = inputs.get("message") or user_message or ""
         lowered = message.lower()
@@ -3815,6 +3860,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_message: str,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        *,
+        source_registry: Optional[SourceRegistry] = None,
     ) -> Dict[str, Any]:
         prompt = inputs.get("message") or inputs.get("prompt") or ""
         resp = self.llm.generate(
@@ -3836,6 +3883,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_message: str,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        *,
+        source_registry: Optional[SourceRegistry] = None,
     ) -> Dict[str, Any]:
         return {"content": inputs.get("message", ""), "usage": {}, "status": "end"}
 

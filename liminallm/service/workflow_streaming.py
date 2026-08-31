@@ -34,6 +34,8 @@ from liminallm.service.node_attempt import (
     StreamedNodeAttempt,
     StreamPump,
 )
+from liminallm.service.provenance import SourceRegistry
+from liminallm.service.rag import register_retrieved_chunks
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
@@ -142,6 +144,10 @@ class WorkflowStreamingMixin:
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
 
         vars_scope: Dict[str, Any] = {}
+        # One per streaming turn, for the reason the blocking path has one:
+        # `vars_scope` is deep-copied per parallel child and an `Invocation`
+        # is one tool call, so neither can hold the turn's identity space.
+        source_registry = SourceRegistry()
         workflow_trace: List[Dict[str, Any]] = []
         context_snippets: List[str] = []
         context_seen = set()
@@ -243,6 +249,7 @@ class WorkflowStreamingMixin:
                         adapters=adapters,
                         history=history,
                         vars_scope=vars_scope,
+                        source_registry=source_registry,
                         user_id=user_id,
                         tenant_id=tenant_id,
                         workflow_start_time=workflow_start_time,
@@ -365,6 +372,7 @@ class WorkflowStreamingMixin:
                     adapters=adapters,
                     history=history,
                     vars_scope=vars_scope,
+                    source_registry=source_registry,
                     user_id=user_id,
                     tenant_id=tenant_id,
                     tool_scope=tool_scope,
@@ -403,6 +411,7 @@ class WorkflowStreamingMixin:
                             adapters=adapters,
                             history=history,
                             vars_scope=vars_scope,
+                            source_registry=source_registry,
                             user_id=user_id,
                             tenant_id=tenant_id,
                             workflow_start_time=workflow_start_time,
@@ -549,6 +558,7 @@ class WorkflowStreamingMixin:
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         workflow_start_time: float,
@@ -630,6 +640,7 @@ class WorkflowStreamingMixin:
                     adapters=adapters,
                     history=history,
                     vars_scope=vars_scope,
+                    source_registry=source_registry,
                     user_id=user_id,
                     tenant_id=tenant_id,
                     tool_scope=tool_scope,
@@ -666,6 +677,7 @@ class WorkflowStreamingMixin:
                     adapters=adapters,
                     history=history,
                     vars_scope=vars_scope,
+                    source_registry=source_registry,
                     user_id=user_id,
                     tenant_id=tenant_id,
                     invocation=invocation,
@@ -712,6 +724,7 @@ class WorkflowStreamingMixin:
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         invocation: Invocation,
@@ -735,6 +748,8 @@ class WorkflowStreamingMixin:
         ctx_chunks = self.rag.retrieve(
             allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
         )
+        if source_registry is not None:
+            register_retrieved_chunks(source_registry, ctx_chunks)
         context_snippets = [c.content for c in ctx_chunks]
         # The digest of turns older than the window rides in front of the
         # retrieved context, so it survives pruning longest.
@@ -872,6 +887,7 @@ class WorkflowStreamingMixin:
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         invocation: Invocation,
@@ -925,6 +941,7 @@ class WorkflowStreamingMixin:
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
+                source_registry=source_registry,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 invocation=invocation,
@@ -982,6 +999,9 @@ class WorkflowStreamingMixin:
                         adapters=list(adapters or []),
                         history=list(history or []),
                         user_message=user_message,
+                        # The turn's registry by reference, so the streamed
+                        # path records into the same one as the rest of it.
+                        source_registry=source_registry,
                         # On the context, never in the plan above: the plan is
                         # what the worker reads, and an entry there carries the
                         # server's URL and its taint class.
@@ -1093,6 +1113,7 @@ class WorkflowStreamingMixin:
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
+                source_registry=source_registry,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 invocation=invocation,

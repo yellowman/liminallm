@@ -30,6 +30,11 @@ from liminallm.service.late import (
     maxsim,
     segment_text,
 )
+from liminallm.service.provenance import (
+    EvidenceLocator,
+    ProvenanceError,
+    SourceRegistry,
+)
 from liminallm.service.ranking import (
     LATE_WEIGHT,
     LEXICAL_WEIGHT,
@@ -73,6 +78,78 @@ def _detokenize(tokens: List[str]) -> str:
             result.append(" ")
         result.append(token)
     return "".join(result)
+
+
+#: What `ingest_text` writes as `fs_path` when it was given no source path.
+#: It names no file, so it is not mapped to one.
+INLINE_PATH = "inline"
+
+
+def register_retrieved_chunks(
+    registry: SourceRegistry,
+    chunks: Sequence[KnowledgeChunk],
+) -> List[Dict[str, str]]:
+    """Record what a context retrieval found, and return the bindings.
+
+    The first producer to speak the provenance vocabulary. Retrieval already
+    happened; this says where the grounding came from, so the turn stops
+    flattening chunks into anonymous text.
+
+    A file is identified by its path, as a `locator`. `origin_id` is a source
+    system's own stable identity, and RAG has none to give: the schema records
+    no generation, so a chunk claims to describe whatever its path holds now.
+    Leaving `origin_id` empty keeps it free for a real generation id later,
+    and costs nothing today - the registry falls back to the canonical locator
+    when there is no origin id, so two retrievals of one file still merge.
+
+    Which context found what is returned rather than stored on the source.
+    One file can be described by several contexts and registration is
+    first-wins, so a `context_id` field would freeze whichever context
+    retrieved it first and read as if the document belonged to that one. The
+    binding is also the only place the second context survives at all: when
+    two contexts reach the same passage of the same file, the evidence dedupe
+    correctly returns one record, and without the binding there would be
+    nothing left to say that two scopes found it.
+    """
+    bindings: List[Dict[str, str]] = []
+    for chunk in chunks:
+        fs_path = _require_str(chunk.fs_path, what="chunk fs_path")
+        if fs_path == INLINE_PATH:
+            # Not a file: `inline` names no document, and mapping every
+            # context's inline text onto one locator would make them one
+            # source. Neutral kind, and an identity scoped to the context
+            # that actually holds the text.
+            source = registry.register_source(
+                kind="unknown",
+                title="inline text",
+                origin_id=f"context:{chunk.context_id}:inline",
+            )
+        else:
+            source = registry.register_source(
+                kind="file",
+                title=Path(fs_path).name,
+                locator=fs_path,
+            )
+        evidence = registry.add_evidence(
+            source.source_id,
+            text=chunk.content,
+            locator=EvidenceLocator(chunk_index=chunk.chunk_index),
+        )
+        bindings.append(
+            {
+                "context_id": chunk.context_id,
+                "source_id": source.source_id,
+                "evidence_id": evidence.evidence_id,
+            }
+        )
+    return bindings
+
+
+def _require_str(value, *, what: str) -> str:
+    """A path the adapter cannot describe is refused, not invented."""
+    if not isinstance(value, str) or not value:
+        raise ProvenanceError(f"{what} must be a non-empty string, got {value!r}")
+    return value
 
 
 def _internal_source(path: Path, allowed_base) -> bool:
