@@ -57,7 +57,7 @@ TABS = [
     ("notes-tab", "03-notes", ".note-item"),
     ("contexts-tab", "04-contexts", ".context-card"),
     ("files-tab", "05-files", None),
-    ("artifacts-tab", "06-artifacts", "tr.clickable"),
+    ("artifacts-tab", "06-artifacts", ".artifact-card"),
     ("tools-tab", "07-tools", ".tool-card"),
     ("insights-tab", "08-insights", None),
     ("settings-tab", "09-settings", None),

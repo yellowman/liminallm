@@ -1185,3 +1185,231 @@ class TestTheDefaultFollowsTheWidthWhileItIsStillTheDefault:
             assert self._stored(page) == "1"
         finally:
             context.close()
+
+
+class TestAPaneListFitsItsPane:
+    """Nothing in a 240px column may be wider than 240px.
+
+    The lists were written for a full-width panel and moved into the pane
+    without being re-laid out. The overflow was then contained rather than
+    removed - `overflow-x: auto` on the wrapper - which keeps the column the
+    right width and lets the content scroll out of sight inside it. The
+    artifacts list was a five-column table, so what scrolled away was the
+    name: the pane showed VERSION and UPDATED, and the field you pick a row
+    by was off the left edge.
+
+    Measuring the pane proves nothing, because the pane was always 240px.
+    These measure the content against it.
+    """
+
+    #: Panes whose list is populated by the fixtures a fresh account has.
+    #: Chat and Notes start empty for a new signup, so their emptiness is not
+    #: evidence either way; Tools ships a built-in catalogue.
+    POPULATED = ["tools-tab"]
+
+    def _overflow(self, page):
+        """How far the widest thing in the pane sticks out past it."""
+        return page.evaluate(
+            """() => {
+              const pane = document.querySelector('.context-pane');
+              if (!pane) return null;
+              const limit = pane.getBoundingClientRect().width;
+              let worst = 0, culprit = '';
+              for (const el of pane.querySelectorAll('*')) {
+                if (!el.getClientRects().length) continue;
+                const over = el.scrollWidth - limit;
+                if (over > worst) {
+                  worst = over;
+                  culprit = el.className || el.tagName;
+                }
+              }
+              return {over: Math.round(worst), culprit, limit: Math.round(limit)};
+            }"""
+        )
+
+    @pytest.mark.parametrize("tab", WITH_PANE)
+    def test_nothing_in_the_pane_is_wider_than_the_pane(
+        self, browser, server, tab
+    ):
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click(f'.rail-btn[data-tab="{tab}"]')
+            page.wait_for_timeout(600)
+            result = self._overflow(page)
+            assert result is not None, "the pane is missing"
+            assert result["over"] <= 1, (
+                f"{tab}: `{result['culprit']}` is {result['over']}px wider "
+                f"than the {result['limit']}px pane, so part of it can only "
+                f"be reached by scrolling sideways"
+            )
+        finally:
+            context.close()
+
+    @pytest.mark.parametrize("tab", POPULATED)
+    def test_a_row_leads_with_its_name(self, browser, server, tab):
+        """The other half. A list that fits but shows the wrong field first
+        would pass the test above and still be useless.
+        """
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click(f'.rail-btn[data-tab="{tab}"]')
+            page.wait_for_selector(".tool-card", timeout=15000)
+            leads = page.evaluate(
+                """() => {
+                  const card = document.querySelector('.tool-card');
+                  const pane = document.querySelector('.context-pane');
+                  const name = card.querySelector('.tool-name');
+                  const p = pane.getBoundingClientRect();
+                  const n = name.getBoundingClientRect();
+                  return {
+                    visible: n.left >= p.left - 1 && n.right <= p.right + 1,
+                    text: name.textContent.trim(),
+                  };
+                }"""
+            )
+            assert leads["visible"], (
+                f"{tab}: the name is outside the pane's own box, so the row "
+                f"cannot be identified without scrolling"
+            )
+            assert leads["text"], "the row has no name to lead with"
+        finally:
+            context.close()
+
+
+class TestTheRailIsOneColumnOfEqualIcons:
+    """Ten controls down a 48px edge, each aligned and each able to say
+    what it is.
+
+    The rail is icons and nothing else, so a reader learns it by hovering.
+    That only works if every control has a label and the icons line up: one
+    icon 8px out of column reads as a different kind of thing.
+    """
+
+    def _admin_page(self, browser, server):
+        """A signed-in admin, because the shield only exists for one."""
+        import httpx
+
+        email = f"rail_{uuid.uuid4().hex[:8]}@example.com"
+        resp = httpx.post(
+            f"{server.base_url}/v1/auth/signup",
+            json={"email": email, "password": PASSWORD},
+            timeout=30,
+        )
+        assert resp.status_code == 201, resp.text
+        token = resp.json()["data"]["access_token"]
+        me = httpx.get(
+            f"{server.base_url}/v1/me",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        user_id = me.json()["data"]["id"]
+
+        from liminallm.service.runtime import get_runtime
+
+        get_runtime().store.update_user_role(user_id, "admin")
+
+        context = browser.new_context(viewport=DESKTOP)
+        page = context.new_page()
+        page.goto(f"{server.base_url}/", wait_until="domcontentloaded")
+        page.fill("#email", email)
+        page.fill("#password", PASSWORD)
+        page.click("#auth-form button[type=submit]")
+        page.wait_for_function(
+            "() => !!sessionStorage.getItem('liminal.accessToken')", timeout=30000
+        )
+        page.wait_for_selector("#admin-link", state="visible", timeout=15000)
+        page.wait_for_timeout(400)
+        return context, page
+
+    def test_every_icon_sits_in_the_same_column(self, browser, server):
+        """The admin link is an anchor among buttons and was the one that
+        drifted: JS set `display: inline-flex` on it, overriding `.rail-btn`'s
+        `grid`, and `place-items: center` does not centre a flex row.
+        """
+        context, page = self._admin_page(browser, server)
+        try:
+            lefts = page.evaluate(
+                """() => [...document.querySelectorAll('#main-tabs .rail-btn')]
+                     .filter(el => el.getBoundingClientRect().width > 0)
+                     .map(el => ({
+                       id: el.id || el.dataset.tab,
+                       x: Math.round(
+                         el.querySelector('svg').getBoundingClientRect().x),
+                     }))"""
+            )
+            assert len(lefts) >= 9, f"expected the full rail, saw {lefts}"
+            columns = sorted({row["x"] for row in lefts})
+            assert len(columns) == 1, (
+                f"the rail's icons sit in {len(columns)} columns at x={columns}: "
+                + ", ".join(f"{r['id']}@{r['x']}" for r in lefts)
+            )
+        finally:
+            context.close()
+
+    def test_every_control_says_what_it_is(self, browser, server):
+        """One label each. Every control carried a `title` as well as its
+        own pill, so the native tooltip repeated the label a beat later.
+        """
+        context, page = self._admin_page(browser, server)
+        try:
+            report = page.evaluate(
+                """() => [...document.querySelectorAll('#main-tabs .rail-btn')]
+                     .map(el => ({
+                       id: el.id || el.dataset.tab,
+                       label: (el.querySelector('.rail-name') || {}).textContent,
+                       title: el.getAttribute('title'),
+                       aria: el.getAttribute('aria-label'),
+                     }))"""
+            )
+            missing = [r["id"] for r in report if not (r["label"] or "").strip()]
+            assert not missing, f"rail controls with no hover label: {missing}"
+
+            doubled = [r["id"] for r in report if r["title"]]
+            assert not doubled, (
+                f"these carry a `title` as well as a pill, so the browser "
+                f"repeats the label in a second tooltip: {doubled}"
+            )
+
+            unnamed = [r["id"] for r in report if not (r["aria"] or "").strip()]
+            assert not unnamed, f"rail controls with no accessible name: {unnamed}"
+        finally:
+            context.close()
+
+    def test_a_label_appears_on_hover_over_the_pane(self, browser, server):
+        """The pill is drawn outside the 48px rail, across whatever is beside
+        it, so it has to win that paint order to be readable at all."""
+        context, page = self._admin_page(browser, server)
+        try:
+            page.click('.rail-btn[data-tab="chat-tab"]')
+            page.wait_for_timeout(300)
+            page.hover('.rail-btn[data-tab="notes-tab"]')
+            page.wait_for_timeout(400)
+            shown = page.evaluate(
+                """() => {
+                  const b = document.querySelector(
+                    '.rail-btn[data-tab="notes-tab"]');
+                  const n = b.querySelector('.rail-name');
+                  const box = n.getBoundingClientRect();
+                  // `pointer-events: none` keeps the pill from swallowing the
+                  // hover, and would also make elementFromPoint skip it, so
+                  // ask about paint order rather than hit testing.
+                  const prev = n.style.pointerEvents;
+                  n.style.pointerEvents = 'auto';
+                  const top = document.elementFromPoint(
+                    box.x + box.width / 2, box.y + box.height / 2);
+                  n.style.pointerEvents = prev;
+                  return {
+                    opacity: getComputedStyle(n).opacity,
+                    onTop: top === n,
+                    text: n.textContent.trim(),
+                  };
+                }"""
+            )
+            assert shown["opacity"] == "1", "the label stayed transparent"
+            assert shown["text"] == "Notes", shown["text"]
+            assert shown["onTop"], (
+                "the label is drawn behind the pane it overlaps, so hovering "
+                "the rail explains nothing"
+            )
+        finally:
+            context.close()

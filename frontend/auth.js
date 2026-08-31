@@ -30,7 +30,11 @@ const showAuthForm = (formName) => {
 const renderAdminNotice = () => {
   const isAdmin = state.role === 'admin';
   if (approvePatches) approvePatches.classList.toggle('hidden', !isAdmin);
-  if (adminLink) adminLink.style.display = isAdmin ? 'inline-flex' : 'none';
+  // A class, so the stylesheet keeps deciding how a rail button lays out.
+  // Setting `display: inline-flex` here overrode `.rail-btn`'s own `grid`,
+  // and `place-items: center` centres nothing in a flex row - the shield sat
+  // 8px left of every other icon, the one item in the rail out of line.
+  if (adminLink) adminLink.classList.toggle('hidden', !isAdmin);
   // Show/hide admin settings section based on role
   renderAdminSettingsSection();
 };

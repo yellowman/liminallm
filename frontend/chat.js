@@ -300,7 +300,7 @@ const PANE_ITEM_SELECTOR = [
   '.note-item',
   '.note-search-hit',
   '.context-card',
-  '.artifacts-list tr.clickable',
+  '.artifact-card',
   '.tool-card',
   '.workflow-card',
 ].join(', ');
@@ -2035,30 +2035,33 @@ const renderArtifactsList = () => {
     return;
   }
 
-  const rows = state.artifacts
+  // A card, not a table row. Five columns need more than the 240px pane has,
+  // so the table scrolled sideways and the name - the only thing you pick a
+  // row by - was the part that went off the edge, while the version and the
+  // date kept their full slots. Same shape as the contexts and tools lists.
+  list.innerHTML = state.artifacts
     .map((a) => {
       const isSelected = a.id === state.selectedArtifact?.id;
+      const type = a.type || 'unknown';
+      const visibility = a.visibility || 'private';
       return `
-        <tr class="clickable ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(a.id)}">
-          <td><span class="type-badge ${a.type || 'unknown'}">${escapeHtml(a.type || 'unknown')}</span></td>
-          <td>${escapeHtml(a.name || a.id)}</td>
-          <td><span class="visibility-badge ${a.visibility || 'private'}">${escapeHtml(a.visibility || 'private')}</span></td>
-          <td>v${a.version || 1}</td>
-          <td>${new Date(a.updated_at).toLocaleDateString()}</td>
-        </tr>
+        <div class="artifact-card ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(a.id)}">
+          <div class="name">${escapeHtml(a.name || a.id)}</div>
+          <div class="badges">
+            <span class="type-badge ${escapeAttr(type)}">${escapeHtml(type)}</span>
+            <span class="visibility-badge ${escapeAttr(visibility)}">${escapeHtml(visibility)}</span>
+          </div>
+          <div class="stats">
+            <span class="stat">v${escapeHtml(String(a.version || 1))}</span>
+            <span class="stat">${escapeHtml(new Date(a.updated_at).toLocaleDateString())}</span>
+          </div>
+        </div>
       `;
     })
     .join('');
 
-  list.innerHTML = `
-    <table class="table">
-      <thead><tr><th>Type</th><th>Name</th><th>Visibility</th><th>Version</th><th>Updated</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
-  `;
-
-  list.querySelectorAll('tr.clickable').forEach((row) => {
-    row.addEventListener('click', () => selectArtifact(row.dataset.id));
+  list.querySelectorAll('.artifact-card').forEach((card) => {
+    card.addEventListener('click', () => selectArtifact(card.dataset.id));
   });
 };
 
