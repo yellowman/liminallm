@@ -584,6 +584,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         merged_usage: Dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         all_snippets: List[str] = []
         all_bindings: List[Dict[str, str]] = []
+        seen_bindings: set = set()
         failed_nodes: List[str] = []
 
         for item in results:
@@ -621,7 +622,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # Grounding, only from a child that succeeded: a failed
                 # child's retrieval is consulted, not supporting.
                 if result.get("status") != "error":
-                    all_bindings.extend(bindings or [])
+                    self._merge_bindings(all_bindings, seen_bindings, bindings)
 
         # Deduplicate snippets
         seen_snippets: set = set()
@@ -728,7 +729,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # succeeded, so a citation cannot rest on evidence from an attempt
         # whose generation failed.
         provenance_bindings: List[Dict[str, str]] = []
-        bindings_seen = set()
         # The turn's provenance, created once here and passed by reference to
         # every node that can retrieve. Not in `vars_scope`, which a parallel
         # child deep-copies, and not on an `Invocation`, which is one tool
@@ -875,6 +875,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     # Update content if parallel nodes produced any
                     if parallel_result.merged_content:
                         content = parallel_result.merged_content
+                        # The block's answer is every successful child's
+                        # answer concatenated, so its grounding is theirs.
+                        provenance_bindings = list(parallel_result.merged_bindings)
 
                     # Merge usage
                     usage = self._merge_usage(usage, parallel_result.merged_usage)
@@ -884,11 +887,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         if snippet not in context_seen and len(context_snippets) < MAX_CONTEXT_SNIPPETS:
                             context_seen.add(snippet)
                             context_snippets.append(snippet)
-                    self._merge_bindings(
-                        provenance_bindings,
-                        bindings_seen,
-                        parallel_result.merged_bindings,
-                    )
+
 
                     # Handle parallel failures
                     if parallel_result.status == "error":
@@ -918,11 +917,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         break
                     context_seen.add(snippet)
                     context_snippets.append(snippet)
-            self._merge_bindings(
-                provenance_bindings, bindings_seen, result.get("provenance_bindings")
-            )
+            # Content is replacement, so eligible provenance is too. A later
+            # node's answer is not supported by an earlier node's sources
+            # merely because that node also succeeded, and a union would let a
+            # citation validator accept a reference to one. A node that
+            # produces no content changes neither.
             if result.get("content"):
                 content = result["content"]
+                provenance_bindings = list(result.get("provenance_bindings") or [])
             node_usage = result.get("usage")
             usage = self._merge_usage(usage, node_usage or {})
 
@@ -2904,11 +2906,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
             explicit_context_ids=explicit_ids,
             grounding=grounding,
         )
-        # Registered from `grounded`, which is the subset that survived
-        # budgeting, and held on the context rather than sent in the plan.
-        # The worker must not be able to say what supported the answer: it
-        # would be naming source authority for text it was handed.
-        context.provenance_bindings = self._record_grounding(
+        # Computed from `grounded`, the subset that survived budgeting, but
+        # held locally until this plan is known to be the answer path.
+        agent_bindings = self._record_grounding(
             source_registry, ctx_chunks, grounded, leading=0
         )
         # On the context, never in the plan: the plan is what the worker reads.
@@ -2916,8 +2916,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
         if not tools or not self.llm.supports_tools:
             # Nothing to offer, or a backend that cannot call tools: answer the
             # ordinary way rather than degrading the reply.
+            #
+            # The agent prompt this abandons grounded nothing. Its retrieval
+            # stays in the registry as consulted, and the fallback body fills
+            # the sink from the prompt it actually builds - which is a
+            # different assembly with its own budget.
             fallback = {"inputs": {**dict(inputs or {}), "message": message}}
             return "llm.generic", fallback, context, preamble
+        # Past the fallback, so this plan is the one that answers. On the
+        # context rather than in the plan: a worker that could name what
+        # supported the answer could name a source it never read.
+        context.provenance_bindings = agent_bindings
         plan.update(
             {
                 "messages": messages,
