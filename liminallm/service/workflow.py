@@ -122,6 +122,15 @@ MAX_RETRIES_HARD_CAP = 3  # SPEC §18.3: hard cap at 3 retries
 # when the kill landed, and each of those carries a timeout of its own.
 ATTEMPT_HANDOVER_SECONDS = 30.0
 
+#: The one key in a tool result the parent owns outright. A tool worker runs
+#: model-chosen control flow over attacker-controlled bytes (SPEC §18); a
+#: worker able to name what supported an answer could name a source it never
+#: read, and once citations are validated against these that is an authority
+#: bypass rather than bookkeeping. `tool_postflight` refuses any tool output
+#: carrying it, and the parent attaches its own afterwards.
+RESERVED_PARENT_FIELD = "provenance_bindings"
+
+
 @dataclass
 class ParallelNodeResult:
     """Result of parallel node execution with merged outputs."""
@@ -2852,6 +2861,24 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 "content": "tool output validation failed",
                 "error": "validation_error",
                 "details": {"errors": output_errors},
+            }
+        # After the schema, so a strict `additionalProperties: false` still
+        # reports it as the extra property it is, and here rather than in the
+        # two callers: one function on both transports is what stops a
+        # blocking rule and a streaming rule drifting apart.
+        #
+        # Refused rather than stripped. A worker that sent this was either
+        # compromised or is speaking a protocol this parent does not have, and
+        # neither is something to continue from quietly. The parent adds its
+        # own afterwards, so nothing legitimate needs the field to survive.
+        if RESERVED_PARENT_FIELD in sanitized:
+            return sanitized, {
+                "status": "error",
+                "content": "tool output contained a reserved field",
+                "error": "validation_error",
+                "details": {
+                    "errors": [f"{RESERVED_PARENT_FIELD} is parent-owned"]
+                },
             }
         return sanitized, None
 

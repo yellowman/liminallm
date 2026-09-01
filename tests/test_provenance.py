@@ -1,9 +1,13 @@
-"""The provenance vocabulary, before anything speaks it.
+"""The provenance vocabulary itself, independent of any producer.
 
-Nothing in the application imports `provenance` yet. These tests are the
-review surface for the shape itself: each one pins an invariant that four
-future producers - web search, web fetch, context retrieval and note search -
-will all depend on, and that would be expensive to change once they do.
+These tests are the review surface for the shape: each one pins an invariant
+that every producer depends on, and that would be expensive to change once
+they do. Context retrieval speaks it today; explicit `file_search`, web
+search, web fetch, notes and MCP have yet to migrate.
+
+Nothing here reaches for a producer. What one of them records through this
+vocabulary is pinned beside that producer instead - see
+`tests/test_provenance_rag.py`.
 """
 
 from __future__ import annotations

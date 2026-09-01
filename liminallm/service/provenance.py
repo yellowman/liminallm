@@ -7,11 +7,14 @@ before the model sees it. Provenance dies at that flattening: the answer can
 say a thing, but nothing downstream can say which retrieved thing supports
 it.
 
-This module is the common vocabulary those producers will share. It holds
-three records and a registry, and deliberately nothing else: no storage, no
-API schema, no retrieval, no prompt text. Nothing in the application imports
-it yet. The shape comes first so that four producers cannot each invent
-their own dialect of it.
+This module is the common vocabulary those producers share. It holds three
+records and a registry, and deliberately nothing else: no storage, no API
+schema, no retrieval, no prompt text.
+
+Automatic knowledge-context grounding is the first adopter. Explicit
+`file_search`, web search, web fetch, notes and MCP still flatten their
+results and have yet to migrate, which is why the shape came first: so those
+producers cannot each invent their own dialect of it.
 
 Two distinctions are built in rather than left to callers.
 
@@ -309,7 +312,15 @@ def _canonical_locator(locator: str) -> str:
 
 
 class SourceRegistry:
-    """The turn's own record of what it retrieved.
+    """The turn's own record of what its answer rests on.
+
+    Not everything retrieval offered. A producer registers what actually
+    reached the model - for the automatic path, the evidence that survived
+    prompt budgeting - because a chunk the pruner dropped never grounded
+    anything. Attempts that reached the grounding stage and then failed do
+    leave their evidence here, so the registry is the turn's *consulted*
+    superset; which of it supports the answer is a relation the producer
+    returns and the caller keeps.
 
     One registry per turn, held by the caller. There is no module-level
     instance and no process-wide default, because a registry is turn-local
