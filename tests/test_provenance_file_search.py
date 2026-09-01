@@ -45,7 +45,7 @@ class TestTheModelIsToldWhichFileAnExcerptCameFrom:
         user_id, ctx_id = _context_with(
             store, {"reports/turbines.md": MANUAL}
         )
-        rendered, _ = agent_tools.run_file_search(
+        rendered, _, _chunks = agent_tools.run_file_search(
             "turbine blade inspection", 3, [ctx_id],
             rag=get_runtime().rag, user_id=user_id, tenant_id=None,
         )
@@ -61,7 +61,7 @@ class TestTheModelIsToldWhichFileAnExcerptCameFrom:
             store,
             {"reports/turbines.md": MANUAL, "reports/logbook.md": LOGBOOK},
         )
-        rendered, snippets = agent_tools.run_file_search(
+        rendered, snippets, _chunks = agent_tools.run_file_search(
             "inspection", 6, [ctx_id],
             rag=get_runtime().rag, user_id=user_id, tenant_id=None,
         )
@@ -84,7 +84,7 @@ class TestTheModelIsToldWhichFileAnExcerptCameFrom:
         names no file, so the header must not pretend it does."""
         user_id, ctx_id = _context_with(store, {})
         get_runtime().rag.ingest_text(ctx_id, MANUAL)
-        rendered, _ = agent_tools.run_file_search(
+        rendered, _, _chunks = agent_tools.run_file_search(
             "turbine blade inspection", 3, [ctx_id],
             rag=get_runtime().rag, user_id=user_id, tenant_id=None,
         )
@@ -116,7 +116,7 @@ class TestTheLabelInventsNothing:
 class TestNothingRetrievedSaysSo:
     def test_an_empty_result_is_still_an_answer(self, store):
         user_id, ctx_id = _context_with(store, {"reports/turbines.md": MANUAL})
-        rendered, snippets = agent_tools.run_file_search(
+        rendered, snippets, _chunks = agent_tools.run_file_search(
             "zzzz nonexistent phrase zzzz", 3, [ctx_id],
             rag=get_runtime().rag, user_id=user_id, tenant_id=None,
         )

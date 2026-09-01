@@ -144,8 +144,12 @@ def run_file_search(
     tenant_id: Optional[str],
     attachment_context_ids: Optional[Set[str]] = None,
     authorized_paths: Optional[Set[str]] = None,
-) -> Tuple[str, List[str]]:
-    """Retrieve excerpts for a model-supplied query. Returns (text, snippets).
+) -> Tuple[str, List[str], List[Any]]:
+    """Retrieve excerpts for a model-supplied query.
+
+    Returns `(text, snippets, chunks)`. The chunks are the ones actually
+    rendered, after scoping - what the caller needs to record where this
+    grounding came from, and narrower than what the retriever offered.
 
     Scoping is the caller's job: `context_ids` must already be the set this
     user is allowed to read.
@@ -157,7 +161,7 @@ def run_file_search(
     record from being a capability in the window before it does.
     """
     if not context_ids:
-        return ("No searchable files are attached to this conversation.", [])
+        return ("No searchable files are attached to this conversation.", [], [])
     allowed = authorized_paths or set()
     chunks = rag.retrieve(
         context_ids,
@@ -183,12 +187,12 @@ def run_file_search(
             or chunk.fs_path in allowed
         ]
     if not chunks:
-        return (f"No excerpts matched '{query}'.", [])
+        return (f"No excerpts matched '{query}'.", [], [])
     rendered, snippets = [], []
     for chunk in chunks:
         rendered.append(f"[{chunk_label(chunk)}]\n{chunk.content}")
         snippets.append(chunk.content)
-    return ("\n\n".join(rendered), snippets)
+    return ("\n\n".join(rendered), snippets, chunks)
 
 
 def run_python(

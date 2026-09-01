@@ -1021,6 +1021,12 @@ class WorkflowStreamingMixin:
         agent_bindings = self._record_grounding(
             source_registry, ctx_chunks, grounded, leading=0
         )
+        # What the worker's own searches record, kept beside the assembly's
+        # rather than in the caller's sink. If this path abandons the
+        # assembly for the plain fallback, streams a partial answer, or fails,
+        # the list dies with it - the evidence stays in the turn's registry as
+        # consulted, and neither half becomes authority.
+        capability_bindings: List[Dict[str, str]] = []
         if not tools or not self.llm.supports_tools:
             # The plain body answers, so it fills the sink from the prompt it
             # builds. `agent_bindings` above are discarded with the assembly
@@ -1094,10 +1100,11 @@ class WorkflowStreamingMixin:
                         user_message=user_message,
                         # The turn's registry by reference, so the streamed
                         # path records into the same one as the rest of it.
-                        # No bindings here: the parent already holds them in
-                        # its own sink, and the worker is never told what
-                        # supported the answer.
+                        # No bindings sent: the worker is never told what
+                        # supported the answer. This is the collector the
+                        # broker writes into when it serves a search.
                         source_registry=source_registry,
+                        provenance_bindings=capability_bindings,
                         # On the context, never in the plan above: the plan is
                         # what the worker reads, and an entry there carries the
                         # server's URL and its taint class.
@@ -1228,10 +1235,15 @@ class WorkflowStreamingMixin:
         # `StreamedNodeAttempt`, then the client's `message_done`. The
         # handler names its result's fields; the attempt must not.
         # The agent assembly produced the answer, so its grounding is what
-        # supported it. A fallback returned above and committed nothing here,
-        # leaving the plain body to record the prompt it actually built.
+        # supported it - the opening prompt's, and whatever its own searches
+        # added. A fallback returned above and committed neither, leaving the
+        # plain body to record the prompt it actually built.
         if bindings_sink is not None:
-            bindings_sink.extend(agent_bindings)
+            successful: List[Dict[str, str]] = []
+            seen: set = set()
+            self._merge_bindings(successful, seen, agent_bindings)
+            self._merge_bindings(successful, seen, capability_bindings)
+            bindings_sink.extend(successful)
         completed = {
             "content": content,
             "usage": usage,

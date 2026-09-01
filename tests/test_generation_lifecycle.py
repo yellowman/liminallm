@@ -2089,7 +2089,7 @@ class TestAChatSearchesOnlyWhatItStillHolds:
         )
 
     def _search(self, runtime, conversation_id, user_id, query):
-        text, _snippets = runtime.workflow._run_file_search(
+        text, _snippets, _chunks = runtime.workflow._run_file_search(
             query,
             8,
             conversation_id=conversation_id,
@@ -2539,7 +2539,7 @@ class TestAnAutoContextIsNotATransferableCapability:
         auto_ctx = self._auto_context(runtime, user_id, first)
         assert "CHAT A ONLY TEXT" in _text(runtime, auto_ctx)
 
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "chat a only text",
             8,
             conversation_id=second,
@@ -2560,7 +2560,7 @@ class TestAnAutoContextIsNotATransferableCapability:
         self._attach_searchable(
             client, headers, conversation_id, "own.md", b"# own\nTHIS CHATS TEXT\n" * 800
         )
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "this chats text",
             8,
             conversation_id=conversation_id,
@@ -2789,7 +2789,7 @@ class TestOneObjectCanHoldTwoInterpretations:
         assert "THE PARAGRAPH INSIDE THE DOCUMENT" in _text(runtime, auto_ctx), (
             "reading the object a second way deleted the first reading"
         )
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "paragraph inside the document",
             8,
             conversation_id=conversation_id,
@@ -2857,7 +2857,7 @@ class TestOneObjectCanHoldTwoInterpretations:
             "replacing one name retired the reading the other name still "
             "authorizes, so a file the chat still holds left the index"
         )
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "the text that both names hold",
             8,
             conversation_id=conversation_id,
@@ -2955,7 +2955,7 @@ class TestAuthorizationReachesCandidateSelection:
             ],
         )
 
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "treaty clause this chat holds and cites",
             1,
             conversation_id=conversation_id,
@@ -3053,7 +3053,7 @@ class TestOneConversationHasOneImplicitContext:
             "rule about them assumes one"
         )
 
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "attached document",
             8,
             conversation_id=conversation_id,
@@ -3294,7 +3294,7 @@ class TestOneConversationHasOneImplicitContext:
                 user_id, f"filler-{index}", "pushes the older one off the page"
             )
 
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "text this chat holds",
             8,
             conversation_id=conversation_id,
@@ -3392,7 +3392,7 @@ class TestAuthorizationIsNeverAPage:
                 user_id, f"newer-{index}", "pushes the target off the page"
             )
 
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "marker older corpus",
             8,
             conversation_id=conversation_id,
@@ -3421,7 +3421,7 @@ class TestAuthorizationIsNeverAPage:
         )
         conversation_id = resp.json()["data"]["id"]
 
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "another accounts corpus",
             8,
             conversation_id=conversation_id,
@@ -3456,7 +3456,7 @@ class TestAuthorizationIsNeverAPage:
         auto_ctx = find_conversation_context_id(
             runtime.store, user_id=user_id, conversation_id=first
         )
-        found, _snippets = runtime.workflow._run_file_search(
+        found, _snippets, _chunks = runtime.workflow._run_file_search(
             "the first chats text",
             8,
             conversation_id=second,

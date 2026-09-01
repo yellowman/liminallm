@@ -3251,8 +3251,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
         context_id: Optional[str],
         user_id: Optional[str],
         tenant_id: Optional[str],
-    ) -> Tuple[str, List[str]]:
-        """Resolve what this user may search, then hand off to the tool."""
+    ) -> Tuple[str, List[str], List[Any]]:
+        """Resolve what this user may search, then hand off to the tool.
+
+        The rendered chunks come back with the text so the caller can record
+        where the grounding came from. Scoping has already happened by then -
+        authorize first, record second.
+        """
         attachment_ctx_ids = self._attachment_context_ids(conversation_id, user_id) or []
         ctx_ids = list(attachment_ctx_ids)
         if context_id:
@@ -3556,6 +3561,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         operation_seq: int = 0,
         step: str = "",
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """Run one model-requested tool and return its text result.
 
@@ -3580,7 +3587,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
             return taint.refusal(session)
         if name == "file_search":
-            result, found = self._run_file_search(
+            result, found, chunks = self._run_file_search(
                 str(args.get("query") or fallback_query),
                 int(args.get("limit") or 4),
                 conversation_id=conversation_id,
@@ -3589,6 +3596,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 tenant_id=tenant_id,
             )
             snippets.extend(found)
+            # Every rendered chunk, because nothing budgets between here and
+            # the next model turn: this text is appended to the agent's
+            # messages as it stands. Scoping already happened inside the
+            # search - authorize first, record second.
+            if source_registry is not None and bindings_sink is not None:
+                bindings_sink.extend(
+                    register_retrieved_chunks(source_registry, chunks)
+                )
             return result
         if name == "run_python":
             return self._run_python_capability(
@@ -3668,6 +3683,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         invocation: Optional[Invocation] = None,
         operation_seq: int = 0,
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
+        source_registry: Optional[SourceRegistry] = None,
+        bindings: Optional[List[Dict[str, str]]] = None,
     ) -> List[str]:
         """Execute one round's tool calls; results always in call order.
 
@@ -3691,7 +3708,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             [name for name, tool in (mcp_tools or {}).items() if tool.is_egress],
         )
 
-        def run_one(index: int, name: str, args: Dict[str, Any], sink: List[str]) -> str:
+        def run_one(
+            index: int,
+            name: str,
+            args: Dict[str, Any],
+            sink: List[str],
+            binding_sink: List[Dict[str, str]],
+        ) -> str:
             with current_invocation(bound), tool_network_guard(
                 self.tool_network_policy
             ):
@@ -3713,6 +3736,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     # position in a matching round is the same call.
                     step=f"call{index}",
                     mcp_tools=mcp_tools,
+                    source_registry=source_registry,
+                    bindings_sink=binding_sink,
                 )
 
         if len(parsed) > 1 and all(
@@ -3721,19 +3746,31 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # Per-call snippet sinks keep context_snippets in call order no
             # matter which pool worker finishes first.
             sinks: List[List[str]] = [[] for _ in parsed]
+            # And per-call binding sinks, for the same reason: the registry is
+            # thread-safe, but which relation was found first is not the order
+            # the calls were made in.
+            binding_sinks: List[List[Dict[str, str]]] = [[] for _ in parsed]
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(4, len(parsed))
             ) as pool:
                 futures = [
-                    pool.submit(run_one, index, name, args, sink)
-                    for index, ((_, name, args), sink) in enumerate(zip(parsed, sinks))
+                    pool.submit(run_one, index, name, args, sink, binding_sink)
+                    for index, ((_, name, args), sink, binding_sink) in enumerate(
+                        zip(parsed, sinks, binding_sinks)
+                    )
                 ]
                 results = [future.result() for future in futures]
             for sink in sinks:
                 snippets.extend(sink)
+            if bindings is not None:
+                seen: set = set()
+                self._merge_bindings(bindings, seen, [
+                    binding for sink in binding_sinks for binding in sink
+                ])
             return results
+        round_bindings = bindings if bindings is not None else []
         return [
-            run_one(index, name, args, snippets)
+            run_one(index, name, args, snippets, round_bindings)
             for index, (_, name, args) in enumerate(parsed)
         ]
 

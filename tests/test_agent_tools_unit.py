@@ -91,7 +91,7 @@ class TestWebToolsDisabled:
 
 class TestFileSearch:
     def test_no_contexts_is_a_message_not_a_crash(self):
-        text, snippets = agent_tools.run_file_search(
+        text, snippets, _chunks = agent_tools.run_file_search(
             "q", 4, [], rag=None, user_id="u", tenant_id=None
         )
         assert "No searchable files" in text
@@ -99,7 +99,7 @@ class TestFileSearch:
 
     def test_no_matches_names_the_query(self):
         rag = SimpleNamespace(retrieve=lambda *a, **k: [])
-        text, snippets = agent_tools.run_file_search(
+        text, snippets, _chunks = agent_tools.run_file_search(
             "widgets", 4, ["ctx"], rag=rag, user_id="u", tenant_id=None
         )
         assert "widgets" in text
@@ -122,7 +122,7 @@ class TestFileSearch:
             chunk_index=0,
         )
         rag = SimpleNamespace(retrieve=lambda *a, **k: [chunk])
-        text, snippets = agent_tools.run_file_search(
+        text, snippets, _chunks = agent_tools.run_file_search(
             "answer", 4, ["ctx"], rag=rag, user_id="u", tenant_id=None
         )
         assert "[report.pdf]" in text
