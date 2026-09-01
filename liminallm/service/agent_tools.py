@@ -27,6 +27,7 @@ from liminallm.service import attachments as attachments_service
 from liminallm.service import compaction, interpreter, web
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.invocation import Invocation, commit_guard
+from liminallm.service.rag import INLINE_PATH
 from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 
 PYTHON_TOOL_TIMEOUT = 12.0
@@ -111,6 +112,28 @@ def run_web_fetch(url: str, *, settings: Any, logger: Any) -> Tuple[str, List[di
     )
 
 
+def chunk_label(chunk: Any) -> str:
+    """What to call this excerpt when showing it to the model.
+
+    `fs_path` is where a chunk's path lives - `ingest_text` writes it from
+    `source_path`, and `_commit_generation` replaces a path's generation by
+    it. Nothing writes `meta["source_path"]`, so reading that key labelled
+    every excerpt `attachment` and made two documents in one answer
+    indistinguishable.
+
+    The `inline` sentinel names no file. Rendering it as one would tell the
+    model a filename that does not exist, which is the same class of
+    invention the provenance layer exists to prevent - one stage earlier, in
+    the text the model actually reads.
+    """
+    path = getattr(chunk, "fs_path", None)
+    if not isinstance(path, str) or not path:
+        return "unknown source"
+    if path == INLINE_PATH:
+        return "inline text"
+    return Path(path).name
+
+
 def run_file_search(
     query: str,
     limit: int,
@@ -163,8 +186,7 @@ def run_file_search(
         return (f"No excerpts matched '{query}'.", [])
     rendered, snippets = [], []
     for chunk in chunks:
-        source = Path((chunk.meta or {}).get("source_path") or "attachment").name
-        rendered.append(f"[{source}]\n{chunk.content}")
+        rendered.append(f"[{chunk_label(chunk)}]\n{chunk.content}")
         snippets.append(chunk.content)
     return ("\n\n".join(rendered), snippets)
 
