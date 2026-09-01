@@ -7,18 +7,25 @@ before the model sees it. Provenance dies at that flattening: the answer can
 say a thing, but nothing downstream can say which retrieved thing supports
 it.
 
-This module is the common vocabulary those producers will share. It holds
-three records and a registry, and deliberately nothing else: no storage, no
-API schema, no retrieval, no prompt text. Nothing in the application imports
-it yet. The shape comes first so that four producers cannot each invent
-their own dialect of it.
+This module is the common vocabulary those producers share. It holds three
+records and a registry, and deliberately nothing else: no storage, no API
+schema, no retrieval, no prompt text.
+
+Automatic knowledge-context grounding is the first adopter. Explicit
+`file_search`, web search, web fetch, notes and MCP still flatten their
+results and have yet to migrate, which is why the shape came first: so those
+producers cannot each invent their own dialect of it.
 
 Two distinctions are built in rather than left to callers.
 
 A knowledge context is not a source. It is a retrieval scope - a corpus you
-search - and the thing worth citing is the file or chunk inside it. So a
-context appears as `metadata["context_id"]` on a `kind="file"` source, never
-as a kind of its own.
+search - and the thing worth citing is the file or chunk inside it, so a
+context is never a kind of its own. Nor does it belong *on* a source: one
+file can be described by several contexts, and registration is first-wins,
+so a `context_id` field would freeze whichever context happened to retrieve
+it first and read as if the document belonged to that one. Which scope found
+what is a relation between a context and a piece of evidence, and producers
+keep it beside the registry rather than inside it.
 
 A note is not a file. Notes carry authorship, chronology and links between
 them, which a chunk of an uploaded document does not, so they keep their own
@@ -35,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
 from typing import Any, Dict, Literal, Mapping, Optional, Tuple
@@ -258,9 +266,10 @@ def _json_safe(value: Any, *, what: str) -> Any:
         encoded = json.dumps(value, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ProvenanceError(f"{what} must be JSON-safe: {exc}") from exc
-    if len(encoded.encode("utf-8")) > MAX_METADATA_BYTES:
+    measured = len(encoded.encode("utf-8"))
+    if measured > MAX_METADATA_BYTES:
         raise ProvenanceError(
-            f"{what} is too large: {len(encoded)} bytes serialised exceeds "
+            f"{what} is too large: {measured} bytes serialised exceeds "
             f"the {MAX_METADATA_BYTES} byte ceiling"
         )
     return json.loads(encoded)
@@ -303,16 +312,35 @@ def _canonical_locator(locator: str) -> str:
 
 
 class SourceRegistry:
-    """The turn's own record of what it retrieved.
+    """The turn's own record of what its answer rests on.
+
+    Not everything retrieval offered. A producer registers what actually
+    reached the model - for the automatic path, the evidence that survived
+    prompt budgeting - because a chunk the pruner dropped never grounded
+    anything. Attempts that reached the grounding stage and then failed do
+    leave their evidence here, so the registry is the turn's *consulted*
+    superset; which of it supports the answer is a relation the producer
+    returns and the caller keeps.
 
     One registry per turn, held by the caller. There is no module-level
     instance and no process-wide default, because a registry is turn-local
     authority: ids mean something only inside the turn that assigned them,
     and a shared one would let a later turn's `src_3` collide with an earlier
     turn's citation.
+
+    One turn is not one thread. A workflow runs child nodes concurrently and
+    each child can retrieve, so registration into the turn's registry is
+    genuinely parallel. Ids are derived from the number of records held, and
+    dedupe is a read followed by a write, so both need the lock: without it
+    two children reading the same count mint the same id and one record
+    overwrites the other, and two children registering the same document
+    both miss the dedupe and register it twice.
     """
 
     def __init__(self) -> None:
+        # Reentrant so a future helper can hold the lock across two of these
+        # calls without deadlocking on itself. Nothing nests today.
+        self._lock = threading.RLock()
         self._sources: Dict[str, Source] = {}
         self._evidence: Dict[str, Evidence] = {}
         #: identity -> source_id, for the dedupe described on `register_source`
@@ -322,15 +350,21 @@ class SourceRegistry:
 
     # -- reading -----------------------------------------------------------
 
+    # Every read that walks a mapping takes the lock. A sibling node
+    # registering mid-iteration would otherwise raise `dictionary changed
+    # size during iteration` in a caller that only wanted to look.
+
     @property
     def sources(self) -> Tuple[Source, ...]:
         """Every source, in the order it was first registered."""
-        return tuple(self._sources.values())
+        with self._lock:
+            return tuple(self._sources.values())
 
     @property
     def evidence(self) -> Tuple[Evidence, ...]:
         """Every piece of evidence, in the order it was first added."""
-        return tuple(self._evidence.values())
+        with self._lock:
+            return tuple(self._evidence.values())
 
     def get_source(self, source_id: str) -> Optional[Source]:
         return self._sources.get(source_id)
@@ -339,7 +373,10 @@ class SourceRegistry:
         return self._evidence.get(evidence_id)
 
     def evidence_for(self, source_id: str) -> Tuple[Evidence, ...]:
-        return tuple(e for e in self._evidence.values() if e.source_id == source_id)
+        with self._lock:
+            return tuple(
+                e for e in self._evidence.values() if e.source_id == source_id
+            )
 
     # -- writing -----------------------------------------------------------
 
@@ -384,36 +421,45 @@ class SourceRegistry:
         elif locator:
             key = f"locator:{_canonical_locator(locator)}"
 
-        if key is not None:
-            existing_id = self._by_identity.get((kind, key))
-            if existing_id is not None:
-                return self._sources[existing_id]
-
-            # The same identity under a second kind is a producer disagreeing
-            # with itself about what a thing is. Merging would pick one
-            # silently; refusing names the two claims that conflict.
-            for (other_kind, other_key), source_id in self._by_identity.items():
-                if other_key == key and other_kind != kind:
-                    raise ProvenanceError(
-                        f"{key} is already registered as {other_kind!r} "
-                        f"({source_id}); it cannot also be {kind!r}"
-                    )
-
         # Frozen, and a copy: the caller keeps no handle on the registry's
         # record, and mutating what they passed in afterwards reaches nothing.
+        # Outside the lock: it touches only the caller's own data, and it is
+        # the widest part of the call to hold a shared lock across.
         checked = _json_safe(_checked_metadata(metadata), what="source metadata")
-        source = Source(
-            source_id=f"src_{len(self._sources) + 1}",
-            kind=kind,
-            title=title,
-            origin_id=origin_id,
-            locator=locator,
-            metadata=_freeze(checked),
-        )
-        self._sources[source.source_id] = source
-        if key is not None:
-            self._by_identity[(kind, key)] = source.source_id
-        return source
+
+        # From the dedupe read to the two writes is one critical section.
+        # Split, two children of one turn retrieving the same document both
+        # miss the dedupe, and two retrieving different ones read the same
+        # count, mint the same id, and lose a record to the overwrite.
+        with self._lock:
+            if key is not None:
+                existing_id = self._by_identity.get((kind, key))
+                if existing_id is not None:
+                    return self._sources[existing_id]
+
+                # The same identity under a second kind is a producer
+                # disagreeing with itself about what a thing is. Merging would
+                # pick one silently; refusing names the two claims that
+                # conflict.
+                for (other_kind, other_key), source_id in self._by_identity.items():
+                    if other_key == key and other_kind != kind:
+                        raise ProvenanceError(
+                            f"{key} is already registered as {other_kind!r} "
+                            f"({source_id}); it cannot also be {kind!r}"
+                        )
+
+            source = Source(
+                source_id=f"src_{len(self._sources) + 1}",
+                kind=kind,
+                title=title,
+                origin_id=origin_id,
+                locator=locator,
+                metadata=_freeze(checked),
+            )
+            self._sources[source.source_id] = source
+            if key is not None:
+                self._by_identity[(kind, key)] = source.source_id
+            return source
 
     def add_evidence(
         self,
@@ -435,9 +481,6 @@ class SourceRegistry:
         # Typed first: an unhashable id fails the membership test itself with
         # a raw `TypeError`, before the check below can report it.
         source_id = _require_text(source_id, what="source_id")
-        if source_id not in self._sources:
-            raise ProvenanceError(f"no such source {source_id!r} in this turn")
-
         text = _require_text(text, what="evidence text")
         # `is None`, not `or`: an empty dict is falsy, and would have been
         # replaced by an empty locator instead of refused as the wrong type.
@@ -446,20 +489,25 @@ class SourceRegistry:
         )
         content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         key = (source_id, json.dumps(asdict(where), sort_keys=True), content_hash)
-        existing_id = self._by_evidence.get(key)
-        if existing_id is not None:
-            return self._evidence[existing_id]
 
-        record = Evidence(
-            evidence_id=f"ev_{len(self._evidence) + 1}",
-            source_id=source_id,
-            text=text,
-            locator=where,
-            content_hash=content_hash,
-        )
-        self._evidence[record.evidence_id] = record
-        self._by_evidence[key] = record.evidence_id
-        return record
+        with self._lock:
+            if source_id not in self._sources:
+                raise ProvenanceError(f"no such source {source_id!r} in this turn")
+
+            existing_id = self._by_evidence.get(key)
+            if existing_id is not None:
+                return self._evidence[existing_id]
+
+            record = Evidence(
+                evidence_id=f"ev_{len(self._evidence) + 1}",
+                source_id=source_id,
+                text=text,
+                locator=where,
+                content_hash=content_hash,
+            )
+            self._evidence[record.evidence_id] = record
+            self._by_evidence[key] = record.evidence_id
+            return record
 
     # -- export ------------------------------------------------------------
 
@@ -468,29 +516,34 @@ class SourceRegistry:
 
         Sources are a mapping so a citation can name one in a few bytes;
         evidence is a list because its order is the order it was found.
+
+        Taken under the lock, so an export is one coherent picture of the
+        turn rather than sources from before a sibling's registration and
+        evidence from after it.
         """
-        return {
-            "sources": {
-                source_id: {
-                    "source_id": source.source_id,
-                    "kind": source.kind,
-                    "title": source.title,
-                    "origin_id": source.origin_id,
-                    "locator": source.locator,
-                    # Built by hand rather than by `asdict`, which would carry
-                    # the frozen mappings straight into the export.
-                    "metadata": _plain(source.metadata),
-                }
-                for source_id, source in self._sources.items()
-            },
-            "evidence": [
-                {
-                    "evidence_id": record.evidence_id,
-                    "source_id": record.source_id,
-                    "text": record.text,
-                    "locator": asdict(record.locator),
-                    "content_hash": record.content_hash,
-                }
-                for record in self._evidence.values()
-            ],
-        }
+        with self._lock:
+            return {
+                "sources": {
+                    source_id: {
+                        "source_id": source.source_id,
+                        "kind": source.kind,
+                        "title": source.title,
+                        "origin_id": source.origin_id,
+                        "locator": source.locator,
+                        # Built by hand rather than by `asdict`, which would
+                        # carry the frozen mappings straight into the export.
+                        "metadata": _plain(source.metadata),
+                    }
+                    for source_id, source in self._sources.items()
+                },
+                "evidence": [
+                    {
+                        "evidence_id": record.evidence_id,
+                        "source_id": record.source_id,
+                        "text": record.text,
+                        "locator": asdict(record.locator),
+                        "content_hash": record.content_hash,
+                    }
+                    for record in self._evidence.values()
+                ],
+            }

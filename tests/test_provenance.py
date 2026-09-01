@@ -1,18 +1,25 @@
-"""The provenance vocabulary, before anything speaks it.
+"""The provenance vocabulary itself, independent of any producer.
 
-Nothing in the application imports `provenance` yet. These tests are the
-review surface for the shape itself: each one pins an invariant that four
-future producers - web search, web fetch, context retrieval and note search -
-will all depend on, and that would be expensive to change once they do.
+These tests are the review surface for the shape: each one pins an invariant
+that every producer depends on, and that would be expensive to change once
+they do. Context retrieval speaks it today; explicit `file_search`, web
+search, web fetch, notes and MCP have yet to migrate.
+
+Nothing here reaches for a producer. What one of them records through this
+vocabulary is pinned beside that producer instead - see
+`tests/test_provenance_rag.py`.
 """
 
 from __future__ import annotations
 
 import json
+import threading
+import time
 from types import MappingProxyType
 
 import pytest
 
+from liminallm.service import provenance
 from liminallm.service.provenance import (
     Evidence,
     EvidenceLocator,
@@ -365,6 +372,27 @@ class TestTheMetadataBagIsActuallyBounded:
                 metadata={"page": "x" * 32_768},
             )
 
+    def test_the_rejected_size_is_reported_in_the_unit_it_was_measured_in(self):
+        """The message must name the number the ceiling actually compared.
+
+        It does today by coincidence rather than by construction: `json.dumps`
+        defaults to `ensure_ascii=True`, so the serialised form is pure ASCII
+        and its character count equals its byte count for every input, CJK and
+        emoji included. Set `ensure_ascii=False` and the two diverge, and a
+        producer sent looking for a payload of the reported size would be
+        looking for one up to four times smaller than the one that breached.
+        This pins the number to the measurement rather than to that default.
+        """
+        r = SourceRegistry()
+        value = "\u4e2d" * 9000
+        with pytest.raises(ProvenanceError) as excinfo:
+            r.register_source(
+                kind="web", title="P", locator="https://ex.test/p",
+                metadata={"note": value},
+            )
+        measured = len(json.dumps({"note": value}).encode("utf-8"))
+        assert f"{measured} bytes serialised" in str(excinfo.value)
+
     def test_ordinary_provenance_metadata_fits_easily(self):
         r = SourceRegistry()
         source = r.register_source(
@@ -523,3 +551,95 @@ class TestTheContainersAreCheckedNotJustTheirContents:
                     locator="https://ex.test/p",
                     metadata={"x": bad},
                 )
+
+
+class TestOneTurnsParallelNodesShareOneRegistry:
+    """A workflow can run child nodes concurrently, and each child can retrieve.
+
+    They share the turn's registry, so registration is genuinely concurrent.
+    The window is between reading the dedupe map and writing the new record:
+    both threads see the same length, both mint the same id, and one record
+    overwrites the other. `_slow` widens that existing window rather than
+    inventing one - it delegates to the real function after yielding.
+    """
+
+    @staticmethod
+    def _widen(monkeypatch, name):
+        real = getattr(provenance, name)
+
+        def slowed(*args, **kwargs):
+            time.sleep(0.01)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(provenance, name, slowed)
+
+    @staticmethod
+    def _run(fn, count=2):
+        barrier = threading.Barrier(count)
+        out = []
+
+        def worker():
+            barrier.wait()
+            out.append(fn())
+
+        threads = [threading.Thread(target=worker) for _ in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return out
+
+    def test_two_nodes_retrieving_different_files_lose_neither(self, monkeypatch):
+        """The sharpest form: a record that was registered and is simply gone,
+        because the other thread minted the same id and overwrote it. The
+        window is between reading the length and writing the dict, which is
+        where the record is built."""
+        self._widen(monkeypatch, "Source")
+        r = SourceRegistry()
+        paths = ["/u/a.md", "/u/b.md"]
+        self._run(
+            lambda: r.register_source(
+                kind="file", title="t", locator=paths.pop()
+            )
+        )
+        assert len(r.sources) == 2
+        assert {s.source_id for s in r.sources} == {"src_1", "src_2"}
+
+    def test_two_nodes_retrieving_the_same_file_get_one_source(self, monkeypatch):
+        self._widen(monkeypatch, "_json_safe")
+        r = SourceRegistry()
+        got = self._run(
+            lambda: r.register_source(
+                kind="file", title="manual", locator="/u/manual.md"
+            )
+        )
+        assert len(r.sources) == 1
+        assert {s.source_id for s in got} == {"src_1"}
+
+    def test_two_nodes_quoting_different_passages_lose_neither(self, monkeypatch):
+        """Evidence mints its id the same way, so it loses records the same
+        way. Two children of one turn quoting two passages must keep both."""
+        self._widen(monkeypatch, "Evidence")
+        r = SourceRegistry()
+        r.register_source(kind="file", title="manual", locator="/u/manual.md")
+        passages = ["first passage", "second passage"]
+        self._run(lambda: r.add_evidence("src_1", text=passages.pop()))
+        assert len(r.evidence) == 2
+        assert {e.evidence_id for e in r.evidence} == {"ev_1", "ev_2"}
+
+    def test_two_nodes_quoting_the_same_passage_get_one_evidence(self, monkeypatch):
+        """Count cannot witness this one: two records minted concurrently
+        both claim `ev_1` and collide into a single dict slot, so the registry
+        looks right while two callers hold different objects. Dedupe means
+        the second caller gets the record the first one stored."""
+        self._widen(monkeypatch, "Evidence")
+        r = SourceRegistry()
+        r.register_source(kind="file", title="manual", locator="/u/manual.md")
+        got = self._run(
+            lambda: r.add_evidence(
+                "src_1", text="same bytes", locator=EvidenceLocator(chunk_index=3)
+            )
+        )
+        assert len(r.evidence) == 1
+        assert {e.evidence_id for e in got} == {"ev_1"}
+        assert got[0] is got[1] is r.get_evidence("ev_1")

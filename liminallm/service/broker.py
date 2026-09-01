@@ -48,6 +48,7 @@ from liminallm.service.invocation import (
     current_invocation,
     payload_hash,
 )
+from liminallm.service.provenance import SourceRegistry
 from liminallm.service.sandbox import tool_network_guard
 from liminallm.service.tool_worker import FrameBudget
 from liminallm.service.wire import WireError, recv_frame, send_frame
@@ -92,6 +93,15 @@ class InvocationContext:
     #: and call it `local_read`. The worker sends a name; the parent decides
     #: what that name means.
     mcp_tools: Dict[str, Any] = field(default_factory=dict)
+    #: The turn's provenance registry, created once in the workflow entry
+    #: point and passed by reference so every node of one turn records into
+    #: the same one. Never crosses the pipe either: ids are turn-local
+    #: authority, and a worker that could mint them could claim a citation
+    #: came from a source it never read.
+    source_registry: Optional[SourceRegistry] = None
+    #: What the parent placed in this invocation's prompt, computed parent-side
+    #: after budgeting. Never sent to the worker and never read back from it.
+    provenance_bindings: List[Dict[str, str]] = field(default_factory=list)
 
 
 class CapabilityBroker:

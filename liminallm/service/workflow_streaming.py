@@ -34,6 +34,7 @@ from liminallm.service.node_attempt import (
     StreamedNodeAttempt,
     StreamPump,
 )
+from liminallm.service.provenance import SourceRegistry
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
@@ -142,6 +143,13 @@ class WorkflowStreamingMixin:
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
 
         vars_scope: Dict[str, Any] = {}
+        # One per streaming turn, for the reason the blocking path has one:
+        # `vars_scope` is deep-copied per parallel child and an `Invocation`
+        # is one tool call, so neither can hold the turn's identity space.
+        source_registry = SourceRegistry()
+        # What may support the answer: the registry is the turn's consulted
+        # superset, these are the bindings of nodes that actually completed.
+        provenance_bindings: List[Dict[str, str]] = []
         workflow_trace: List[Dict[str, Any]] = []
         context_snippets: List[str] = []
         context_seen = set()
@@ -231,6 +239,10 @@ class WorkflowStreamingMixin:
                 # because it is also the retry boundary.
                 emitted_tokens = False
                 cancelled = False
+                # One sink per node, folded into the turn only when the node
+                # reaches `message_done`. A node that failed mid-answer
+                # consulted its sources; it did not ground anything.
+                node_sink: List[Dict[str, str]] = []
 
                 async with aclosing(
                     self._stream_node_with_retry(
@@ -243,6 +255,8 @@ class WorkflowStreamingMixin:
                         adapters=adapters,
                         history=history,
                         vars_scope=vars_scope,
+                        source_registry=source_registry,
+                        bindings_sink=node_sink,
                         user_id=user_id,
                         tenant_id=tenant_id,
                         workflow_start_time=workflow_start_time,
@@ -268,7 +282,15 @@ class WorkflowStreamingMixin:
                             # Update state from completed message
                             saw_done = True
                             data = event.get("data", {})
-                            content = data.get("content", "")
+                            # Replacement, as the content is - and only for
+                            # a node that actually produced one. An empty
+                            # completed answer changes neither, which is what
+                            # the blocking driver does and what keeps the
+                            # server-authored "No response generated." below
+                            # from inheriting the model's grounding.
+                            if data.get("content"):
+                                content = data["content"]
+                                provenance_bindings = list(node_sink)
                             node_usage = data.get("usage", {})
                             usage = self._merge_usage(usage, node_usage)
                             for snippet in data.get("context_snippets") or []:
@@ -349,6 +371,12 @@ class WorkflowStreamingMixin:
                         context_snippets.append(snippet)
                     if result.get("content"):
                         content = result["content"]
+                        # A blocking-bodied attempt carries its bindings in
+                        # its result rather than through the sink, and this
+                        # branch used to copy everything but them.
+                        provenance_bindings = list(
+                            result.get("provenance_bindings") or []
+                        )
                     usage = self._merge_usage(usage, result.get("usage") or {})
                     pending.extend(node_outcome.next_nodes)
                     continue
@@ -365,6 +393,7 @@ class WorkflowStreamingMixin:
                     adapters=adapters,
                     history=history,
                     vars_scope=vars_scope,
+                    source_registry=source_registry,
                     user_id=user_id,
                     tenant_id=tenant_id,
                     tool_scope=tool_scope,
@@ -403,6 +432,7 @@ class WorkflowStreamingMixin:
                             adapters=adapters,
                             history=history,
                             vars_scope=vars_scope,
+                            source_registry=source_registry,
                             user_id=user_id,
                             tenant_id=tenant_id,
                             workflow_start_time=workflow_start_time,
@@ -432,6 +462,13 @@ class WorkflowStreamingMixin:
                         vars_scope.update(parallel_result.merged_outputs)
                         if parallel_result.merged_content:
                             content = parallel_result.merged_content
+                            # The block's answer is its successful children's
+                            # answers concatenated, so its grounding is
+                            # theirs - the same ownership rule the blocking
+                            # driver applies.
+                            provenance_bindings = list(
+                                parallel_result.merged_bindings
+                            )
                         usage = self._merge_usage(usage, parallel_result.merged_usage)
                         for snippet in parallel_result.merged_snippets:
                             if snippet not in context_seen and len(context_snippets) < MAX_CONTEXT_SNIPPETS:
@@ -517,6 +554,7 @@ class WorkflowStreamingMixin:
                 "adapters": adapters,
                 "adapter_gates": adapter_gates,
                 "context_snippets": context_snippets,
+                "provenance_bindings": provenance_bindings,
                 "workflow_trace": workflow_trace,
                 "routing_trace": routing_trace,
                 "vars": vars_scope,
@@ -549,6 +587,8 @@ class WorkflowStreamingMixin:
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         workflow_start_time: float,
@@ -630,6 +670,9 @@ class WorkflowStreamingMixin:
                     adapters=adapters,
                     history=history,
                     vars_scope=vars_scope,
+                    # No sink: the blocking fallback reaches the host tools
+                    # through an `InvocationContext`, which carries its own.
+                    source_registry=source_registry,
                     user_id=user_id,
                     tenant_id=tenant_id,
                     tool_scope=tool_scope,
@@ -647,10 +690,49 @@ class WorkflowStreamingMixin:
             # finished answer passes.
             output_schema = (fresh.schema or {}).get("output_schema")
 
+            # Per attempt, not per node. A retry re-retrieves, and its body
+            # records grounding before the provider stream begins, so a list
+            # shared across attempts would let an attempt that failed before
+            # producing an answer contribute to the one that succeeded.
+            attempt_bindings: List[Dict[str, str]] = []
+
             def finalize(result: Dict[str, Any]):
-                return self.tool_postflight(
+
+                sanitized, refusal = self.tool_postflight(
                     result, fresh.schema, tool_name=tool_name
                 )
+                # Both halves of "this attempt answered": its output
+                # validated, and the tool did not report failure. Only the
+                # first is a refusal; the second passes postflight cleanly.
+                #
+                # Neither half is witnessed here, and both stay. A streamed
+                # body reports failure by raising or by yielding no result at
+                # all - every `tool_result` it emits carries content, usage
+                # and snippets and no `status` key - and an output-schema
+                # refusal is terminal for the node, measured: it emits no
+                # retry. So on this transport the predicate is inert today,
+                # and it is the same rule the blocking producer enforces
+                # where both halves are reachable. Keeping them symmetric is
+                # what stops the two transports answering differently the
+                # first time a streamed body does report failure in band.
+                if (
+                    refusal is None
+                    and sanitized.get("status") != "error"
+                    and bindings_sink is not None
+                ):
+                    # The success boundary: postflight passed, so this
+                    # attempt's prompt is the one that produced the answer.
+                    # A failed attempt leaves its retrieval in the registry as
+                    # consulted and binds nothing.
+                    #
+                    # No mutation kills the `refusal is None` half, and it
+                    # stays anyway: an output-schema refusal is terminal for
+                    # the node today - measured, it emits no retry - so a
+                    # refused attempt's bindings never reach a result either
+                    # way. This is what makes the commit point the success
+                    # boundary rather than merely the finalize boundary.
+                    bindings_sink.extend(attempt_bindings)
+                return sanitized, refusal
 
             body = (
                 self._stream_agent_files_node
@@ -666,6 +748,8 @@ class WorkflowStreamingMixin:
                     adapters=adapters,
                     history=history,
                     vars_scope=vars_scope,
+                    source_registry=source_registry,
+                    bindings_sink=attempt_bindings,
                     user_id=user_id,
                     tenant_id=tenant_id,
                     invocation=invocation,
@@ -712,6 +796,8 @@ class WorkflowStreamingMixin:
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         invocation: Invocation,
@@ -738,16 +824,26 @@ class WorkflowStreamingMixin:
         context_snippets = [c.content for c in ctx_chunks]
         # The digest of turns older than the window rides in front of the
         # retrieved context, so it survives pruning longest.
+        leading = 0
         digest = self._digest_snippet(conversation_id)
         if digest:
             context_snippets.insert(0, digest)
+            leading += 1
         # Assembled window: relevance-recalled turns ride behind the digest;
         # both are snippets, so the pruner drops them before the verbatim tail.
         recall = self._recall_snippet(conversation_id, user_id, message or "", history)
         if recall:
             context_snippets.insert(1 if digest else 0, recall)
+            leading += 1
         context_snippets, history = self._apply_prompt_budget(
             message or "", context_snippets, history
+        )
+        # After the budget, as on the blocking path: a chunk the pruner
+        # dropped never reached the model. Held until the stream completes -
+        # a node that fails mid-answer grounded nothing.
+        self._record_grounding(
+            source_registry, ctx_chunks, context_snippets,
+            leading=leading, sink=bindings_sink,
         )
 
         # `generate_stream` is a synchronous iterator, and iterating it here
@@ -872,6 +968,8 @@ class WorkflowStreamingMixin:
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         invocation: Invocation,
@@ -891,7 +989,7 @@ class WorkflowStreamingMixin:
         # Retrieval for an explicitly selected knowledge context. Off the loop
         # for the plainer of the two reasons below: it is a database round
         # trip.
-        explicit_ids, grounding = await asyncio.to_thread(
+        explicit_ids, grounding, ctx_chunks = await asyncio.to_thread(
             self._explicit_context_grounding,
             message, context_id, user_id=user_id, tenant_id=tenant_id,
         )
@@ -916,7 +1014,17 @@ class WorkflowStreamingMixin:
             ),
             message, attachments, history, user_id, conversation_id,
         )
+        # Computed from `grounded` - the subset that survived budgeting - but
+        # held locally until this assembly is known to be the answer path.
+        # Committed to the sink below, and never sent in the plan: the worker
+        # must not be able to name what supported the answer.
+        agent_bindings = self._record_grounding(
+            source_registry, ctx_chunks, grounded, leading=0
+        )
         if not tools or not self.llm.supports_tools:
+            # The plain body answers, so it fills the sink from the prompt it
+            # builds. `agent_bindings` above are discarded with the assembly
+            # they described: that prompt never ran.
             async for event in self._stream_llm_node(
                 node,
                 user_message=user_message,
@@ -925,6 +1033,8 @@ class WorkflowStreamingMixin:
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
+                source_registry=source_registry,
+                bindings_sink=bindings_sink,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 invocation=invocation,
@@ -982,6 +1092,12 @@ class WorkflowStreamingMixin:
                         adapters=list(adapters or []),
                         history=list(history or []),
                         user_message=user_message,
+                        # The turn's registry by reference, so the streamed
+                        # path records into the same one as the rest of it.
+                        # No bindings here: the parent already holds them in
+                        # its own sink, and the worker is never told what
+                        # supported the answer.
+                        source_registry=source_registry,
                         # On the context, never in the plan above: the plan is
                         # what the worker reads, and an entry there carries the
                         # server's URL and its taint class.
@@ -1093,6 +1209,7 @@ class WorkflowStreamingMixin:
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
+                source_registry=source_registry,
                 user_id=user_id,
                 tenant_id=tenant_id,
                 invocation=invocation,
@@ -1110,6 +1227,11 @@ class WorkflowStreamingMixin:
         # agent loop returns on the blocking path - as its own event for
         # `StreamedNodeAttempt`, then the client's `message_done`. The
         # handler names its result's fields; the attempt must not.
+        # The agent assembly produced the answer, so its grounding is what
+        # supported it. A fallback returned above and committed nothing here,
+        # leaving the plain body to record the prompt it actually built.
+        if bindings_sink is not None:
+            bindings_sink.extend(agent_bindings)
         completed = {
             "content": content,
             "usage": usage,

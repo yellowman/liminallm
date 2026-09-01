@@ -30,6 +30,11 @@ from liminallm.service.late import (
     maxsim,
     segment_text,
 )
+from liminallm.service.provenance import (
+    EvidenceLocator,
+    ProvenanceError,
+    SourceRegistry,
+)
 from liminallm.service.ranking import (
     LATE_WEIGHT,
     LEXICAL_WEIGHT,
@@ -73,6 +78,121 @@ def _detokenize(tokens: List[str]) -> str:
             result.append(" ")
         result.append(token)
     return "".join(result)
+
+
+#: What `ingest_text` writes as `fs_path` when it was given no source path.
+#: It names no file, so it is not mapped to one.
+INLINE_PATH = "inline"
+
+
+def register_retrieved_chunks(
+    registry: SourceRegistry,
+    chunks: Sequence[KnowledgeChunk],
+) -> List[Dict[str, str]]:
+    """Record what a context retrieval found, and return the bindings.
+
+    The first producer to speak the provenance vocabulary. Retrieval already
+    happened; this says where the grounding came from, so the turn stops
+    flattening chunks into anonymous text.
+
+    A file is identified by its path, as a `locator`. `origin_id` is a source
+    system's own stable identity, and RAG has none to give: the schema records
+    no generation, so a chunk claims to describe whatever its path holds now.
+    Leaving `origin_id` empty keeps it free for a real generation id later,
+    and costs nothing today - the registry falls back to the canonical locator
+    when there is no origin id, so two retrievals of one file still merge.
+
+    Which context found what is returned rather than stored on the source.
+    One file can be described by several contexts and registration is
+    first-wins, so a `context_id` field would freeze whichever context
+    retrieved it first and read as if the document belonged to that one. The
+    binding is also the only place the second context survives at all: when
+    two contexts reach the same passage of the same file, the evidence dedupe
+    correctly returns one record, and without the binding there would be
+    nothing left to say that two scopes found it.
+    """
+    bindings: List[Dict[str, str]] = []
+    for chunk in chunks:
+        fs_path = _require_str(chunk.fs_path, what="chunk fs_path")
+        if fs_path == INLINE_PATH:
+            # Not a file: `inline` names no document. Two anonymous ingests
+            # into one context are unrelated documents that both land under
+            # this sentinel - `_commit_generation` adds inline text rather
+            # than replacing a path's generation, so nothing collapses them -
+            # and a context-scoped identity would merge them, which is the
+            # context being the source again by another name.
+            #
+            # The row id is the only real identity available, so evidence
+            # from an unpersisted chunk gets no identity at all and therefore
+            # never merges. One source per inline chunk is the honest cost
+            # until ingestion has a document or generation id to offer.
+            source = registry.register_source(
+                kind="unknown",
+                title="inline text",
+                origin_id=(
+                    f"knowledge_chunk:{chunk.id}" if chunk.id is not None else None
+                ),
+            )
+        else:
+            source = registry.register_source(
+                kind="file",
+                title=Path(fs_path).name,
+                locator=fs_path,
+            )
+        # The row id refines an inline locator and only an inline one. The
+        # same file in two contexts has two sets of rows with two sets of
+        # ids, so carrying it for a file source would split one passage into
+        # two pieces of evidence and defeat the cross-context dedupe. Inline
+        # evidence has no path to point at, and the row is what it is.
+        evidence = registry.add_evidence(
+            source.source_id,
+            text=chunk.content,
+            locator=EvidenceLocator(
+                chunk_id=(
+                    str(chunk.id)
+                    if fs_path == INLINE_PATH and chunk.id is not None
+                    else None
+                ),
+                chunk_index=chunk.chunk_index,
+            ),
+        )
+        bindings.append(
+            {
+                "context_id": chunk.context_id,
+                "source_id": source.source_id,
+                "evidence_id": evidence.evidence_id,
+            }
+        )
+    return bindings
+
+
+def chunks_that_survived(
+    chunks: Sequence[KnowledgeChunk],
+    snippets: Sequence[str],
+    *,
+    leading: int,
+) -> List[KnowledgeChunk]:
+    """Which retrieved chunks are still in the prompt after budgeting.
+
+    Provenance must describe what grounded the answer, not what retrieval
+    happened to find. Registering the whole retrieved set would make a chunk
+    the budget dropped an eligible citation target, which is a citation to
+    something the model never read.
+
+    `_apply_prompt_budget` prunes snippets from the end, and the retrieved
+    chunks are the tail of the list - behind whatever digest or recall entry
+    was inserted in front of them, which `leading` counts. So the survivors
+    are a prefix of the retrieved order, and the count is what is left after
+    those leading entries are set aside.
+    """
+    return list(chunks[: max(0, len(snippets) - leading)])
+
+
+def _require_str(value, *, what: str) -> str:
+    """A path the adapter cannot describe is refused, not invented."""
+    if not isinstance(value, str) or not value:
+        raise ProvenanceError(f"{what} must be a non-empty string, got {value!r}")
+    return value
 
 
 def _internal_source(path: Path, allowed_base) -> bool:

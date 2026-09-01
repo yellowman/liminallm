@@ -53,6 +53,7 @@ import pytest
 
 from liminallm.service.runtime import get_runtime
 from liminallm.service.tool_namespace import SYSTEM_SCOPE, ToolResolutionScope
+from liminallm.storage.models import KnowledgeChunk
 
 
 def _u(p):
@@ -1710,8 +1711,6 @@ class TestTheStreamedResultCarriesItsGrounding:
 
     @pytest.mark.asyncio
     async def test_retrieved_snippets_reach_message_done(self, store):
-        from types import SimpleNamespace
-
         from liminallm.service.workflow import WorkflowEngine
 
         rt = get_runtime()
@@ -1723,7 +1722,19 @@ class TestTheStreamedResultCarriesItsGrounding:
 
         class Grounded:
             def retrieve(self, ctx_ids, query, **kwargs):
-                return [SimpleNamespace(content="GROUNDING-42")]
+                # A real chunk, not a namespace carrying only `.content`:
+                # the turn now records where its grounding came from, and a
+                # double built from a belief about the interface would have
+                # kept passing while the production path broke.
+                return [
+                    KnowledgeChunk(
+                        context_id=(ctx_ids or ["ctx"])[0],
+                        fs_path="notes/grounding.md",
+                        content="GROUNDING-42",
+                        embedding=[],
+                        chunk_index=0,
+                    )
+                ]
 
         engine = WorkflowEngine(store, rt.llm, rt.router, Grounded(), cache=rt.cache)
         engine.llm.generate_stream = lambda *a, **k: iter([
