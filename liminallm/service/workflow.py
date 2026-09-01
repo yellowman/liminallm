@@ -2811,10 +2811,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # from the worker's own payload: a worker that could name what
         # supported the answer could name a source it never read.
         #
-        # A refusal carries none, and needs no test for it here: the refusal
-        # is a different object and is what gets returned, so the key set on
-        # `sanitized` never reaches the caller.
-        if context.provenance_bindings:
+        # Only a tool that succeeded. `status="error"` with ordinary valid
+        # output passes postflight, so validating is not the same question as
+        # succeeding, and a failed node's sources are not authority for
+        # whatever answer the graph recovers with. A refusal carries none for
+        # a structural reason instead: it is a different object and is what
+        # gets returned, so the key set here never reaches the caller.
+        succeeded = sanitized.get("status") != "error"
+        if succeeded and context.provenance_bindings:
             sanitized["provenance_bindings"] = list(context.provenance_bindings)
         return refusal or sanitized
 

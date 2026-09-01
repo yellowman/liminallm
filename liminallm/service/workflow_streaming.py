@@ -282,11 +282,15 @@ class WorkflowStreamingMixin:
                             # Update state from completed message
                             saw_done = True
                             data = event.get("data", {})
-                            content = data.get("content", "")
-                            # Replacement, as the content is: a later node's
-                            # answer is not supported by an earlier node's
-                            # sources merely because that node also finished.
-                            provenance_bindings = list(node_sink)
+                            # Replacement, as the content is - and only for
+                            # a node that actually produced one. An empty
+                            # completed answer changes neither, which is what
+                            # the blocking driver does and what keeps the
+                            # server-authored "No response generated." below
+                            # from inheriting the model's grounding.
+                            if data.get("content"):
+                                content = data["content"]
+                                provenance_bindings = list(node_sink)
                             node_usage = data.get("usage", {})
                             usage = self._merge_usage(usage, node_usage)
                             for snippet in data.get("context_snippets") or []:
@@ -458,6 +462,13 @@ class WorkflowStreamingMixin:
                         vars_scope.update(parallel_result.merged_outputs)
                         if parallel_result.merged_content:
                             content = parallel_result.merged_content
+                            # The block's answer is its successful children's
+                            # answers concatenated, so its grounding is
+                            # theirs - the same ownership rule the blocking
+                            # driver applies.
+                            provenance_bindings = list(
+                                parallel_result.merged_bindings
+                            )
                         usage = self._merge_usage(usage, parallel_result.merged_usage)
                         for snippet in parallel_result.merged_snippets:
                             if snippet not in context_seen and len(context_snippets) < MAX_CONTEXT_SNIPPETS:
@@ -686,10 +697,29 @@ class WorkflowStreamingMixin:
             attempt_bindings: List[Dict[str, str]] = []
 
             def finalize(result: Dict[str, Any]):
+
                 sanitized, refusal = self.tool_postflight(
                     result, fresh.schema, tool_name=tool_name
                 )
-                if refusal is None and bindings_sink is not None:
+                # Both halves of "this attempt answered": its output
+                # validated, and the tool did not report failure. Only the
+                # first is a refusal; the second passes postflight cleanly.
+                #
+                # Neither half is witnessed here, and both stay. A streamed
+                # body reports failure by raising or by yielding no result at
+                # all - every `tool_result` it emits carries content, usage
+                # and snippets and no `status` key - and an output-schema
+                # refusal is terminal for the node, measured: it emits no
+                # retry. So on this transport the predicate is inert today,
+                # and it is the same rule the blocking producer enforces
+                # where both halves are reachable. Keeping them symmetric is
+                # what stops the two transports answering differently the
+                # first time a streamed body does report failure in band.
+                if (
+                    refusal is None
+                    and sanitized.get("status") != "error"
+                    and bindings_sink is not None
+                ):
                     # The success boundary: postflight passed, so this
                     # attempt's prompt is the one that produced the answer.
                     # A failed attempt leaves its retrieval in the registry as

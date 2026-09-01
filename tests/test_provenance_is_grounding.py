@@ -677,3 +677,163 @@ class TestTheStreamedTurnObeysTheSameOwnership:
             "a streamed turn through a non-streamable backend lost its "
             "provenance entirely"
         )
+
+
+class TestAFailedResultIsNoAuthority:
+    """`status="error"` with ordinary valid output is not a refusal - it
+    passes postflight. So the producer boundary has to ask whether the tool
+    succeeded, not only whether its output validated."""
+
+    @pytest.mark.asyncio
+    async def test_a_failed_host_tool_carries_no_bindings(
+        self, store, engine, monkeypatch
+    ):
+        user_id, ctx_id = _grounded_context(store)
+        registry = SourceRegistry()
+        real = engine._tool_llm_generic
+
+        def _fails(*args, **kwargs):
+            result = real(*args, **kwargs)
+            # Grounding happened; the tool then failed on its own terms.
+            return {**result, "status": "error", "content": "failed"}
+
+        monkeypatch.setattr(engine, "_tool_llm_generic", _fails)
+        result = await engine._invoke_tool(
+            "llm.generic",
+            {"message": "turbine blade inspection"},
+            [],
+            [],
+            ctx_id,
+            None,
+            "turbine blade inspection",
+            source_registry=registry,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        assert result.get("status") == "error"
+        assert registry.evidence, "the retrieval is still consulted"
+        assert "provenance_bindings" not in result, (
+            "a failed tool became citation authority for whatever follows"
+        )
+
+    def test_a_failed_node_does_not_own_the_turns_bindings(self, store, engine):
+        """`on_error` hands off to a node that answers. The failed node's
+        content is what the turn keeps only because the recovery produced
+        none - and its sources are not authority for that sentence."""
+        import uuid as _uuid
+
+        user = store.create_user(email=f"fn_{_uuid.uuid4().hex[:8]}@t.local")
+        ctx = store.upsert_context(
+            name=f"fn-{_uuid.uuid4().hex[:6]}", description="c",
+            owner_user_id=user.id,
+        )
+        engine.rag.ingest_text(ctx.id, "Epsilon turbine blade inspection record. " * 60)
+        # Your scenario: the failed node's content is what the turn keeps,
+        # because the node that recovered produced none of its own.
+        # `llm.intent_classifier_v1` returns `{"intent": ...}` and no content.
+        artifact = _stream_workflow(store, user, [
+            {"id": "a", "type": "tool_call", "tool": "llm.generic",
+             "inputs": {"context_id": ctx.id},
+             "next": "fin", "on_error": "rec"},
+            {"id": "rec", "type": "tool_call",
+             "tool": "llm.intent_classifier_v1", "next": "fin"},
+            {"id": "fin", "type": "end"},
+        ])
+        real = engine._tool_llm_generic
+
+        def _fails(*args, **kwargs):
+            result = real(*args, **kwargs)
+            return {**result, "status": "error", "content": "failed"}
+
+        engine._tool_llm_generic = _fails
+        try:
+            result = asyncio.run(
+                engine.run(
+                    artifact.id, None, "turbine blade inspection", None, user.id
+                )
+            )
+        finally:
+            engine._tool_llm_generic = real
+        # Not vacuous: the failed node's content is what the turn kept, and
+        # the retrieval did happen - only the authority is withheld.
+        assert result.get("content") == "failed", result.get("content")
+        assert result.get("context_snippets"), "the fixture never retrieved"
+        assert not (result.get("provenance_bindings") or []), (
+            "a failed node owns the turn's provenance: "
+            f"{result.get('provenance_bindings')}"
+        )
+
+
+class TestTheStreamedParallelBlockOwnsItsOwn:
+    @pytest.mark.asyncio
+    async def test_streamed_parallel_children_replace_earlier_bindings(
+        self, store, engine
+    ):
+        """The blocking driver got this rule; the streamed one did not, so a
+        parallel block's concatenated answer kept an earlier node's sources."""
+        import uuid as _uuid
+
+        user = store.create_user(email=f"sp2_{_uuid.uuid4().hex[:8]}@t.local")
+        first, second = _two_contexts(store, engine, user)
+        artifact = _stream_workflow(store, user, [
+            {"id": "a", "type": "tool_call", "tool": "llm.generic",
+             "inputs": {"context_id": first}, "next": "fan"},
+            {"id": "fan", "type": "parallel", "next": ["b"], "after": "fin"},
+            {"id": "b", "type": "tool_call", "tool": "llm.generic",
+             "inputs": {"context_id": second}},
+            {"id": "fin", "type": "end"},
+        ])
+        engine.llm.generate_stream = _plain_stream
+        events = [
+            e async for e in engine.run_streaming(
+                artifact.id, None, "turbine blade inspection", None,
+                user_id=user.id, tenant_id=None,
+            )
+        ]
+        done = [e for e in events if e.get("event") == "message_done"]
+        assert done, [e.get("event") for e in events]
+        bindings = done[-1]["data"].get("provenance_bindings") or []
+        assert bindings, "the streamed parallel block reported no grounding"
+        assert {b["context_id"] for b in bindings} == {second}, (
+            "the node before the parallel block still owns the answer's "
+            f"sources: {sorted({b['context_id'] for b in bindings})}"
+        )
+
+
+class TestASentenceTheServerWroteHasNoSources:
+    @pytest.mark.asyncio
+    async def test_the_synthetic_empty_answer_inherits_nothing(
+        self, store, engine
+    ):
+        """`No response generated.` is server-authored. Retrieval happened,
+        but that sentence rests on none of it."""
+        import uuid as _uuid
+
+        user = store.create_user(email=f"sy_{_uuid.uuid4().hex[:8]}@t.local")
+        ctx = store.upsert_context(
+            name=f"sy-{_uuid.uuid4().hex[:6]}", description="c",
+            owner_user_id=user.id,
+        )
+        engine.rag.ingest_text(ctx.id, "Zeta turbine blade inspection record. " * 60)
+        artifact = _stream_workflow(store, user, [
+            {"id": "call", "type": "tool_call", "tool": "llm.generic",
+             "next": "fin"},
+            {"id": "fin", "type": "end"},
+        ])
+        engine.llm.generate_stream = lambda *a, **k: iter([
+            {"event": "message_done", "data": {"content": "", "usage": {}}},
+        ])
+        events = [
+            e async for e in engine.run_streaming(
+                artifact.id, None, "turbine blade inspection", ctx.id,
+                user_id=user.id, tenant_id=None,
+            )
+        ]
+        done = [e for e in events if e.get("event") == "message_done"]
+        assert done, [e.get("event") for e in events]
+        data = done[-1]["data"]
+        assert data.get("content") == "No response generated."
+        assert not (data.get("provenance_bindings") or []), (
+            "a sentence the server wrote inherited the model's grounding: "
+            f"{data.get('provenance_bindings')}"
+        )
