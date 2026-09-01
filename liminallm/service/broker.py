@@ -99,6 +99,9 @@ class InvocationContext:
     #: authority, and a worker that could mint them could claim a citation
     #: came from a source it never read.
     source_registry: Optional[SourceRegistry] = None
+    #: What the parent placed in this invocation's prompt, computed parent-side
+    #: after budgeting. Never sent to the worker and never read back from it.
+    provenance_bindings: List[Dict[str, str]] = field(default_factory=list)
 
 
 class CapabilityBroker:

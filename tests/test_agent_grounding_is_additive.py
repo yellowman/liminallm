@@ -29,6 +29,7 @@ import pytest
 
 from liminallm.config import Settings
 from liminallm.service.runtime import get_runtime
+from liminallm.storage.models import KnowledgeChunk
 from tests.mcpfixture import MCPFixture, allow_local
 
 # Invented, so a hit can only have come out of the corpus.
@@ -370,10 +371,20 @@ class TestGroundingObeysThePromptBudget:
         monkeypatch.setattr(engine, "prompt_budget", lambda: 700)
         chunks = [f"chunk {i} " + ("filler " * 120) for i in range(5)]
 
+        # Real chunks, not bare strings: the same retrieval now also feeds
+        # provenance, and a double shaped from the old belief would keep
+        # passing here while the production path broke.
+        records = [
+            KnowledgeChunk(
+                context_id=ctx_id, fs_path=f"notes/c{i}.md", content=text,
+                embedding=[], chunk_index=i,
+            )
+            for i, text in enumerate(chunks)
+        ]
         monkeypatch.setattr(
             engine,
             "_explicit_context_grounding",
-            lambda *a, **k: ([ctx_id], list(chunks)),
+            lambda *a, **k: ([ctx_id], list(chunks), list(records)),
         )
         result = asyncio.run(engine.run(None, None, QUESTION, ctx_id, user_id))
 

@@ -115,14 +115,23 @@ def register_retrieved_chunks(
     for chunk in chunks:
         fs_path = _require_str(chunk.fs_path, what="chunk fs_path")
         if fs_path == INLINE_PATH:
-            # Not a file: `inline` names no document, and mapping every
-            # context's inline text onto one locator would make them one
-            # source. Neutral kind, and an identity scoped to the context
-            # that actually holds the text.
+            # Not a file: `inline` names no document. Two anonymous ingests
+            # into one context are unrelated documents that both land under
+            # this sentinel - `_commit_generation` adds inline text rather
+            # than replacing a path's generation, so nothing collapses them -
+            # and a context-scoped identity would merge them, which is the
+            # context being the source again by another name.
+            #
+            # The row id is the only real identity available, so evidence
+            # from an unpersisted chunk gets no identity at all and therefore
+            # never merges. One source per inline chunk is the honest cost
+            # until ingestion has a document or generation id to offer.
             source = registry.register_source(
                 kind="unknown",
                 title="inline text",
-                origin_id=f"context:{chunk.context_id}:inline",
+                origin_id=(
+                    f"knowledge_chunk:{chunk.id}" if chunk.id is not None else None
+                ),
             )
         else:
             source = registry.register_source(
@@ -130,10 +139,22 @@ def register_retrieved_chunks(
                 title=Path(fs_path).name,
                 locator=fs_path,
             )
+        # The row id refines an inline locator and only an inline one. The
+        # same file in two contexts has two sets of rows with two sets of
+        # ids, so carrying it for a file source would split one passage into
+        # two pieces of evidence and defeat the cross-context dedupe. Inline
+        # evidence has no path to point at, and the row is what it is.
         evidence = registry.add_evidence(
             source.source_id,
             text=chunk.content,
-            locator=EvidenceLocator(chunk_index=chunk.chunk_index),
+            locator=EvidenceLocator(
+                chunk_id=(
+                    str(chunk.id)
+                    if fs_path == INLINE_PATH and chunk.id is not None
+                    else None
+                ),
+                chunk_index=chunk.chunk_index,
+            ),
         )
         bindings.append(
             {
@@ -143,6 +164,28 @@ def register_retrieved_chunks(
             }
         )
     return bindings
+
+
+def chunks_that_survived(
+    chunks: Sequence[KnowledgeChunk],
+    snippets: Sequence[str],
+    *,
+    leading: int,
+) -> List[KnowledgeChunk]:
+    """Which retrieved chunks are still in the prompt after budgeting.
+
+    Provenance must describe what grounded the answer, not what retrieval
+    happened to find. Registering the whole retrieved set would make a chunk
+    the budget dropped an eligible citation target, which is a citation to
+    something the model never read.
+
+    `_apply_prompt_budget` prunes snippets from the end, and the retrieved
+    chunks are the tail of the list - behind whatever digest or recall entry
+    was inserted in front of them, which `leading` counts. So the survivors
+    are a prefix of the retrieved order, and the count is what is left after
+    those leading entries are set aside.
+    """
+    return list(chunks[: max(0, len(snippets) - leading)])
 
 
 def _require_str(value, *, what: str) -> str:

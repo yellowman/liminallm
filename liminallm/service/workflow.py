@@ -70,7 +70,11 @@ from liminallm.service.node_attempt import (
     bounded,
 )
 from liminallm.service.provenance import SourceRegistry
-from liminallm.service.rag import RAGService, register_retrieved_chunks
+from liminallm.service.rag import (
+    RAGService,
+    chunks_that_survived,
+    register_retrieved_chunks,
+)
 from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import (
     DEFAULT_SANDBOX_CONFIG,
@@ -125,6 +129,7 @@ class ParallelNodeResult:
     merged_content: str  # Concatenated content from all nodes
     merged_usage: Dict[str, Any]  # Summed token counts
     merged_snippets: List[str]  # Deduplicated context snippets
+    merged_bindings: List[Dict[str, str]]  # What actually grounded each child
     failed_nodes: List[str]  # Node IDs that failed
     # "ok" if all succeeded, "partial" if some failed, "error" if all failed,
     # "budget_exhausted" if the batch was refused before any of it began.
@@ -281,7 +286,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "status": refusal.get("status", "error"),
             "outputs": {},
         }
-        for k in ("content", "usage", "context_snippets", "error"):
+        for k in ("content", "usage", "context_snippets", "provenance_bindings", "error"):
             if k in refusal:
                 payload[k] = refusal[k]
         return payload, next_nodes
@@ -500,6 +505,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 merged_content="",
                 merged_usage={},
                 merged_snippets=[],
+                merged_bindings=[],
                 failed_nodes=[],
                 status="ok",
             )
@@ -519,15 +525,18 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 merged_content="",
                 merged_usage={},
                 merged_snippets=[],
+                merged_bindings=[],
                 failed_nodes=[],
                 status="budget_exhausted",
             )
 
-        async def execute_single_node(node_id: str) -> Tuple[str, Dict[str, Any], List[str]]:
+        async def execute_single_node(
+            node_id: str,
+        ) -> Tuple[str, Dict[str, Any], List[str], List[Dict[str, str]]]:
             """Execute a single node with its own vars_scope copy."""
             node = node_map.get(node_id)
             if not node:
-                return node_id, {"status": "error", "error": f"Node {node_id} not found"}, []
+                return node_id, {"status": "error", "error": f"Node {node_id} not found"}, [], []
 
             # Each parallel node gets its own copy of vars_scope
             local_vars = copy.deepcopy(vars_scope)
@@ -555,10 +564,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     cancel_event=cancel_event,
                 )
                 snippets = result.get("context_snippets", []) if isinstance(result, dict) else []
-                return node_id, result, snippets
+                bindings = (
+                    result.get("provenance_bindings", [])
+                    if isinstance(result, dict)
+                    else []
+                )
+                return node_id, result, snippets, bindings
             except Exception as exc:
                 self.logger.error("parallel_node_failed", node_id=node_id, error=str(exc))
-                return node_id, {"status": "error", "error": str(exc)}, []
+                return node_id, {"status": "error", "error": str(exc)}, [], []
 
         # Execute all nodes concurrently
         tasks = [execute_single_node(nid) for nid in node_ids]
@@ -569,6 +583,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         merged_content_parts: List[str] = []
         merged_usage: Dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         all_snippets: List[str] = []
+        all_bindings: List[Dict[str, str]] = []
         failed_nodes: List[str] = []
 
         for item in results:
@@ -576,13 +591,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 self.logger.error("parallel_gather_exception", error=str(item))
                 continue
 
-            node_id, result, snippets = item
+            node_id, result, snippets, bindings = item
 
             if isinstance(result, dict):
                 # Namespace outputs by node ID
                 merged_outputs[node_id] = {
                     k: v for k, v in result.items()
-                    if k not in {"usage", "context_snippets", "status"}
+                    if k not in {"usage", "context_snippets", "provenance_bindings", "status"}
                 }
 
                 # Check for failure
@@ -603,6 +618,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
                 # Collect snippets
                 all_snippets.extend(snippets)
+                # Grounding, only from a child that succeeded: a failed
+                # child's retrieval is consulted, not supporting.
+                if result.get("status") != "error":
+                    all_bindings.extend(bindings or [])
 
         # Deduplicate snippets
         seen_snippets: set = set()
@@ -626,6 +645,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             merged_content="\n\n".join(merged_content_parts),
             merged_usage=merged_usage,
             merged_snippets=deduped_snippets[:MAX_CONTEXT_SNIPPETS],
+            merged_bindings=all_bindings,
             failed_nodes=failed_nodes,
             status=status,
         )
@@ -702,6 +722,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
         workflow_trace: List[Dict[str, Any]] = []
         max_trace_entries = 500
         context_snippets: List[str] = []
+        # What may support the final answer. The registry is the turn's
+        # consulted superset - a failed attempt's retrieval legitimately sits
+        # in it - while these are the bindings of attempts that actually
+        # succeeded, so a citation cannot rest on evidence from an attempt
+        # whose generation failed.
+        provenance_bindings: List[Dict[str, str]] = []
+        bindings_seen = set()
         # The turn's provenance, created once here and passed by reference to
         # every node that can retrieve. Not in `vars_scope`, which a parallel
         # child deep-copies, and not on an `Invocation`, which is one tool
@@ -857,6 +884,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         if snippet not in context_seen and len(context_snippets) < MAX_CONTEXT_SNIPPETS:
                             context_seen.add(snippet)
                             context_snippets.append(snippet)
+                    self._merge_bindings(
+                        provenance_bindings,
+                        bindings_seen,
+                        parallel_result.merged_bindings,
+                    )
 
                     # Handle parallel failures
                     if parallel_result.status == "error":
@@ -886,6 +918,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         break
                     context_seen.add(snippet)
                     context_snippets.append(snippet)
+            self._merge_bindings(
+                provenance_bindings, bindings_seen, result.get("provenance_bindings")
+            )
             if result.get("content"):
                 content = result["content"]
             node_usage = result.get("usage")
@@ -922,6 +957,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 "routing_trace": routing_trace,
                 "workflow_trace": workflow_trace,
                 "context_snippets": context_snippets,
+                "provenance_bindings": provenance_bindings,
                 "vars": vars_scope,
             }
 
@@ -934,6 +970,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "adapters": adapters,
             "adapter_gates": adapter_gates,
             "context_snippets": context_snippets,
+            "provenance_bindings": provenance_bindings,
             "workflow_trace": workflow_trace,
             "routing_trace": routing_trace,
             "vars": vars_scope,
@@ -1794,6 +1831,61 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return None
         return compaction.digest_system_block(conversation) if conversation else None
 
+    def _record_grounding(
+        self,
+        source_registry: Optional[SourceRegistry],
+        chunks: Sequence[Any],
+        snippets: Sequence[str],
+        *,
+        leading: int,
+        sink: Optional[List[Dict[str, str]]] = None,
+    ) -> List[Dict[str, str]]:
+        """Register the chunks that reached the model, and return the bindings.
+
+        Called after budgeting, so the registry holds what grounded the answer
+        rather than everything retrieval offered. The bindings say which
+        context reached which evidence, which is the only place that relation
+        survives: two contexts reaching one passage correctly dedupe to a
+        single piece of evidence.
+        """
+        if source_registry is None:
+            return []
+        bindings = register_retrieved_chunks(
+            source_registry,
+            chunks_that_survived(chunks, snippets, leading=leading),
+        )
+        # Into the parent's sink, never into the tool's own output. A tool's
+        # declared `output_schema` may set `additionalProperties: false`, so
+        # a new key in the validated result would refuse every published
+        # workflow that declared one - and the bindings are the parent's
+        # statement about the turn, not part of what the tool produced.
+        if sink is not None:
+            sink.extend(bindings)
+        return bindings
+
+    @staticmethod
+    def _merge_bindings(
+        collected: List[Dict[str, str]],
+        seen: set,
+        offered: Optional[Sequence[Dict[str, str]]],
+    ) -> None:
+        """Fold one node's grounding into the turn's, once each.
+
+        Two nodes reaching the same passage of the same source is one
+        binding, for the same reason the registry gives them one piece of
+        evidence: the relation is what was found, not how many times.
+        """
+        for binding in offered or []:
+            key = (
+                binding.get("context_id"),
+                binding.get("source_id"),
+                binding.get("evidence_id"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append(dict(binding))
+
     def _apply_prompt_budget(
         self,
         prompt: str,
@@ -2553,7 +2645,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             outputs = {
                 k: v
                 for k, v in tool_result.items()
-                if k not in {"usage", "context_snippets"}
+                if k not in {"usage", "context_snippets", "provenance_bindings"}
             }
         next_nodes_list = self._successors(node, tool_result)
         result_payload: Dict[str, Any] = {
@@ -2565,7 +2657,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "outputs": outputs,
         }
         if isinstance(tool_result, dict):
-            for k in ("content", "usage", "context_snippets"):
+            for k in ("content", "usage", "context_snippets", "provenance_bindings"):
                 if k in tool_result:
                     result_payload[k] = tool_result[k]
         return result_payload, next_nodes_list
@@ -2713,6 +2805,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
         sanitized, refusal = self.tool_postflight(
             result, tool_spec, tool_name=tool_name
         )
+        # Attached by the parent, after the worker has returned. Never taken
+        # from the worker's own payload: a worker that could name what
+        # supported the answer could name a source it never read.
+        #
+        # A refusal carries none, and needs no test for it here: the refusal
+        # is a different object and is what gets returned, so the key set on
+        # `sanitized` never reaches the caller.
+        if context.provenance_bindings:
+            sanitized["provenance_bindings"] = list(context.provenance_bindings)
         return refusal or sanitized
 
     def tool_postflight(
@@ -2791,12 +2892,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # reach. What crosses is the finished message list.
         message = inputs.get("message") or user_message or ""
         attachments = self._conversation_attachments(conversation_id, user_id)
-        explicit_ids, grounding = self._explicit_context_grounding(
-            message,
-            context_id,
-            user_id=user_id,
-            tenant_id=tenant_id,
-            source_registry=source_registry,
+        explicit_ids, grounding, ctx_chunks = self._explicit_context_grounding(
+            message, context_id, user_id=user_id, tenant_id=tenant_id
         )
         messages, tools, preamble, mcp_tools, grounded = self._build_agent_context(
             message,
@@ -2806,6 +2903,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             conversation_id,
             explicit_context_ids=explicit_ids,
             grounding=grounding,
+        )
+        # Registered from `grounded`, which is the subset that survived
+        # budgeting, and held on the context rather than sent in the plan.
+        # The worker must not be able to say what supported the answer: it
+        # would be naming source authority for text it was handed.
+        context.provenance_bindings = self._record_grounding(
+            source_registry, ctx_chunks, grounded, leading=0
         )
         # On the context, never in the plan: the plan is what the worker reads.
         context.mcp_tools = mcp_tools
@@ -2993,6 +3097,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             context.user_id,
             context.tenant_id,
             source_registry=context.source_registry,
+            bindings_sink=context.provenance_bindings,
         )
 
     def _builtin_tool_handlers(
@@ -3068,8 +3173,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         user_id: Optional[str],
         tenant_id: Optional[str],
-        source_registry: Optional[SourceRegistry] = None,
-    ) -> Tuple[List[str], List[str]]:
+    ) -> Tuple[List[str], List[str], List[Any]]:
         """What a named knowledge context contributes to an agent turn.
 
         The same validation and the same retriever `llm.generic` uses, because
@@ -3081,20 +3185,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
         The ids come back beside the snippets rather than folded into them:
         an empty retrieval is not an absent context, and `file_search` is
         still worth offering for a context whose top-k missed this phrasing.
+
+        The chunks come back too, and nothing is registered here. Only some
+        of them survive `_build_agent_context`'s budgeting, and provenance
+        has to describe what the model was actually given.
         """
         if not context_id:
-            return [], []
+            return [], [], []
         allowed = self._validate_context_scope(
             [context_id], user_id=user_id, tenant_id=tenant_id
         )
         if not allowed:
-            return [], []
+            return [], [], []
         chunks = self.rag.retrieve(
             allowed, message, user_id=user_id, tenant_id=tenant_id
         )
-        if source_registry is not None:
-            register_retrieved_chunks(source_registry, chunks)
-        return list(allowed), [chunk.content for chunk in chunks]
+        return list(allowed), [chunk.content for chunk in chunks], list(chunks)
 
     def _run_file_search(
         self,
@@ -3691,6 +3797,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         message = (
             inputs.get("message") or inputs.get("prompt") or inputs.get("text") or ""
@@ -3711,21 +3818,29 @@ class WorkflowEngine(WorkflowStreamingMixin):
         ctx_chunks = self.rag.retrieve(
             allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
         )
-        if source_registry is not None:
-            register_retrieved_chunks(source_registry, ctx_chunks)
         context_snippets = [c.content for c in ctx_chunks]
         # The digest of turns older than the window rides in front of the
         # retrieved context, so it survives pruning longest.
+        leading = 0
         digest = self._digest_snippet(conversation_id)
         if digest:
             context_snippets.insert(0, digest)
+            leading += 1
         # Assembled window: relevance-recalled turns ride behind the digest;
         # both are snippets, so the pruner drops them before the verbatim tail.
         recall = self._recall_snippet(conversation_id, user_id, message or "", history)
         if recall:
             context_snippets.insert(1 if digest else 0, recall)
+            leading += 1
         context_snippets, history = self._apply_prompt_budget(
             message, context_snippets, history
+        )
+        # After the budget, never before it: a chunk the pruner dropped never
+        # reached the model, and registering it would make it an eligible
+        # citation target for an answer it did not ground.
+        self._record_grounding(
+            source_registry, ctx_chunks, context_snippets,
+            leading=leading, sink=bindings_sink,
         )
         try:
             resp = self.llm.generate(
@@ -3795,6 +3910,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         question = inputs.get("question") or inputs.get("message") or ""
         ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
@@ -3805,9 +3921,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         chunks = self.rag.retrieve(
             allowed_ctx_ids, question, user_id=user_id, tenant_id=tenant_id
         )
-        if source_registry is not None:
-            register_retrieved_chunks(source_registry, chunks)
         snippets = [c.content for c in chunks]
+        # No budgeting between here and the model: every retrieved chunk is
+        # sent, so every one of them grounded the answer.
+        self._record_grounding(
+            source_registry, chunks, snippets, leading=0, sink=bindings_sink,
+        )
         try:
             resp = self.llm.generate(
                 question or "",
@@ -3842,6 +3961,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         message = inputs.get("message") or user_message or ""
         lowered = message.lower()
@@ -3862,6 +3982,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         prompt = inputs.get("message") or inputs.get("prompt") or ""
         resp = self.llm.generate(
@@ -3885,6 +4006,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         return {"content": inputs.get("message", ""), "usage": {}, "status": "end"}
 
