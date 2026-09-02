@@ -41,9 +41,24 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Protocol
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 from liminallm.logging import get_logger
+from liminallm.service.citations import (
+    CitationTable,
+    extend_citation_table,
+    mint_nonce,
+)
+from liminallm.service.provenance import SourceRegistry
 
 __all__ = [
     "Attempt",
@@ -613,6 +628,17 @@ class Invocation:
         self.resources = ResourceRegistry()
         self.attempts: List[Attempt] = []
         self.session: Dict[str, Any] = {}
+        #: This execution's citation namespace, and what it has issued so far.
+        #: It belongs here rather than to an attempt because the ledger does:
+        #: a replacement attempt can replay a committed model response, and
+        #: that text quotes the handles the *first* attempt was offered. A
+        #: per-attempt namespace would hand attempt B its predecessor's
+        #: citations with nothing to resolve them against.
+        #:
+        #: One logical execution, one namespace; when this execution finally
+        #: fails, its citation authority is discarded with it, and the next
+        #: one opens a namespace of its own.
+        self.citations = CitationTable(nonce=mint_nonce())
         #: The registry that opened this execution, so `close` can retire the
         #: entry without any module-level lookup.
         self.registry = registry
@@ -621,6 +647,20 @@ class Invocation:
         self._closed = False
         self._current: Optional[Attempt] = None
         self._lock = threading.RLock()
+
+    def extend_citations(
+        self, registry: SourceRegistry, bindings: Sequence[Any]
+    ) -> CitationTable:
+        """Grow this execution's citation namespace, and return it.
+
+        Under the lock, because a workflow runs children concurrently and the
+        table is replaced rather than mutated: two threads reading the old one
+        and each writing a successor would lose one of the two extensions, and
+        with it the handles it allocated.
+        """
+        with self._lock:
+            self.citations = extend_citation_table(registry, self.citations, bindings)
+            return self.citations
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"Invocation({self.invocation_id!r}, tool={self.tool!r})"

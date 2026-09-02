@@ -9,6 +9,8 @@ retrieved document wrote it.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from liminallm.service.citations import (
@@ -18,6 +20,7 @@ from liminallm.service.citations import (
     NONCE_LENGTH,
     CitationTable,
     build_citation_table,
+    extend_citation_table,
     mint_nonce,
     strip_citations,
     validate_citations,
@@ -372,3 +375,156 @@ class TestTheMarkersCanBeTakenBackOut:
 
     def test_text_with_no_markers_is_unchanged(self):
         assert strip_citations("plain answer") == "plain answer"
+
+
+class TestOneNamespacePerLogicalExecution:
+    """A namespace belongs to the invocation, not to an attempt.
+
+    The ledger spans retries: a replacement attempt can be handed a committed
+    model response without the handler running again, and that text quotes the
+    handles the *first* attempt was offered. A per-attempt namespace would
+    give attempt B its predecessor's citations and nothing to resolve them
+    against.
+    """
+
+    @staticmethod
+    def _invocation(user_id="u"):
+        from liminallm.service.invocation import InvocationRegistry
+
+        return InvocationRegistry().open(
+            uuid.uuid4().hex, tool="agent.files_v1", user_id=user_id, tenant_id=None
+        )
+
+    def test_a_replayed_answer_still_resolves_on_the_next_attempt(self):
+        """Attempt A is offered a handle and the model quotes it. Attempt B
+        replays that committed text; the handle has to mean the same source."""
+        registry = SourceRegistry()
+        source = registry.register_source(
+            kind="file", title="manual.md", locator="/files/manual.md"
+        )
+        evidence = registry.add_evidence(source.source_id, text="400 hours")
+        invocation = self._invocation()
+
+        # Attempt A: the offer, and the model's answer quoting it.
+        table_a = invocation.extend_citations(
+            registry, [binding(source.source_id, evidence.evidence_id)]
+        )
+        handle = table_a.handle_for(source.source_id)
+        replayed = f"400 hours [cite:{handle}]."
+
+        # Attempt B: the same invocation, the same ledger, the replayed text.
+        table_b = invocation.citations
+        found = validate_citations(replayed, table_b)
+        assert [c.source_id for c in found] == [source.source_id], (
+            "a replayed answer's citation did not survive the retry"
+        )
+
+    def test_two_executions_do_not_share_a_namespace(self):
+        first, second = self._invocation(), self._invocation()
+        assert first.citations.nonce != second.citations.nonce
+
+    def test_a_fresh_invocation_can_cite_nothing(self):
+        assert not self._invocation().citations
+
+
+class TestTheNamespaceGrowsRatherThanRestarting:
+    """Two offers in one assembly - a round adds sources, then another does.
+    Building a second table from the second round alone would allocate `-1`
+    again, to a different source, under the same nonce."""
+
+    @staticmethod
+    def _registry_with(*titles):
+        registry = SourceRegistry()
+        pairs = []
+        for title in titles:
+            source = registry.register_source(
+                kind="file", title=title, locator=f"/files/{title}"
+            )
+            evidence = registry.add_evidence(source.source_id, text=f"from {title}")
+            pairs.append((source, evidence))
+        return registry, pairs
+
+    def test_a_new_source_takes_the_next_number(self):
+        registry, pairs = self._registry_with("a.md", "b.md")
+        (first, ea), (second, eb) = pairs
+        table = build_citation_table(
+            registry, [binding(first.source_id, ea.evidence_id)], nonce=NONCE
+        )
+        grown = extend_citation_table(
+            registry, table, [binding(second.source_id, eb.evidence_id)]
+        )
+
+        assert grown.nonce == table.nonce
+        assert grown.handle_for(first.source_id) == f"{NONCE}-1"
+        assert grown.handle_for(second.source_id) == f"{NONCE}-2", (
+            "the second offer restarted the numbering"
+        )
+
+    def test_an_existing_source_keeps_its_handle(self):
+        registry, pairs = self._registry_with("a.md")
+        (first, ea) = pairs[0]
+        second_passage = registry.add_evidence(first.source_id, text="another passage")
+        table = build_citation_table(
+            registry, [binding(first.source_id, ea.evidence_id)], nonce=NONCE
+        )
+        grown = extend_citation_table(
+            registry, table, [binding(first.source_id, second_passage.evidence_id)]
+        )
+
+        assert grown.handle_for(first.source_id) == table.handle_for(first.source_id)
+        # Seen again only widens what may be cited within it.
+        assert grown.evidence_for(first.source_id) == (
+            ea.evidence_id,
+            second_passage.evidence_id,
+        )
+
+    def test_an_invalid_binding_changes_nothing(self):
+        registry, pairs = self._registry_with("a.md", "b.md")
+        (first, ea), (second, eb) = pairs
+        table = build_citation_table(
+            registry, [binding(first.source_id, ea.evidence_id)], nonce=NONCE
+        )
+        grown = extend_citation_table(
+            registry,
+            table,
+            [
+                binding(second.source_id, "ev_404"),
+                binding(second.source_id, ea.evidence_id),
+            ],
+        )
+        assert dict(grown.by_handle) == dict(table.by_handle)
+
+    def test_the_grown_table_is_frozen_too(self):
+        registry, pairs = self._registry_with("a.md")
+        (first, ea) = pairs[0]
+        grown = extend_citation_table(
+            registry,
+            CitationTable(nonce=NONCE),
+            [binding(first.source_id, ea.evidence_id)],
+        )
+        with pytest.raises(TypeError):
+            grown.by_handle["forged"] = "src_1"
+
+    def test_a_table_from_another_registry_is_refused(self):
+        """Immutability is not validity. Extension is another authority gate,
+        and a table whose entries do not resolve here would renumber a
+        namespace that text already quotes."""
+        registry, pairs = self._registry_with("a.md")
+        stranger = CitationTable(
+            nonce=NONCE,
+            by_handle={f"{NONCE}-1": "src_99"},
+            by_source={"src_99": f"{NONCE}-1"},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(registry, stranger, [])
+
+    def test_a_handle_from_another_namespace_is_refused(self):
+        registry, pairs = self._registry_with("a.md")
+        (first, _ea) = pairs[0]
+        stranger = CitationTable(
+            nonce=NONCE,
+            by_handle={"ZZZZZZZZ-1": first.source_id},
+            by_source={first.source_id: "ZZZZZZZZ-1"},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(registry, stranger, [])

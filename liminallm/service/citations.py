@@ -244,6 +244,89 @@ def build_citation_table(
     )
 
 
+def _handle_number(nonce: str, handle: str) -> Optional[int]:
+    """The source number inside a handle of this namespace, or None."""
+    prefix = f"{nonce}-"
+    if not handle.startswith(prefix):
+        return None
+    tail = handle[len(prefix) :]
+    return int(tail) if tail.isdigit() else None
+
+
+def extend_citation_table(
+    registry: SourceRegistry,
+    table: CitationTable,
+    bindings: Sequence[Binding],
+) -> CitationTable:
+    """The same namespace, grown by whatever became eligible since.
+
+    One assembly offers the model handles more than once - a tool round adds
+    sources, then another round adds more - and each offer has to extend the
+    previous one rather than start over. Building a second table from the
+    second round's bindings alone would allocate `-1` again, to a different
+    source, under the same nonce: two documents with one name, in one
+    conversation the model can see both halves of.
+
+    So an existing source keeps the handle it already has, a new one takes the
+    next unused number, and a source seen again only adds to what may be cited
+    within it.
+
+    The table handed in is re-checked against the registry rather than trusted
+    for being immutable. `CitationTable` guarantees its representation cannot
+    be edited and that its nonce is well formed; it cannot guarantee that its
+    contents mean anything here, and extension is another authority gate. A
+    table whose entries do not resolve is a programming error rather than a
+    data condition, so it raises instead of being silently repaired - dropping
+    an entry would renumber the namespace under text that already quotes it.
+    """
+    numbers = []
+    for handle, source_id in table.by_handle.items():
+        number = _handle_number(table.nonce, handle)
+        if number is None:
+            raise ProvenanceError(
+                f"citation handle {handle!r} is not of namespace {table.nonce!r}"
+            )
+        if table.by_source.get(source_id) != handle:
+            raise ProvenanceError(
+                f"citation handle {handle!r} and source {source_id!r} disagree"
+            )
+        if registry.get_source(source_id) is None:
+            raise ProvenanceError(
+                f"citation handle {handle!r} names {source_id!r}, "
+                "which this registry does not hold"
+            )
+        numbers.append(number)
+
+    by_handle = dict(table.by_handle)
+    by_source = dict(table.by_source)
+    evidence = {key: list(value) for key, value in table.evidence.items()}
+    allocated = max(numbers, default=0)
+    for entry in bindings:
+        source_id = entry.get("source_id")
+        evidence_id = entry.get("evidence_id")
+        if not source_id or not evidence_id:
+            continue
+        if registry.get_source(source_id) is None:
+            continue
+        record = registry.get_evidence(evidence_id)
+        if record is None or record.source_id != source_id:
+            continue
+        if source_id not in by_source:
+            allocated += 1
+            handle = f"{table.nonce}-{allocated}"
+            by_source[source_id] = handle
+            by_handle[handle] = source_id
+            evidence.setdefault(source_id, [])
+        if evidence_id not in evidence[source_id]:
+            evidence[source_id].append(evidence_id)
+    return CitationTable(
+        nonce=table.nonce,
+        by_handle=by_handle,
+        by_source=by_source,
+        evidence=evidence,
+    )
+
+
 def validate_citations(answer: str, table: CitationTable) -> List[CitationOccurrence]:
     """The citations in this answer that this turn actually issued.
 
