@@ -22,10 +22,13 @@ from liminallm.service.citations import (
     strip_citations,
     validate_citations,
 )
-from liminallm.service.provenance import SourceRegistry, binding
+from liminallm.service.provenance import ProvenanceError, SourceRegistry, binding
+
+#: A nonce of the real width, so no test exercises a namespace the type refuses.
+NONCE = "K7Q2ABCD"
 
 
-def _turn(*titles, nonce="K7Q2"):
+def _turn(*titles, nonce=NONCE):
     """A registry holding these sources, and a table over all of them."""
     registry = SourceRegistry()
     bindings = []
@@ -55,7 +58,7 @@ class TestOnlyWhatGroundedTheAnswerIsCitable:
         dropped = registry.register_source(kind="file", title="dropped.md", locator="/b")
         evidence = registry.add_evidence(kept.source_id, text="passage")
         table = build_citation_table(
-            registry, [binding(kept.source_id, evidence.evidence_id)], nonce="K7Q2"
+            registry, [binding(kept.source_id, evidence.evidence_id)], nonce=NONCE
         )
 
         assert table.handle_for(kept.source_id) is not None
@@ -65,17 +68,17 @@ class TestOnlyWhatGroundedTheAnswerIsCitable:
 
     def test_an_unknown_handle_is_not_a_citation(self):
         _registry, _bindings, table = _turn("manual.md")
-        assert validate_citations("Claimed [cite:K7Q2-9].", table) == []
+        assert validate_citations(f"Claimed [cite:{NONCE}-9].", table) == []
 
     def test_a_binding_the_registry_cannot_resolve_gets_no_handle(self):
         """A citation nobody can follow is worse than a missing one: there is
         no title, kind or locator to show for a source that is not there."""
         registry = SourceRegistry()
         table = build_citation_table(
-            registry, [binding("src_404", "ev_404")], nonce="K7Q2"
+            registry, [binding("src_404", "ev_404")], nonce=NONCE
         )
         assert not table
-        assert validate_citations("Claimed [cite:K7Q2-1].", table) == []
+        assert validate_citations(f"Claimed [cite:{NONCE}-1].", table) == []
 
 
 class TestABindingIsCheckedAsARelation:
@@ -99,7 +102,7 @@ class TestABindingIsCheckedAsARelation:
     def test_a_real_source_with_no_such_evidence_gets_no_handle(self):
         registry, first, _second, _ea, _eb = self._two_sources()
         table = build_citation_table(
-            registry, [binding(first.source_id, "ev_404")], nonce="K7Q2"
+            registry, [binding(first.source_id, "ev_404")], nonce=NONCE
         )
         assert not table, dict(table.by_handle)
 
@@ -108,7 +111,7 @@ class TestABindingIsCheckedAsARelation:
         is not its own would attach a citation to text it never contained."""
         registry, first, _second, _ea, from_b = self._two_sources()
         table = build_citation_table(
-            registry, [binding(first.source_id, from_b.evidence_id)], nonce="K7Q2"
+            registry, [binding(first.source_id, from_b.evidence_id)], nonce=NONCE
         )
         assert not table, dict(table.by_handle)
 
@@ -124,7 +127,7 @@ class TestABindingIsCheckedAsARelation:
                 binding(first.source_id, from_b.evidence_id),
                 binding(first.source_id, from_a.evidence_id),
             ],
-            nonce="K7Q2",
+            nonce=NONCE,
         )
         assert len(table.by_handle) == 1, dict(table.by_handle)
         assert table.evidence_for(first.source_id) == (from_a.evidence_id,)
@@ -132,7 +135,7 @@ class TestABindingIsCheckedAsARelation:
     def test_a_binding_with_no_evidence_grants_nothing(self):
         registry, first, _second, _ea, _eb = self._two_sources()
         table = build_citation_table(
-            registry, [{"source_id": first.source_id, "evidence_id": ""}], nonce="K7Q2"
+            registry, [{"source_id": first.source_id, "evidence_id": ""}], nonce=NONCE
         )
         assert not table
 
@@ -151,7 +154,51 @@ class TestTheTableCannotBeEditedAfterItIsBuilt:
     def test_an_empty_table_is_frozen_too(self):
         """Otherwise the default is the one writable table in the system."""
         with pytest.raises(TypeError):
-            CitationTable(nonce="K7Q2").by_handle["forged"] = "src_1"
+            CitationTable(nonce=NONCE).by_handle["forged"] = "src_1"
+
+    def test_a_table_built_directly_is_frozen_too(self):
+        """The builder is not the only way to get one of these. A rule kept
+        there is a rule the constructor does not have, and this is the object
+        the next stage makes authority."""
+        table = CitationTable(nonce=NONCE, by_handle={f"{NONCE}-1": "src_1"})
+        with pytest.raises(TypeError):
+            table.by_handle["forged"] = "src_2"
+
+    def test_the_callers_own_mapping_is_not_kept(self):
+        """Wrapping a caller's dict without copying it leaves the caller
+        holding the writable original."""
+        mine = {f"{NONCE}-1": "src_1"}
+        table = CitationTable(nonce=NONCE, by_handle=mine)
+        mine["forged"] = "src_2"
+        assert table.source_for("forged") is None, dict(table.by_handle)
+
+
+class TestTheNamespaceCannotBeNarrowedByACaller:
+    """The default mint is 40 bits. An override that skips the floor would
+    make the guarantee a convention rather than a property - and the next
+    stage needs one nonce reused across a growing assembly, so the override
+    becomes a production path rather than a test convenience."""
+
+    @pytest.mark.parametrize(
+        "nonce",
+        [
+            "K7Q2",        # the old width
+            "A",           # one character
+            "",            # none at all
+            "k7q2abcd",    # outside the alphabet
+            "K7Q2ABC0",    # a digit the alphabet excludes
+            "K7Q2ABCDE",   # one too many
+        ],
+    )
+    def test_a_nonce_off_the_alphabet_or_the_width_is_refused(self, nonce):
+        registry = SourceRegistry()
+        with pytest.raises(ProvenanceError):
+            build_citation_table(registry, [], nonce=nonce)
+
+    def test_a_minted_nonce_is_always_accepted(self):
+        registry = SourceRegistry()
+        for _ in range(50):
+            build_citation_table(registry, [], nonce=mint_nonce())
 
 
 class TestAHandleFromAnotherTurnDoesNotResolve:
@@ -160,8 +207,8 @@ class TestAHandleFromAnotherTurnDoesNotResolve:
     would let yesterday's citation name today's unrelated document."""
 
     def test_yesterdays_handle_is_refused_today(self):
-        _r1, _b1, yesterday = _turn("rates-2024.md", nonce="AAAA")
-        _r2, _b2, today = _turn("rates-2025.md", nonce="BBBB")
+        _r1, _b1, yesterday = _turn("rates-2024.md", nonce="AAAAAAAA")
+        _r2, _b2, today = _turn("rates-2025.md", nonce="BBBBBBBB")
         stale = yesterday.handle_for("src_1")
 
         # Both turns minted `src_1`; only the nonce tells them apart.
@@ -173,7 +220,7 @@ class TestAHandleFromAnotherTurnDoesNotResolve:
         """Retrieved text reaches the model as data, and a hostile page can
         write a citation marker as easily as any other string. It cannot write
         this turn's nonce, which is minted after the corpus was."""
-        _registry, _bindings, table = _turn("manual.md", nonce="K7Q2")
+        _registry, _bindings, table = _turn("manual.md", nonce=NONCE)
         answer = "The page said [cite:ZZZZ-1] and also [cite:src_1-1]."
         assert validate_citations(answer, table) == []
 
@@ -199,11 +246,11 @@ class TestTheModelCannotNameASourceItself:
     @pytest.mark.parametrize(
         "answer",
         [
-            "[cite K7Q2-1]",      # no colon
-            "cite:K7Q2-1",        # no brackets
+            "[cite K7Q2ABCD-1]",      # no colon
+            "cite:K7Q2ABCD-1",        # no brackets
             "[cite:]",            # no handle
-            "[cite:K7Q2]",        # a nonce with no source number
-            "[cite:K7Q2-]",       # a source number that is not one
+            "[cite:K7Q2ABCD]",        # a nonce with no source number
+            "[cite:K7Q2ABCD-]",       # a source number that is not one
         ],
     )
     def test_malformed_syntax_does_not_become_evidence(self, answer):
@@ -243,7 +290,7 @@ class TestOneSourceHoweverManyTimesItIsCited:
                 binding(source.source_id, first.evidence_id, context_id="ctx_a"),
                 binding(source.source_id, second.evidence_id, context_id="ctx_b"),
             ],
-            nonce="K7Q2",
+            nonce=NONCE,
         )
 
         assert len(table.by_handle) == 1, table.by_handle
@@ -303,7 +350,7 @@ class TestTheMarkersCanBeTakenBackOut:
 
     @pytest.mark.parametrize(
         "answer",
-        ["Alpha [cite:K7Q2].", "Alpha [cite:].", "Alpha [cite:K7Q2-]."],
+        ["Alpha [cite:K7Q2ABCD].", "Alpha [cite:].", "Alpha [cite:K7Q2ABCD-]."],
     )
     def test_a_mistyped_marker_is_removed_too(self, answer):
         """Stripping is deliberately wider than validation. A marker the
@@ -312,15 +359,15 @@ class TestTheMarkersCanBeTakenBackOut:
         out."""
         assert strip_citations(answer) == "Alpha.", answer
 
-    @pytest.mark.parametrize("marker", ["[CITE:K7Q2-1]", "[Cite:K7Q2-1]"])
+    @pytest.mark.parametrize("marker", ["[CITE:K7Q2ABCD-1]", "[Cite:K7Q2ABCD-1]"])
     def test_a_mistyped_keyword_is_removed_too(self, marker):
         """`[CITE:...]` is the same weak-model typo the broad stripper exists
         for; only the handle inside has to be exact."""
         assert strip_citations(f"Alpha {marker}.") == "Alpha."
 
     def test_an_unclosed_marker_does_not_eat_the_sentence(self):
-        assert strip_citations("Alpha [cite:K7Q2 and the rest.") == (
-            "Alpha [cite:K7Q2 and the rest."
+        assert strip_citations("Alpha [cite:K7Q2ABCD and the rest.") == (
+            "Alpha [cite:K7Q2ABCD and the rest."
         )
 
     def test_text_with_no_markers_is_unchanged(self):

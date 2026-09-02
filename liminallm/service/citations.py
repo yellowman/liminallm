@@ -10,7 +10,7 @@ just as easily, and every one of those reaches the model as data.
 
 So the model is given a per-turn handle instead:
 
-    [cite:K7Q2-1]
+    [cite:K7Q2ABCD-1]
 
 The nonce is minted once per turn and the mapping back to `src_#` stays here,
 parent-side. A handle from another turn does not resolve, and neither does one
@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from liminallm.service.provenance import Binding, SourceRegistry
+from liminallm.service.provenance import Binding, ProvenanceError, SourceRegistry
 
 #: The nonce alphabet, without the characters a reader or a small model
 #: confuses: no O/0 and no I/1.
@@ -135,6 +135,34 @@ class CitationTable:
         default_factory=lambda: _EMPTY
     )
 
+    def __post_init__(self) -> None:
+        """Enforce the type's own invariants, wherever it was built.
+
+        The builder is not the only way to get one of these, and a rule kept
+        there is a rule the constructor does not have. Both live here so there
+        is one boundary rather than one convention: the mappings are copied
+        and wrapped so a caller's dict cannot be written through afterwards,
+        and the nonce is checked, so a namespace narrower than the floor
+        cannot be supplied by a caller that the default mint would never have
+        produced.
+        """
+        if len(self.nonce) != NONCE_LENGTH or any(
+            character not in ALPHABET for character in self.nonce
+        ):
+            raise ProvenanceError(
+                f"a citation nonce must be {NONCE_LENGTH} characters of "
+                f"{ALPHABET!r}, got {self.nonce!r}"
+            )
+        object.__setattr__(self, "by_handle", MappingProxyType(dict(self.by_handle)))
+        object.__setattr__(self, "by_source", MappingProxyType(dict(self.by_source)))
+        object.__setattr__(
+            self,
+            "evidence",
+            MappingProxyType(
+                {key: tuple(value) for key, value in self.evidence.items()}
+            ),
+        )
+
     def source_for(self, handle: str) -> Optional[str]:
         return self.by_handle.get(handle)
 
@@ -172,7 +200,10 @@ def build_citation_table(
     source whose only binding is malformed is uncitable rather than citable
     with nothing under it.
     """
-    token = nonce or mint_nonce()
+    # `is None` rather than falsy: omitting the nonce asks for one, and
+    # supplying an empty string is a caller naming a namespace. The second
+    # is refused below rather than quietly replaced with a good one.
+    token = mint_nonce() if nonce is None else nonce
     by_handle: Dict[str, str] = {}
     by_source: Dict[str, str] = {}
     evidence: Dict[str, List[str]] = {}
@@ -202,13 +233,14 @@ def build_citation_table(
             evidence[source_id] = []
         if evidence_id not in evidence[source_id]:
             evidence[source_id].append(evidence_id)
+    # Freezing and nonce validation belong to the type, so an explicitly
+    # supplied narrow nonce is refused here by the same rule that refuses it
+    # anywhere else.
     return CitationTable(
         nonce=token,
-        by_handle=MappingProxyType(dict(by_handle)),
-        by_source=MappingProxyType(dict(by_source)),
-        evidence=MappingProxyType(
-            {key: tuple(value) for key, value in evidence.items()}
-        ),
+        by_handle=by_handle,
+        by_source=by_source,
+        evidence=evidence,
     )
 
 
