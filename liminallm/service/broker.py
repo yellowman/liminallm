@@ -495,7 +495,7 @@ class CapabilityBroker:
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
         invocation.check_live()
-        text, snippets, chunks = self._engine._run_file_search(
+        text, snippets, chunks, hints = self._engine._run_file_search(
             str(payload.get("query") or ""),
             int(payload.get("limit") or 4),
             conversation_id=self._ctx.conversation_id,
@@ -514,7 +514,9 @@ class CapabilityBroker:
         # rules to drift.
         bindings: List[Dict[str, str]] = []
         if self._ctx.source_registry is not None:
-            bindings = register_retrieved_chunks(self._ctx.source_registry, chunks)
+            bindings = register_retrieved_chunks(
+                self._ctx.source_registry, chunks, hints=hints
+            )
         # `text` and `snippets` cross the pipe; the bindings do not. An id in
         # the reply is an id the untrusted side can quote back as its own.
         return CapabilityOutcome(

@@ -5,12 +5,14 @@ import re
 import stat
 import unicodedata
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from typing import (
     Callable,
     ContextManager,
     Dict,
     List,
+    Mapping,
     Optional,
     Sequence,
     Union,
@@ -85,9 +87,27 @@ def _detokenize(tokens: List[str]) -> str:
 INLINE_PATH = "inline"
 
 
+@dataclass(frozen=True)
+class SourceHint:
+    """What the caller knows about a source that the chunk's rows do not.
+
+    A chunk's `fs_path` is whatever its ingestion said it was the contents
+    of, and that is not always a path: a conversation attachment is indexed
+    by `generation_key()`, one immutable *reading* of an object. The digest
+    identifies it and the filename is not in it, so the subsystem that owns
+    the identity has to supply the name - and say that the identity is an
+    origin rather than a place, which is what dropping the locator does.
+    """
+
+    title: str
+    origin_id: str
+
+
 def register_retrieved_chunks(
     registry: SourceRegistry,
     chunks: Sequence[KnowledgeChunk],
+    *,
+    hints: Optional[Mapping[str, SourceHint]] = None,
 ) -> List[Dict[str, str]]:
     """Record what a context retrieval found, and return the bindings.
 
@@ -95,12 +115,17 @@ def register_retrieved_chunks(
     happened; this says where the grounding came from, so the turn stops
     flattening chunks into anonymous text.
 
+    One adapter for every retrieval, so the identity rules cannot drift
+    between the paths that reach it. `hints`, keyed by `fs_path`, is how a
+    caller that knows more than the rows do says so - see `SourceHint`.
+
     A file is identified by its path, as a `locator`. `origin_id` is a source
-    system's own stable identity, and RAG has none to give: the schema records
-    no generation, so a chunk claims to describe whatever its path holds now.
-    Leaving `origin_id` empty keeps it free for a real generation id later,
-    and costs nothing today - the registry falls back to the canonical locator
-    when there is no origin id, so two retrievals of one file still merge.
+    system's own stable identity, and plain RAG has none to give: the schema
+    records no generation, so a chunk claims to describe whatever its path
+    holds now. Leaving `origin_id` empty keeps it free for a real generation
+    id later, and costs nothing today - the registry falls back to the
+    canonical locator when there is no origin id, so two retrievals of one
+    file still merge.
 
     Which context found what is returned rather than stored on the source.
     One file can be described by several contexts and registration is
@@ -114,7 +139,19 @@ def register_retrieved_chunks(
     bindings: List[Dict[str, str]] = []
     for chunk in chunks:
         fs_path = _require_str(chunk.fs_path, what="chunk fs_path")
-        if fs_path == INLINE_PATH:
+        hint = (hints or {}).get(fs_path)
+        if hint is not None:
+            # A named identity, so there is nothing to derive: the caller's
+            # title is what the source is called, and its identity goes where
+            # identities go. No locator, because this names no place - one
+            # recorded here would be a filesystem path that resolves to
+            # nothing, offered to whatever later reads a citation.
+            source = registry.register_source(
+                kind="file",
+                title=hint.title,
+                origin_id=hint.origin_id,
+            )
+        elif fs_path == INLINE_PATH:
             # Not a file: `inline` names no document. Two anonymous ingests
             # into one context are unrelated documents that both land under
             # this sentinel - `_commit_generation` adds inline text rather

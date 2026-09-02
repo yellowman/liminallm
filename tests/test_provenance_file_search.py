@@ -13,12 +13,17 @@ import uuid
 import pytest
 
 from liminallm.service import agent_tools
+from liminallm.service.provenance import SourceRegistry
 from liminallm.service.runtime import get_runtime
 
 MANUAL = "Turbine blade inspection happens every 400 flight hours. " * 40
 LOGBOOK = "The logbook records each inspection against its airframe. " * 40
 ENGINE_A = "Left engine inspection: compressor stage two within limits. " * 40
 ENGINE_B = "Right engine inspection: compressor stage two out of limits. " * 40
+#: Past `INLINE_MAX_BYTES`, which is what makes an attachment searchable at
+#: all - a small text file is carried into the prompt whole and never indexed,
+#: so a smaller fixture would exercise no retrieval.
+SEARCHABLE = MANUAL * 7
 
 
 def _context_with(store, files):
@@ -149,6 +154,136 @@ class TestTheLabelInventsNothing:
         assert chunk_label(SimpleNamespace()) == "unknown source"
 
 
+class TestAnAttachmentIsNamedByTheNameTheChatGaveIt:
+    """A searchable attachment's `fs_path` is not a path at all.
+
+    Attachment ingestion keys the index by `generation_key()` - one *reading*
+    of an object, spelled `attachment-generation:<sha256>:<extension>` -
+    because the same bytes attached under two names parse two ways. The
+    filename is not encoded in it. So anything that treats every non-inline
+    `fs_path` as a filesystem path shows the model a checksum instead of a
+    document, and records the reading as a locator the attachment subsystem
+    says it is not.
+
+    The parent has the missing half: the conversation's own records name
+    every generation it holds.
+    """
+
+    def _account(self, client):
+        email = f"prov_{uuid.uuid4().hex[:8]}@example.com"
+        resp = client.post(
+            "/v1/auth/signup", json={"email": email, "password": "TestPassword123!"}
+        )
+        assert resp.status_code == 201, resp.text
+        data = resp.json()["data"]
+        return data["user_id"], {"Authorization": f"Bearer {data['access_token']}"}
+
+    def _attached(self, client, headers, name, body):
+        """One conversation holding one searchable attachment, uploaded the
+        way the chat uploads it."""
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": "attachment chat"}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        conversation_id = resp.json()["data"]["id"]
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": uuid.uuid4().hex},
+            files={"file": (name, body, "text/markdown")},
+            data={"conversation_id": conversation_id},
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return conversation_id
+
+    def _generation(self, runtime, conversation_id, user_id):
+        """The reading this conversation authorizes, and its checksum."""
+        from liminallm.service.attachments import generation_key, list_attachments
+
+        conversation = runtime.store.get_conversation(
+            conversation_id, user_id=user_id
+        )
+        records = list_attachments(conversation)
+        assert len(records) == 1, records
+        key = generation_key(records[0].get("checksum"), records[0].get("name"))
+        assert key, records
+        return key, str(records[0].get("checksum"))
+
+    def test_the_model_reads_the_filename_and_not_the_reading(self, client):
+        user_id, headers = self._account(client)
+        runtime = get_runtime()
+        conversation_id = self._attached(
+            client, headers, "flight-manual.pdf.md", SEARCHABLE
+        )
+        key, checksum = self._generation(runtime, conversation_id, user_id)
+
+        rendered, snippets, _chunks, _hints = runtime.workflow._run_file_search(
+            "turbine blade inspection", 4,
+            conversation_id=conversation_id, context_id=None,
+            user_id=user_id, tenant_id=None,
+        )
+        assert snippets, f"the fixture attached nothing searchable: {rendered!r}"
+        headers_read = _headers(rendered)
+        assert headers_read, f"nothing was retrieved: {rendered!r}"
+        assert all(h == "[flight-manual.pdf.md]" for h in headers_read), (
+            f"the model was told a generation key: {headers_read}"
+        )
+        # Not only the header: the key names the object by digest, and a
+        # digest in the model's context is a string it can quote back.
+        assert "attachment-generation:" not in rendered, rendered[:200]
+        assert checksum not in rendered, "the model was shown a checksum"
+        assert key not in rendered
+
+    def test_the_reading_is_an_origin_and_never_a_locator(self, client):
+        """`Source.locator` says where a document is. The generation key is
+        not a place, it is the attachment subsystem's own stable identity for
+        one reading - which is what `origin_id` is for."""
+        from liminallm.service.broker import CapabilityBroker, InvocationContext
+        from liminallm.service.invocation import InvocationRegistry
+
+        user_id, headers = self._account(client)
+        runtime = get_runtime()
+        conversation_id = self._attached(
+            client, headers, "flight-manual.pdf.md", SEARCHABLE
+        )
+        key, _checksum = self._generation(runtime, conversation_id, user_id)
+
+        registry = SourceRegistry()
+        context = InvocationContext(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            source_registry=registry,
+            provenance_bindings=[],
+        )
+        broker = CapabilityBroker(runtime.workflow, context)
+        reply = broker._answer(
+            InvocationRegistry().open(
+                uuid.uuid4().hex, tool="file.search_v1", user_id=user_id,
+                tenant_id=None,
+            ),
+            {
+                "capability": "rag.retrieve",
+                "operation_seq": 1,
+                "payload": {"query": "turbine blade inspection", "limit": 4},
+            },
+        )
+        assert reply["ok"] and reply["result"].get("text"), reply
+        assert context.provenance_bindings, "the search grounded nothing"
+
+        sources = [
+            registry.get_source(b["source_id"])
+            for b in context.provenance_bindings
+        ]
+        assert len(set(s.source_id for s in sources)) == 1, (
+            f"one attachment became several sources: {sources}"
+        )
+        source = sources[0]
+        assert source.title == "flight-manual.pdf.md", source
+        assert source.origin_id == key, source
+        assert source.locator is None, (
+            f"a reading was recorded as a filesystem path: {source.locator}"
+        )
+
+
 class TestTheLabelGrowsOnlyAsFarAsItMust:
     """The widening rule itself, on path shapes a corpus fixture cannot
     produce cheaply. A label the model reads is a claim about identity, so it
@@ -182,6 +317,21 @@ class TestTheLabelGrowsOnlyAsFarAsItMust:
             "a/report.md",
             "b/a/report.md",
         ]
+
+    def test_the_whole_path_fallback_is_not_an_absolute_path(self):
+        """The fallback's input is routinely absolute: a context source is
+        `authorize_path`-resolved before `ingest_path` sees it, and the
+        resolved path is what RAG stores when no separate identity is given.
+        A label is text the model can quote back, so the rooted spelling must
+        not be what it is handed."""
+        labels = self._labels(
+            "/srv/liminallm/users/u/a/report.md",
+            "/srv/liminallm/users/u/srv/liminallm/users/u/a/report.md",
+        )
+        assert not any(label.startswith("/") for label in labels), labels
+        assert labels[0] != labels[1], (
+            f"the two reports are still indistinguishable: {labels}"
+        )
 
     def test_inline_text_takes_no_part_in_the_widening(self):
         from liminallm.service.rag import INLINE_PATH

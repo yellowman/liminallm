@@ -21,13 +21,13 @@ import hashlib
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Set, Tuple
+from typing import Any, Callable, List, Mapping, Optional, Set, Tuple
 
 from liminallm.service import attachments as attachments_service
 from liminallm.service import compaction, interpreter, web
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.invocation import Invocation, commit_guard
-from liminallm.service.rag import INLINE_PATH
+from liminallm.service.rag import INLINE_PATH, SourceHint
 from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 
 PYTHON_TOOL_TIMEOUT = 12.0
@@ -124,7 +124,10 @@ def _path_suffixes(path: str) -> List[str]:
     return ["/".join(parts[index:]) for index in range(len(parts) - 1, -1, -1)]
 
 
-def chunk_labels(chunks: List[Any]) -> List[str]:
+def chunk_labels(
+    chunks: List[Any],
+    hints: Optional[Mapping[str, SourceHint]] = None,
+) -> List[str]:
     """What to call each excerpt when showing this result set to the model.
 
     `fs_path` is where a chunk's path lives - `ingest_text` writes it from
@@ -132,26 +135,32 @@ def chunk_labels(chunks: List[Any]) -> List[str]:
     it. Nothing writes `meta["source_path"]`, so reading that key labelled
     every excerpt `attachment`.
 
-    A file name is not an identity either. A corpus ingested from a directory
-    tree holds `reports/engine-a/status.md` beside
+    It is not always a path, either. A conversation attachment is indexed
+    under `generation_key()`, and rendering that told the model a SHA-256 and
+    no filename. `hints` is what the parent knows and the rows do not: for a
+    hinted source the title is the whole label, because the identity behind
+    it names an object rather than a place and has no parts to shorten.
+
+    For the rest, a file name is not an identity. A corpus ingested from a
+    directory tree holds `reports/engine-a/status.md` beside
     `reports/engine-b/status.md`, and calling both `status.md` tells the model
     that one document said both things. So each path gets the shortest
     trailing run of segments no other path in this result set ends with: an
-    unambiguous file stays `turbines.md`, an ambiguous one grows only as far
-    as it must, and the model is never handed a whole absolute path it has no
-    use for. Labels are per path rather than per excerpt, so several excerpts
-    from one file share one.
+    unambiguous file stays `turbines.md`, and an ambiguous one grows only as
+    far as it must. Labels are per source rather than per excerpt, so several
+    excerpts from one file share one.
 
     The `inline` sentinel names no file. Rendering it as one would tell the
     model a filename that does not exist, which is the same class of
     invention the provenance layer exists to prevent - one stage earlier, in
     the text the model actually reads.
     """
+    named = hints or {}
     paths = [_chunk_path(chunk) for chunk in chunks]
     suffixes = {
         path: _path_suffixes(path)
         for path in paths
-        if path is not None and path != INLINE_PATH
+        if path is not None and path != INLINE_PATH and path not in named
     }
     shortest: dict = {}
     for path, own in suffixes.items():
@@ -162,12 +171,21 @@ def chunk_labels(chunks: List[Any]) -> List[str]:
             for suffix in other_suffixes
         }
         # Two paths can share every suffix either has - `a/report.md` is the
-        # tail of `b/a/report.md` - so the whole path is the last resort.
-        shortest[path] = next((s for s in own if s not in taken), path)
+        # tail of `b/a/report.md` - and then the label is the whole path,
+        # spelled as its own segments joined. `authorize_path` resolves a
+        # user's file to an absolute path before ingestion, so the raw
+        # spelling here is routinely rooted, and joining the segments keeps
+        # the root marker out of a string the model can quote back. Unique
+        # unless two paths hold identical segments, which takes two spellings
+        # of one path.
+        widest = own[-1] if own else path
+        shortest[path] = next((s for s in own if s not in taken), widest)
     labels = []
     for path in paths:
         if path is None:
             labels.append("unknown source")
+        elif path in named:
+            labels.append(named[path].title)
         elif path == INLINE_PATH:
             labels.append("inline text")
         else:
@@ -190,6 +208,7 @@ def run_file_search(
     tenant_id: Optional[str],
     attachment_context_ids: Optional[Set[str]] = None,
     authorized_paths: Optional[Set[str]] = None,
+    source_hints: Optional[Mapping[str, SourceHint]] = None,
 ) -> Tuple[str, List[str], List[Any]]:
     """Retrieve excerpts for a model-supplied query.
 
@@ -198,7 +217,9 @@ def run_file_search(
     grounding came from, and narrower than what the retriever offered.
 
     Scoping is the caller's job: `context_ids` must already be the set this
-    user is allowed to read.
+    user is allowed to read. Naming is too: `source_hints` says what a source
+    is called when its `fs_path` does not, and the caller is what holds the
+    conversation's records.
 
     A conversation's implicit context is scoped once more, by what the
     conversation still holds. Its rows describe attachment generations, and
@@ -235,7 +256,7 @@ def run_file_search(
     if not chunks:
         return (f"No excerpts matched '{query}'.", [], [])
     rendered, snippets = [], []
-    for chunk, label in zip(chunks, chunk_labels(chunks)):
+    for chunk, label in zip(chunks, chunk_labels(chunks, source_hints)):
         rendered.append(f"[{label}]\n{chunk.content}")
         snippets.append(chunk.content)
     return ("\n\n".join(rendered), snippets, chunks)

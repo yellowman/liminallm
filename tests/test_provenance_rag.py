@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from liminallm.service.provenance import ProvenanceError, SourceRegistry
-from liminallm.service.rag import register_retrieved_chunks
+from liminallm.service.rag import SourceHint, register_retrieved_chunks
 from liminallm.storage.models import KnowledgeChunk
 
 
@@ -47,6 +47,47 @@ class TestAFileIsIdentifiedByWhereItIsNotByAnIdItDoesNotHave:
         r = SourceRegistry()
         register_retrieved_chunks(r, [chunk("/users/u/files/annual report.pdf")])
         assert r.get_source("src_1").title == "annual report.pdf"
+
+    def test_a_named_identity_is_an_origin_and_not_a_place(self):
+        """A conversation attachment is indexed under `generation_key()`, one
+        immutable reading of an object. It is an identity, not a location, so
+        recording it as a locator would put a path that resolves to nothing
+        in front of whatever later reads the citation - and its title has to
+        come from the caller, because the digest does not carry the name."""
+        r = SourceRegistry()
+        reading = "attachment-generation:" + "a" * 64 + ":.pdf"
+        register_retrieved_chunks(
+            r,
+            [chunk(reading)],
+            hints={reading: SourceHint(title="flight-manual.pdf", origin_id=reading)},
+        )
+        source = r.get_source("src_1")
+        assert source.title == "flight-manual.pdf"
+        assert source.origin_id == reading
+        assert source.locator is None
+        assert source.kind == "file"
+
+    def test_a_hint_names_one_source_and_not_the_others(self):
+        r = SourceRegistry()
+        reading = "attachment-generation:" + "b" * 64 + ":.md"
+        register_retrieved_chunks(
+            r,
+            [chunk(reading), chunk("reports/turbines.md")],
+            hints={reading: SourceHint(title="notes.md", origin_id=reading)},
+        )
+        assert r.get_source("src_1").locator is None
+        assert r.get_source("src_2").locator == "reports/turbines.md"
+        assert r.get_source("src_2").origin_id is None
+
+    def test_two_contexts_reaching_one_reading_record_one_source(self):
+        """The identity is the generation, so the merge that already works
+        for a path works for a reading - registration is first-wins on it."""
+        r = SourceRegistry()
+        reading = "attachment-generation:" + "c" * 64 + ":.md"
+        hints = {reading: SourceHint(title="notes.md", origin_id=reading)}
+        register_retrieved_chunks(r, [chunk(reading, context_id="ctx_a")], hints=hints)
+        register_retrieved_chunks(r, [chunk(reading, context_id="ctx_b")], hints=hints)
+        assert len(r.sources) == 1, r.sources
 
     def test_two_chunks_of_one_file_are_one_source_with_two_passages(self):
         r = SourceRegistry()

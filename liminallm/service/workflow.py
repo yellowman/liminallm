@@ -72,6 +72,7 @@ from liminallm.service.node_attempt import (
 from liminallm.service.provenance import SourceRegistry
 from liminallm.service.rag import (
     RAGService,
+    SourceHint,
     chunks_that_survived,
     register_retrieved_chunks,
 )
@@ -3251,12 +3252,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
         context_id: Optional[str],
         user_id: Optional[str],
         tenant_id: Optional[str],
-    ) -> Tuple[str, List[str], List[Any]]:
+    ) -> Tuple[str, List[str], List[Any], Dict[str, SourceHint]]:
         """Resolve what this user may search, then hand off to the tool.
 
         The rendered chunks come back with the text so the caller can record
         where the grounding came from. Scoping has already happened by then -
         authorize first, record second.
+
+        The hints come back with them, from the same reading of the records
+        that authorized the search. Registration happens in the caller, and
+        two reads could disagree: what the model was told an excerpt is
+        called and what the turn records it as have to be one answer.
         """
         attachment_ctx_ids = self._attachment_context_ids(conversation_id, user_id) or []
         ctx_ids = list(attachment_ctx_ids)
@@ -3269,14 +3275,33 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # explicitly named knowledge context is not filtered this way: it
         # follows paths on purpose, and its rows are its own answer.
         records = self._conversation_attachments(conversation_id, user_id)
-        return agent_tools.run_file_search(
+        hints = self._attachment_source_hints(records)
+        text, snippets, chunks = agent_tools.run_file_search(
             query, limit, ctx_ids, rag=self.rag,
             user_id=user_id, tenant_id=tenant_id,
             attachment_context_ids=set(attachment_ctx_ids),
             authorized_paths=set(
                 attachments_service.authorized_generation_keys(records)
             ),
+            source_hints=hints,
         )
+        return text, snippets, chunks, hints
+
+    def _attachment_source_hints(
+        self, records: List[dict]
+    ) -> Dict[str, SourceHint]:
+        """What each of this conversation's readings is called, and is.
+
+        Every authorized reading gets one, so a searchable attachment can
+        never fall through to being described by its own generation key -
+        which is a digest, and would be both an unreadable label and a
+        filesystem locator that resolves to nothing.
+        """
+        names = attachments_service.generation_names(records)
+        return {
+            key: SourceHint(title=names.get(key) or "attached file", origin_id=key)
+            for key in attachments_service.authorized_generation_keys(records)
+        }
 
     def _run_python_capability(
         self,
@@ -3587,7 +3612,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
             return taint.refusal(session)
         if name == "file_search":
-            result, found, chunks = self._run_file_search(
+            result, found, chunks, hints = self._run_file_search(
                 str(args.get("query") or fallback_query),
                 int(args.get("limit") or 4),
                 conversation_id=conversation_id,
@@ -3602,7 +3627,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # search - authorize first, record second.
             if source_registry is not None and bindings_sink is not None:
                 bindings_sink.extend(
-                    register_retrieved_chunks(source_registry, chunks)
+                    register_retrieved_chunks(source_registry, chunks, hints=hints)
                 )
             return result
         if name == "run_python":
