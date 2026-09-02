@@ -139,7 +139,9 @@ def chunk_labels(
     under `generation_key()`, and rendering that told the model a SHA-256 and
     no filename. `hints` is what the parent knows and the rows do not: for a
     hinted source the title is the whole label, because the identity behind
-    it names an object rather than a place and has no parts to shorten.
+    it names an object rather than a place and has no parts to shorten. Its
+    name is kept as given, and a path that would collide with it widens
+    instead.
 
     For the rest, a file name is not an identity. A corpus ingested from a
     directory tree holds `reports/engine-a/status.md` beside
@@ -162,9 +164,17 @@ def chunk_labels(
         for path in paths
         if path is not None and path != INLINE_PATH and path not in named
     }
+    # A hinted title takes no suffix of its own, but it does take a label. A
+    # conversation attachment called `report.md` and a selected context's
+    # `manuals/report.md` are searched together - that pairing is the ordinary
+    # product path, not a contrived one - and without this the path source
+    # sees no competing `report.md` and renders the same header. Only the
+    # titles in this result set, so a document the model was not shown never
+    # widens one it was.
+    reserved = {named[path].title for path in paths if path in named}
     shortest: dict = {}
     for path, own in suffixes.items():
-        taken = {
+        taken = reserved | {
             suffix
             for other, other_suffixes in suffixes.items()
             if other != path

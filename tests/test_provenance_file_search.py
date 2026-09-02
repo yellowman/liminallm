@@ -233,6 +233,59 @@ class TestAnAttachmentIsNamedByTheNameTheChatGaveIt:
         assert checksum not in rendered, "the model was shown a checksum"
         assert key not in rendered
 
+    def _selected_context(self, client, headers, files):
+        """A knowledge context the chat can name, holding real paths."""
+        resp = client.post(
+            "/v1/contexts",
+            headers=headers,
+            json={"name": f"ctx-{uuid.uuid4().hex[:6]}", "description": "manuals"},
+        )
+        assert resp.status_code in (200, 201), resp.text
+        context_id = resp.json()["data"]["id"]
+        for path, text in files.items():
+            written = get_runtime().rag.ingest_text(
+                context_id, text, source_path=path
+            )
+            assert written > 0, f"the fixture failed to index {path}"
+        return context_id
+
+    def test_an_attachment_and_a_context_file_of_one_name_stay_two(
+        self, client
+    ):
+        """The two scopes are searched together - `_run_file_search` starts
+        with the conversation's attachment context and adds the selected
+        knowledge context to the same list, and the agent offers `file_search`
+        whenever either exists. So a chat holding `report.md` beside a context
+        holding `manuals/report.md` is an ordinary configuration that puts
+        both in one answer.
+
+        The attachment keeps the name its owner gave it; the path widens
+        around it, because a path has parts to widen with and a name does
+        not."""
+        user_id, headers = self._account(client)
+        runtime = get_runtime()
+        conversation_id = self._attached(client, headers, "report.md", SEARCHABLE)
+        context_id = self._selected_context(
+            client, headers, {"manuals/report.md": LOGBOOK * 4}
+        )
+
+        # A term from each document, so the ranking has a reason to return
+        # both rather than filling every slot from whichever is longer.
+        rendered, _snippets, chunks, _hints = runtime.workflow._run_file_search(
+            "turbine logbook", 6,
+            conversation_id=conversation_id, context_id=context_id,
+            user_id=user_id, tenant_id=None,
+        )
+        # Checked rather than assumed: the collision is only reachable if both
+        # scopes actually answered.
+        assert len({c.fs_path for c in chunks}) == 2, (
+            f"the fixture searched one scope only: {[c.fs_path for c in chunks]}"
+        )
+        assert set(_headers(rendered)) == {"[report.md]", "[manuals/report.md]"}, (
+            "an attachment and a context file were rendered under one label: "
+            f"{_headers(rendered)}"
+        )
+
     def test_the_reading_is_an_origin_and_never_a_locator(self, client):
         """`Source.locator` says where a document is. The generation key is
         not a place, it is the attachment subsystem's own stable identity for
@@ -340,6 +393,41 @@ class TestTheLabelGrowsOnlyAsFarAsItMust:
             "inline text",
             "status.md",
         ]
+
+    @staticmethod
+    def _labels_with(hints, *paths):
+        from types import SimpleNamespace
+
+        from liminallm.service.agent_tools import chunk_labels
+        from liminallm.service.rag import SourceHint
+
+        return chunk_labels(
+            [SimpleNamespace(fs_path=path) for path in paths],
+            {
+                key: SourceHint(title=title, origin_id=key)
+                for key, title in hints.items()
+            },
+        )
+
+    def test_a_hinted_title_holds_the_label_it_uses(self):
+        """A hinted source has no suffixes to compete with, but it does take
+        a label, and a path that would render the same one has to widen."""
+        assert self._labels_with(
+            {"reading:1": "report.md"}, "reading:1", "manuals/report.md"
+        ) == ["report.md", "manuals/report.md"]
+
+    def test_a_hinted_title_that_collides_with_nothing_widens_nothing(self):
+        assert self._labels_with(
+            {"reading:1": "notes.md"}, "reading:1", "manuals/report.md"
+        ) == ["notes.md", "report.md"]
+
+    def test_a_hint_for_a_document_not_shown_holds_nothing(self):
+        """The hints cover every reading the conversation authorizes, not
+        only what this search returned. A document the model was not shown
+        must not widen one it was."""
+        assert self._labels_with(
+            {"reading:1": "report.md"}, "manuals/report.md"
+        ) == ["report.md"]
 
 
 class TestNothingRetrievedSaysSo:
