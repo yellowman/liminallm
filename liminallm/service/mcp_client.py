@@ -242,6 +242,12 @@ class RemoteTool:
     #: The name the *server* knows it by. Never the projected one: dispatching
     #: on the model-visible name would send a server a tool it does not have.
     remote_name: str
+    #: The `mcp.server` artifact this came from. The row id, because that is
+    #: the only thing about a configured server that is unique: the schema
+    #: does not constrain artifact names, so two admins can legitimately
+    #: configure two different servers as `inventory`. `server_name` is
+    #: presentation; this is identity.
+    server_id: str
     server_name: str
     server_url: str
     taint_class: str
@@ -398,6 +404,7 @@ async def discover(servers: Iterable[dict], *, policy, timeout: float = 10.0) ->
                 RemoteTool(
                     model_name=name,
                     remote_name=tool.name,
+                    server_id=str(server.get("artifact_id") or ""),
                     server_name=server["name"],
                     server_url=server["url"],
                     taint_class=server["taint_class"],
@@ -473,15 +480,44 @@ async def call(
             tool=tool.remote_name,
             kinds=sorted({f["type"] for f in findings}),
         )
+    # Scan first, then neutralize: the scanner must see the text as the server
+    # wrote it, and `shown` is what the envelope will carry. Recorded from
+    # `shown` rather than `redacted`, because a passage the answer may rest on
+    # has to be the passage the model was given - a marker the server wrote is
+    # `[filtered]` by the time it is read, and evidence holding the original
+    # would be checked against text that never reached the model.
+    shown = neutralize_markers(redacted)
     if source_registry is not None and bindings_sink is not None:
-        # Here, where the redacted text exists. The envelope below is this
-        # system's own words about the result, and the refusal above returned
-        # already - a turn that was refused read nothing to rest on.
-        bindings_sink.extend(register_tool_result(source_registry, tool, redacted))
+        # The refusal above returned already: a turn that was refused read
+        # nothing it could rest on.
+        bindings_sink.extend(register_tool_result(source_registry, tool, shown))
+    # `neutralize_markers` is idempotent, so the envelope re-applying it to
+    # `shown` changes nothing.
     return wrap_untrusted(
-        redacted,
+        shown,
         source=f"MCP server {tool.server_name} :: {tool.remote_name}",
         findings=findings,
+    )
+
+
+def _tool_identity(tool: RemoteTool) -> str:
+    """The stable identity of one remote tool, encoded unambiguously.
+
+    The artifact row id rather than the display name: nothing constrains
+    `mcp.server` names to be unique, so two admins can configure two different
+    servers as `inventory` and the registry - which merges on `(kind,
+    origin_id)` - would attach one server's answers to the other. The model
+    already tells them apart, because `model_tool_name` disambiguates on
+    collision; this is the same distinction on the provenance side.
+
+    JSON rather than concatenation, so no component can spell another one's
+    boundary: a server id containing a colon cannot be read as a shorter id
+    plus part of a tool name.
+    """
+    return "mcp:" + json.dumps(
+        [str(tool.server_id), tool.remote_name],
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
 
 
@@ -510,7 +546,7 @@ def register_tool_result(
     source = registry.register_source(
         kind="mcp",
         title=f"{tool.server_name} :: {tool.remote_name}",
-        origin_id=f"mcp:{tool.server_name}:{tool.remote_name}",
+        origin_id=_tool_identity(tool),
     )
     evidence = registry.add_evidence(source.source_id, text=text)
     return [binding(source.source_id, evidence.evidence_id)]

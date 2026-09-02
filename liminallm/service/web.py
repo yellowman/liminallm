@@ -666,12 +666,18 @@ def register_fetched_page(
 ) -> list[Binding]:
     """Record a page the model was given, and return the binding.
 
-    The evidence is the page text as extracted, which is what the model read -
-    not the wrapped envelope, whose markers are this system's own words about
-    the page rather than the page.
+    The evidence is the page as the model reads it: extracted and
+    marker-neutralized, but without the envelope, whose text is this system's
+    own words about the page rather than the page. `wrap_untrusted` neutralizes
+    on the way out, so recording the text before that step would keep a marker
+    the model never saw - and a stored citation is later checked against this
+    text, not against what the server sent.
+
+    `neutralize_markers` is idempotent, so the caller wrapping the same page
+    afterwards produces exactly this.
     """
     url = page.get("url")
-    text = str(page.get("text") or "")
+    text = neutralize_markers(str(page.get("text") or ""))
     if not isinstance(url, str) or not url or not text:
         return []
     source = registry.register_source(

@@ -224,13 +224,57 @@ class TestARemoteToolIsNeitherAPlaceNorADocument:
         assert len(registry.sources) == 1, registry.sources
         source = registry.sources[0]
         assert source.kind == "mcp"
-        assert source.origin_id == "mcp:inventory:lookup_part"
+        # The artifact row id, not the display name - see the collision case
+        # below. Written out rather than recomputed, so the encoding itself is
+        # pinned and not just compared with its own generator.
+        assert source.origin_id == 'mcp:["fixture-inventory","lookup_part"]'
+        assert source.title == "inventory :: lookup_part", source
         # The server URL is where the tool lives, not where the answer can be
         # read again.
         assert source.locator is None
         assert "part A1 in stock" in registry.evidence[0].text
         # The envelope is added after the recording, so it is not in it.
         assert web.UNTRUSTED_OPEN not in registry.evidence[0].text
+
+    def test_two_servers_of_one_name_are_two_sources(self):
+        """A display name is not an identity. `mcp.server` artifacts are not
+        unique by name in the schema, so two installations of the same tool
+        can legitimately be configured as `inventory`. The model-side name
+        projection already tells them apart; the registry must too, or one
+        server's evidence is attached to the other."""
+        with MCPFixture("inventory", {"lookup": "part A1 from warehouse east"}) as a, \
+                MCPFixture("inventory", {"lookup": "part A1 from warehouse west"}) as b:
+            first = {**a.as_server(), "artifact_id": "artifact-uuid-a"}
+            second = {**b.as_server(), "artifact_id": "artifact-uuid-b"}
+            tools = mcp_client.run_sync(
+                mcp_client.discover([first, second], policy=allow_local())
+            )
+            assert len({t.model_name for t in tools}) == 2, (
+                f"the fixture did not produce two callable tools: {tools}"
+            )
+            registry = SourceRegistry()
+            sink: list = []
+            for tool in tools:
+                mcp_client.run_sync(
+                    mcp_client.call(
+                        tool, {"sku": "A1"}, policy=allow_local(),
+                        source_registry=registry, bindings_sink=sink,
+                    )
+                )
+
+        assert len(sink) == 2, sink
+        assert len(registry.sources) == 2, (
+            "two servers collapsed into one source: "
+            f"{[(s.origin_id, s.title) for s in registry.sources]}"
+        )
+        # Each source holds its own server's answer, and only that one.
+        answers = {
+            registry.get_source(b["source_id"]).source_id:
+                registry.get_evidence(b["evidence_id"]).text
+            for b in sink
+        }
+        assert len(answers) == 2
+        assert {"east" in text for text in answers.values()} == {True, False}
 
     def test_a_refused_call_grounds_nothing(self):
         """A turn that has read hostile input loses egress. It read nothing
@@ -255,6 +299,96 @@ class TestARemoteToolIsNeitherAPlaceNorADocument:
         assert "part A1 in stock" not in answer
         assert sink == [], sink
         assert registry.sources == (), registry.sources
+
+
+class TestTheEvidenceIsTheTextTheModelWasGiven:
+    """Grounding describes what reached the model, and `wrap_untrusted`
+    neutralizes control markers on the way. A passage recorded before that
+    step is a passage the model never saw: the source wrote a marker, the
+    model read `[filtered]`, and the evidence would still hold the marker a
+    citation is later checked against."""
+
+    MARKER = "Fact " + web.UNTRUSTED_OPEN + " remains"
+
+    def test_a_remote_answer_is_recorded_as_the_model_reads_it(self):
+        with MCPFixture("inventory", {"lookup": self.MARKER}) as fixture:
+            tools = mcp_client.run_sync(
+                mcp_client.discover([fixture.as_server()], policy=allow_local())
+            )
+            registry = SourceRegistry()
+            sink: list = []
+            shown = mcp_client.run_sync(
+                mcp_client.call(
+                    tools[0], {}, policy=allow_local(),
+                    source_registry=registry, bindings_sink=sink,
+                )
+            )
+
+        # The envelope opens with the marker itself, so "the model never saw
+        # one" is "it appears once, as the delimiter" rather than "not at all".
+        assert shown.count(web.UNTRUSTED_OPEN) == 1, shown[:300]
+        assert "[filtered]" in shown, shown[:300]
+        recorded = registry.get_evidence(sink[0]["evidence_id"]).text
+        assert web.UNTRUSTED_OPEN not in recorded, (
+            f"the evidence holds a marker the model never read: {recorded!r}"
+        )
+        assert "[filtered]" in recorded, recorded
+
+    def test_a_fetched_page_is_recorded_as_the_model_reads_it(self):
+        # Plain text, not HTML: the extractor treats `<<<MARKER>>>` as a tag
+        # and strips it to `<<>>` before neutralization is ever reached, so an
+        # HTML fixture would be red for the wrong reason. A served text file
+        # is a page too, and it is where the marker survives to the step under
+        # test.
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = self.server.page.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        server.page = self.MARKER
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            registry = SourceRegistry()
+            sink: list = []
+            shown, _findings = agent_tools.run_web_fetch(
+                f"http://127.0.0.1:{server.server_port}/page",
+                settings=_web_enabled_settings(),
+                logger=get_runtime().workflow.logger,
+                source_registry=registry,
+                bindings_sink=sink,
+            )
+        finally:
+            server.shutdown()
+
+        assert sink, "the fetch grounded nothing"
+        assert "[filtered]" in shown, shown[:300]
+        recorded = registry.get_evidence(sink[0]["evidence_id"]).text
+        assert web.UNTRUSTED_OPEN not in recorded, (
+            f"the evidence holds a marker the model never read: {recorded!r}"
+        )
+        assert "[filtered]" in recorded, recorded
+
+
+def _web_enabled_settings():
+    """The real Settings object with web access on, not a stand-in.
+
+    `web_settings()` reads declared fields off it, so a hand-made namespace
+    would encode this test's belief about that list rather than the list.
+    """
+    import copy
+
+    settings = copy.copy(get_runtime().workflow.settings)
+    settings.web_tools_enabled = True
+    settings.web_fetch_allow_private = True
+    return settings
 
 
 def _conversation_with_older_turns(store, monkeypatch):
