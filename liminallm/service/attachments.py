@@ -324,12 +324,39 @@ def authorized_generation_keys(records: list[dict[str, Any]]) -> list[str]:
     generation whose object has been reclaimed is still not retrievable and
     a chunk written outside a record is not authorized merely by existing.
     """
-    keys = []
+    return [key for key, _name in _authorized_generations(records)]
+
+
+def _authorized_generations(
+    records: list[dict[str, Any]],
+) -> list[tuple[str, str]]:
+    """Each authorized reading, with the name its record gives it."""
+    pairs = []
     for record in records:
         key = generation_key(record.get("checksum"), record.get("name"))
         if key is not None:
-            keys.append(key)
-    return keys
+            pairs.append((key, str(record.get("name") or "")))
+    return pairs
+
+
+def generation_names(records: list[dict[str, Any]]) -> dict[str, str]:
+    """What the conversation calls each of the readings it authorizes.
+
+    A reading is keyed by digest and extension, so the name is not recoverable
+    from the key and has to come from the records. Anything showing an
+    attachment to the model or recording where an answer came from needs it:
+    the key names an object, and `attachment-generation:<sha256>:.pdf` is not
+    what the person calls the file they attached.
+
+    First name wins. Identical bytes attached twice under one extension are
+    one reading however many names point at it, and the conversation's first
+    name for it is the one it is shown under.
+    """
+    names: dict[str, str] = {}
+    for key, name in _authorized_generations(records):
+        if name:
+            names.setdefault(key, name)
+    return names
 
 
 def resolved_sources(

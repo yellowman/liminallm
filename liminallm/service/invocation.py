@@ -129,6 +129,13 @@ class Operation:
     payload_hash: str
     state: str = PENDING
     result: Any = None
+    #: What the parent learned from this step that the worker must not.
+    #: `result` crosses the pipe; this never does. It lives here because the
+    #: ledger is what survives the worker that produced it: a replacement
+    #: attempt replays the committed result without running the handler, so
+    #: anything the parent needs to re-apply has to be stored beside it or it
+    #: is lost exactly when a retry needs it.
+    parent_state: Any = None
     step: str = ""
 
     @property
@@ -217,12 +224,20 @@ class OperationLedger:
             self._ops[(operation_seq, step)] = op
             return op
 
-    def commit(self, operation_seq: int, result: Any, *, step: str = "") -> None:
+    def commit(
+        self,
+        operation_seq: int,
+        result: Any,
+        *,
+        step: str = "",
+        parent_state: Any = None,
+    ) -> None:
         with self._lock:
             op = self._ops.get((operation_seq, step))
             if op is not None:
                 op.state = COMMITTED
                 op.result = result
+                op.parent_state = parent_state
 
     def fail(self, operation_seq: int, error: str, *, step: str = "") -> None:
         with self._lock:

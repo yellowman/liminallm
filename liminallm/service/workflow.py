@@ -72,6 +72,7 @@ from liminallm.service.node_attempt import (
 from liminallm.service.provenance import SourceRegistry
 from liminallm.service.rag import (
     RAGService,
+    SourceHint,
     chunks_that_survived,
     register_retrieved_chunks,
 )
@@ -3251,8 +3252,18 @@ class WorkflowEngine(WorkflowStreamingMixin):
         context_id: Optional[str],
         user_id: Optional[str],
         tenant_id: Optional[str],
-    ) -> Tuple[str, List[str]]:
-        """Resolve what this user may search, then hand off to the tool."""
+    ) -> Tuple[str, List[str], List[Any], Dict[str, SourceHint]]:
+        """Resolve what this user may search, then hand off to the tool.
+
+        The rendered chunks come back with the text so the caller can record
+        where the grounding came from. Scoping has already happened by then -
+        authorize first, record second.
+
+        The hints come back with them, from the same reading of the records
+        that authorized the search. Registration happens in the caller, and
+        two reads could disagree: what the model was told an excerpt is
+        called and what the turn records it as have to be one answer.
+        """
         attachment_ctx_ids = self._attachment_context_ids(conversation_id, user_id) or []
         ctx_ids = list(attachment_ctx_ids)
         if context_id:
@@ -3264,14 +3275,33 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # explicitly named knowledge context is not filtered this way: it
         # follows paths on purpose, and its rows are its own answer.
         records = self._conversation_attachments(conversation_id, user_id)
-        return agent_tools.run_file_search(
+        hints = self._attachment_source_hints(records)
+        text, snippets, chunks = agent_tools.run_file_search(
             query, limit, ctx_ids, rag=self.rag,
             user_id=user_id, tenant_id=tenant_id,
             attachment_context_ids=set(attachment_ctx_ids),
             authorized_paths=set(
                 attachments_service.authorized_generation_keys(records)
             ),
+            source_hints=hints,
         )
+        return text, snippets, chunks, hints
+
+    def _attachment_source_hints(
+        self, records: List[dict]
+    ) -> Dict[str, SourceHint]:
+        """What each of this conversation's readings is called, and is.
+
+        Every authorized reading gets one, so a searchable attachment can
+        never fall through to being described by its own generation key -
+        which is a digest, and would be both an unreadable label and a
+        filesystem locator that resolves to nothing.
+        """
+        names = attachments_service.generation_names(records)
+        return {
+            key: SourceHint(title=names.get(key) or "attached file", origin_id=key)
+            for key in attachments_service.authorized_generation_keys(records)
+        }
 
     def _run_python_capability(
         self,
@@ -3556,6 +3586,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         operation_seq: int = 0,
         step: str = "",
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Dict[str, str]]] = None,
     ) -> str:
         """Run one model-requested tool and return its text result.
 
@@ -3580,7 +3612,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
             return taint.refusal(session)
         if name == "file_search":
-            result, found = self._run_file_search(
+            result, found, chunks, hints = self._run_file_search(
                 str(args.get("query") or fallback_query),
                 int(args.get("limit") or 4),
                 conversation_id=conversation_id,
@@ -3589,6 +3621,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 tenant_id=tenant_id,
             )
             snippets.extend(found)
+            # Every rendered chunk, because nothing budgets between here and
+            # the next model turn: this text is appended to the agent's
+            # messages as it stands. Scoping already happened inside the
+            # search - authorize first, record second.
+            if source_registry is not None and bindings_sink is not None:
+                bindings_sink.extend(
+                    register_retrieved_chunks(source_registry, chunks, hints=hints)
+                )
             return result
         if name == "run_python":
             return self._run_python_capability(
@@ -3668,6 +3708,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         invocation: Optional[Invocation] = None,
         operation_seq: int = 0,
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
+        source_registry: Optional[SourceRegistry] = None,
+        bindings: Optional[List[Dict[str, str]]] = None,
     ) -> List[str]:
         """Execute one round's tool calls; results always in call order.
 
@@ -3691,7 +3733,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             [name for name, tool in (mcp_tools or {}).items() if tool.is_egress],
         )
 
-        def run_one(index: int, name: str, args: Dict[str, Any], sink: List[str]) -> str:
+        def run_one(
+            index: int,
+            name: str,
+            args: Dict[str, Any],
+            sink: List[str],
+            binding_sink: List[Dict[str, str]],
+        ) -> str:
             with current_invocation(bound), tool_network_guard(
                 self.tool_network_policy
             ):
@@ -3713,6 +3761,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     # position in a matching round is the same call.
                     step=f"call{index}",
                     mcp_tools=mcp_tools,
+                    source_registry=source_registry,
+                    bindings_sink=binding_sink,
                 )
 
         if len(parsed) > 1 and all(
@@ -3721,19 +3771,31 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # Per-call snippet sinks keep context_snippets in call order no
             # matter which pool worker finishes first.
             sinks: List[List[str]] = [[] for _ in parsed]
+            # And per-call binding sinks, for the same reason: the registry is
+            # thread-safe, but which relation was found first is not the order
+            # the calls were made in.
+            binding_sinks: List[List[Dict[str, str]]] = [[] for _ in parsed]
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(4, len(parsed))
             ) as pool:
                 futures = [
-                    pool.submit(run_one, index, name, args, sink)
-                    for index, ((_, name, args), sink) in enumerate(zip(parsed, sinks))
+                    pool.submit(run_one, index, name, args, sink, binding_sink)
+                    for index, ((_, name, args), sink, binding_sink) in enumerate(
+                        zip(parsed, sinks, binding_sinks)
+                    )
                 ]
                 results = [future.result() for future in futures]
             for sink in sinks:
                 snippets.extend(sink)
+            if bindings is not None:
+                seen: set = set()
+                self._merge_bindings(bindings, seen, [
+                    binding for sink in binding_sinks for binding in sink
+                ])
             return results
+        round_bindings = bindings if bindings is not None else []
         return [
-            run_one(index, name, args, snippets)
+            run_one(index, name, args, snippets, round_bindings)
             for index, (_, name, args) in enumerate(parsed)
         ]
 

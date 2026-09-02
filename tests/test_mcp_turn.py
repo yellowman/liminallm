@@ -308,7 +308,10 @@ class TestBothPathsCarryTheMapToTheRound:
             finally:
                 invocation.close()
 
-            assert "from the broker" in out["results"][0]
+            # `_tools_round` returns the two halves separately now: the
+            # public reply that crosses the pipe, and the parent-only record
+            # of what the round grounded.
+            assert "from the broker" in out.public["results"][0]
             assert fixture.calls == [("read", {})]
 
     def test_the_streaming_path_puts_the_map_on_its_context(

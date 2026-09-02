@@ -49,6 +49,7 @@ from liminallm.service.invocation import (
     payload_hash,
 )
 from liminallm.service.provenance import SourceRegistry
+from liminallm.service.rag import register_retrieved_chunks
 from liminallm.service.sandbox import tool_network_guard
 from liminallm.service.tool_worker import FrameBudget
 from liminallm.service.wire import WireError, recv_frame, send_frame
@@ -59,6 +60,23 @@ logger = get_logger(__name__)
 #: worker is still alive. A killed worker never sends again, so without this
 #: the loop would block forever on a process that no longer exists.
 _POLL_SECONDS = 0.05
+
+
+@dataclass
+class CapabilityOutcome:
+    """A capability's two outputs, separated by who may see them.
+
+    `public` is the reply, and it crosses the pipe. `parent_state` does not:
+    it is what the parent learned by serving the request, and it is committed
+    to the ledger beside the reply so a replacement attempt replaying that
+    reply gets it back without the handler running again.
+
+    A handler with nothing to keep just returns its dict; only the ones with
+    parent-side consequences reach for this.
+    """
+
+    public: Dict[str, Any]
+    parent_state: Optional[Dict[str, Any]] = None
 
 
 class UnknownCapability(RuntimeError):
@@ -275,6 +293,11 @@ class CapabilityBroker:
                     capability=capability,
                     operation_seq=operation_seq,
                 )
+                # The handler does not run, so this is the only place the
+                # replacement attempt can learn what the first one recorded.
+                # Re-deriving it instead would bind replayed text to a fresh
+                # retrieval, and the corpus may have moved since.
+                self._apply_parent_state(replayed.parent_state)
                 return {"ok": True, "result": replayed.result, "replayed": True}
             invocation.ledger.begin(operation_seq, capability, digest)
             self._notify(capability)
@@ -284,7 +307,12 @@ class CapabilityBroker:
             # it here covers every capability - which is the point, since the
             # capabilities are now the only things that open sockets at all.
             with tool_network_guard(self._engine.tool_network_policy):
-                result = handler(invocation, operation_seq, payload)
+                outcome = handler(invocation, operation_seq, payload)
+            parent_state: Optional[Dict[str, Any]] = None
+            if isinstance(outcome, CapabilityOutcome):
+                result, parent_state = outcome.public, outcome.parent_state
+            else:
+                result = outcome
             if _is_error(result):
                 # A failed step is not a committed one. Recording it as
                 # committed would make the ledger replay the failure on every
@@ -293,7 +321,12 @@ class CapabilityBroker:
                     operation_seq, str(result.get("error") or "error")
                 )
             else:
-                invocation.ledger.commit(operation_seq, result)
+                # Beside the reply, not inside it: committed together so a
+                # replay cannot get one without the other.
+                invocation.ledger.commit(
+                    operation_seq, result, parent_state=parent_state
+                )
+                self._apply_parent_state(parent_state)
             logger.info(
                 "capability_served",
                 invocation_id=invocation.invocation_id,
@@ -430,13 +463,39 @@ class CapabilityBroker:
         after = list(invocation.session.get("artifacts") or [])
         return {"text": text, "artifacts": after[len(before) :]}
 
+    def _apply_parent_state(self, parent_state: Optional[Dict[str, Any]]) -> None:
+        """Fold what a capability recorded into the invocation's own record.
+
+        Deduped on the triple, because one relation reached twice is still
+        one relation: a selected context may already have put a chunk in the
+        opening prompt, and an explicit search may retrieve the same chunk
+        again.
+        """
+        if not parent_state:
+            return
+        collected = self._ctx.provenance_bindings
+        seen = {
+            (b.get("context_id"), b.get("source_id"), b.get("evidence_id"))
+            for b in collected
+        }
+        for binding in parent_state.get("provenance_bindings") or []:
+            key = (
+                binding.get("context_id"),
+                binding.get("source_id"),
+                binding.get("evidence_id"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append(dict(binding))
+
     # -- retrieval, notes, history ----------------------------------------
 
     def _rag_retrieve(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> CapabilityOutcome:
         invocation.check_live()
-        text, snippets = self._engine._run_file_search(
+        text, snippets, chunks, hints = self._engine._run_file_search(
             str(payload.get("query") or ""),
             int(payload.get("limit") or 4),
             conversation_id=self._ctx.conversation_id,
@@ -444,7 +503,26 @@ class CapabilityBroker:
             user_id=self._ctx.user_id,
             tenant_id=self._ctx.tenant_id,
         )
-        return {"text": text, "snippets": snippets}
+        # The chunks that were rendered, after the attachment-generation
+        # scope has already dropped what this conversation no longer holds -
+        # authorize first, record second. There is no second budgeting step
+        # between here and the model: this text is appended to the agent's
+        # messages as it stands, so every rendered chunk is grounding.
+        #
+        # Through the same adapter the automatic paths use. A second mapping
+        # here would be a second place for the file-versus-inline identity
+        # rules to drift.
+        bindings: List[Dict[str, str]] = []
+        if self._ctx.source_registry is not None:
+            bindings = register_retrieved_chunks(
+                self._ctx.source_registry, chunks, hints=hints
+            )
+        # `text` and `snippets` cross the pipe; the bindings do not. An id in
+        # the reply is an id the untrusted side can quote back as its own.
+        return CapabilityOutcome(
+            public={"text": text, "snippets": snippets},
+            parent_state={"provenance_bindings": bindings} if bindings else None,
+        )
 
     def _notes_search(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
@@ -494,7 +572,7 @@ class CapabilityBroker:
 
     def _tools_round(
         self, invocation: Invocation, seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> CapabilityOutcome:
         """Execute the tools the model asked for in one round.
 
         The round arrives as one request because how its calls are *run* is a
@@ -529,6 +607,7 @@ class CapabilityBroker:
                 user_id=self._ctx.user_id,
             )
         snippets: List[str] = []
+        round_bindings: List[Dict[str, str]] = []
         before = list(invocation.session.get("artifacts") or [])
         results = self._engine._run_round_tools(
             parsed,
@@ -542,14 +621,24 @@ class CapabilityBroker:
             invocation=invocation,
             operation_seq=seq,
             mcp_tools=self._ctx.mcp_tools,
+            source_registry=self._ctx.source_registry,
+            bindings=round_bindings,
         )
         after = list(invocation.session.get("artifacts") or [])
-        return {
-            "results": results,
-            "snippets": snippets,
-            "artifacts": after[len(before) :],
-            "findings": list(invocation.session.get("injection_findings") or []),
-        }
+        return CapabilityOutcome(
+            public={
+                "results": results,
+                "snippets": snippets,
+                "artifacts": after[len(before) :],
+                "findings": list(invocation.session.get("injection_findings") or []),
+            },
+            # A round is one committed operation, so its grounding is
+            # committed with it and comes back on a replay by the same route
+            # a single retrieval's does.
+            parent_state=(
+                {"provenance_bindings": round_bindings} if round_bindings else None
+            ),
+        )
 
     def _tool_host(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]

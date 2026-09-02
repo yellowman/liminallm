@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from liminallm.service import agent_tools
+from liminallm.storage.models import KnowledgeChunk
 
 
 class _Log:
@@ -90,7 +91,7 @@ class TestWebToolsDisabled:
 
 class TestFileSearch:
     def test_no_contexts_is_a_message_not_a_crash(self):
-        text, snippets = agent_tools.run_file_search(
+        text, snippets, _chunks = agent_tools.run_file_search(
             "q", 4, [], rag=None, user_id="u", tenant_id=None
         )
         assert "No searchable files" in text
@@ -98,18 +99,30 @@ class TestFileSearch:
 
     def test_no_matches_names_the_query(self):
         rag = SimpleNamespace(retrieve=lambda *a, **k: [])
-        text, snippets = agent_tools.run_file_search(
+        text, snippets, _chunks = agent_tools.run_file_search(
             "widgets", 4, ["ctx"], rag=rag, user_id="u", tenant_id=None
         )
         assert "widgets" in text
         assert snippets == []
 
     def test_excerpts_are_labelled_with_their_file(self):
-        chunk = SimpleNamespace(
-            content="the answer is 42", meta={"source_path": "/x/report.pdf"}
+        """A real chunk, not a namespace carrying `meta["source_path"]`.
+
+        That key is where this test's double put the path and where the code
+        read it, and nothing in the application writes it - `fs_path` does.
+        So the double and the code shared one wrong belief, this assertion
+        passed, and every excerpt the model actually saw was headed
+        `[attachment]`.
+        """
+        chunk = KnowledgeChunk(
+            context_id="ctx",
+            fs_path="/x/report.pdf",
+            content="the answer is 42",
+            embedding=[],
+            chunk_index=0,
         )
         rag = SimpleNamespace(retrieve=lambda *a, **k: [chunk])
-        text, snippets = agent_tools.run_file_search(
+        text, snippets, _chunks = agent_tools.run_file_search(
             "answer", 4, ["ctx"], rag=rag, user_id="u", tenant_id=None
         )
         assert "[report.pdf]" in text
