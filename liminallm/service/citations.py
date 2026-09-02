@@ -253,31 +253,22 @@ def _handle_number(nonce: str, handle: str) -> Optional[int]:
     return int(tail) if tail.isdigit() else None
 
 
-def extend_citation_table(
-    registry: SourceRegistry,
-    table: CitationTable,
-    bindings: Sequence[Binding],
-) -> CitationTable:
-    """The same namespace, grown by whatever became eligible since.
+def _require_consistent(
+    registry: SourceRegistry, table: CitationTable
+) -> List[int]:
+    """Check an inherited table whole, and return its allocated numbers.
 
-    One assembly offers the model handles more than once - a tool round adds
-    sources, then another round adds more - and each offer has to extend the
-    previous one rather than start over. Building a second table from the
-    second round's bindings alone would allocate `-1` again, to a different
-    source, under the same nonce: two documents with one name, in one
-    conversation the model can see both halves of.
+    Every part of it, not only the part extension happens to read. The maps
+    have to be exact inverses, each source has to resolve here, and each
+    eligible passage has to exist and belong to the source it is filed under -
+    the same relation new bindings are held to, applied to state arriving
+    already built. Checking only what the loop below touches would let a
+    malformed table pass its own contents straight through into the grown one,
+    which is the defect fixed for new bindings reappearing by inheritance.
 
-    So an existing source keeps the handle it already has, a new one takes the
-    next unused number, and a source seen again only adds to what may be cited
-    within it.
-
-    The table handed in is re-checked against the registry rather than trusted
-    for being immutable. `CitationTable` guarantees its representation cannot
-    be edited and that its nonce is well formed; it cannot guarantee that its
-    contents mean anything here, and extension is another authority gate. A
-    table whose entries do not resolve is a programming error rather than a
-    data condition, so it raises instead of being silently repaired - dropping
-    an entry would renumber the namespace under text that already quotes it.
+    An extra `by_source` entry is refused rather than ignored for a second
+    reason: it silently suppresses allocation when that source later becomes
+    genuinely eligible, and reached the loop below as a raw `KeyError`.
     """
     numbers = []
     for handle, source_id in table.by_handle.items():
@@ -297,6 +288,60 @@ def extend_citation_table(
             )
         numbers.append(number)
 
+    orphaned = set(table.by_source) - set(table.by_handle.values())
+    if orphaned:
+        raise ProvenanceError(
+            f"citation sources {sorted(orphaned)} have no handle of their own"
+        )
+
+    for source_id, evidence_ids in table.evidence.items():
+        if source_id not in table.by_source:
+            raise ProvenanceError(
+                f"citation evidence is filed under {source_id!r}, "
+                "which this table does not cite"
+            )
+        for evidence_id in evidence_ids:
+            record = registry.get_evidence(evidence_id)
+            if record is None:
+                raise ProvenanceError(
+                    f"citation evidence {evidence_id!r} is not in this registry"
+                )
+            if record.source_id != source_id:
+                raise ProvenanceError(
+                    f"citation evidence {evidence_id!r} belongs to "
+                    f"{record.source_id!r}, not to {source_id!r}"
+                )
+    return numbers
+
+
+def extend_citation_table(
+    registry: SourceRegistry,
+    table: CitationTable,
+    bindings: Sequence[Binding],
+) -> CitationTable:
+    """The same namespace, grown by whatever became eligible since.
+
+    One assembly offers the model handles more than once - a tool round adds
+    sources, then another round adds more - and each offer has to extend the
+    previous one rather than start over. Building a second table from the
+    second round's bindings alone would allocate `-1` again, to a different
+    source, under the same nonce: two documents with one name, in one
+    conversation the model can see both halves of.
+
+    So an existing source keeps the handle it already has, a new one takes the
+    next unused number, and a source seen again only adds to what may be cited
+    within it.
+
+    The table handed in is re-checked whole against the registry rather than
+    trusted for being immutable - see `_require_consistent`. `CitationTable`
+    guarantees its representation cannot be edited and that its nonce is well
+    formed; it cannot guarantee that its contents mean anything here, and
+    extension is another authority gate. A table whose entries do not resolve
+    is a programming error rather than a data condition, so it raises instead
+    of being silently repaired - dropping an entry would renumber the
+    namespace under text that already quotes it.
+    """
+    numbers = _require_consistent(registry, table)
     by_handle = dict(table.by_handle)
     by_source = dict(table.by_source)
     evidence = {key: list(value) for key, value in table.evidence.items()}

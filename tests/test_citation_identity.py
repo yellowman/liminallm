@@ -528,3 +528,86 @@ class TestTheNamespaceGrowsRatherThanRestarting:
         )
         with pytest.raises(ProvenanceError):
             extend_citation_table(registry, stranger, [])
+
+
+class TestAnInheritedTableIsCheckedWhole:
+    """Extension validated only what its own loop read: the handle maps. The
+    evidence map was copied through untouched, so state the builder would
+    refuse in a new binding was preserved by arriving already built."""
+
+    @staticmethod
+    def _registry():
+        registry = SourceRegistry()
+        first = registry.register_source(kind="file", title="a.md", locator="/a")
+        second = registry.register_source(kind="file", title="b.md", locator="/b")
+        return (
+            registry,
+            registry.add_evidence(first.source_id, text="from a"),
+            registry.add_evidence(second.source_id, text="from b"),
+        )
+
+    def test_inherited_evidence_that_does_not_exist_is_refused(self):
+        registry, _from_a, _from_b = self._registry()
+        table = CitationTable(
+            nonce=NONCE,
+            by_handle={f"{NONCE}-1": "src_1"},
+            by_source={"src_1": f"{NONCE}-1"},
+            evidence={"src_1": ("ev_404",)},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(registry, table, [])
+
+    def test_inherited_evidence_belonging_to_another_source_is_refused(self):
+        """The relation defect fixed for new bindings, arriving by
+        inheritance instead."""
+        registry, _from_a, from_b = self._registry()
+        table = CitationTable(
+            nonce=NONCE,
+            by_handle={f"{NONCE}-1": "src_1"},
+            by_source={"src_1": f"{NONCE}-1"},
+            evidence={"src_1": (from_b.evidence_id,)},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(registry, table, [])
+
+    def test_a_source_with_no_handle_of_its_own_is_refused(self):
+        """Validation read `by_handle` only, so a stray reverse entry was
+        never inspected. It suppresses allocation when that source later
+        becomes genuinely eligible - and reached the loop as a `KeyError`."""
+        registry, _from_a, from_b = self._registry()
+        table = CitationTable(
+            nonce=NONCE,
+            by_handle={f"{NONCE}-1": "src_1"},
+            by_source={"src_1": f"{NONCE}-1", "src_2": f"{NONCE}-2"},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(
+                registry, table, [binding("src_2", from_b.evidence_id)]
+            )
+
+    def test_evidence_filed_under_an_uncited_source_is_refused(self):
+        registry, _from_a, from_b = self._registry()
+        table = CitationTable(
+            nonce=NONCE,
+            by_handle={f"{NONCE}-1": "src_1"},
+            by_source={"src_1": f"{NONCE}-1"},
+            evidence={"src_2": (from_b.evidence_id,)},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(registry, table, [])
+
+    def test_a_consistent_table_still_grows(self):
+        """The check has to refuse the malformed without refusing the real."""
+        registry, from_a, from_b = self._registry()
+        table = CitationTable(
+            nonce=NONCE,
+            by_handle={f"{NONCE}-1": "src_1"},
+            by_source={"src_1": f"{NONCE}-1"},
+            evidence={"src_1": (from_a.evidence_id,)},
+        )
+        grown = extend_citation_table(
+            registry, table, [binding("src_2", from_b.evidence_id)]
+        )
+        assert grown.handle_for("src_1") == f"{NONCE}-1"
+        assert grown.handle_for("src_2") == f"{NONCE}-2"
+        assert grown.evidence_for("src_1") == (from_a.evidence_id,)
