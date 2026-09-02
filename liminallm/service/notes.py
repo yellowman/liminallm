@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from liminallm.logging import get_logger
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.embeddings import cosine_similarity
+from liminallm.service.provenance import Binding, SourceRegistry, binding
 from liminallm.service.ranking import (
     LEXICAL_WEIGHT,
     SEMANTIC_WEIGHT,
@@ -41,6 +42,11 @@ MAX_WITNESS_CANDIDATES = 6
 NOTE_FROM_FILE_MAX_BYTES = 64 * 1024
 MAX_PATH_DEPTH = 6
 _EXCERPT_CHARS = 700
+#: How much of a note a search shows the model. Named because provenance has
+#: to record the passage that was shown: the number lived only in the render,
+#: so recording a longer one would have made the evidence disagree with what
+#: the answer could actually have rested on.
+NOTE_SEARCH_EXCERPT_CHARS = 300
 
 # Order matters twice: parse_verdict scans in this order, and reports sort by
 # it - movement first, then confirmation, then noise.
@@ -444,6 +450,44 @@ def vault_sweep(
     }
 
 
+def register_note_results(
+    registry: SourceRegistry, results: List[Tuple[Any, float]]
+) -> List[Binding]:
+    """Record the notes a search found, and return the bindings.
+
+    A note has a real identity of its own, so this is the first producer able
+    to fill `origin_id` honestly: the row id, which survives the note being
+    retitled or rewritten. The title is what the user calls it today, and is
+    what a reader would recognise; the identity is what a citation resolves
+    through.
+
+    The evidence is the excerpt that was rendered, not the whole note. Only
+    the excerpt was put in front of the model, and evidence describes what the
+    answer could rest on rather than what the vault holds.
+
+    Note that `_excerpt` is applied here and in `format_note_results`
+    separately. They must agree, so both go through the same function - the
+    passage recorded has to be the passage shown.
+    """
+    bindings: List[Binding] = []
+    for note, _score in results:
+        note_id = getattr(note, "id", None)
+        title = str(getattr(note, "title", "") or "")
+        text = _excerpt(str(getattr(note, "content", "") or ""))[:NOTE_SEARCH_EXCERPT_CHARS]
+        if not title or not text:
+            # A note with no title has nothing a reader could be shown, and
+            # one with no text supports nothing. Neither is invented.
+            continue
+        source = registry.register_source(
+            kind="note",
+            title=title,
+            origin_id=f"note:{note_id}" if note_id is not None else None,
+        )
+        evidence = registry.add_evidence(source.source_id, text=text)
+        bindings.append(binding(source.source_id, evidence.evidence_id))
+    return bindings
+
+
 def format_note_results(results: List[Tuple[Any, float]]) -> str:
     """Tool-output rendering of a notes search: the user's own words, as data."""
     if not results:
@@ -452,7 +496,7 @@ def format_note_results(results: List[Tuple[Any, float]]) -> str:
     for note, _score in results:
         lines.append(
             f"- [[{note.title}]] ({note.updated_at.date().isoformat()}): "
-            f"{_excerpt(note.content)[:300]}"
+            f"{_excerpt(note.content)[:NOTE_SEARCH_EXCERPT_CHARS]}"
         )
     return "\n".join(lines)
 

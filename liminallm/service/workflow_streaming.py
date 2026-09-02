@@ -34,7 +34,7 @@ from liminallm.service.node_attempt import (
     StreamedNodeAttempt,
     StreamPump,
 )
-from liminallm.service.provenance import SourceRegistry
+from liminallm.service.provenance import Binding, SourceRegistry
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
@@ -149,7 +149,7 @@ class WorkflowStreamingMixin:
         source_registry = SourceRegistry()
         # What may support the answer: the registry is the turn's consulted
         # superset, these are the bindings of nodes that actually completed.
-        provenance_bindings: List[Dict[str, str]] = []
+        provenance_bindings: List[Binding] = []
         workflow_trace: List[Dict[str, Any]] = []
         context_snippets: List[str] = []
         context_seen = set()
@@ -588,7 +588,7 @@ class WorkflowStreamingMixin:
         history: List[Any],
         vars_scope: Dict[str, Any],
         source_registry: Optional[SourceRegistry] = None,
-        bindings_sink: Optional[List[Dict[str, str]]] = None,
+        bindings_sink: Optional[List[Binding]] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         workflow_start_time: float,
@@ -694,7 +694,7 @@ class WorkflowStreamingMixin:
             # records grounding before the provider stream begins, so a list
             # shared across attempts would let an attempt that failed before
             # producing an answer contribute to the one that succeeded.
-            attempt_bindings: List[Dict[str, str]] = []
+            attempt_bindings: List[Binding] = []
 
             def finalize(result: Dict[str, Any]):
 
@@ -797,7 +797,7 @@ class WorkflowStreamingMixin:
         history: List[Any],
         vars_scope: Dict[str, Any],
         source_registry: Optional[SourceRegistry] = None,
-        bindings_sink: Optional[List[Dict[str, str]]] = None,
+        bindings_sink: Optional[List[Binding]] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         invocation: Invocation,
@@ -969,7 +969,7 @@ class WorkflowStreamingMixin:
         history: List[Any],
         vars_scope: Dict[str, Any],
         source_registry: Optional[SourceRegistry] = None,
-        bindings_sink: Optional[List[Dict[str, str]]] = None,
+        bindings_sink: Optional[List[Binding]] = None,
         user_id: Optional[str],
         tenant_id: Optional[str],
         invocation: Invocation,
@@ -1026,7 +1026,7 @@ class WorkflowStreamingMixin:
         # assembly for the plain fallback, streams a partial answer, or fails,
         # the list dies with it - the evidence stays in the turn's registry as
         # consulted, and neither half becomes authority.
-        capability_bindings: List[Dict[str, str]] = []
+        capability_bindings: List[Binding] = []
         if not tools or not self.llm.supports_tools:
             # The plain body answers, so it fills the sink from the prompt it
             # builds. `agent_bindings` above are discarded with the assembly

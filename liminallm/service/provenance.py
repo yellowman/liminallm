@@ -72,6 +72,38 @@ class ProvenanceError(ValueError):
     """A source or evidence record that cannot be trusted as stated."""
 
 
+#: One relation the turn may cite, as `binding` builds it. `context_id` is
+#: absent for every producer that did not retrieve through a knowledge
+#: context, which is why the values are optional.
+Binding = Dict[str, Optional[str]]
+
+
+def binding(
+    source_id: str,
+    evidence_id: str,
+    *,
+    context_id: Optional[str] = None,
+) -> Binding:
+    """One relation this turn may cite, as every producer states it.
+
+    The registry is what the turn consulted; a binding is what may support
+    its answer. Five producers now build these - context retrieval, explicit
+    file search, the web, the vault and remote tools - and the parent dedupes
+    them on the whole triple, so the shape is agreed here rather than spelled
+    out five times and drifting in one of them.
+
+    `context_id` is the knowledge context a retrieval came through, and it is
+    absent for everything that was not retrieved through one. A web page was
+    not found by a context, and saying it was would put the document inside a
+    scope it never belonged to.
+    """
+    return {
+        "context_id": context_id,
+        "source_id": _require_text(source_id, what="source_id"),
+        "evidence_id": _require_text(evidence_id, what="evidence_id"),
+    }
+
+
 @dataclass(frozen=True)
 class Source:
     """A thing evidence came from, as the producer can honestly describe it.

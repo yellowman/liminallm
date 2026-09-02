@@ -41,6 +41,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 import httpx
 
 from liminallm.logging import get_logger
+from liminallm.service.provenance import Binding, SourceRegistry, binding
 
 logger = get_logger(__name__)
 
@@ -619,6 +620,73 @@ def _results_from_ddg_html(html: str) -> list[dict[str, str]]:
             {"title": title, "url": _unwrap_ddg_url(match.group("url")), "snippet": ""}
         )
     return results
+
+
+def register_search_results(
+    registry: SourceRegistry, results: list[dict[str, Any]]
+) -> list[Binding]:
+    """Record the pages a search offered, and return the bindings.
+
+    One source per result, identified by its URL. A page has no identity the
+    web gives it other than where it is, so `origin_id` stays empty and the
+    URL is the locator - the registry canonicalises it, so the same page
+    reached twice in one turn is one source.
+
+    The title and the snippet come from the provider, which relays what the
+    page's author wrote. Both are already sanitized and scanned by the time
+    they reach here, and neither becomes an instruction by being recorded:
+    what a citation later resolves to is the URL, not the words a stranger
+    chose to describe it with.
+
+    A result missing a URL is skipped rather than given a fabricated one. It
+    is a result the model was shown and the turn cannot honestly cite.
+    """
+    bindings: list[Binding] = []
+    for result in results:
+        url = result.get("url")
+        if not isinstance(url, str) or not url:
+            continue
+        source = registry.register_source(
+            kind="web",
+            title=str(result.get("title") or url),
+            locator=url,
+        )
+        snippet = str(result.get("snippet") or "")
+        if not snippet:
+            # Nothing was quoted, so there is no passage to rest on. The
+            # source stays in the registry as consulted.
+            continue
+        evidence = registry.add_evidence(source.source_id, text=snippet)
+        bindings.append(binding(source.source_id, evidence.evidence_id))
+    return bindings
+
+
+def register_fetched_page(
+    registry: SourceRegistry, page: dict[str, Any]
+) -> list[Binding]:
+    """Record a page the model was given, and return the binding.
+
+    The evidence is the page as the model reads it: extracted and
+    marker-neutralized, but without the envelope, whose text is this system's
+    own words about the page rather than the page. `wrap_untrusted` neutralizes
+    on the way out, so recording the text before that step would keep a marker
+    the model never saw - and a stored citation is later checked against this
+    text, not against what the server sent.
+
+    `neutralize_markers` is idempotent, so the caller wrapping the same page
+    afterwards produces exactly this.
+    """
+    url = page.get("url")
+    text = neutralize_markers(str(page.get("text") or ""))
+    if not isinstance(url, str) or not url or not text:
+        return []
+    source = registry.register_source(
+        kind="web",
+        title=str(page.get("title") or url),
+        locator=url,
+    )
+    evidence = registry.add_evidence(source.source_id, text=text)
+    return [binding(source.source_id, evidence.evidence_id)]
 
 
 def format_search_results(
