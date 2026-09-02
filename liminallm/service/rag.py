@@ -33,9 +33,11 @@ from liminallm.service.late import (
     segment_text,
 )
 from liminallm.service.provenance import (
+    Binding,
     EvidenceLocator,
     ProvenanceError,
     SourceRegistry,
+    binding,
 )
 from liminallm.service.ranking import (
     LATE_WEIGHT,
@@ -108,7 +110,7 @@ def register_retrieved_chunks(
     chunks: Sequence[KnowledgeChunk],
     *,
     hints: Optional[Mapping[str, SourceHint]] = None,
-) -> List[Dict[str, str]]:
+) -> List[Binding]:
     """Record what a context retrieval found, and return the bindings.
 
     The first producer to speak the provenance vocabulary. Retrieval already
@@ -136,7 +138,7 @@ def register_retrieved_chunks(
     correctly returns one record, and without the binding there would be
     nothing left to say that two scopes found it.
     """
-    bindings: List[Dict[str, str]] = []
+    bindings: List[Binding] = []
     for chunk in chunks:
         fs_path = _require_str(chunk.fs_path, what="chunk fs_path")
         hint = (hints or {}).get(fs_path)
@@ -194,11 +196,11 @@ def register_retrieved_chunks(
             ),
         )
         bindings.append(
-            {
-                "context_id": chunk.context_id,
-                "source_id": source.source_id,
-                "evidence_id": evidence.evidence_id,
-            }
+            binding(
+                source.source_id,
+                evidence.evidence_id,
+                context_id=chunk.context_id,
+            )
         )
     return bindings
 

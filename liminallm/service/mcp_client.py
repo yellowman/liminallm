@@ -36,6 +36,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from liminallm.logging import get_logger
 from liminallm.service import taint
+from liminallm.service.provenance import Binding, SourceRegistry, binding
 from liminallm.service.sandbox import tool_network_guard
 from liminallm.service.web import (
     neutralize_markers,
@@ -435,6 +436,8 @@ async def call(
     policy,
     session: Optional[Dict[str, Any]] = None,
     timeout: float = 30.0,
+    source_registry: Optional[SourceRegistry] = None,
+    bindings_sink: Optional[List[Binding]] = None,
 ) -> str:
     """Run one remote tool and return its result as untrusted data.
 
@@ -470,8 +473,44 @@ async def call(
             tool=tool.remote_name,
             kinds=sorted({f["type"] for f in findings}),
         )
+    if source_registry is not None and bindings_sink is not None:
+        # Here, where the redacted text exists. The envelope below is this
+        # system's own words about the result, and the refusal above returned
+        # already - a turn that was refused read nothing to rest on.
+        bindings_sink.extend(register_tool_result(source_registry, tool, redacted))
     return wrap_untrusted(
         redacted,
         source=f"MCP server {tool.server_name} :: {tool.remote_name}",
         findings=findings,
     )
+
+
+def register_tool_result(
+    registry: SourceRegistry, tool: RemoteTool, text: str
+) -> List[Binding]:
+    """Record what a remote tool answered, and return the bindings.
+
+    The source is the tool, not the answer. A remote tool is not a document
+    the turn can point at: calling it twice with different arguments returns
+    different text, and neither result exists anywhere a reader could open.
+    What is stable is which server's which tool produced it, so that is the
+    `origin_id` and each answer is a piece of evidence under it. Two calls in
+    one turn are one source with two passages, which is what happened.
+
+    No locator. The server URL is where the tool lives, not where the answer
+    can be read, and a locator that resolves to something else is the defect
+    the file producers already had to remove.
+
+    The text is a stranger's, and recording it does not make it less so: it is
+    stored as the passage an answer would rest on, and what a citation resolves
+    through is the tool's identity, which the server does not choose.
+    """
+    if not text:
+        return []
+    source = registry.register_source(
+        kind="mcp",
+        title=f"{tool.server_name} :: {tool.remote_name}",
+        origin_id=f"mcp:{tool.server_name}:{tool.remote_name}",
+    )
+    evidence = registry.add_evidence(source.source_id, text=text)
+    return [binding(source.source_id, evidence.evidence_id)]

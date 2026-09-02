@@ -48,7 +48,7 @@ from liminallm.service.invocation import (
     current_invocation,
     payload_hash,
 )
-from liminallm.service.provenance import SourceRegistry
+from liminallm.service.provenance import Binding, SourceRegistry
 from liminallm.service.rag import register_retrieved_chunks
 from liminallm.service.sandbox import tool_network_guard
 from liminallm.service.tool_worker import FrameBudget
@@ -119,7 +119,9 @@ class InvocationContext:
     source_registry: Optional[SourceRegistry] = None
     #: What the parent placed in this invocation's prompt, computed parent-side
     #: after budgeting. Never sent to the worker and never read back from it.
-    provenance_bindings: List[Dict[str, str]] = field(default_factory=list)
+    provenance_bindings: List[Binding] = field(
+        default_factory=list
+    )
 
 
 class CapabilityBroker:
@@ -413,19 +415,50 @@ class CapabilityBroker:
 
     def _web_search(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> CapabilityOutcome:
         invocation.check_live()
+        grounds = self._sink()
         text, findings = self._engine._run_web_search(
-            str(payload.get("query") or ""), int(payload.get("limit") or 5)
+            str(payload.get("query") or ""), int(payload.get("limit") or 5),
+            source_registry=self._ctx.source_registry, bindings_sink=grounds,
         )
-        return self._with_findings(invocation, text, findings)
+        return self._grounded(
+            self._with_findings(invocation, text, findings), grounds
+        )
 
     def _web_fetch(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> CapabilityOutcome:
         invocation.check_live()
-        text, findings = self._engine._run_web_fetch(str(payload.get("url") or ""))
-        return self._with_findings(invocation, text, findings)
+        grounds = self._sink()
+        text, findings = self._engine._run_web_fetch(
+            str(payload.get("url") or ""),
+            source_registry=self._ctx.source_registry, bindings_sink=grounds,
+        )
+        return self._grounded(
+            self._with_findings(invocation, text, findings), grounds
+        )
+
+    def _sink(self) -> Optional[List[Dict[str, Optional[str]]]]:
+        """Where a producer records, or None when this turn keeps no record."""
+        return None if self._ctx.source_registry is None else []
+
+    @staticmethod
+    def _grounded(
+        public: Dict[str, Any],
+        grounds: Optional[List[Dict[str, Optional[str]]]],
+    ) -> CapabilityOutcome:
+        """The reply, and beside it what the parent learned by serving it.
+
+        The bindings do not cross the pipe. Every producer says this the same
+        way, so a new capability cannot leak ids by forgetting to split its
+        two outputs - it either returns through here or it has no grounding
+        to leak.
+        """
+        return CapabilityOutcome(
+            public=public,
+            parent_state={"provenance_bindings": grounds} if grounds else None,
+        )
 
     def _with_findings(
         self, invocation: Invocation, text: str, findings: List[dict]
@@ -512,42 +545,43 @@ class CapabilityBroker:
         # Through the same adapter the automatic paths use. A second mapping
         # here would be a second place for the file-versus-inline identity
         # rules to drift.
-        bindings: List[Dict[str, str]] = []
+        bindings: List[Binding] = []
         if self._ctx.source_registry is not None:
             bindings = register_retrieved_chunks(
                 self._ctx.source_registry, chunks, hints=hints
             )
         # `text` and `snippets` cross the pipe; the bindings do not. An id in
         # the reply is an id the untrusted side can quote back as its own.
-        return CapabilityOutcome(
-            public={"text": text, "snippets": snippets},
-            parent_state={"provenance_bindings": bindings} if bindings else None,
-        )
+        return self._grounded({"text": text, "snippets": snippets}, bindings)
 
     def _notes_search(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> CapabilityOutcome:
         invocation.check_live()
-        return {
-            "text": self._engine._run_note_search(
-                str(payload.get("query") or ""),
-                int(payload.get("limit") or 6),
-                user_id=self._ctx.user_id,
-            )
-        }
+        grounds = self._sink()
+        text = self._engine._run_note_search(
+            str(payload.get("query") or ""),
+            int(payload.get("limit") or 6),
+            user_id=self._ctx.user_id,
+            source_registry=self._ctx.source_registry,
+            bindings_sink=grounds,
+        )
+        return self._grounded({"text": text}, grounds)
 
     def _history_search(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> CapabilityOutcome:
         invocation.check_live()
-        return {
-            "text": self._engine._run_history_search(
-                str(payload.get("query") or ""),
-                int(payload.get("limit") or 4),
-                conversation_id=self._ctx.conversation_id,
-                user_id=self._ctx.user_id,
-            )
-        }
+        grounds = self._sink()
+        text = self._engine._run_history_search(
+            str(payload.get("query") or ""),
+            int(payload.get("limit") or 4),
+            conversation_id=self._ctx.conversation_id,
+            user_id=self._ctx.user_id,
+            source_registry=self._ctx.source_registry,
+            bindings_sink=grounds,
+        )
+        return self._grounded({"text": text}, grounds)
 
     # -- the model --------------------------------------------------------
 
@@ -607,7 +641,7 @@ class CapabilityBroker:
                 user_id=self._ctx.user_id,
             )
         snippets: List[str] = []
-        round_bindings: List[Dict[str, str]] = []
+        round_bindings: List[Binding] = []
         before = list(invocation.session.get("artifacts") or [])
         results = self._engine._run_round_tools(
             parsed,
@@ -625,19 +659,17 @@ class CapabilityBroker:
             bindings=round_bindings,
         )
         after = list(invocation.session.get("artifacts") or [])
-        return CapabilityOutcome(
-            public={
+        # A round is one committed operation, so its grounding is committed
+        # with it and comes back on a replay by the same route a single
+        # retrieval's does.
+        return self._grounded(
+            {
                 "results": results,
                 "snippets": snippets,
                 "artifacts": after[len(before) :],
                 "findings": list(invocation.session.get("injection_findings") or []),
             },
-            # A round is one committed operation, so its grounding is
-            # committed with it and comes back on a replay by the same route
-            # a single retrieval's does.
-            parent_state=(
-                {"provenance_bindings": round_bindings} if round_bindings else None
-            ),
+            round_bindings,
         )
 
     def _tool_host(

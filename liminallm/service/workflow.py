@@ -69,7 +69,7 @@ from liminallm.service.node_attempt import (
     NodeOutcome,
     bounded,
 )
-from liminallm.service.provenance import SourceRegistry
+from liminallm.service.provenance import Binding, SourceRegistry
 from liminallm.service.rag import (
     RAGService,
     SourceHint,
@@ -139,7 +139,7 @@ class ParallelNodeResult:
     merged_content: str  # Concatenated content from all nodes
     merged_usage: Dict[str, Any]  # Summed token counts
     merged_snippets: List[str]  # Deduplicated context snippets
-    merged_bindings: List[Dict[str, str]]  # What actually grounded each child
+    merged_bindings: List[Binding]  # What actually grounded each child
     failed_nodes: List[str]  # Node IDs that failed
     # "ok" if all succeeded, "partial" if some failed, "error" if all failed,
     # "budget_exhausted" if the batch was refused before any of it began.
@@ -593,7 +593,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         merged_content_parts: List[str] = []
         merged_usage: Dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         all_snippets: List[str] = []
-        all_bindings: List[Dict[str, str]] = []
+        all_bindings: List[Binding] = []
         seen_bindings: set = set()
         failed_nodes: List[str] = []
 
@@ -738,7 +738,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # in it - while these are the bindings of attempts that actually
         # succeeded, so a citation cannot rest on evidence from an attempt
         # whose generation failed.
-        provenance_bindings: List[Dict[str, str]] = []
+        provenance_bindings: List[Binding] = []
         # The turn's provenance, created once here and passed by reference to
         # every node that can retrieve. Not in `vars_scope`, which a parallel
         # child deep-copies, and not on an `Invocation`, which is one tool
@@ -3360,14 +3360,29 @@ class WorkflowEngine(WorkflowStreamingMixin):
     def _web_settings(self) -> dict:
         return agent_tools.web_settings(self.settings)
 
-    def _run_web_search(self, query: str, limit: int) -> Tuple[str, List[dict]]:
+    def _run_web_search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Binding]] = None,
+    ) -> Tuple[str, List[dict]]:
         return agent_tools.run_web_search(
-            query, limit, settings=self.settings, logger=self.logger
+            query, limit, settings=self.settings, logger=self.logger,
+            source_registry=source_registry, bindings_sink=bindings_sink,
         )
 
-    def _run_web_fetch(self, url: str) -> Tuple[str, List[dict]]:
+    def _run_web_fetch(
+        self,
+        url: str,
+        *,
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Binding]] = None,
+    ) -> Tuple[str, List[dict]]:
         return agent_tools.run_web_fetch(
-            url, settings=self.settings, logger=self.logger
+            url, settings=self.settings, logger=self.logger,
+            source_registry=source_registry, bindings_sink=bindings_sink,
         )
 
     def _run_history_search(
@@ -3377,8 +3392,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         conversation_id: Optional[str],
         user_id: Optional[str],
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Binding]] = None,
     ) -> str:
-        """Check scope and read the record, then hand off to the tool."""
+        """Check scope and read the record, then hand off to the tool.
+
+        The scope check is what makes the conversation citable: it is the same
+        authorization the retrieval needs, and it runs before anything is read
+        or recorded.
+        """
         if not conversation_id:
             return "No earlier turns are available."
         if not self._validate_conversation_scope(
@@ -3393,6 +3415,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         return agent_tools.run_history_search(
             query, limit, history,
             keep_tokens=self.history_budget(), count=self._count_fn(),
+            conversation_id=conversation_id,
+            source_registry=source_registry, bindings_sink=bindings_sink,
         )
 
     def _notes_enabled(self) -> bool:
@@ -3400,9 +3424,20 @@ class WorkflowEngine(WorkflowStreamingMixin):
         return bool(self.settings.notes_enabled)
 
     def _run_note_search(
-        self, query: str, limit: int, *, user_id: Optional[str]
+        self,
+        query: str,
+        limit: int,
+        *,
+        user_id: Optional[str],
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Binding]] = None,
     ) -> str:
-        """Search the user's own vault. Empty when notes are off."""
+        """Search the user's own vault. Empty when notes are off.
+
+        `search_notes` is already scoped to this user, so what comes back is
+        what may be recorded - authorize first, record second, as everywhere
+        else.
+        """
         if not user_id or not self._notes_enabled():
             return "No notes available."
         results = notes_service.search_notes(
@@ -3412,6 +3447,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
             str(query),
             limit=max(1, min(int(limit or 6), 10)),
         )
+        if source_registry is not None and bindings_sink is not None:
+            bindings_sink.extend(
+                notes_service.register_note_results(source_registry, results)
+            )
         return notes_service.format_note_results(results)
 
     def _discover_mcp_tools(self) -> Dict[str, "mcp_client.RemoteTool"]:
@@ -3587,7 +3626,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         step: str = "",
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
         source_registry: Optional[SourceRegistry] = None,
-        bindings_sink: Optional[List[Dict[str, str]]] = None,
+        bindings_sink: Optional[List[Binding]] = None,
     ) -> str:
         """Run one model-requested tool and return its text result.
 
@@ -3640,14 +3679,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 user_id=user_id,
                 session=session,
             )
+        # Each producer records into the round's sink when the caller passed
+        # one. `_grounds` is None when it did not, and every producer then
+        # behaves exactly as it did before provenance existed.
+        _grounds = bindings_sink if source_registry is not None else None
         if name == "web_search":
             text, found = self._run_web_search(
-                str(args.get("query") or fallback_query), int(args.get("limit") or 5)
+                str(args.get("query") or fallback_query), int(args.get("limit") or 5),
+                source_registry=source_registry, bindings_sink=_grounds,
             )
             taint.record_findings(session, found)
             return text
         if name == "web_fetch":
-            text, found = self._run_web_fetch(str(args.get("url") or ""))
+            text, found = self._run_web_fetch(
+                str(args.get("url") or ""),
+                source_registry=source_registry, bindings_sink=_grounds,
+            )
             taint.record_findings(session, found)
             return text
         if name == "history_search":
@@ -3656,12 +3703,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 max(1, min(int(args.get("limit") or 4), 8)),
                 conversation_id=conversation_id,
                 user_id=user_id,
+                source_registry=source_registry, bindings_sink=_grounds,
             )
         if name == "note_search":
             return self._run_note_search(
                 str(args.get("query") or fallback_query),
                 int(args.get("limit") or 6),
                 user_id=user_id,
+                source_registry=source_registry, bindings_sink=_grounds,
             )
         remote = (mcp_tools or {}).get(name)
         if remote is not None:
@@ -3675,6 +3724,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         args,
                         policy=self.tool_network_policy,
                         session=session,
+                        source_registry=source_registry,
+                        bindings_sink=_grounds,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - a third party being down
@@ -3709,7 +3760,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         operation_seq: int = 0,
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
         source_registry: Optional[SourceRegistry] = None,
-        bindings: Optional[List[Dict[str, str]]] = None,
+        bindings: Optional[List[Binding]] = None,
     ) -> List[str]:
         """Execute one round's tool calls; results always in call order.
 
@@ -3738,7 +3789,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             name: str,
             args: Dict[str, Any],
             sink: List[str],
-            binding_sink: List[Dict[str, str]],
+            binding_sink: List[Binding],
         ) -> str:
             with current_invocation(bound), tool_network_guard(
                 self.tool_network_policy
@@ -3899,7 +3950,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
-        bindings_sink: Optional[List[Dict[str, str]]] = None,
+        bindings_sink: Optional[List[Binding]] = None,
     ) -> Dict[str, Any]:
         message = (
             inputs.get("message") or inputs.get("prompt") or inputs.get("text") or ""
@@ -4012,7 +4063,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
-        bindings_sink: Optional[List[Dict[str, str]]] = None,
+        bindings_sink: Optional[List[Binding]] = None,
     ) -> Dict[str, Any]:
         question = inputs.get("question") or inputs.get("message") or ""
         ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
@@ -4063,7 +4114,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
-        bindings_sink: Optional[List[Dict[str, str]]] = None,
+        bindings_sink: Optional[List[Binding]] = None,
     ) -> Dict[str, Any]:
         message = inputs.get("message") or user_message or ""
         lowered = message.lower()
@@ -4084,7 +4135,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
-        bindings_sink: Optional[List[Dict[str, str]]] = None,
+        bindings_sink: Optional[List[Binding]] = None,
     ) -> Dict[str, Any]:
         prompt = inputs.get("message") or inputs.get("prompt") or ""
         resp = self.llm.generate(
@@ -4108,7 +4159,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
         *,
         source_registry: Optional[SourceRegistry] = None,
-        bindings_sink: Optional[List[Dict[str, str]]] = None,
+        bindings_sink: Optional[List[Binding]] = None,
     ) -> Dict[str, Any]:
         return {"content": inputs.get("message", ""), "usage": {}, "status": "end"}
 
