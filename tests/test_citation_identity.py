@@ -12,7 +12,11 @@ from __future__ import annotations
 import pytest
 
 from liminallm.service.citations import (
+    ALPHABET,
     CITATION_RE,
+    MIN_NONCE_BITS,
+    NONCE_LENGTH,
+    CitationTable,
     build_citation_table,
     mint_nonce,
     strip_citations,
@@ -74,6 +78,82 @@ class TestOnlyWhatGroundedTheAnswerIsCitable:
         assert validate_citations("Claimed [cite:K7Q2-1].", table) == []
 
 
+class TestABindingIsCheckedAsARelation:
+    """The gate that grants citation authority is the wrong place to inherit
+    an upstream invariant. Today's producers do not emit these shapes; that is
+    a fact about today's producers, not a property of this function."""
+
+    @staticmethod
+    def _two_sources():
+        registry = SourceRegistry()
+        first = registry.register_source(kind="file", title="a.md", locator="/a")
+        second = registry.register_source(kind="file", title="b.md", locator="/b")
+        return (
+            registry,
+            first,
+            second,
+            registry.add_evidence(first.source_id, text="from a"),
+            registry.add_evidence(second.source_id, text="from b"),
+        )
+
+    def test_a_real_source_with_no_such_evidence_gets_no_handle(self):
+        registry, first, _second, _ea, _eb = self._two_sources()
+        table = build_citation_table(
+            registry, [binding(first.source_id, "ev_404")], nonce="K7Q2"
+        )
+        assert not table, dict(table.by_handle)
+
+    def test_evidence_belonging_to_another_source_gets_no_handle(self):
+        """The worst of the two: a real source paired with a real passage that
+        is not its own would attach a citation to text it never contained."""
+        registry, first, _second, _ea, from_b = self._two_sources()
+        table = build_citation_table(
+            registry, [binding(first.source_id, from_b.evidence_id)], nonce="K7Q2"
+        )
+        assert not table, dict(table.by_handle)
+
+    def test_a_bad_binding_does_not_spoil_a_good_one(self):
+        """Failing closed per binding, not per source: the source is still
+        citable through the binding that resolves, and only that one is
+        eligible under it."""
+        registry, first, _second, from_a, from_b = self._two_sources()
+        table = build_citation_table(
+            registry,
+            [
+                binding(first.source_id, "ev_404"),
+                binding(first.source_id, from_b.evidence_id),
+                binding(first.source_id, from_a.evidence_id),
+            ],
+            nonce="K7Q2",
+        )
+        assert len(table.by_handle) == 1, dict(table.by_handle)
+        assert table.evidence_for(first.source_id) == (from_a.evidence_id,)
+
+    def test_a_binding_with_no_evidence_grants_nothing(self):
+        registry, first, _second, _ea, _eb = self._two_sources()
+        table = build_citation_table(
+            registry, [{"source_id": first.source_id, "evidence_id": ""}], nonce="K7Q2"
+        )
+        assert not table
+
+
+class TestTheTableCannotBeEditedAfterItIsBuilt:
+    """A frozen dataclass does not freeze what its attributes point at. This
+    is the object the next stage makes authority, so a retained reference must
+    not be able to add a handle to it."""
+
+    @pytest.mark.parametrize("attribute", ["by_handle", "by_source", "evidence"])
+    def test_no_mapping_can_be_written_through(self, attribute):
+        _registry, _bindings, table = _turn("manual.md")
+        with pytest.raises(TypeError):
+            getattr(table, attribute)["forged"] = "src_1"
+
+    def test_an_empty_table_is_frozen_too(self):
+        """Otherwise the default is the one writable table in the system."""
+        with pytest.raises(TypeError):
+            CitationTable(nonce="K7Q2").by_handle["forged"] = "src_1"
+
+
 class TestAHandleFromAnotherTurnDoesNotResolve:
     """`source_id` restarts at `src_1` in every registry, and history is
     replayed verbatim into later prompts. A handle built from the internal id
@@ -99,6 +179,16 @@ class TestAHandleFromAnotherTurnDoesNotResolve:
 
     def test_two_turns_do_not_share_a_nonce(self):
         assert len({mint_nonce() for _ in range(200)}) > 1
+
+    def test_the_namespace_is_too_large_to_guess(self):
+        """The property that matters is the size of the space, not that the
+        nonces differ. A retrieved page is attacker-controlled text that can
+        carry a thousand candidate markers and pay nothing for a miss, so a
+        namespace it could plausibly cover is not a boundary at all."""
+        assert len(ALPHABET) ** NONCE_LENGTH >= 2 ** MIN_NONCE_BITS, (
+            f"{len(ALPHABET)}**{NONCE_LENGTH} is under the {MIN_NONCE_BITS}-bit floor"
+        )
+        assert len(set(ALPHABET)) == len(ALPHABET), "a repeated symbol shrinks it"
 
 
 class TestTheModelCannotNameASourceItself:
@@ -221,6 +311,12 @@ class TestTheMarkersCanBeTakenBackOut:
         be left in front of a reader if only well-formed markers are taken
         out."""
         assert strip_citations(answer) == "Alpha.", answer
+
+    @pytest.mark.parametrize("marker", ["[CITE:K7Q2-1]", "[Cite:K7Q2-1]"])
+    def test_a_mistyped_keyword_is_removed_too(self, marker):
+        """`[CITE:...]` is the same weak-model typo the broad stripper exists
+        for; only the handle inside has to be exact."""
+        assert strip_citations(f"Alpha {marker}.") == "Alpha."
 
     def test_an_unclosed_marker_does_not_eat_the_sentence(self):
         assert strip_citations("Alpha [cite:K7Q2 and the rest.") == (

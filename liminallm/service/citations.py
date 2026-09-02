@@ -29,17 +29,29 @@ from __future__ import annotations
 import re
 import secrets
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from liminallm.service.provenance import Binding, SourceRegistry
 
 #: The nonce alphabet, without the characters a reader or a small model
-#: confuses: no O/0 and no I/1. Four of these is about a million turns-worth of
-#: distinct nonces, and short enough that a weak model copies it back intact -
-#: which is the failure that matters most here, since a mangled handle is a
-#: citation the answer loses rather than one it forges.
-_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-NONCE_LENGTH = 4
+#: confuses: no O/0 and no I/1.
+ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+#: The namespace a hostile document has to guess. This is the number that
+#: matters, not uniqueness: a retrieved page is attacker-controlled text of
+#: some tens of kilobytes, so it can carry on the order of a thousand
+#: candidate markers and pay nothing for a miss. At four characters the
+#: namespace is about a million, which gives such a page roughly one chance in
+#: a thousand of naming a source it never was - far too generous for the one
+#: mechanism whose whole purpose is refusing source-authored citations.
+#:
+#: Eight characters is 2**40. The cost is four more characters in a token the
+#: model copies, and the claim that a shorter one is easier for a weak model to
+#: reproduce is a guess nobody has measured, while the loss in guess resistance
+#: is arithmetic. `test_the_namespace_is_too_large_to_guess` pins the floor.
+NONCE_LENGTH = 8
+MIN_NONCE_BITS = 40
 
 #: Anything the model meant as a citation. Deliberately broad, because
 #: resolution is the gate and lexing is not: a marker whose handle this turn
@@ -47,17 +59,26 @@ NONCE_LENGTH = 4
 #: only the well-formed shape would buy no safety and would hide the mistyped
 #: ones from the one pass that has to remove them.
 #:
+#: The keyword is matched case-insensitively for the same reason - `[CITE:x]`
+#: is a typo that must still be taken back out - while the handle inside stays
+#: exact, because that is the part resolution gates on.
+#:
 #: The shape of a real handle is defined where handles are minted, which is
 #: the only place that can be authoritative about it.
 #:
 #: Bounded, and stopping at the first `]` or newline, so an unclosed `[cite:`
 #: cannot swallow the rest of a sentence.
-CITATION_RE = re.compile(r"\[cite:([^\]\n]{0,64})\]")
+CITATION_RE = re.compile(r"\[(?i:cite):([^\]\n]{0,64})\]")
+
+#: An empty table's mappings. Frozen like a built one's, so the default is not
+#: the one writable `CitationTable` in the system. Behind a factory because
+#: `dataclasses` refuses a mappingproxy as a bare default.
+_EMPTY: Mapping[str, Any] = MappingProxyType({})
 
 
 def mint_nonce() -> str:
     """One turn's citation namespace."""
-    return "".join(secrets.choice(_ALPHABET) for _ in range(NONCE_LENGTH))
+    return "".join(secrets.choice(ALPHABET) for _ in range(NONCE_LENGTH))
 
 
 @dataclass(frozen=True)
@@ -93,17 +114,26 @@ class CitationTable:
     retrieval and an explicit search reaching the same file - share one
     citation identity rather than inviting the model to cite the same document
     twice under two names.
+
+    Deeply frozen, not merely a frozen dataclass. This is the object the next
+    stage makes authority, and a frozen dataclass does not freeze what its
+    attributes point at: plain dicts here would let anything holding a
+    reference add a handle after the table was built, which is the whole
+    conservation rule undone through a side door. S1 froze source metadata for
+    this reason and the same applies here.
     """
 
     nonce: str
     #: handle -> source_id, and the reverse. Both directions are needed: the
     #: offer is built from sources and the validator resolves from handles.
-    by_handle: Mapping[str, str] = field(default_factory=dict)
-    by_source: Mapping[str, str] = field(default_factory=dict)
+    by_handle: Mapping[str, str] = field(default_factory=lambda: _EMPTY)
+    by_source: Mapping[str, str] = field(default_factory=lambda: _EMPTY)
     #: source_id -> the evidence ids bound to it, in binding order. What the
     #: answer may rest on within that source, for whatever later checks a
     #: claim against a passage.
-    evidence: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+    evidence: Mapping[str, Tuple[str, ...]] = field(
+        default_factory=lambda: _EMPTY
+    )
 
     def source_for(self, handle: str) -> Optional[str]:
         return self.by_handle.get(handle)
@@ -126,34 +156,59 @@ def build_citation_table(
 ) -> CitationTable:
     """The handles this turn may offer, from what actually grounded it.
 
-    Every binding is resolved through the registry rather than trusted as a
-    pair of strings. A binding naming a source the registry does not hold
-    cannot be described to a reader - there is no title, kind or locator to
-    show - so it gets no handle and becomes uncitable. That is the safe
-    direction: the alternative is a citation that resolves to nothing at the
-    point someone tries to follow it.
+    Both halves of every binding are resolved through the registry, and the
+    relation between them is checked: the evidence has to exist and has to
+    belong to the source named beside it. A binding naming a source the
+    registry does not hold cannot be described to a reader - there is no
+    title, kind or locator to show - and one pairing a real source with
+    another source's passage would attach a citation to text that source
+    never contained.
+
+    Today's producers do not manufacture either shape, and this does not
+    depend on them continuing not to. The gate that grants citation authority
+    is the wrong place to inherit an upstream invariant.
+
+    A source is not given a handle until it has one binding that passes, so a
+    source whose only binding is malformed is uncitable rather than citable
+    with nothing under it.
     """
     token = nonce or mint_nonce()
     by_handle: Dict[str, str] = {}
     by_source: Dict[str, str] = {}
     evidence: Dict[str, List[str]] = {}
+    # Two of these four checks cannot currently fire, and both are kept.
+    # `add_evidence` refuses a source the registry does not hold, so no
+    # evidence can name a missing one and the relation check below already
+    # covers the source lookup; and `get_evidence("")` returns None, so the
+    # empty-id guard is covered too. Each is redundant *because of an
+    # invariant this function does not own*, which is the one place not to
+    # rely on that: this is the gate that grants citation authority. They are
+    # deliberately unkillable by mutation - recorded here rather than left for
+    # a later reader to simplify away.
     for entry in bindings:
         source_id = entry.get("source_id")
         evidence_id = entry.get("evidence_id")
-        if not source_id or registry.get_source(source_id) is None:
+        if not source_id or not evidence_id:
+            continue
+        if registry.get_source(source_id) is None:
+            continue
+        record = registry.get_evidence(evidence_id)
+        if record is None or record.source_id != source_id:
             continue
         if source_id not in by_source:
             handle = f"{token}-{len(by_source) + 1}"
             by_source[source_id] = handle
             by_handle[handle] = source_id
             evidence[source_id] = []
-        if evidence_id and evidence_id not in evidence[source_id]:
+        if evidence_id not in evidence[source_id]:
             evidence[source_id].append(evidence_id)
     return CitationTable(
         nonce=token,
-        by_handle=dict(by_handle),
-        by_source=dict(by_source),
-        evidence={key: tuple(value) for key, value in evidence.items()},
+        by_handle=MappingProxyType(dict(by_handle)),
+        by_source=MappingProxyType(dict(by_source)),
+        evidence=MappingProxyType(
+            {key: tuple(value) for key, value in evidence.items()}
+        ),
     )
 
 
@@ -188,8 +243,10 @@ def validate_citations(answer: str, table: CitationTable) -> List[CitationOccurr
 def strip_citations(answer: str) -> str:
     """The answer with every citation marker removed.
 
-    Marker-shaped text is removed whether or not it resolves, and whether or
-    not it is well formed. This is what runs when the
+    Every closed marker-shaped token is removed, whether or not it resolves
+    and whether or not it is well formed. An unclosed `[cite:` is left alone:
+    there is no boundary at which deleting the rest of a sentence would be
+    the safer guess. This is what runs when the
     markers must not reach a reader, and a mistyped one is exactly the kind
     that would otherwise be left behind. Spacing left by a removed marker is
     closed up, so a sentence does not end with a gap where a handle used to
