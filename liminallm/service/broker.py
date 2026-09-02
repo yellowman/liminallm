@@ -570,7 +570,7 @@ class CapabilityBroker:
 
     def _tools_round(
         self, invocation: Invocation, seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> CapabilityOutcome:
         """Execute the tools the model asked for in one round.
 
         The round arrives as one request because how its calls are *run* is a

@@ -112,26 +112,72 @@ def run_web_fetch(url: str, *, settings: Any, logger: Any) -> Tuple[str, List[di
     )
 
 
-def chunk_label(chunk: Any) -> str:
-    """What to call this excerpt when showing it to the model.
+def _chunk_path(chunk: Any) -> Optional[str]:
+    """The path this excerpt came from, or None if it names none."""
+    path = getattr(chunk, "fs_path", None)
+    return path if isinstance(path, str) and path else None
+
+
+def _path_suffixes(path: str) -> List[str]:
+    """Every trailing run of segments of `path`, shortest first."""
+    parts = [part for part in path.split("/") if part]
+    return ["/".join(parts[index:]) for index in range(len(parts) - 1, -1, -1)]
+
+
+def chunk_labels(chunks: List[Any]) -> List[str]:
+    """What to call each excerpt when showing this result set to the model.
 
     `fs_path` is where a chunk's path lives - `ingest_text` writes it from
     `source_path`, and `_commit_generation` replaces a path's generation by
     it. Nothing writes `meta["source_path"]`, so reading that key labelled
-    every excerpt `attachment` and made two documents in one answer
-    indistinguishable.
+    every excerpt `attachment`.
+
+    A file name is not an identity either. A corpus ingested from a directory
+    tree holds `reports/engine-a/status.md` beside
+    `reports/engine-b/status.md`, and calling both `status.md` tells the model
+    that one document said both things. So each path gets the shortest
+    trailing run of segments no other path in this result set ends with: an
+    unambiguous file stays `turbines.md`, an ambiguous one grows only as far
+    as it must, and the model is never handed a whole absolute path it has no
+    use for. Labels are per path rather than per excerpt, so several excerpts
+    from one file share one.
 
     The `inline` sentinel names no file. Rendering it as one would tell the
     model a filename that does not exist, which is the same class of
     invention the provenance layer exists to prevent - one stage earlier, in
     the text the model actually reads.
     """
-    path = getattr(chunk, "fs_path", None)
-    if not isinstance(path, str) or not path:
-        return "unknown source"
-    if path == INLINE_PATH:
-        return "inline text"
-    return Path(path).name
+    paths = [_chunk_path(chunk) for chunk in chunks]
+    suffixes = {
+        path: _path_suffixes(path)
+        for path in paths
+        if path is not None and path != INLINE_PATH
+    }
+    shortest: dict = {}
+    for path, own in suffixes.items():
+        taken = {
+            suffix
+            for other, other_suffixes in suffixes.items()
+            if other != path
+            for suffix in other_suffixes
+        }
+        # Two paths can share every suffix either has - `a/report.md` is the
+        # tail of `b/a/report.md` - so the whole path is the last resort.
+        shortest[path] = next((s for s in own if s not in taken), path)
+    labels = []
+    for path in paths:
+        if path is None:
+            labels.append("unknown source")
+        elif path == INLINE_PATH:
+            labels.append("inline text")
+        else:
+            labels.append(shortest[path])
+    return labels
+
+
+def chunk_label(chunk: Any) -> str:
+    """What to call one excerpt, with nothing to distinguish it from."""
+    return chunk_labels([chunk])[0]
 
 
 def run_file_search(
@@ -189,8 +235,8 @@ def run_file_search(
     if not chunks:
         return (f"No excerpts matched '{query}'.", [], [])
     rendered, snippets = [], []
-    for chunk in chunks:
-        rendered.append(f"[{chunk_label(chunk)}]\n{chunk.content}")
+    for chunk, label in zip(chunks, chunk_labels(chunks)):
+        rendered.append(f"[{label}]\n{chunk.content}")
         snippets.append(chunk.content)
     return ("\n\n".join(rendered), snippets, chunks)
 

@@ -17,6 +17,8 @@ from liminallm.service.runtime import get_runtime
 
 MANUAL = "Turbine blade inspection happens every 400 flight hours. " * 40
 LOGBOOK = "The logbook records each inspection against its airframe. " * 40
+ENGINE_A = "Left engine inspection: compressor stage two within limits. " * 40
+ENGINE_B = "Right engine inspection: compressor stage two out of limits. " * 40
 
 
 def _context_with(store, files):
@@ -74,10 +76,44 @@ class TestTheModelIsToldWhichFileAnExcerptCameFrom:
             f"fixture retrieved one document only: {[c.fs_path for c in chunks]}"
         )
         assert len(snippets) >= 2, f"fixture retrieved too little: {snippets}"
-        assert len(set(_headers(rendered))) > 1, (
+        # Exactly the file names: two documents that are already told apart by
+        # their names must not be widened to tell them apart.
+        assert set(_headers(rendered)) == {"[turbines.md]", "[logbook.md]"}, (
             "two documents were rendered under one indistinguishable label: "
             f"{_headers(rendered)}"
         )
+
+    def test_one_name_in_two_directories_is_two_files(self, store):
+        """A corpus ingested from a directory tree holds the same file name
+        more than once - `**/*` is a supported source. The name alone then
+        says nothing, and an answer resting on both reports would attribute
+        each one's finding to the other."""
+        user_id, ctx_id = _context_with(
+            store,
+            {
+                "reports/engine-a/status.md": ENGINE_A,
+                "reports/engine-b/status.md": ENGINE_B,
+            },
+        )
+        rendered, snippets, _chunks = agent_tools.run_file_search(
+            "compressor inspection", 6, [ctx_id],
+            rag=get_runtime().rag, user_id=user_id, tenant_id=None,
+        )
+        chunks = get_runtime().rag.retrieve(
+            [ctx_id], "compressor inspection", limit=6,
+            user_id=user_id, tenant_id=None,
+        )
+        assert len({c.fs_path for c in chunks}) == 2, (
+            f"fixture retrieved one document only: {[c.fs_path for c in chunks]}"
+        )
+        headers = _headers(rendered)
+        # More excerpts than files, so this also says that several excerpts
+        # from one file share one label.
+        assert len(headers) > 2, f"fixture retrieved too little: {headers}"
+        assert set(headers) == {"[engine-a/status.md]", "[engine-b/status.md]"}, (
+            f"two reports were rendered under one label: {headers}"
+        )
+        assert len(snippets) == len(headers)
 
     def test_inline_text_is_not_given_a_filename_it_does_not_have(self, store):
         """`ingest_text` with no source path writes the `inline` sentinel. It
@@ -111,6 +147,49 @@ class TestTheLabelInventsNothing:
         assert chunk_label(SimpleNamespace(fs_path=None)) == "unknown source"
         assert chunk_label(SimpleNamespace(fs_path="")) == "unknown source"
         assert chunk_label(SimpleNamespace()) == "unknown source"
+
+
+class TestTheLabelGrowsOnlyAsFarAsItMust:
+    """The widening rule itself, on path shapes a corpus fixture cannot
+    produce cheaply. A label the model reads is a claim about identity, so it
+    has to be wide enough to separate the files in front of it and no wider."""
+
+    @staticmethod
+    def _labels(*paths):
+        from types import SimpleNamespace
+
+        from liminallm.service.agent_tools import chunk_labels
+
+        return chunk_labels([SimpleNamespace(fs_path=path) for path in paths])
+
+    def test_one_directory_is_enough_when_one_directory_separates_them(self):
+        assert self._labels("a/b/c/report.md", "a/b/d/report.md") == [
+            "c/report.md",
+            "d/report.md",
+        ]
+
+    def test_a_shared_name_does_not_widen_an_unshared_one(self):
+        assert self._labels("x/status.md", "y/status.md", "notes.md") == [
+            "x/status.md",
+            "y/status.md",
+            "notes.md",
+        ]
+
+    def test_one_path_ending_another_falls_back_to_the_whole_path(self):
+        """Every trailing run of `a/report.md` is also a trailing run of
+        `b/a/report.md`, so no suffix separates the two."""
+        assert self._labels("a/report.md", "b/a/report.md") == [
+            "a/report.md",
+            "b/a/report.md",
+        ]
+
+    def test_inline_text_takes_no_part_in_the_widening(self):
+        from liminallm.service.rag import INLINE_PATH
+
+        assert self._labels(INLINE_PATH, "reports/status.md") == [
+            "inline text",
+            "status.md",
+        ]
 
 
 class TestNothingRetrievedSaysSo:

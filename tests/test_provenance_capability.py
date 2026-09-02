@@ -20,6 +20,7 @@ from liminallm.service.provenance import SourceRegistry
 from liminallm.service.runtime import get_runtime
 
 MANUAL = "Turbine blade inspection happens every 400 flight hours. " * 40
+QUERY = "turbine blade inspection"
 
 
 @pytest.fixture
@@ -48,7 +49,7 @@ def _broker(user_id, ctx_id, registry, bindings):
     return CapabilityBroker(get_runtime().workflow, context), context
 
 
-def _ask(broker, invocation, seq=1, query="turbine blade inspection"):
+def _ask(broker, invocation, seq=1, query=QUERY):
     return broker._answer(
         invocation,
         {
@@ -110,16 +111,21 @@ class TestAReplayedCapabilityStillCarriesItsProvenance:
     def test_the_replacement_attempt_gets_the_original_bindings(self, store):
         user_id, ctx_id = _grounded(store)
         invocation = _open()
+        # One registry, because a turn has one: it is created at the workflow
+        # entry point and passed by reference, and a retry replaces the
+        # worker, not the turn. Giving each attempt its own would model a
+        # lifecycle that cannot occur, and would hide the failure that
+        # matters - ids that name nothing the turn can cite.
+        registry = SourceRegistry()
 
-        first_registry, first_bindings = SourceRegistry(), []
-        broker_a, ctx_a = _broker(user_id, ctx_id, first_registry, first_bindings)
+        broker_a, ctx_a = _broker(user_id, ctx_id, registry, [])
         reply_a = _ask(broker_a, invocation)
         assert ctx_a.provenance_bindings, "attempt A recorded nothing"
 
         # Attempt B: the same invocation and ledger, a fresh worker and so a
-        # fresh broker, asking for the same capability at the same position.
-        second_registry, second_bindings = SourceRegistry(), []
-        broker_b, ctx_b = _broker(user_id, ctx_id, second_registry, second_bindings)
+        # fresh broker and a fresh collector, asking for the same capability
+        # at the same position.
+        broker_b, ctx_b = _broker(user_id, ctx_id, registry, [])
         ran = {"handler": False}
         real = broker_b._rag_retrieve
 
@@ -137,6 +143,87 @@ class TestAReplayedCapabilityStillCarriesItsProvenance:
             "the replayed attempt received the text with no provenance: "
             f"{ctx_b.provenance_bindings}"
         )
+        # Equal ids are not enough: the point of replaying them is that the
+        # turn can still resolve them to what the answer rests on.
+        for binding in ctx_b.provenance_bindings:
+            assert registry.get_source(binding["source_id"]) is not None, (
+                f"a replayed id names no source: {binding}"
+            )
+            assert registry.get_evidence(binding["evidence_id"]) is not None, (
+                f"a replayed id names no evidence: {binding}"
+            )
+
+
+class TestARetriedToolStillCitesWhatItRead:
+    """The same replay, through the whole path rather than at the seam.
+
+    The unit above drives the broker directly. This one runs `file.search_v1`
+    for real over a ledger that already holds its search, so every stage has
+    to carry the record: the ledger returns the sidecar, the broker folds it
+    into the replacement attempt's context, and the parent attaches it to the
+    result the caller receives.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_search_still_grounds_the_result(
+        self, store, monkeypatch
+    ):
+        engine = get_runtime().workflow
+        user_id, ctx_id = _grounded(store)
+        registry = SourceRegistry()
+        invocation = engine.invocations.open(
+            uuid.uuid4().hex, tool="file.search_v1", user_id=user_id,
+            tenant_id=None,
+        )
+
+        # Attempt A: the search a first worker asked for and that outlived it.
+        # `_body_file_search` sends exactly this, at exactly this position, so
+        # the replacement worker's own first request replays it.
+        broker_a, ctx_a = _broker(user_id, ctx_id, registry, [])
+        reply_a = broker_a._answer(
+            invocation,
+            {
+                "capability": "rag.retrieve",
+                "operation_seq": 1,
+                "payload": {"query": QUERY, "limit": 4},
+            },
+        )
+        assert reply_a["ok"], reply_a
+        assert ctx_a.provenance_bindings, "attempt A recorded nothing"
+
+        ran = {"handler": False}
+        real = CapabilityBroker._rag_retrieve
+
+        def _tripwire(self, *args, **kwargs):
+            ran["handler"] = True
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(CapabilityBroker, "_rag_retrieve", _tripwire)
+        result = await engine._invoke_tool(
+            "file.search_v1",
+            {"query": QUERY, "limit": 4},
+            [],
+            [],
+            ctx_id,
+            None,
+            QUERY,
+            source_registry=registry,
+            user_id=user_id,
+            tenant_id=None,
+            invocation=invocation,
+        )
+
+        assert result.get("status") != "error", result
+        # Not a coincidence of ids: the handler never ran, so the only place
+        # this attempt could have learned them is the committed sidecar.
+        assert not ran["handler"], "the retry re-ran retrieval"
+        assert result.get("provenance_bindings") == ctx_a.provenance_bindings, (
+            "a retried tool answered from replayed text and cited nothing: "
+            f"{result.get('provenance_bindings')}"
+        )
+        for binding in result["provenance_bindings"]:
+            assert registry.get_source(binding["source_id"]) is not None
+            assert registry.get_evidence(binding["evidence_id"]) is not None
 
 
 class TestOneRelationHoweverManyTimesItIsReached:
