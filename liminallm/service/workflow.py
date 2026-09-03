@@ -44,7 +44,7 @@ from liminallm.service import (
 from liminallm.service import attachments as attachments_service
 from liminallm.service import notes as notes_service
 from liminallm.service.broker import CapabilityBroker, InvocationContext
-from liminallm.service.citations import citation_payload, transfer_citations
+from liminallm.service.citations import transfer_citations
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     cosine_similarity,
@@ -951,8 +951,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 content = result["content"]
                 provenance_bindings = list(result.get("provenance_bindings") or [])
                 # Same rule, same reason: these are citations *in this
-                # content*, and their offsets index it. A node that replaces
-                # the answer replaces them, including with none.
+                # content*, and their `public_offset` indexes it. A node that
+                # replaces the answer replaces them, including with none.
                 validated_citations = list(result.get("validated_citations") or [])
             node_usage = result.get("usage")
             usage = self._merge_usage(usage, node_usage or {})
@@ -2895,13 +2895,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             and worker_tool == "agent.files_v1"
             and not plan.get("stream_final")
         ):
-            occurrences = transfer_citations(
+            citations = transfer_citations(
                 context.canonical_model_response,
                 invocation.citations,
                 sanitized.get("content"),
             )
-            if occurrences:
-                sanitized["validated_citations"] = citation_payload(occurrences)
+            if citations:
+                sanitized["validated_citations"] = citations
         return refusal or sanitized
 
     def tool_postflight(

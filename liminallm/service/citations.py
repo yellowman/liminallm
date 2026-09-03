@@ -32,6 +32,7 @@ produced, and only when the answer coming back is that response unchanged.
 
 from __future__ import annotations
 
+import bisect
 import json
 import re
 import secrets
@@ -448,7 +449,7 @@ def transfer_citations(
     canonical: Optional[Mapping[str, Any]],
     table: CitationTable,
     worker_content: Any,
-) -> List[CitationOccurrence]:
+) -> List[Dict[str, Any]]:
     """The citations the model wrote, if this is the answer it wrote them in.
 
     The parent kept what the model said; the worker returned what it claims
@@ -494,27 +495,50 @@ def transfer_citations(
     canonical_text = str(canonical.get("content") or "")
     if not canonical_text:
         return []
-    if worker_content != scrub_namespace(canonical_text, table.nonce):
+    public, origins = scrub_positions(canonical_text, table.nonce)
+    if worker_content != public:
         return []
-    return validate_citations(canonical_text, table)
+    return citation_payload(validate_citations(canonical_text, table), origins)
 
 
 def citation_payload(
     occurrences: Sequence[CitationOccurrence],
+    origins: Sequence[int],
 ) -> List[Dict[str, Any]]:
     """Validated citations as plain data, for one turn's transport.
 
-    Offsets into the canonical answer, which is not what the caller holds -
-    what it holds is that answer scrubbed. They are carried because dropping
-    them here would mean recovering them later by re-parsing, and re-parsing
-    is the thing this layer exists to avoid. S6 decides what is durable.
+    Two coordinate spaces, each named for the string it indexes, because they
+    are not the same string and a record that said only `start` would be read
+    as indexing whichever one the reader had in hand:
+
+    * `canonical_start` and `canonical_end` span the marker in the answer the
+      model produced. That string is parent-side and goes no further, so these
+      are measurement, not something to render against.
+    * `public_offset` is where the marker was in the answer the caller holds -
+      an insertion point, since the marker is not there any more. This is the
+      coordinate anything rendering or persisting a citation wants.
+
+    `public_offset` comes from the scrub that removed the marker rather than
+    from arithmetic over marker widths, because the scrub also takes out bare
+    nonces, leading whitespace and case variants, and repeats until nothing is
+    left. Recovering it later by re-parsing is the work this layer exists to
+    avoid, so it is carried.
+
+    The handle stops here. It is the model-facing name for a source and its
+    job ended when it resolved to `source_id`; carrying it further would push
+    the nonce past the invocation that minted it and blur the line between
+    what the model called a source and what the parent decided it was.
+
+    Mapping the marker's start or its end gives the same number, since the
+    span between them is exactly what was removed. The start is used because
+    that is where the marker was.
     """
     return [
         {
-            "handle": item.handle,
             "source_id": item.source_id,
-            "start": item.start,
-            "end": item.end,
+            "canonical_start": item.start,
+            "canonical_end": item.end,
+            "public_offset": public_index(origins, item.start),
         }
         for item in occurrences
     ]
@@ -574,17 +598,61 @@ def scrub_namespace(value: Any, nonce: str) -> Any:
     return _scrub(value, _namespace_pattern(nonce))
 
 
-def _scrub(value: Any, pattern: "re.Pattern[str]") -> Any:
-    if isinstance(value, str):
-        scrubbed = pattern.sub("", value)
+def scrub_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
+    """The scrubbed text, and where each surviving character came from.
+
+    `origins[i]` is the index in `text` of the character at `i` in the result,
+    so the two together say not only what crossed but where every removal
+    happened. `public_index` reads that back.
+
+    One transformation answers both questions on purpose. The same scrub
+    decides whether the worker returned the answer unchanged and where a
+    validated marker went, and deriving the second by subtracting marker
+    widths would be a second implementation that disagrees with the first:
+    this one also removes bare nonces, leading whitespace and case variants,
+    and repeats until nothing is left to find. Each of those shifts positions.
+    """
+    return _scrub_text(text, _namespace_pattern(nonce))
+
+
+def public_index(origins: Sequence[int], index: int) -> int:
+    """Where position `index` of the original text landed after scrubbing.
+
+    An insertion point rather than a character: a position inside a removed
+    span maps to where that span used to start, which is what a renderer
+    needs to put something back.
+    """
+    return bisect.bisect_left(origins, index)
+
+
+def _scrub_text(text: str, pattern: "re.Pattern[str]") -> Tuple[str, List[int]]:
+    current = text
+    origins = list(range(len(text)))
+    while True:
         # Removing a substring can splice its neighbours into a fresh
         # occurrence: `ABCD` + nonce + `EFGH` becomes the nonce again, for
-        # any nonce. `re.sub` does not rescan what it has rewritten, so the
-        # pass is repeated until it stops finding anything. Each pass is at
-        # least a nonce shorter than the last, so this ends.
-        while pattern.search(scrubbed):
-            scrubbed = pattern.sub("", scrubbed)
-        return scrubbed
+        # any nonce. A pass does not rescan what it has rewritten, so passes
+        # repeat until one finds nothing. Each pass is at least a nonce
+        # shorter than the last, so this ends.
+        matches = list(pattern.finditer(current))
+        if not matches:
+            return current, origins
+        kept: List[str] = []
+        kept_origins: List[int] = []
+        cursor = 0
+        for match in matches:
+            kept.append(current[cursor : match.start()])
+            kept_origins.extend(origins[cursor : match.start()])
+            cursor = match.end()
+        kept.append(current[cursor:])
+        kept_origins.extend(origins[cursor:])
+        current = "".join(kept)
+        origins = kept_origins
+
+
+def _scrub(value: Any, pattern: "re.Pattern[str]") -> Any:
+    if isinstance(value, str):
+        return _scrub_text(value, pattern)[0]
     if isinstance(value, Mapping):
         # Keys as well as values. Today every adapter re-serializes a tool
         # call's arguments to a JSON string, so no key here is model-chosen;

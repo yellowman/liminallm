@@ -10,6 +10,9 @@ writes a marker of its own is writing into a string nobody parses.
 from __future__ import annotations
 
 import asyncio
+import json
+import random
+import string
 import uuid
 
 import pytest
@@ -17,6 +20,8 @@ import pytest
 from liminallm.service.citations import (
     CitationTable,
     build_citation_table,
+    mint_nonce,
+    scrub_positions,
     transfer_citations,
 )
 from liminallm.service.provenance import SourceRegistry, binding
@@ -62,7 +67,7 @@ class TestTheAnswerMustBeTheOneTheModelWrote:
         found = transfer_citations(
             {"content": f"{ANSWER} [cite:{handle}]"}, table, ANSWER
         )
-        assert [item.source_id for item in found] == ["src_1"]
+        assert [item["source_id"] for item in found] == ["src_1"]
 
     def test_a_worker_that_changed_one_word_transfers_nothing(self):
         """The whole boundary in one case: the worker holds the handle, and
@@ -111,14 +116,110 @@ class TestAuthorityIsReadOnlyFromTheParentsCopy:
             {"content": ANSWER}, table, f"{ANSWER} [cite:{handle}]"
         ) == []
 
-    def test_the_offsets_index_the_canonical_text(self):
-        """Not the scrubbed answer the worker was handed. S6 needs to know
-        which string they belong to, so this pins it."""
+    def test_the_canonical_offsets_span_the_marker_in_the_model_s_answer(self):
+        """Named for the string they index, because it is not the string the
+        caller holds - that one has no marker in it at all."""
         _, table = _table()
         handle = table.handle_for("src_1")
         canonical = f"{ANSWER} [cite:{handle}]"
         found = transfer_citations({"content": canonical}, table, ANSWER)
-        assert canonical[found[0].start : found[0].end] == f"[cite:{handle}]"
+        span = canonical[found[0]["canonical_start"] : found[0]["canonical_end"]]
+        assert span == f"[cite:{handle}]"
+
+    def test_the_handle_stops_at_the_authority_boundary(self):
+        """It named a source for the model and resolved to `source_id`. Past
+        that it is only the nonce, travelling further than the invocation
+        that minted it."""
+        _, table = _table()
+        handle = table.handle_for("src_1")
+        found = transfer_citations(
+            {"content": f"{ANSWER} [cite:{handle}]"}, table, ANSWER
+        )
+        assert found and "handle" not in found[0], found
+        assert NONCE not in json.dumps(found)
+
+
+class TestThePublicOffsetPointsIntoTheAnswerTheCallerHolds:
+    """The marker is gone from that string, so the offset is where it was -
+    an insertion point. Taken from the scrub that removed it, not from
+    arithmetic over marker widths."""
+
+    @staticmethod
+    def _split(canonical, table):
+        public, _ = scrub_positions(canonical, table.nonce)
+        found = transfer_citations({"content": canonical}, table, public)
+        return public, [
+            (public[: item["public_offset"]], public[item["public_offset"] :])
+            for item in found
+        ]
+
+    def test_each_marker_reopens_where_it_was_taken_out(self):
+        _, table = _table(count=2)
+        canonical = (
+            f"Alpha [cite:{table.handle_for('src_1')}]. "
+            f"Beta [cite:{table.handle_for('src_2')}]."
+        )
+        public, splits = self._split(canonical, table)
+        assert public == "Alpha. Beta."
+        assert splits == [("Alpha", ". Beta."), ("Alpha. Beta", ".")]
+
+    def test_a_bare_nonce_earlier_in_the_answer_shifts_the_offsets(self):
+        """The case that separates a real mapping from subtracting marker
+        widths: nothing here is a marker, and everything after it moves."""
+        _, table = _table()
+        canonical = f"{NONCE} Alpha [cite:{table.handle_for('src_1')}]."
+        public, splits = self._split(canonical, table)
+        assert public == " Alpha."
+        assert splits == [(" Alpha", ".")]
+        # Marker-width arithmetic would have said 15 - 0 = 15, past the end.
+        found = transfer_citations({"content": canonical}, table, public)
+        assert found[0]["canonical_start"] == 15
+        assert found[0]["public_offset"] == 6
+
+    def test_a_repeated_splice_before_a_marker_shifts_the_offsets(self):
+        """Two passes of removal, so the offsets have to compose rather than
+        describe one pass."""
+        _, table = _table()
+        spliced = NONCE[:4] + NONCE + NONCE[4:]
+        canonical = f"{spliced}Alpha [cite:{table.handle_for('src_1')}]."
+        public, splits = self._split(canonical, table)
+        assert public == "Alpha."
+        assert splits == [("Alpha", ".")]
+
+    def test_every_origin_names_the_character_it_kept(self):
+        """The invariant the whole mapping rests on: reading the original
+        text at the recorded positions reproduces the scrubbed string, in
+        order. Measured over generated input because a mapping that composes
+        wrongly across passes is right on any one example someone picks."""
+        random.seed(20260903)
+        pool = string.printable + NONCE + "[cite:]"
+        for index in range(2000):
+            nonce = mint_nonce()
+            filler = [
+                "".join(random.choice(pool) for _ in range(random.randint(0, 8)))
+                for _ in range(3)
+            ]
+            spliced = nonce[:4] + nonce + nonce[4:]
+            shape = index % 3
+            if shape == 0:
+                text = spliced + filler[0]
+            elif shape == 1:
+                # A first-pass removal, then surviving text, then a splice
+                # that only forms on the second pass. That is the shape where
+                # a later pass has to read positions through the earlier one
+                # rather than through the string in front of it.
+                text = nonce + filler[0] + spliced + filler[1]
+            else:
+                text = (
+                    filler[0]
+                    + f"[cite:{nonce}-1]"
+                    + filler[1]
+                    + nonce.lower()
+                    + filler[2]
+                )
+            public, origins = scrub_positions(text, nonce)
+            assert public == "".join(text[at] for at in origins), (text, origins)
+            assert origins == sorted(origins), (text, origins)
 
 
 class TestThereIsNoCanonicalResponseToTransferFrom:
@@ -157,7 +258,7 @@ class TestOnlyTheLastCanonicalResponseIsEligible:
         # be reached. The check is that the caller passes the last, which is
         # what `_apply_parent_state` replacement guarantees.
         found = transfer_citations({"content": last}, table, ANSWER)
-        assert [item.source_id for item in found] == ["src_2"]
+        assert [item["source_id"] for item in found] == ["src_2"]
 
 
 class TestThroughTheRealAgentLoop:
@@ -220,10 +321,12 @@ class TestThroughTheRealAgentLoop:
         assert result.get("content") == ANSWER, repr(result.get("content"))
         assert result.get("validated_citations") == [
             {
-                "handle": handle,
                 "source_id": "src_1",
-                "start": len(ANSWER) + 1,
-                "end": len(ANSWER) + 1 + len(f"[cite:{handle}]"),
+                "canonical_start": len(ANSWER) + 1,
+                "canonical_end": len(ANSWER) + 1 + len(f"[cite:{handle}]"),
+                # The marker sat at the very end, after a space that goes
+                # with it, so it reopens exactly where the answer stops.
+                "public_offset": len(ANSWER),
             }
         ], result.get("validated_citations")
 
@@ -579,7 +682,7 @@ class TestTheNamesTravelWithTheCitations:
         )
         snapshot = registry.snapshot()
         for item in found:
-            assert item.source_id in snapshot["sources"], snapshot
+            assert item["source_id"] in snapshot["sources"], snapshot
 
     def test_an_empty_table_is_falsey(self):
         assert not CitationTable(nonce=NONCE)
