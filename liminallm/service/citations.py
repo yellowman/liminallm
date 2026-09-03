@@ -444,6 +444,82 @@ def validate_citations(answer: str, table: CitationTable) -> List[CitationOccurr
     return found
 
 
+def transfer_citations(
+    canonical: Optional[Mapping[str, Any]],
+    table: CitationTable,
+    worker_content: Any,
+) -> List[CitationOccurrence]:
+    """The citations the model wrote, if this is the answer it wrote them in.
+
+    The parent kept what the model said; the worker returned what it claims
+    the answer is. Those are different objects with different trust, and this
+    is the only place the first becomes authority for the second.
+
+    The rule is one exact comparison. What the worker returned must equal the
+    canonical answer with this turn's namespace taken out of it - the string
+    the worker was handed. Then, and only then, the citations are read out of
+    the canonical text. Two asymmetries carry the whole boundary:
+
+    * equality is checked against the worker's text, because that is the
+      thing being vouched for;
+    * markers are parsed only from the parent's text, because a worker that
+      could write a marker could cite a source it never read.
+
+    So a worker that edits one word - `400 hours` to `800 hours` - transfers
+    nothing. It can still return whatever it likes; it just cannot have the
+    parent call it cited.
+
+    Exact, with no normalization. A worker that trims or rewraps the answer
+    loses its citations, which is the safe direction: the alternative is a
+    comparison that accepts an answer the model did not write. The blocking
+    agent path returns the terminal response unchanged, so this costs nothing
+    there, and the cases where it does differ - an empty terminal response,
+    the "could not derive an answer" default - are answers the model did not
+    write and should carry nothing.
+
+    `canonical` is replacement state, not a history: the last model turn of
+    the assembly is the only candidate. Two turns whose public text is the
+    same but whose citations differ must not both be eligible, and searching
+    backwards for one that happens to match would make them so.
+    """
+    # Two contract statements rather than two behaviours, and neither is
+    # separately killable: drop the first and the second catches a missing
+    # response, drop the second and the empty text compares equal to an empty
+    # answer and validates to nothing anyway. Drop both and this raises on
+    # `None`. Written out because "no canonical answer text, no transfer" is
+    # the rule, and leaving it to be re-derived from how the validator treats
+    # an empty string is how it stops being true.
+    if not canonical:
+        return []
+    canonical_text = str(canonical.get("content") or "")
+    if not canonical_text:
+        return []
+    if worker_content != scrub_namespace(canonical_text, table.nonce):
+        return []
+    return validate_citations(canonical_text, table)
+
+
+def citation_payload(
+    occurrences: Sequence[CitationOccurrence],
+) -> List[Dict[str, Any]]:
+    """Validated citations as plain data, for one turn's transport.
+
+    Offsets into the canonical answer, which is not what the caller holds -
+    what it holds is that answer scrubbed. They are carried because dropping
+    them here would mean recovering them later by re-parsing, and re-parsing
+    is the thing this layer exists to avoid. S6 decides what is durable.
+    """
+    return [
+        {
+            "handle": item.handle,
+            "source_id": item.source_id,
+            "start": item.start,
+            "end": item.end,
+        }
+        for item in occurrences
+    ]
+
+
 def _namespace_pattern(nonce: str) -> "re.Pattern[str]":
     """Every plain form one turn's namespace can be written in.
 

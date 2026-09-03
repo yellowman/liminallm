@@ -44,6 +44,7 @@ from liminallm.service import (
 from liminallm.service import attachments as attachments_service
 from liminallm.service import notes as notes_service
 from liminallm.service.broker import CapabilityBroker, InvocationContext
+from liminallm.service.citations import citation_payload, transfer_citations
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     cosine_similarity,
@@ -608,7 +609,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # Namespace outputs by node ID
                 merged_outputs[node_id] = {
                     k: v for k, v in result.items()
-                    if k not in {"usage", "context_snippets", "provenance_bindings", "status"}
+                    if k
+                    not in {
+                        "usage",
+                        "context_snippets",
+                        "provenance_bindings",
+                        "validated_citations",
+                        "status",
+                    }
                 }
 
                 # Check for failure
@@ -739,6 +747,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # succeeded, so a citation cannot rest on evidence from an attempt
         # whose generation failed.
         provenance_bindings: List[Binding] = []
+        validated_citations: List[Dict[str, Any]] = []
         # The turn's provenance, created once here and passed by reference to
         # every node that can retrieve. Not in `vars_scope`, which a parallel
         # child deep-copies, and not on an `Invocation`, which is one tool
@@ -888,6 +897,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         # The block's answer is every successful child's
                         # answer concatenated, so its grounding is theirs.
                         provenance_bindings = list(parallel_result.merged_bindings)
+                        # Citations are not merged, and cannot be: their
+                        # offsets index one child's answer, which is not the
+                        # concatenation. Cleared rather than carried, because
+                        # carrying would leave the previous node's offsets
+                        # pointing into a string that is no longer the answer.
+                        validated_citations = []
 
                     # Merge usage
                     usage = self._merge_usage(usage, parallel_result.merged_usage)
@@ -935,6 +950,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
             if result.get("content"):
                 content = result["content"]
                 provenance_bindings = list(result.get("provenance_bindings") or [])
+                # Same rule, same reason: these are citations *in this
+                # content*, and their offsets index it. A node that replaces
+                # the answer replaces them, including with none.
+                validated_citations = list(result.get("validated_citations") or [])
             node_usage = result.get("usage")
             usage = self._merge_usage(usage, node_usage or {})
 
@@ -983,10 +1002,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "adapter_gates": adapter_gates,
             "context_snippets": context_snippets,
             "provenance_bindings": provenance_bindings,
+            "validated_citations": validated_citations,
             "workflow_trace": workflow_trace,
             "routing_trace": routing_trace,
             "vars": vars_scope,
         }
+        if validated_citations:
+            # Transient, and only where something names it. A citation says
+            # `src_3`, which means nothing once this registry goes out of
+            # scope with the turn, so whatever resolves the name has to
+            # travel beside it.
+            #
+            # Not eligibility. The registry is everything consulted, and the
+            # answer rests on the bindings; this is the lookup table for names
+            # already validated against those. S6 decides what is durable and
+            # in what shape - hence the explicit name, which is transport.
+            result["provenance_snapshot"] = source_registry.snapshot()
         await self._retire_workflow_state(state_key)
         await self.cache_conversation_state(conversation_id, history, user_id)
         return result
@@ -2657,7 +2688,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             outputs = {
                 k: v
                 for k, v in tool_result.items()
-                if k not in {"usage", "context_snippets", "provenance_bindings"}
+                if k
+                not in {
+                    "usage",
+                    "context_snippets",
+                    "provenance_bindings",
+                    "validated_citations",
+                }
             }
         next_nodes_list = self._successors(node, tool_result)
         result_payload: Dict[str, Any] = {
@@ -2669,7 +2706,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "outputs": outputs,
         }
         if isinstance(tool_result, dict):
-            for k in ("content", "usage", "context_snippets", "provenance_bindings"):
+            for k in (
+                "content",
+                "usage",
+                "context_snippets",
+                "provenance_bindings",
+                "validated_citations",
+            ):
                 if k in tool_result:
                     result_payload[k] = tool_result[k]
         return result_payload, next_nodes_list
@@ -2830,6 +2873,35 @@ class WorkflowEngine(WorkflowStreamingMixin):
         succeeded = sanitized.get("status") != "error"
         if succeeded and context.provenance_bindings:
             sanitized["provenance_bindings"] = list(context.provenance_bindings)
+        # Citations, on the same terms and from the same side. The canonical
+        # response exists because this assembly made `llm.generate_with_tools`
+        # broker calls, so the transfer is gated on the resolved worker body.
+        #
+        # Both parts of that gate are deliberately unkillable by mutation, and
+        # are here for what they refuse next rather than for anything today:
+        #
+        # * no other body calls that capability, so a non-agent tool has no
+        #   canonical response and would transfer nothing anyway. Named
+        #   explicitly so that a later host tool filling in similarly named
+        #   state does not inherit a protocol nobody wrote it for.
+        # * `stream_final` never arrives here at all: that path calls
+        #   `_serve_invocation` directly and streams its own final turn. Its
+        #   worker `content` is the last *tool* round's text, which can equal
+        #   the canonical public text exactly - measured, not assumed - so a
+        #   refactor routing streaming through this seam would attach
+        #   citations to an answer that had not been written yet.
+        if (
+            succeeded
+            and worker_tool == "agent.files_v1"
+            and not plan.get("stream_final")
+        ):
+            occurrences = transfer_citations(
+                context.canonical_model_response,
+                invocation.citations,
+                sanitized.get("content"),
+            )
+            if occurrences:
+                sanitized["validated_citations"] = citation_payload(occurrences)
         return refusal or sanitized
 
     def tool_postflight(
