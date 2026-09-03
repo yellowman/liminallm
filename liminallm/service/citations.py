@@ -26,6 +26,7 @@ anything the turn did not read.
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 from dataclasses import dataclass, field
@@ -435,6 +436,65 @@ def validate_citations(answer: str, table: CitationTable) -> List[CitationOccurr
             )
         )
     return found
+
+
+def scrub_namespace(value: Any, nonce: str) -> Any:
+    """A copy of `value` with this turn's citation namespace taken out of it.
+
+    Stronger than removing citation markers, and for the wire rather than for
+    a reader. Once the model has been offered `[cite:K7Q2ABCD-1]` it can put
+    that handle anywhere in its reply, and everything in that reply crosses
+    the pipe to a worker that is the untrusted half of the boundary. A worker
+    holding one valid handle can attach a real citation to text it wrote
+    itself; a worker holding the bare nonce can derive every handle the turn
+    will ever issue. So the nonce goes, not only the well-formed markers.
+
+    Recursive, because a model-controlled string is not only `content`: an
+    assistant message carries one, and a tool call's `arguments` carry
+    whatever the model decided to search for. Every container is rebuilt, so
+    the scrubbed copy shares no mutable structure with the original - the
+    canonical record must not change when something edits what crossed.
+
+    A document could in principle contain this turn's nonce by accident and
+    lose it here. That is one string in 2**40 per candidate token, against a
+    channel that otherwise hands the untrusted side its own authority.
+    """
+    if isinstance(value, str):
+        without_markers = strip_citations(value)
+        # What is left of a handle whose brackets the model omitted, and the
+        # namespace on its own. Same leading-whitespace rule, so removing one
+        # does not leave a gap mid-sentence.
+        return re.sub(rf"[ \t]*{re.escape(nonce)}(?:-\d+)?", "", without_markers)
+    if isinstance(value, Mapping):
+        # Keys as well as values. Today every adapter re-serializes a tool
+        # call's arguments to a JSON string, so no key here is model-chosen;
+        # that is a property of the adapters rather than of this reply, and
+        # a key is a string like any other. Two keys that scrub to the same
+        # name collapse to one, which is the safe direction for a copy whose
+        # only purpose is to cross to the untrusted side.
+        return {
+            scrub_namespace(key, nonce): scrub_namespace(item, nonce)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        rebuilt = [scrub_namespace(item, nonce) for item in value]
+        return tuple(rebuilt) if isinstance(value, tuple) else rebuilt
+    return value
+
+
+def assert_scrubbed(value: Any, nonce: str) -> None:
+    """Refuse to hand the untrusted side anything naming this namespace.
+
+    Checked on the serialized whole rather than on the fields this module
+    happens to know about: a field added later is model-controlled the moment
+    it exists, and a scrubber that lists its keys would keep passing while a
+    new one carried the handle straight across.
+    """
+    serialized = json.dumps(value, default=repr)
+    if nonce in serialized:
+        raise ProvenanceError(
+            "a citation namespace reached a public capability result"
+        )
 
 
 def strip_citations(answer: str) -> str:

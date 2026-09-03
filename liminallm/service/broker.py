@@ -37,10 +37,12 @@ the body runs here, and the capability name says so.
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from liminallm.logging import get_logger
+from liminallm.service.citations import assert_scrubbed, scrub_namespace
 from liminallm.service.invocation import (
     Invocation,
     LeaseRevoked,
@@ -122,6 +124,11 @@ class InvocationContext:
     provenance_bindings: List[Binding] = field(
         default_factory=list
     )
+    #: The last model turn of this assembly as the model wrote it, citation
+    #: handles included. The worker gets a scrubbed copy; this is the only one
+    #: any citation can honestly be read out of, so it stays here and is
+    #: restored from the ledger when an attempt replays rather than runs.
+    canonical_model_response: Optional[Dict[str, Any]] = None
 
 
 class CapabilityBroker:
@@ -506,6 +513,17 @@ class CapabilityBroker:
         """
         if not parent_state:
             return
+        canonical = parent_state.get("canonical_model_response")
+        if canonical is not None:
+            # The last model turn of this assembly, as the model wrote it. On
+            # a replay the handler does not run, so this is the only place a
+            # replacement attempt can recover the citations in an answer it is
+            # otherwise handed intact - the same reason the bindings are here.
+            #
+            # Copied rather than referenced: the ledger keeps this record for
+            # every later attempt, and an attempt that edited it in place
+            # would change what the next one is told the model said.
+            self._ctx.canonical_model_response = deepcopy(canonical)
         collected = self._ctx.provenance_bindings
         seen = {
             (b.get("context_id"), b.get("source_id"), b.get("evidence_id"))
@@ -587,7 +605,22 @@ class CapabilityBroker:
 
     def _llm_generate_with_tools(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> CapabilityOutcome:
+        """One model turn, in two representations.
+
+        The canonical one is what the model actually said, citation handles
+        and all, and it never crosses the pipe. The public one is the same
+        answer with this turn's citation namespace taken out of it, and that
+        is what the worker sees and what the ledger commits.
+
+        Both are needed and they are separate objects. Once the model has been
+        offered a handle it can put it anywhere in its reply - in the prose,
+        in the assistant message, in the arguments of a tool call it wants run
+        - and every one of those crosses to the untrusted half. A worker
+        holding one valid handle can attach a real citation to text it wrote
+        itself. So the scrub is recursive over the whole reply and is checked
+        on the serialized result rather than on the fields named here.
+        """
         invocation.check_live()
         response = self._engine.llm.generate_with_tools(
             payload.get("messages") or [],
@@ -595,12 +628,33 @@ class CapabilityBroker:
             self._ctx.adapters,
             user_id=self._ctx.user_id,
         )
-        return {
+        canonical = {
             "content": response.get("content") or "",
             "tool_calls": response.get("tool_calls") or [],
             "assistant_message": response.get("assistant_message"),
             "usage": response.get("usage") or {},
         }
+        nonce = invocation.citations.nonce
+        public = scrub_namespace(canonical, nonce)
+        # Belt and braces, on the whole serialized reply: a model-controlled
+        # field added later is model-controlled the moment it exists, and a
+        # check that listed today's keys would keep passing while a new one
+        # carried the handle straight across.
+        #
+        # It cannot fire against the scrubber above, which reaches every JSON
+        # shape that can hold a string, and an object of any other type does
+        # not cross at all - `send_frame` refuses one rather than sending its
+        # repr. So this call is deliberately unkillable by mutation, and is
+        # recorded here rather than left for a later reader to simplify away:
+        # what it guards is the next field, not this one.
+        assert_scrubbed(public, nonce)
+        return CapabilityOutcome(
+            public=public,
+            # What the worker must not see, kept where a replay can restore
+            # it: the answer as the model wrote it, which is the only copy
+            # any citation can honestly be read out of.
+            parent_state={"canonical_model_response": canonical},
+        )
 
     # -- one round of the agent loop --------------------------------------
 
