@@ -22,6 +22,12 @@ nothing and is dropped, and the nonce is not visible before the turn that
 mints it. A correct guess would misattribute one span among the sources this
 turn already grounded on - handles exist only for those - rather than reach
 anything the turn did not read.
+
+None of that rests on the namespace staying secret once the model has seen
+it. A model can encode a nonce past any scrubber, so what makes a leaked one
+worthless is where citations are read from: the response the model actually
+produced, and only when the answer coming back is that response unchanged.
+`scrub_namespace` keeps the plain forms off the wire; it is not the boundary.
 """
 
 from __future__ import annotations
@@ -438,16 +444,42 @@ def validate_citations(answer: str, table: CitationTable) -> List[CitationOccurr
     return found
 
 
+def _namespace_pattern(nonce: str) -> "re.Pattern[str]":
+    """Every plain form one turn's namespace can be written in.
+
+    Three of them: the well-formed marker, a handle whose brackets the model
+    omitted, and the nonce on its own. The leading-whitespace rule is shared,
+    so removing one does not leave a gap mid-sentence.
+
+    Matched case-insensitively. The alphabet is uppercase, so `k7q2abcd` is
+    not an encoding of the namespace but a lossless normalization of it: a
+    worker handed the lowercase form recovers the real one by uppercasing.
+
+    Only this nonce. Anything else shaped like a citation is left exactly as
+    the model wrote it, including another turn's marker - see the caller.
+    """
+    token = re.escape(nonce)
+    return re.compile(
+        rf"[ \t]*(?:\[cite:{token}(?:-\d+)?\]|{token}(?:-\d+)?)",
+        re.IGNORECASE,
+    )
+
+
 def scrub_namespace(value: Any, nonce: str) -> Any:
     """A copy of `value` with this turn's citation namespace taken out of it.
 
-    Stronger than removing citation markers, and for the wire rather than for
-    a reader. Once the model has been offered `[cite:K7Q2ABCD-1]` it can put
+    For the wire rather than for a reader, and narrower than `strip_citations`
+    on purpose. Once the model has been offered `[cite:K7Q2ABCD-1]` it can put
     that handle anywhere in its reply, and everything in that reply crosses
-    the pipe to a worker that is the untrusted half of the boundary. A worker
-    holding one valid handle can attach a real citation to text it wrote
-    itself; a worker holding the bare nonce can derive every handle the turn
-    will ever issue. So the nonce goes, not only the well-formed markers.
+    the pipe to a worker that is the untrusted half of the boundary. So this
+    turn's nonce goes, in the marker and on its own.
+
+    What does not go is anything else citation-shaped. `strip_citations` is
+    the reader's cleanup and deliberately removes every closed marker, this
+    turn's or not; using it here would rewrite text carrying no authority at
+    all. A model asked to search for the literal `[cite:OLDTURN-1]` must get
+    that tool call executed as it wrote it, and a turn that was offered no
+    handles must cross unchanged.
 
     Recursive, because a model-controlled string is not only `content`: an
     assistant message carries one, and a tool call's `arguments` carry
@@ -455,30 +487,49 @@ def scrub_namespace(value: Any, nonce: str) -> Any:
     the scrubbed copy shares no mutable structure with the original - the
     canonical record must not change when something edits what crossed.
 
-    A document could in principle contain this turn's nonce by accident and
-    lose it here. That is one string in 2**40 per candidate token, against a
-    channel that otherwise hands the untrusted side its own authority.
+    What this buys, stated at its real width: no plain representation of the
+    namespace crosses the wire. It is not a secrecy proof. A model that has
+    seen the nonce can encode it into text no scrubber recognises - reversed,
+    base64, spelled out - so this cannot be the control citation correctness
+    depends on. That control is the canonical-response transfer rule, which
+    grants nothing when the worker's answer differs from what the model
+    actually said. This keeps the namespace out of ordinary worker state.
     """
+    return _scrub(value, _namespace_pattern(nonce))
+
+
+def _scrub(value: Any, pattern: "re.Pattern[str]") -> Any:
     if isinstance(value, str):
-        without_markers = strip_citations(value)
-        # What is left of a handle whose brackets the model omitted, and the
-        # namespace on its own. Same leading-whitespace rule, so removing one
-        # does not leave a gap mid-sentence.
-        return re.sub(rf"[ \t]*{re.escape(nonce)}(?:-\d+)?", "", without_markers)
+        scrubbed = pattern.sub("", value)
+        # Removing a substring can splice its neighbours into a fresh
+        # occurrence: `ABCD` + nonce + `EFGH` becomes the nonce again, for
+        # any nonce. `re.sub` does not rescan what it has rewritten, so the
+        # pass is repeated until it stops finding anything. Each pass is at
+        # least a nonce shorter than the last, so this ends.
+        while pattern.search(scrubbed):
+            scrubbed = pattern.sub("", scrubbed)
+        return scrubbed
     if isinstance(value, Mapping):
         # Keys as well as values. Today every adapter re-serializes a tool
         # call's arguments to a JSON string, so no key here is model-chosen;
         # that is a property of the adapters rather than of this reply, and
-        # a key is a string like any other. Two keys that scrub to the same
-        # name collapse to one, which is the safe direction for a copy whose
-        # only purpose is to cross to the untrusted side.
-        return {
-            scrub_namespace(key, nonce): scrub_namespace(item, nonce)
-            for key, item in value.items()
-        }
+        # a key is a string like any other.
+        rebuilt: Dict[Any, Any] = {}
+        for key, item in value.items():
+            scrubbed_key = _scrub(key, pattern)
+            if scrubbed_key in rebuilt:
+                # Two distinct keys became one. Refused rather than resolved:
+                # for a primitive whose whole job is to protect the field
+                # nobody has added yet, dropping one of them quietly is the
+                # wrong half of the choice.
+                raise ProvenanceError(
+                    "scrubbing a citation namespace collapsed two mapping keys"
+                )
+            rebuilt[scrubbed_key] = _scrub(item, pattern)
+        return rebuilt
     if isinstance(value, (list, tuple)):
-        rebuilt = [scrub_namespace(item, nonce) for item in value]
-        return tuple(rebuilt) if isinstance(value, tuple) else rebuilt
+        items = [_scrub(item, pattern) for item in value]
+        return tuple(items) if isinstance(value, tuple) else items
     return value
 
 
@@ -489,9 +540,20 @@ def assert_scrubbed(value: Any, nonce: str) -> None:
     happens to know about: a field added later is model-controlled the moment
     it exists, and a scrubber that lists its keys would keep passing while a
     new one carried the handle straight across.
+
+    Case-folded, for the same reason the scrubber is: the lowercase nonce is
+    the namespace, written differently.
+
+    Serialized without ASCII escaping so that this cannot fire on a payload
+    the scrubber correctly cleaned. `\\uXXXX` escapes are hex, and a nonce
+    drawn only from hex characters can be spliced out of one: `chr(0x2345)`
+    followed by `"6789"` escapes to `\\u23456789`, which contains a nonce the
+    string never held. Every escape that survives here is a control character
+    - always `\\u00XX`, and `0` is not in the alphabet - so no escape can
+    contribute. A real occurrence is ASCII and still appears verbatim.
     """
-    serialized = json.dumps(value, default=repr)
-    if nonce in serialized:
+    serialized = json.dumps(value, ensure_ascii=False, default=repr)
+    if nonce.lower() in serialized.lower():
         raise ProvenanceError(
             "a citation namespace reached a public capability result"
         )

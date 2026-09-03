@@ -1,19 +1,26 @@
-"""No citation authority crosses the pipe to the worker.
+"""No plain form of the citation namespace crosses the pipe to the worker.
 
 Once the model has been offered a handle it can put that handle anywhere in
 its reply, and every part of that reply goes to a worker running model-chosen
-control flow over attacker-controlled bytes. A worker holding one valid
-handle can attach a real citation to text it wrote itself; one holding the
-bare nonce can derive every handle the turn will ever issue.
+control flow over attacker-controlled bytes. So the namespace does not occur
+anywhere in the serialized public reply, in the marker or on its own, in
+whatever case it was written. What the model actually said is kept
+parent-side, where a replay can restore it.
 
-So the wire rule is stronger than removing well-formed markers: the namespace
-itself must not occur anywhere in the serialized public reply. What the model
-actually said is kept parent-side, where a replay can restore it.
+Stated at its real width, because the width matters for what comes next: this
+is not a secrecy proof. A model that has seen the nonce can encode it into
+text no scrubber recognises. What makes such a disclosure worthless is the
+canonical-response transfer rule - citations come from what the model said,
+and only when the worker returns it unchanged - not this scrub. The scrub
+keeps the namespace out of ordinary worker state, and it is narrow: text
+carrying no authority of this turn crosses exactly as the model wrote it.
 """
 
 from __future__ import annotations
 
 import json
+import random
+import string
 import uuid
 
 import pytest
@@ -22,6 +29,7 @@ from liminallm.service.broker import CapabilityBroker, InvocationContext
 from liminallm.service.citations import (
     assert_scrubbed,
     build_citation_table,
+    mint_nonce,
     scrub_namespace,
 )
 from liminallm.service.invocation import InvocationRegistry
@@ -92,6 +100,79 @@ class TestTheScrubberReachesEveryModelControlledString:
         assert scrub_namespace(reply, NONCE) == reply
 
 
+class TestOnlyThisTurnsNamespaceIsTakenOut:
+    """`strip_citations` is the reader's cleanup and removes every closed
+    marker. Using it on the wire would rewrite text carrying no authority."""
+
+    OTHER = "ABCDEFGH"
+
+    def test_another_turns_marker_is_left_exactly_as_written(self):
+        text = f"quote [cite:{self.OTHER}-1] exactly"
+        assert scrub_namespace(text, NONCE) == text
+
+    def test_another_turns_marker_inside_tool_arguments_survives(self):
+        """These arguments are parsed by the worker and sent back to be
+        executed. A model asked to search for a literal citation-shaped
+        token gets that search run, not a rewritten one."""
+        reply = {
+            "tool_calls": [
+                {
+                    "name": "web_search",
+                    "arguments": '{"q":"[cite:%s-1]"}' % self.OTHER,
+                }
+            ]
+        }
+        assert scrub_namespace(reply, NONCE) == reply
+
+    def test_a_turn_that_was_offered_no_handles_crosses_unchanged(self):
+        """Until S6 shows the model a handle, nothing in a reply belongs to
+        this namespace, so the scrub must be a no-op on every real reply."""
+        reply = {
+            "content": "See [cite:OLDTURN-1] and src_1.",
+            "tool_calls": [],
+            "usage": {},
+        }
+        assert scrub_namespace(reply, NONCE) == reply
+
+
+class TestTheNamespaceGoesInWhateverCaseItWasWritten:
+    """The alphabet is uppercase, so the lowercase nonce is not an encoding
+    of the namespace. It is the namespace, normalized losslessly."""
+
+    def test_a_lowercase_handle_does_not_survive(self):
+        scrubbed = scrub_namespace(f"x {NONCE.lower()}-1 y", NONCE)
+        assert NONCE.lower() not in scrubbed.lower()
+
+    def test_a_mixed_case_marker_does_not_survive(self):
+        scrubbed = scrub_namespace(f"a [CiTe:{NONCE.title()}-2] b", NONCE)
+        assert NONCE.lower() not in scrubbed.lower()
+
+    def test_the_assertion_case_folds_too(self):
+        with pytest.raises(ProvenanceError):
+            assert_scrubbed({"a": f"{NONCE.lower()}-1"}, NONCE)
+
+
+class TestRemovalDoesNotSpliceTheNamespaceBackTogether:
+    def test_a_neighbour_splice_is_removed_as_well(self):
+        """Cutting a substring joins what was on either side of it, and for
+        any nonce there is a string whose halves rejoin into one: here the
+        first pass leaves the nonce behind, so a single pass is not enough."""
+        spliced = NONCE[:4] + NONCE + NONCE[4:]
+        assert NONCE not in scrub_namespace(spliced, NONCE)
+
+
+class TestAKeyCollisionIsRefusedRatherThanResolved:
+    def test_two_keys_that_scrub_to_one_name_are_refused(self):
+        """Dropping one value quietly is the wrong half of the choice for a
+        primitive whose job is to protect a field nobody has added yet."""
+        with pytest.raises(ProvenanceError):
+            scrub_namespace({f"q{NONCE}": "first", "q": "second"}, NONCE)
+
+    def test_keys_that_stay_distinct_are_kept(self):
+        scrubbed = scrub_namespace({f"a{NONCE}": 1, "b": 2}, NONCE)
+        assert scrubbed == {"a": 1, "b": 2}
+
+
 class TestTheAssertionReadsTheWholeReply:
     def test_a_namespace_anywhere_is_refused(self):
         with pytest.raises(ProvenanceError):
@@ -105,6 +186,15 @@ class TestTheAssertionReadsTheWholeReply:
 
     def test_a_clean_reply_passes(self):
         assert_scrubbed({"content": "400 hours.", "usage": {}}, NONCE)
+
+    def test_json_escaping_does_not_manufacture_a_namespace(self):
+        """`\\uXXXX` escapes are hex. A nonce drawn only from hex characters
+        can be spliced out of one and the text either side of it, so the
+        assertion would refuse a payload the scrubber had correctly cleaned."""
+        hexish = "23456789"
+        text = chr(0x2345) + "6789"
+        assert hexish not in text
+        assert_scrubbed(scrub_namespace(text, hexish), hexish)
 
 
 class TestTheCapabilityReplyCarriesNoNamespace:
@@ -261,6 +351,37 @@ class TestTheCapabilityReplyCarriesNoNamespace:
             },
         )
         assert second.canonical_model_response["content"] == "400 hours."
+
+
+class TestTheScrubberAndTheAssertionAgree:
+    """What the scrubber cleans, the assertion passes. This is what makes the
+    assertion at the broker boundary a guard on the next field rather than a
+    second opinion on this one - and both halves have been rewritten, so it
+    is measured over generated input rather than argued."""
+
+    def test_no_generated_reply_is_cleaned_and_then_refused(self):
+        random.seed(20260903)
+        # Splices, case variants, hex-only nonces and non-ASCII neighbours -
+        # the four shapes that separate the two implementations.
+        pool = string.printable + chr(0x2345) + chr(0x1234)
+        for index in range(2000):
+            nonce = (
+                mint_nonce()
+                if index % 2
+                else "".join(random.choice("23456789ABCDEF") for _ in range(8))
+            )
+            filler = [
+                "".join(random.choice(pool) for _ in range(random.randint(0, 6)))
+                for _ in range(3)
+            ]
+            if index % 5 == 0:
+                text = nonce[:4] + nonce + nonce[4:]
+            else:
+                text = filler[0] + nonce + filler[1] + nonce.lower() + filler[2]
+            try:
+                assert_scrubbed(scrub_namespace(text, nonce), nonce)
+            except ProvenanceError:  # pragma: no cover - the failure report
+                raise AssertionError(f"cleaned then refused: {nonce=} {text=}")
 
 
 class TestWhatTheScrubberCannotReachDoesNotCross:

@@ -616,10 +616,18 @@ class CapabilityBroker:
         Both are needed and they are separate objects. Once the model has been
         offered a handle it can put it anywhere in its reply - in the prose,
         in the assistant message, in the arguments of a tool call it wants run
-        - and every one of those crosses to the untrusted half. A worker
-        holding one valid handle can attach a real citation to text it wrote
-        itself. So the scrub is recursive over the whole reply and is checked
-        on the serialized result rather than on the fields named here.
+        - and every one of those crosses to the untrusted half. So the scrub
+        is recursive over the whole reply and is checked on the serialized
+        result rather than on the fields named here.
+
+        What that establishes is that no plain form of the namespace crosses,
+        not that the worker cannot learn it: a model that has seen the nonce
+        can encode it past any scrubber. The boundary that makes such a
+        disclosure worthless is the canonical response kept below - citations
+        are read out of what the model said, and only when the worker returns
+        it unchanged. The scrub keeps the namespace out of ordinary worker
+        state, and it is narrow enough to leave a reply that names no handle
+        of this turn byte-identical.
         """
         invocation.check_live()
         response = self._engine.llm.generate_with_tools(
@@ -641,12 +649,13 @@ class CapabilityBroker:
         # check that listed today's keys would keep passing while a new one
         # carried the handle straight across.
         #
-        # It cannot fire against the scrubber above, which reaches every JSON
-        # shape that can hold a string, and an object of any other type does
-        # not cross at all - `send_frame` refuses one rather than sending its
-        # repr. So this call is deliberately unkillable by mutation, and is
-        # recorded here rather than left for a later reader to simplify away:
-        # what it guards is the next field, not this one.
+        # No reply the scrubber handled can reach it: that reaches every JSON
+        # shape able to hold a string, an object of any other type does not
+        # cross at all - `send_frame` refuses one rather than sending its
+        # repr - and the two agree on what counts as an occurrence. So this
+        # call is deliberately unkillable by mutation, and is recorded here
+        # rather than left for a later reader to simplify away: what it
+        # guards is the next field, not this one.
         assert_scrubbed(public, nonce)
         return CapabilityOutcome(
             public=public,
