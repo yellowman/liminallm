@@ -50,8 +50,12 @@ from liminallm.service.invocation import (
     current_invocation,
     payload_hash,
 )
-from liminallm.service.provenance import Binding, SourceRegistry
-from liminallm.service.rag import register_retrieved_chunks
+from liminallm.service.provenance import (
+    Binding,
+    GroundedPassage,
+    GroundedSpan,
+    SourceRegistry,
+)
 from liminallm.service.sandbox import tool_network_guard
 from liminallm.service.tool_worker import FrameBudget
 from liminallm.service.wire import WireError, recv_frame, send_frame
@@ -129,6 +133,13 @@ class InvocationContext:
     #: any citation can honestly be read out of, so it stays here and is
     #: restored from the ledger when an attempt replays rather than runs.
     canonical_model_response: Optional[Dict[str, Any]] = None
+    #: What each producer put in front of the model, and where inside it each
+    #: piece of evidence appears. The bindings above say what may be cited;
+    #: these say where it was shown, which is what an offer needs to label the
+    #: right passage instead of the whole tool result. Parent-side, like the
+    #: bindings and for the same reason, and restored from the ledger on a
+    #: replay so a replacement attempt inherits what the first one rendered.
+    grounded_passages: List[GroundedPassage] = field(default_factory=list)
 
 
 class CapabilityBroker:
@@ -425,12 +436,14 @@ class CapabilityBroker:
     ) -> CapabilityOutcome:
         invocation.check_live()
         grounds = self._sink()
+        spans = self._spans()
         text, findings = self._engine._run_web_search(
             str(payload.get("query") or ""), int(payload.get("limit") or 5),
             source_registry=self._ctx.source_registry, bindings_sink=grounds,
+            spans_sink=spans,
         )
         return self._grounded(
-            self._with_findings(invocation, text, findings), grounds
+            self._with_findings(invocation, text, findings), grounds, spans
         )
 
     def _web_fetch(
@@ -438,34 +451,58 @@ class CapabilityBroker:
     ) -> CapabilityOutcome:
         invocation.check_live()
         grounds = self._sink()
+        spans = self._spans()
         text, findings = self._engine._run_web_fetch(
             str(payload.get("url") or ""),
             source_registry=self._ctx.source_registry, bindings_sink=grounds,
+            spans_sink=spans,
         )
         return self._grounded(
-            self._with_findings(invocation, text, findings), grounds
+            self._with_findings(invocation, text, findings), grounds, spans
         )
 
     def _sink(self) -> Optional[List[Dict[str, Optional[str]]]]:
         """Where a producer records, or None when this turn keeps no record."""
         return None if self._ctx.source_registry is None else []
 
+    def _spans(self) -> Optional[List[GroundedSpan]]:
+        """Where a producer records positions, on the same condition."""
+        return None if self._ctx.source_registry is None else []
+
     @staticmethod
     def _grounded(
         public: Dict[str, Any],
         grounds: Optional[List[Dict[str, Optional[str]]]],
+        spans: Optional[List[GroundedSpan]] = None,
+        passages: Optional[List[GroundedPassage]] = None,
     ) -> CapabilityOutcome:
         """The reply, and beside it what the parent learned by serving it.
 
-        The bindings do not cross the pipe. Every producer says this the same
-        way, so a new capability cannot leak ids by forgetting to split its
-        two outputs - it either returns through here or it has no grounding
-        to leak.
+        Neither the bindings nor the spans cross the pipe. Every producer says
+        this the same way, so a new capability cannot leak ids by forgetting
+        to split its two outputs - it either returns through here or it has no
+        grounding to leak.
+
+        The spans are recorded against `public["text"]`, the exact string this
+        capability produced, because an offset means nothing without the
+        string it indexes.
         """
-        return CapabilityOutcome(
-            public=public,
-            parent_state={"provenance_bindings": grounds} if grounds else None,
-        )
+        state: Dict[str, Any] = {}
+        if grounds:
+            state["provenance_bindings"] = grounds
+        # `spans` is the one-string case, where the reply is a single rendered
+        # result. `passages` is for a capability that returns several - a
+        # round of tool calls - and each one carries its own string.
+        kept = list(passages or [])
+        if spans:
+            kept.append(
+                GroundedPassage(
+                    text=str(public.get("text") or ""), spans=tuple(spans)
+                )
+            )
+        if kept:
+            state["grounded_passages"] = [passage.as_dict() for passage in kept]
+        return CapabilityOutcome(public=public, parent_state=state or None)
 
     def _with_findings(
         self, invocation: Invocation, text: str, findings: List[dict]
@@ -539,6 +576,11 @@ class CapabilityBroker:
                 continue
             seen.add(key)
             collected.append(dict(binding))
+        # Not deduped, unlike the bindings above: one relation reached twice
+        # is one relation, but the same evidence shown twice was shown in two
+        # places and both are real positions in two different strings.
+        for passage in parent_state.get("grounded_passages") or []:
+            self._ctx.grounded_passages.append(GroundedPassage.from_dict(passage))
 
     # -- retrieval, notes, history ----------------------------------------
 
@@ -546,16 +588,10 @@ class CapabilityBroker:
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
         invocation.check_live()
-        text, snippets, chunks, hints = self._engine._run_file_search(
-            str(payload.get("query") or ""),
-            int(payload.get("limit") or 4),
-            conversation_id=self._ctx.conversation_id,
-            context_id=self._ctx.context_id,
-            user_id=self._ctx.user_id,
-            tenant_id=self._ctx.tenant_id,
-        )
-        # The chunks that were rendered, after the attachment-generation
-        # scope has already dropped what this conversation no longer holds -
+        grounds = self._sink()
+        spans = self._spans()
+        # Recorded inside the render, after the attachment-generation scope
+        # has already dropped what this conversation no longer holds -
         # authorize first, record second. There is no second budgeting step
         # between here and the model: this text is appended to the agent's
         # messages as it stands, so every rendered chunk is grounding.
@@ -563,34 +599,45 @@ class CapabilityBroker:
         # Through the same adapter the automatic paths use. A second mapping
         # here would be a second place for the file-versus-inline identity
         # rules to drift.
-        bindings: List[Binding] = []
-        if self._ctx.source_registry is not None:
-            bindings = register_retrieved_chunks(
-                self._ctx.source_registry, chunks, hints=hints
-            )
+        text, snippets, _chunks, _hints = self._engine._run_file_search(
+            str(payload.get("query") or ""),
+            int(payload.get("limit") or 4),
+            conversation_id=self._ctx.conversation_id,
+            context_id=self._ctx.context_id,
+            user_id=self._ctx.user_id,
+            tenant_id=self._ctx.tenant_id,
+            source_registry=self._ctx.source_registry,
+            bindings_sink=grounds,
+            spans_sink=spans,
+        )
         # `text` and `snippets` cross the pipe; the bindings do not. An id in
         # the reply is an id the untrusted side can quote back as its own.
-        return self._grounded({"text": text, "snippets": snippets}, bindings)
+        return self._grounded(
+            {"text": text, "snippets": snippets}, grounds, spans
+        )
 
     def _notes_search(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
         invocation.check_live()
         grounds = self._sink()
+        spans = self._spans()
         text = self._engine._run_note_search(
             str(payload.get("query") or ""),
             int(payload.get("limit") or 6),
             user_id=self._ctx.user_id,
             source_registry=self._ctx.source_registry,
             bindings_sink=grounds,
+            spans_sink=spans,
         )
-        return self._grounded({"text": text}, grounds)
+        return self._grounded({"text": text}, grounds, spans)
 
     def _history_search(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
         invocation.check_live()
         grounds = self._sink()
+        spans = self._spans()
         text = self._engine._run_history_search(
             str(payload.get("query") or ""),
             int(payload.get("limit") or 4),
@@ -598,8 +645,9 @@ class CapabilityBroker:
             user_id=self._ctx.user_id,
             source_registry=self._ctx.source_registry,
             bindings_sink=grounds,
+            spans_sink=spans,
         )
-        return self._grounded({"text": text}, grounds)
+        return self._grounded({"text": text}, grounds, spans)
 
     # -- the model --------------------------------------------------------
 
@@ -705,6 +753,7 @@ class CapabilityBroker:
             )
         snippets: List[str] = []
         round_bindings: List[Binding] = []
+        round_passages: List[GroundedPassage] = []
         before = list(invocation.session.get("artifacts") or [])
         results = self._engine._run_round_tools(
             parsed,
@@ -720,6 +769,7 @@ class CapabilityBroker:
             mcp_tools=self._ctx.mcp_tools,
             source_registry=self._ctx.source_registry,
             bindings=round_bindings,
+            passages=round_passages,
         )
         after = list(invocation.session.get("artifacts") or [])
         # A round is one committed operation, so its grounding is committed
@@ -733,6 +783,7 @@ class CapabilityBroker:
                 "findings": list(invocation.session.get("injection_findings") or []),
             },
             round_bindings,
+            passages=round_passages,
         )
 
     def _tool_host(

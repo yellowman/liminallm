@@ -45,7 +45,7 @@ import json
 import threading
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
-from typing import Any, Dict, Literal, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Literal, Mapping, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 #: Where a piece of evidence came from. Deliberately short: a kind exists
@@ -102,6 +102,153 @@ def binding(
         "source_id": _require_text(source_id, what="source_id"),
         "evidence_id": _require_text(evidence_id, what="evidence_id"),
     }
+
+
+@dataclass(frozen=True)
+class GroundedSpan:
+    """Which run of model-visible text came from which piece of evidence.
+
+    A binding says the answer may rest on some evidence. This says *where* in
+    what the model was shown that evidence appears, which is what a later
+    stage needs to attach a citation handle to the right passage rather than
+    to the whole tool result.
+
+    `start` and `end` index the finished string a producer returns - after
+    neutralization and after the untrusted-data envelope, because that is the
+    string that reaches the model. Built while the text is being assembled,
+    never recovered afterwards by matching evidence text back against it: two
+    results can share a snippet, one can be truncated, and a search that
+    dropped a result without a URL breaks the positional correspondence
+    between what was rendered and what was recorded.
+    """
+
+    start: int
+    end: int
+    source_id: str
+    evidence_id: str
+
+
+@dataclass(frozen=True)
+class GroundedPassage:
+    """One producer's finished text, and where its evidence sits inside it.
+
+    The text is kept beside the spans, not just the spans, because the spans
+    only mean anything against the exact string they were measured in. Two
+    searches in one turn each produce offsets starting near zero, and a later
+    stage looking at an assembled prompt has to know which string a span of
+    `12..48` belongs to.
+
+    It is also what lets that stage refuse. The worker returns tool text and
+    can return anything; a passage recorded here is what the parent actually
+    produced, so labelling is done by matching the parent's own string rather
+    than by trusting the copy that came back.
+    """
+
+    text: str
+    spans: Tuple[GroundedSpan, ...] = ()
+
+    def as_dict(self) -> Dict[str, Any]:
+        """JSON-safe, for the ledger sidecar a replay reads back."""
+        return {
+            "text": self.text,
+            "spans": [asdict(span) for span in self.spans],
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "GroundedPassage":
+        return cls(
+            text=str(raw.get("text") or ""),
+            spans=tuple(
+                GroundedSpan(
+                    start=int(span["start"]),
+                    end=int(span["end"]),
+                    source_id=str(span["source_id"]),
+                    evidence_id=str(span["evidence_id"]),
+                )
+                for span in raw.get("spans") or []
+            ),
+        )
+
+
+class GroundedText:
+    """Model-visible text assembled together with what grounds each part.
+
+    Producers build a result out of pieces - one per search result, chunk,
+    note or remote item - and only some of those pieces are evidence. Adding
+    them here rather than joining strings keeps the association exact, since
+    the offsets are measured as the string is built.
+
+    Neutralization happens per piece, on the way in, so a piece's offsets are
+    its offsets in the final text. `render` then checks that the assembled
+    whole is unchanged by another pass. That check is what makes per-piece
+    neutralization safe: the tool-call pattern tolerates whitespace, so `<`
+    ending one piece and `tool_call>` beginning the next would form a tag that
+    no single piece contained. When the check fails the whole text is
+    neutralized as one and the spans are dropped - a render nothing can cite
+    rather than one whose offsets point at the wrong words.
+    """
+
+    def __init__(self) -> None:
+        self._pieces: list[str] = []
+        self._spans: list[GroundedSpan] = []
+        self._length = 0
+
+    def add(self, text: str, ground: Optional[Binding] = None) -> None:
+        """One piece of the result, and the evidence it came from if any."""
+        from liminallm.service.web import neutralize_markers
+
+        safe = neutralize_markers(text)
+        if ground is not None:
+            source_id = ground.get("source_id")
+            evidence_id = ground.get("evidence_id")
+            if source_id and evidence_id:
+                self._spans.append(
+                    GroundedSpan(
+                        start=self._length,
+                        end=self._length + len(safe),
+                        source_id=source_id,
+                        evidence_id=evidence_id,
+                    )
+                )
+        self._pieces.append(safe)
+        self._length += len(safe)
+
+    def render(
+        self, wrap: Optional[Callable[[str], str]] = None
+    ) -> Tuple[str, Tuple[GroundedSpan, ...]]:
+        """The finished text and the spans into it.
+
+        `wrap` puts the envelope round the assembled text. It is applied here
+        rather than by the caller because the spans have to move with it, and
+        a caller that wrapped afterwards would leave every offset short by the
+        length of the header.
+        """
+        from liminallm.service.web import neutralize_markers
+
+        body = "".join(self._pieces)
+        spans = tuple(self._spans)
+        if neutralize_markers(body) != body:
+            # A control token formed across a seam. Neutralize the whole and
+            # keep nothing: the offsets described the text before this pass.
+            body = neutralize_markers(body)
+            spans = ()
+        if wrap is None:
+            return body, spans
+        wrapped = wrap(body)
+        at = wrapped.find(body)
+        if at < 0:
+            # The envelope rewrote the body, so the offsets no longer describe
+            # it. Same choice as above, for the same reason.
+            return wrapped, ()
+        return wrapped, tuple(
+            GroundedSpan(
+                start=span.start + at,
+                end=span.end + at,
+                source_id=span.source_id,
+                evidence_id=span.evidence_id,
+            )
+            for span in spans
+        )
 
 
 @dataclass(frozen=True)

@@ -159,7 +159,7 @@ class TestANoteIsADocumentWithAnIdentity:
         )
         registry = SourceRegistry()
         notes_service.register_note_results(registry, [(note, 1.0)])
-        shown = notes_service.format_note_results([(note, 1.0)])
+        shown, _spans = notes_service.format_note_results([(note, 1.0)])
 
         recorded = registry.evidence[0].text
         assert len(recorded) <= notes_service.NOTE_SEARCH_EXCERPT_CHARS

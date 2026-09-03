@@ -36,7 +36,13 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from liminallm.logging import get_logger
 from liminallm.service import taint
-from liminallm.service.provenance import Binding, SourceRegistry, binding
+from liminallm.service.provenance import (
+    Binding,
+    GroundedSpan,
+    GroundedText,
+    SourceRegistry,
+    binding,
+)
 from liminallm.service.sandbox import tool_network_guard
 from liminallm.service.web import (
     neutralize_markers,
@@ -445,6 +451,7 @@ async def call(
     timeout: float = 30.0,
     source_registry: Optional[SourceRegistry] = None,
     bindings_sink: Optional[List[Binding]] = None,
+    spans_sink: Optional[List[GroundedSpan]] = None,
 ) -> str:
     """Run one remote tool and return its result as untrusted data.
 
@@ -487,17 +494,27 @@ async def call(
     # `[filtered]` by the time it is read, and evidence holding the original
     # would be checked against text that never reached the model.
     shown = neutralize_markers(redacted)
+    grounds: list[Binding] = []
     if source_registry is not None and bindings_sink is not None:
         # The refusal above returned already: a turn that was refused read
         # nothing it could rest on.
-        bindings_sink.extend(register_tool_result(source_registry, tool, shown))
-    # `neutralize_markers` is idempotent, so the envelope re-applying it to
-    # `shown` changes nothing.
-    return wrap_untrusted(
-        shown,
-        source=f"MCP server {tool.server_name} :: {tool.remote_name}",
-        findings=findings,
+        grounds = register_tool_result(source_registry, tool, shown)
+        bindings_sink.extend(grounds)
+    # The whole result is the evidence, so there is one span and it covers the
+    # body inside the envelope - not the envelope, whose words are this
+    # system's about the server rather than the server's.
+    body = GroundedText()
+    body.add(shown, grounds[0] if grounds else None)
+    text, spans = body.render(
+        lambda inner: wrap_untrusted(
+            inner,
+            source=f"MCP server {tool.server_name} :: {tool.remote_name}",
+            findings=findings,
+        )
     )
+    if spans_sink is not None:
+        spans_sink.extend(spans)
+    return text
 
 
 def _tool_identity(tool: RemoteTool) -> str:

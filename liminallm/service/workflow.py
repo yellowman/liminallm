@@ -70,7 +70,12 @@ from liminallm.service.node_attempt import (
     NodeOutcome,
     bounded,
 )
-from liminallm.service.provenance import Binding, SourceRegistry
+from liminallm.service.provenance import (
+    Binding,
+    GroundedPassage,
+    GroundedSpan,
+    SourceRegistry,
+)
 from liminallm.service.rag import (
     RAGService,
     SourceHint,
@@ -3324,17 +3329,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
         context_id: Optional[str],
         user_id: Optional[str],
         tenant_id: Optional[str],
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> Tuple[str, List[str], List[Any], Dict[str, SourceHint]]:
         """Resolve what this user may search, then hand off to the tool.
 
-        The rendered chunks come back with the text so the caller can record
-        where the grounding came from. Scoping has already happened by then -
+        The rendered chunks come back with the text so a caller that keeps no
+        record can still see them. Scoping has already happened by then -
         authorize first, record second.
 
-        The hints come back with them, from the same reading of the records
-        that authorized the search. Registration happens in the caller, and
-        two reads could disagree: what the model was told an excerpt is
-        called and what the turn records it as have to be one answer.
+        Registration runs inside the render, through the sinks, from the same
+        reading of the records that authorized the search. It has to: an
+        excerpt's position in the text is only knowable while the text is
+        being written, and what the model was told an excerpt is called and
+        what the turn records it as have to be one answer.
         """
         attachment_ctx_ids = self._attachment_context_ids(conversation_id, user_id) or []
         ctx_ids = list(attachment_ctx_ids)
@@ -3348,6 +3357,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # follows paths on purpose, and its rows are its own answer.
         records = self._conversation_attachments(conversation_id, user_id)
         hints = self._attachment_source_hints(records)
+        ground = None
+        if source_registry is not None:
+
+            def ground(scoped: Sequence[Any]) -> Sequence[Optional[Binding]]:
+                """One binding per rendered excerpt, in render order.
+
+                `register_retrieved_chunks` records exactly one per chunk, so
+                this is aligned by construction rather than by hope.
+                """
+                recorded = register_retrieved_chunks(
+                    source_registry, scoped, hints=hints
+                )
+                if bindings_sink is not None:
+                    bindings_sink.extend(recorded)
+                return recorded
+
         text, snippets, chunks = agent_tools.run_file_search(
             query, limit, ctx_ids, rag=self.rag,
             user_id=user_id, tenant_id=tenant_id,
@@ -3356,6 +3381,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 attachments_service.authorized_generation_keys(records)
             ),
             source_hints=hints,
+            ground=ground,
+            spans_sink=spans_sink,
         )
         return text, snippets, chunks, hints
 
@@ -3439,10 +3466,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> Tuple[str, List[dict]]:
         return agent_tools.run_web_search(
             query, limit, settings=self.settings, logger=self.logger,
             source_registry=source_registry, bindings_sink=bindings_sink,
+            spans_sink=spans_sink,
         )
 
     def _run_web_fetch(
@@ -3451,10 +3480,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> Tuple[str, List[dict]]:
         return agent_tools.run_web_fetch(
             url, settings=self.settings, logger=self.logger,
             source_registry=source_registry, bindings_sink=bindings_sink,
+            spans_sink=spans_sink,
         )
 
     def _run_history_search(
@@ -3466,6 +3497,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_id: Optional[str],
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> str:
         """Check scope and read the record, then hand off to the tool.
 
@@ -3489,6 +3521,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             keep_tokens=self.history_budget(), count=self._count_fn(),
             conversation_id=conversation_id,
             source_registry=source_registry, bindings_sink=bindings_sink,
+            spans_sink=spans_sink,
         )
 
     def _notes_enabled(self) -> bool:
@@ -3503,6 +3536,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_id: Optional[str],
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> str:
         """Search the user's own vault. Empty when notes are off.
 
@@ -3519,11 +3553,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
             str(query),
             limit=max(1, min(int(limit or 6), 10)),
         )
+        grounds = None
         if source_registry is not None and bindings_sink is not None:
-            bindings_sink.extend(
-                notes_service.register_note_results(source_registry, results)
-            )
-        return notes_service.format_note_results(results)
+            grounds = notes_service.note_grounds(source_registry, results)
+            bindings_sink.extend(ground for ground in grounds if ground)
+        text, spans = notes_service.format_note_results(results, grounds)
+        if spans_sink is not None:
+            spans_sink.extend(spans)
+        return text
 
     def _discover_mcp_tools(self) -> Dict[str, "mcp_client.RemoteTool"]:
         """This turn's remote tools, keyed by the name the model will use.
@@ -3699,6 +3736,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> str:
         """Run one model-requested tool and return its text result.
 
@@ -3723,23 +3761,24 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
             return taint.refusal(session)
         if name == "file_search":
-            result, found, chunks, hints = self._run_file_search(
+            result, found, _chunks, _hints = self._run_file_search(
                 str(args.get("query") or fallback_query),
                 int(args.get("limit") or 4),
                 conversation_id=conversation_id,
                 context_id=context_id,
                 user_id=user_id,
                 tenant_id=tenant_id,
+                source_registry=source_registry,
+                bindings_sink=(
+                    bindings_sink if source_registry is not None else None
+                ),
+                spans_sink=spans_sink,
             )
             snippets.extend(found)
             # Every rendered chunk, because nothing budgets between here and
             # the next model turn: this text is appended to the agent's
             # messages as it stands. Scoping already happened inside the
             # search - authorize first, record second.
-            if source_registry is not None and bindings_sink is not None:
-                bindings_sink.extend(
-                    register_retrieved_chunks(source_registry, chunks, hints=hints)
-                )
             return result
         if name == "run_python":
             return self._run_python_capability(
@@ -3759,6 +3798,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             text, found = self._run_web_search(
                 str(args.get("query") or fallback_query), int(args.get("limit") or 5),
                 source_registry=source_registry, bindings_sink=_grounds,
+                spans_sink=spans_sink,
             )
             taint.record_findings(session, found)
             return text
@@ -3766,6 +3806,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             text, found = self._run_web_fetch(
                 str(args.get("url") or ""),
                 source_registry=source_registry, bindings_sink=_grounds,
+                spans_sink=spans_sink,
             )
             taint.record_findings(session, found)
             return text
@@ -3776,6 +3817,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 conversation_id=conversation_id,
                 user_id=user_id,
                 source_registry=source_registry, bindings_sink=_grounds,
+                spans_sink=spans_sink,
             )
         if name == "note_search":
             return self._run_note_search(
@@ -3783,6 +3825,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 int(args.get("limit") or 6),
                 user_id=user_id,
                 source_registry=source_registry, bindings_sink=_grounds,
+                spans_sink=spans_sink,
             )
         remote = (mcp_tools or {}).get(name)
         if remote is not None:
@@ -3798,6 +3841,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         session=session,
                         source_registry=source_registry,
                         bindings_sink=_grounds,
+                        spans_sink=spans_sink,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - a third party being down
@@ -3833,6 +3877,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
         source_registry: Optional[SourceRegistry] = None,
         bindings: Optional[List[Binding]] = None,
+        passages: Optional[List[GroundedPassage]] = None,
     ) -> List[str]:
         """Execute one round's tool calls; results always in call order.
 
@@ -3862,6 +3907,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             args: Dict[str, Any],
             sink: List[str],
             binding_sink: List[Binding],
+            span_sink: List[GroundedSpan],
         ) -> str:
             with current_invocation(bound), tool_network_guard(
                 self.tool_network_policy
@@ -3886,6 +3932,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     mcp_tools=mcp_tools,
                     source_registry=source_registry,
                     bindings_sink=binding_sink,
+                    spans_sink=span_sink,
                 )
 
         if len(parsed) > 1 and all(
@@ -3898,14 +3945,20 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # thread-safe, but which relation was found first is not the order
             # the calls were made in.
             binding_sinks: List[List[Dict[str, str]]] = [[] for _ in parsed]
+            # And per-call span sinks. A span indexes one call's result, so a
+            # round-wide list would say only that some evidence appeared
+            # somewhere in some result.
+            span_sinks: List[List[GroundedSpan]] = [[] for _ in parsed]
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(4, len(parsed))
             ) as pool:
                 futures = [
-                    pool.submit(run_one, index, name, args, sink, binding_sink)
-                    for index, ((_, name, args), sink, binding_sink) in enumerate(
-                        zip(parsed, sinks, binding_sinks)
+                    pool.submit(
+                        run_one, index, name, args, sink, binding_sink, span_sink
                     )
+                    for index, (
+                        (_, name, args), sink, binding_sink, span_sink
+                    ) in enumerate(zip(parsed, sinks, binding_sinks, span_sinks))
                 ]
                 results = [future.result() for future in futures]
             for sink in sinks:
@@ -3915,12 +3968,35 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 self._merge_bindings(bindings, seen, [
                     binding for sink in binding_sinks for binding in sink
                 ])
+            self._collect_passages(passages, results, span_sinks)
             return results
         round_bindings = bindings if bindings is not None else []
-        return [
-            run_one(index, name, args, snippets, round_bindings)
+        serial_spans: List[List[GroundedSpan]] = [[] for _ in parsed]
+        results = [
+            run_one(index, name, args, snippets, round_bindings, serial_spans[index])
             for index, (_, name, args) in enumerate(parsed)
         ]
+        self._collect_passages(passages, results, serial_spans)
+        return results
+
+    @staticmethod
+    def _collect_passages(
+        passages: Optional[List[GroundedPassage]],
+        results: List[str],
+        span_sinks: List[List[GroundedSpan]],
+    ) -> None:
+        """One passage per call that grounded something, in call order.
+
+        Per result rather than per round: an offset means nothing without the
+        string it indexes, and a round returns one string per call.
+        """
+        if passages is None:
+            return
+        for result, spans in zip(results, span_sinks):
+            if spans:
+                passages.append(
+                    GroundedPassage(text=str(result), spans=tuple(spans))
+                )
 
     @staticmethod
     def _parse_tool_arguments(call: Dict[str, Any]) -> Dict[str, Any]:
