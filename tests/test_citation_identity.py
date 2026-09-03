@@ -510,10 +510,15 @@ class TestTheNamespaceGrowsRatherThanRestarting:
         and a table whose entries do not resolve here would renumber a
         namespace that text already quotes."""
         registry, pairs = self._registry_with("a.md")
+        (_first, from_a) = pairs[0]
+        # Otherwise consistent: the source is cited, has a handle and has an
+        # evidence entry. Only its absence from this registry is wrong, so
+        # only that check can be what refuses it.
         stranger = CitationTable(
             nonce=NONCE,
             by_handle={f"{NONCE}-1": "src_99"},
             by_source={"src_99": f"{NONCE}-1"},
+            evidence={"src_99": (from_a.evidence_id,)},
         )
         with pytest.raises(ProvenanceError):
             extend_citation_table(registry, stranger, [])
@@ -574,11 +579,17 @@ class TestAnInheritedTableIsCheckedWhole:
         """Validation read `by_handle` only, so a stray reverse entry was
         never inspected. It suppresses allocation when that source later
         becomes genuinely eligible - and reached the loop as a `KeyError`."""
-        registry, _from_a, from_b = self._registry()
+        registry, from_a, from_b = self._registry()
+        # Both sources have evidence, so the starved-source check passes and
+        # the missing `by_handle` entry is the only thing left to catch.
         table = CitationTable(
             nonce=NONCE,
             by_handle={f"{NONCE}-1": "src_1"},
             by_source={"src_1": f"{NONCE}-1", "src_2": f"{NONCE}-2"},
+            evidence={
+                "src_1": (from_a.evidence_id,),
+                "src_2": (from_b.evidence_id,),
+            },
         )
         with pytest.raises(ProvenanceError):
             extend_citation_table(
@@ -586,12 +597,16 @@ class TestAnInheritedTableIsCheckedWhole:
             )
 
     def test_evidence_filed_under_an_uncited_source_is_refused(self):
-        registry, _from_a, from_b = self._registry()
+        registry, from_a, from_b = self._registry()
         table = CitationTable(
             nonce=NONCE,
             by_handle={f"{NONCE}-1": "src_1"},
             by_source={"src_1": f"{NONCE}-1"},
-            evidence={"src_2": (from_b.evidence_id,)},
+            # `src_1` is fed, so only the stray key is left to refuse.
+            evidence={
+                "src_1": (from_a.evidence_id,),
+                "src_2": (from_b.evidence_id,),
+            },
         )
         with pytest.raises(ProvenanceError):
             extend_citation_table(registry, table, [])
@@ -611,3 +626,59 @@ class TestAnInheritedTableIsCheckedWhole:
         assert grown.handle_for("src_1") == f"{NONCE}-1"
         assert grown.handle_for("src_2") == f"{NONCE}-2"
         assert grown.evidence_for("src_1") == (from_a.evidence_id,)
+
+    def test_a_cited_source_with_no_evidence_key_is_refused(self):
+        """A source earns its handle from a binding, and a binding always
+        carries a passage. A handle with nothing under it is one no valid
+        binding could have granted."""
+        registry, _from_a, _from_b = self._registry()
+        table = CitationTable(
+            nonce=NONCE,
+            by_handle={f"{NONCE}-1": "src_1"},
+            by_source={"src_1": f"{NONCE}-1"},
+            evidence={},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(registry, table, [])
+
+    def test_a_cited_source_with_an_empty_evidence_tuple_is_refused(self):
+        """The key alone is not the invariant - it has to hold something."""
+        registry, _from_a, _from_b = self._registry()
+        table = CitationTable(
+            nonce=NONCE,
+            by_handle={f"{NONCE}-1": "src_1"},
+            by_source={"src_1": f"{NONCE}-1"},
+            evidence={"src_1": ()},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(registry, table, [])
+
+    def test_a_starved_source_does_not_crash_on_a_real_binding(self):
+        """Before the equality was required, extending such a table with a
+        genuine binding for that source raised a raw `KeyError`."""
+        registry, from_a, _from_b = self._registry()
+        table = CitationTable(
+            nonce=NONCE,
+            by_handle={f"{NONCE}-1": "src_1"},
+            by_source={"src_1": f"{NONCE}-1"},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(
+                registry, table, [binding("src_1", from_a.evidence_id)]
+            )
+
+    @pytest.mark.parametrize("suffix", ["0", "01", "0007"])
+    def test_a_handle_the_allocator_would_not_mint_is_refused(self, suffix):
+        """`-1` and `-01` parse to one slot but are two tokens the model could
+        be offered for one source. The question is whether this table could
+        have come from the allocator."""
+        registry, from_a, _from_b = self._registry()
+        handle = f"{NONCE}-{suffix}"
+        table = CitationTable(
+            nonce=NONCE,
+            by_handle={handle: "src_1"},
+            by_source={"src_1": handle},
+            evidence={"src_1": (from_a.evidence_id,)},
+        )
+        with pytest.raises(ProvenanceError):
+            extend_citation_table(registry, table, [])

@@ -245,12 +245,25 @@ def build_citation_table(
 
 
 def _handle_number(nonce: str, handle: str) -> Optional[int]:
-    """The source number inside a handle of this namespace, or None."""
+    """The source number in a handle this allocator could have produced.
+
+    Canonical only. `-0`, `-01` and `-0007` all parse as numbers but none is
+    a handle the allocator makes, and accepting them would let two spellings
+    stand for one slot - `-1` and `-01` naming the same source through two
+    different tokens the model could be offered. The question being asked is
+    whether this table could have come from the allocator, not whether a
+    number can be read out of it.
+    """
     prefix = f"{nonce}-"
     if not handle.startswith(prefix):
         return None
     tail = handle[len(prefix) :]
-    return int(tail) if tail.isdigit() else None
+    if not tail.isdigit():
+        return None
+    number = int(tail)
+    if number < 1 or handle != f"{prefix}{number}":
+        return None
+    return number
 
 
 def _require_consistent(
@@ -269,6 +282,15 @@ def _require_consistent(
     An extra `by_source` entry is refused rather than ignored for a second
     reason: it silently suppresses allocation when that source later becomes
     genuinely eligible, and reached the loop below as a raw `KeyError`.
+
+    The source-existence check here cannot currently be the sole reason for a
+    refusal, and is kept anyway. Every route to it is covered by something
+    else: a cited source with no evidence trips the starved check, and one
+    with evidence trips the relation check, because `add_evidence` refuses a
+    source the registry does not hold and so no valid passage can name a
+    missing one. It is redundant because of an invariant this function does
+    not own - the same reason the equivalent guards in `build_citation_table`
+    are kept, at the same gate.
     """
     numbers = []
     for handle, source_id in table.by_handle.items():
@@ -294,11 +316,26 @@ def _require_consistent(
             f"citation sources {sorted(orphaned)} have no handle of their own"
         )
 
+    # Exactly the cited sources, not a subset of them. A source earns its
+    # handle from a binding, and a binding always carries a passage, so a
+    # cited source with no eligible evidence is a handle no valid binding
+    # could have granted - citable with nothing under it, and a `KeyError` in
+    # the allocation loop the moment a real binding for it arrives.
+    starved = set(table.by_source) - set(table.evidence)
+    if starved:
+        raise ProvenanceError(
+            f"citation sources {sorted(starved)} are cited with no evidence"
+        )
+
     for source_id, evidence_ids in table.evidence.items():
         if source_id not in table.by_source:
             raise ProvenanceError(
                 f"citation evidence is filed under {source_id!r}, "
                 "which this table does not cite"
+            )
+        if not evidence_ids:
+            raise ProvenanceError(
+                f"citation source {source_id!r} is cited with no evidence"
             )
         for evidence_id in evidence_ids:
             record = registry.get_evidence(evidence_id)
