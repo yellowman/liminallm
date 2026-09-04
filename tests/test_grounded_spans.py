@@ -27,6 +27,7 @@ from liminallm.service.provenance import (
     GroundedPassage,
     GroundedSpan,
     GroundedText,
+    ProvenanceError,
     SourceRegistry,
     binding,
 )
@@ -688,3 +689,141 @@ class TestEveryProducerRecordsPositions:
             "alpha content",
             "beta content",
         ]
+
+
+class TestAutomaticRetrievalSaysWhichSnippetEachBindingBelongsTo:
+    """The last producer without the association.
+
+    The six explicit producers render and record together, so a span names
+    the passage it covers. Automatic retrieval is different in shape - the
+    snippets are the passages - but it had only the flat eligible-binding
+    list, which says a turn may cite these documents and not which snippet
+    each one is. Reading the position off the flat list works right up until
+    a snippet in front of the retrieved tail is not a document: the digest
+    and the recall window are the parent's own summaries, and counting past
+    them attributes each chunk to the snippet before it.
+    """
+
+    def _engine(self):
+        return get_runtime().workflow
+
+    def test_each_snippet_gets_its_own_entry_and_the_summaries_get_none(
+        self, store
+    ):
+        engine = self._engine()
+        registry = SourceRegistry()
+        chunks = [_Chunk("/files/a.md", "alpha passage"),
+                  _Chunk("/files/b.md", "beta passage")]
+        snippets = ["a digest", "a recall window", "alpha passage", "beta passage"]
+
+        aligned = engine._record_grounding(
+            registry, chunks, snippets, leading=2
+        )
+
+        assert [bool(entry) for entry in aligned] == [False, False, True, True]
+        # The entry at a position names the evidence of the snippet at that
+        # position, which is the whole claim - not merely that two of four
+        # are citable.
+        for index in (2, 3):
+            evidence = registry.get_evidence(aligned[index]["evidence_id"])
+            assert evidence.text == snippets[index]
+
+    def test_a_budget_that_reached_the_summaries_describes_only_what_is_left(
+        self, store
+    ):
+        """`leading` counts what was inserted, not what survived.
+
+        A budget tight enough prunes past the retrieved tail into the digest
+        and the recall entry. A fixed prefix of `None` then claims positions
+        the prompt no longer has.
+        """
+        engine = self._engine()
+        registry = SourceRegistry()
+        chunks = [_Chunk("/files/a.md", "alpha passage")]
+
+        aligned = engine._record_grounding(
+            registry, chunks, ["a digest"], leading=2
+        )
+
+        assert aligned == [None]
+
+    def test_a_chunk_the_budget_dropped_is_in_no_position_and_no_registry(
+        self, store
+    ):
+        engine = self._engine()
+        registry = SourceRegistry()
+        chunks = [_Chunk("/files/a.md", "alpha passage"),
+                  _Chunk("/files/b.md", "beta passage"),
+                  _Chunk("/files/c.md", "gamma passage")]
+        # The pruner took the last snippet, so `gamma passage` never reached
+        # the model.
+        snippets = ["alpha passage", "beta passage"]
+
+        aligned = engine._record_grounding(registry, chunks, snippets, leading=0)
+
+        assert len(aligned) == 2
+        assert [registry.get_evidence(e["evidence_id"]).text for e in aligned] == (
+            snippets
+        )
+        registered = {
+            source.title for source in registry.snapshot().get("sources", [])
+        }
+        assert "c.md" not in registered, registered
+
+    def test_without_a_registry_every_position_is_uncitable(self, store):
+        """Not an empty list: a caller indexing the vector needs the same
+        shape whether or not the turn is recording provenance."""
+        engine = self._engine()
+        chunks = [_Chunk("/files/a.md", "alpha passage")]
+
+        aligned = engine._record_grounding(
+            None, chunks, ["a digest", "alpha passage"], leading=1
+        )
+
+        assert aligned == [None, None]
+
+    def test_a_grounding_that_does_not_line_up_is_refused(self, store, monkeypatch):
+        """The registration is one binding per chunk today. The vector's
+        positions are only meaningful while that holds, so it is checked
+        rather than assumed: a short vector does not fail here, it fails
+        later as a handle minted for one source and shown against another
+        passage."""
+        from liminallm.service import workflow as workflow_module
+
+        engine = self._engine()
+        registry = SourceRegistry()
+        chunks = [_Chunk("/files/a.md", "alpha passage"),
+                  _Chunk("/files/b.md", "beta passage")]
+        monkeypatch.setattr(
+            workflow_module,
+            "register_retrieved_chunks",
+            lambda reg, scoped: [binding("src_1", "ev_1")],
+        )
+
+        with pytest.raises(ProvenanceError):
+            engine._record_grounding(
+                registry, chunks, ["alpha passage", "beta passage"], leading=0
+            )
+
+    def test_the_flat_sink_and_the_aligned_vector_describe_the_same_relations(
+        self, store
+    ):
+        """Two views of one registration, so a reader that takes either one
+        reaches the same set. The sink is what the turn may cite; the vector
+        is where each of those sits."""
+        engine = self._engine()
+        registry = SourceRegistry()
+        chunks = [_Chunk("/files/a.md", "alpha passage"),
+                  _Chunk("/files/b.md", "beta passage")]
+        sink: list = []
+
+        aligned = engine._record_grounding(
+            registry,
+            chunks,
+            ["a digest", "alpha passage", "beta passage"],
+            leading=1,
+            sink=sink,
+        )
+
+        assert None not in sink
+        assert [entry for entry in aligned if entry] == sink

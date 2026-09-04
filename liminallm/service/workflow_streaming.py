@@ -1018,9 +1018,15 @@ class WorkflowStreamingMixin:
         # held locally until this assembly is known to be the answer path.
         # Committed to the sink below, and never sent in the plan: the worker
         # must not be able to name what supported the answer.
-        agent_bindings = self._record_grounding(
-            source_registry, ctx_chunks, grounded, leading=0
-        )
+        # Flat: the sink holds relations, and the aligned vector's positions
+        # belong to a snippet list this does not carry.
+        agent_bindings = [
+            found
+            for found in self._record_grounding(
+                source_registry, ctx_chunks, grounded, leading=0
+            )
+            if found
+        ]
         # What the worker's own searches record, kept beside the assembly's
         # rather than in the caller's sink. If this path abandons the
         # assembly for the plain fallback, streams a partial answer, or fails,

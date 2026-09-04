@@ -74,6 +74,7 @@ from liminallm.service.provenance import (
     Binding,
     GroundedPassage,
     GroundedSpan,
+    ProvenanceError,
     SourceRegistry,
 )
 from liminallm.service.rag import (
@@ -1887,21 +1888,37 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         leading: int,
         sink: Optional[List[Dict[str, str]]] = None,
-    ) -> List[Dict[str, str]]:
-        """Register the chunks that reached the model, and return the bindings.
+    ) -> List[Optional[Dict[str, str]]]:
+        """Register the chunks that reached the model, aligned to `snippets`.
 
         Called after budgeting, so the registry holds what grounded the answer
         rather than everything retrieval offered. The bindings say which
         context reached which evidence, which is the only place that relation
         survives: two contexts reaching one passage correctly dedupe to a
         single piece of evidence.
+
+        Returns one entry per snippet, `None` where the snippet is not a
+        retrieved chunk and so has nothing to cite - the digest and the recall
+        window ride in front of the retrieved tail and are the parent's own
+        summaries, not documents. The same aligned-`None` rule the six
+        explicit producers follow, and for the same reason: with a flat list
+        of eligible bindings, the only way to say which snippet a binding
+        belongs to is to count positions, and a later reader counting them
+        against a list of a different length attaches a source to a passage
+        it never grounded.
+
+        The leading entries are counted against what survived rather than
+        assumed present. Budget pruning takes snippets from the end, so it
+        reaches the retrieved tail first, but a budget small enough consumes
+        the digest and the recall entry too - and then a fixed `leading`
+        prefix of `None` would describe entries no longer in the prompt.
         """
         if source_registry is None:
-            return []
-        bindings = register_retrieved_chunks(
-            source_registry,
-            chunks_that_survived(chunks, snippets, leading=leading),
-        )
+            # Uniform shape: nothing is citable without a registry, which is
+            # what an all-`None` vector says. Callers need no special case.
+            return [None] * len(snippets)
+        survivors = chunks_that_survived(chunks, snippets, leading=leading)
+        bindings = register_retrieved_chunks(source_registry, survivors)
         # Into the parent's sink, never into the tool's own output. A tool's
         # declared `output_schema` may set `additionalProperties: false`, so
         # a new key in the validated result would refuse every published
@@ -1909,7 +1926,24 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # statement about the turn, not part of what the tool produced.
         if sink is not None:
             sink.extend(bindings)
-        return bindings
+        aligned: List[Optional[Dict[str, str]]] = [None] * min(leading, len(snippets))
+        aligned.extend(bindings)
+        if len(aligned) != len(snippets):
+            # Refuse rather than return a vector whose positions mean nothing.
+            # A short or long vector does not fail where it is built; it fails
+            # later, as a handle minted for one source and shown against
+            # another passage.
+            #
+            # One check, on the contract rather than on the intermediate. A
+            # second one comparing the bindings against the survivors was
+            # measured unkillable: registration is one binding per chunk, so
+            # a lossy registration arrives here as a short vector and this
+            # catches it by the same arithmetic.
+            raise ProvenanceError(
+                "grounding is not aligned: "
+                f"{len(aligned)} entries for {len(snippets)} snippets"
+            )
+        return aligned
 
     @staticmethod
     def _merge_bindings(
@@ -3016,10 +3050,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
             grounding=grounding,
         )
         # Computed from `grounded`, the subset that survived budgeting, but
-        # held locally until this plan is known to be the answer path.
-        agent_bindings = self._record_grounding(
-            source_registry, ctx_chunks, grounded, leading=0
-        )
+        # held locally until this plan is known to be the answer path. Flat:
+        # `provenance_bindings` is the set of relations the turn may cite, and
+        # the aligned vector's positions belong to a snippet list this does
+        # not carry.
+        agent_bindings = [
+            found
+            for found in self._record_grounding(
+                source_registry, ctx_chunks, grounded, leading=0
+            )
+            if found
+        ]
         # On the context, never in the plan: the plan is what the worker reads.
         context.mcp_tools = mcp_tools
         if not tools or not self.llm.supports_tools:
