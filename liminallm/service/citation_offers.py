@@ -108,12 +108,12 @@ def _covers_its_evidence(
     parent's own: an untrusted-data envelope, a `source:` header, a result
     number. The span covers the rendered run, and the passage sits inside it.
 
-    Empty evidence is refused. `""` is contained in every string, so a passage
-    with no text would be placeable anywhere. `add_evidence` will not record
-    one, which makes this guard deliberately unkillable by mutation - kept for
-    the same reason the equivalent guards in `build_citation_table` are, at
-    the same kind of gate: it is redundant because of an invariant this
-    function does not own.
+    Empty evidence is refused, and that guard does work. `""` is contained in
+    every string, so a passage with no text is inside whatever run a span
+    happens to name - the containment test above would pass at any valid
+    offset. The registry records one: `add_evidence` requires a `str` and not
+    a non-empty one, so an empty passage reaches `build_citation_table`, earns
+    its source a handle, and arrives here eligible.
     """
     evidence = registry.get_evidence(span.evidence_id)
     if evidence is None or evidence.source_id != span.source_id:

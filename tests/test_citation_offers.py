@@ -316,6 +316,36 @@ class TestTheSpanMustCoverThePassageItNames:
         marker = handle_marker(table.handle_for("src_1"))
         assert f"{wrapped}{MARKER_SEPARATOR}{marker}" in labelled
 
+    def test_a_passage_with_no_text_is_named_nowhere(self):
+        """`""` is inside every string, so an empty passage would be
+        placeable at any valid offset - the containment test passes and the
+        marker lands wherever the span happened to point.
+
+        Reachable through the ordinary route, not a hand-built table.
+        `add_evidence` requires a `str` and not a non-empty one, so an empty
+        passage is registered, binds like any other, and `build_citation_table`
+        gives its source a handle.
+        """
+        registry = SourceRegistry()
+        source = registry.register_source(
+            kind="file", title="a.md", locator="/files/a.md"
+        )
+        empty = registry.add_evidence(source.source_id, text="")
+        table = build_citation_table(
+            registry,
+            [binding(source.source_id, empty.evidence_id)],
+            nonce=NONCE,
+        )
+        assert table.handle_for(source.source_id), "the source earned a handle"
+        span = GroundedSpan(
+            start=TEXT.index(ALPHA),
+            end=TEXT.index(ALPHA) + len(ALPHA),
+            source_id=source.source_id,
+            evidence_id=empty.evidence_id,
+        )
+
+        assert label_passage(TEXT, [span], table, registry) == TEXT
+
     def test_a_passage_the_registry_does_not_hold_is_not_named(self):
         """A table that says a passage is eligible, and a registry with no
         such passage.
