@@ -988,41 +988,66 @@ class TestThePlainAnswerHasTheSameWireBoundary:
         assert reply["result"]["content"] == answer, reply["result"]["content"]
 
     @pytest.mark.asyncio
-    async def test_a_replayed_host_call_restores_the_canonical_answer(
+    async def test_a_replay_is_admissible_only_to_an_attempt_that_authorized_it(
         self, store, monkeypatch
     ):
-        """The canonical copy is committed beside the reply, so a replacement
-        attempt replaying the public answer gets the parent's copy back rather
-        than rerunning the model or losing it."""
+        """A committed result outliving its worker is not the same as it being
+        admissible to the attempt asking for it now.
+
+        Authority is resolved per attempt, so what a plan authorizes can
+        legitimately differ between them: an agent turn that finds no usable
+        tools falls back to `llm.generic` and authorizes it, and the
+        replacement attempt - planning again, finding tools this time -
+        authorizes no host call at all. With the check inside the handler the
+        replacement never reaches it, because the ledger answers first and
+        restores the canonical copy a citation is read out of.
+
+        Three stages, because refusing the inadmissible replay must not
+        destroy the admissible one.
+        """
         engine = get_runtime().workflow
         registry, invocation = TestTheGateIsTheResolvedWorkerBody._seed_generic(
             engine, monkeypatch
         )
         handle = invocation.citations.handle_for("src_1")
-        context = InvocationContext(user_id="u", source_registry=registry)
-        context.remember_host_call("llm.generic", {"message": "how long"})
-        broker = CapabilityBroker(engine, context)
         request = {
             "capability": "tool.host",
             "operation_seq": 1,
             "payload": {"tool": "llm.generic", "inputs": {"message": "how long"}},
         }
-        first = broker._answer(invocation, request)
+
+        # 1. An attempt that authorized this call commits it.
+        first_context = InvocationContext(user_id="u", source_registry=registry)
+        first_context.remember_host_call("llm.generic", {"message": "how long"})
+        first = CapabilityBroker(engine, first_context)._answer(
+            invocation, request
+        )
         assert first["ok"], first
-        assert context.canonical_model_response["content"] == (
+        assert first_context.canonical_model_response["content"] == (
             f"{ANSWER} [cite:{handle}]"
         )
 
-        # A replacement attempt: a fresh context and broker over the same
-        # ledger. The body does not run again - the model is removed to prove
-        # it.
+        # The body must not run again from here on, on any path.
         monkeypatch.setattr(
             engine.llm,
             "generate",
             lambda *a, **k: pytest.fail("the replayed body ran again"),
             raising=False,
         )
+
+        # 2. An attempt that authorized nothing is refused before the ledger.
+        unauthorized = InvocationContext(user_id="u", source_registry=registry)
+        refused = CapabilityBroker(engine, unauthorized)._answer(
+            invocation, request
+        )
+        assert refused["result"]["error"] == "host_call_unauthorized", refused
+        assert not refused.get("replayed")
+        assert unauthorized.canonical_model_response is None
+
+        # 3. An attempt that authorized it still gets the committed read, and
+        # the parent's copy of the answer with it.
         replacement = InvocationContext(user_id="u", source_registry=registry)
+        replacement.remember_host_call("llm.generic", {"message": "how long"})
         replayed = CapabilityBroker(engine, replacement)._answer(
             invocation, request
         )
@@ -1030,8 +1055,50 @@ class TestThePlainAnswerHasTheSameWireBoundary:
         assert replayed.get("replayed") is True, replayed
         assert replayed["result"]["content"] == ANSWER
         assert replacement.canonical_model_response == (
-            context.canonical_model_response
+            first_context.canonical_model_response
         )
+
+    @pytest.mark.asyncio
+    async def test_a_replay_of_a_body_this_attempt_did_not_plan_is_refused(
+        self, store, monkeypatch
+    ):
+        """The discriminating case: the replacement authorizes a host call,
+        just not this one. The ledger holds the old body's answer and the
+        worker submits the old request, so only the current authorization can
+        tell the two apart."""
+        engine = get_runtime().workflow
+        registry, invocation = TestTheGateIsTheResolvedWorkerBody._seed_generic(
+            engine, monkeypatch
+        )
+        request = {
+            "capability": "tool.host",
+            "operation_seq": 1,
+            "payload": {"tool": "llm.generic", "inputs": {"message": "how long"}},
+        }
+        first_context = InvocationContext(user_id="u", source_registry=registry)
+        first_context.remember_host_call("llm.generic", {"message": "how long"})
+        assert CapabilityBroker(engine, first_context)._answer(
+            invocation, request
+        )["ok"]
+
+        monkeypatch.setattr(
+            engine.llm,
+            "generate",
+            lambda *a, **k: pytest.fail("the replayed body ran again"),
+            raising=False,
+        )
+        replacement = InvocationContext(user_id="u", source_registry=registry)
+        replacement.remember_host_call(
+            "rag.answer_with_context_v1", {"message": "how long"}
+        )
+
+        refused = CapabilityBroker(engine, replacement)._answer(
+            invocation, request
+        )
+
+        assert refused["result"]["error"] == "host_call_unauthorized", refused
+        assert not refused.get("replayed")
+        assert replacement.canonical_model_response is None
 
 
 class TestTheStreamedAnswerIsNotThisWorkersToCite:

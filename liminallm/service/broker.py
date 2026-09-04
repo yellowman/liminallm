@@ -187,8 +187,14 @@ class InvocationContext:
     #: schemas are model input for the same reason and are kept for it.
     initial_messages: Tuple[Dict[str, Any], ...] = ()
     initial_tools: Tuple[Dict[str, Any], ...] = ()
-    #: The one host body this invocation authorized, and the exact inputs it
-    #: authorized for it. Empty when the plan is not a host-tool plan at all.
+    #: The one body name this invocation's plan may present through
+    #: `tool.host`, and the exact inputs it may present with it.
+    #:
+    #: A name rather than a resolved handler: it may land on no parent host
+    #: body at all - a plan whose body runs in the worker records its own name
+    #: here - and such a request then gets the ordinary unknown-tool result
+    #: rather than a refusal, which is the answer it had before any of this.
+    #: Empty only for the agent plan, which presents no host call.
     #:
     #: Authority, for the same reason the base prompt above is. A `tool.host`
     #: request names a body and carries its inputs, and both arrive from the
@@ -451,6 +457,24 @@ class CapabilityBroker:
             withdrawn = self._withdrawn(invocation, capability)
             if withdrawn is not None:
                 return {"ok": True, "result": withdrawn}
+            # Ahead of the ledger, because a committed result outliving the
+            # worker that earned it is not the same as it being admissible to
+            # the attempt asking for it now.
+            #
+            # Authority is resolved per attempt on purpose, so what a plan
+            # authorizes can legitimately differ between them: an agent turn
+            # that found no usable tools falls back to `llm.generic` and
+            # authorizes it, and the replacement attempt - planning again,
+            # finding tools this time - authorizes no host call at all. With
+            # the check inside the handler, the replacement's request never
+            # reaches it: the ledger answers first, hands back the abandoned
+            # attempt's answer, and restores the canonical copy a citation is
+            # read out of. The result was real; the authority to use it here
+            # was not.
+            if capability == "tool.host":
+                refusal = self._host_call_refusal(payload)
+                if refusal is not None:
+                    return {"ok": True, "result": refusal}
             digest = payload_hash(payload)
             replayed = invocation.ledger.replay(operation_seq, capability, digest)
             if replayed is not None:
@@ -1026,6 +1050,35 @@ class CapabilityBroker:
             transcript=[round_entry.as_dict()],
         )
 
+    def _host_call_refusal(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """The refusal for a host call this invocation did not authorize.
+
+        On the name as planned, not on what it resolves to. Resolution is
+        `_run_host_tool`'s job and happens on the parent's own copy; what is
+        decided here is only whether this request is the one the plan made.
+
+        The emptiness check is measured redundant: with nothing recorded,
+        every real body name already fails the comparison beside it, and the
+        one request that would slip past names no body and reaches none. Kept
+        because "an invocation that authorized nothing authorizes nothing" is
+        the property, and an authority gate is the wrong place to leave that
+        to be re-derived from how a comparison behaves against an empty
+        string.
+        """
+        if (
+            not self._ctx.host_body
+            or str(payload.get("tool") or "") != self._ctx.host_body
+            or dict(payload.get("inputs") or {}) != self._ctx.host_inputs
+        ):
+            return {
+                "status": "error",
+                "content": "this invocation authorized no such host call",
+                "error": "host_call_unauthorized",
+            }
+        return None
+
     def _tool_host(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
@@ -1053,28 +1106,14 @@ class CapabilityBroker:
         transfer compare the user's answer against a class label.
         """
         invocation.check_live()
-        # On the name as planned, not on what it resolves to. Resolution is
-        # `_run_host_tool`'s job and it happens below on the parent's copy;
-        # what is being decided here is only whether this request is the one
-        # the plan authorized.
-        #
-        # The emptiness check is measured redundant: with nothing recorded,
-        # every real body name already fails the comparison below, and the one
-        # request that would slip past it names no body and reaches none.
-        # Kept because "an invocation that authorized nothing authorizes
-        # nothing" is the property, and an authority gate is the wrong place
-        # to leave that to be re-derived from how a comparison happens to
-        # behave against an empty string.
-        if (
-            not self._ctx.host_body
-            or str(payload.get("tool") or "") != self._ctx.host_body
-            or dict(payload.get("inputs") or {}) != self._ctx.host_inputs
-        ):
-            return {
-                "status": "error",
-                "content": "this invocation authorized no such host call",
-                "error": "host_call_unauthorized",
-            }
+        # Asked again here, having already been asked before the ledger. Two
+        # calls of one function rather than two rules: `_answer` has to ask it
+        # early enough that a replay cannot answer first, and this is the
+        # boundary the body actually runs behind. A later dispatch path that
+        # reached a handler another way would find the check still standing.
+        refusal = self._host_call_refusal(payload)
+        if refusal is not None:
+            return refusal
         # The parent's body and the parent's inputs, not the ones just
         # checked. Measured equivalent, necessarily: the comparison above just
         # established that the two are equal, so no mutation of this line

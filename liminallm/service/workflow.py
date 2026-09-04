@@ -3296,9 +3296,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
     #:
     #: `canonical_model_response` is replacement state, so the cost of a body
     #: being wrongly in this set is not that its own result becomes citable.
-    #: It is that a node running after the answer overwrites it, and the real
-    #: answer loses citations it had earned. A workflow that classifies an
-    #: intent after answering is enough to reach that.
+    #: It is that a later call overwrites the answer, which then loses
+    #: citations it had earned. Separate workflow nodes cannot reach that -
+    #: each gets its own invocation - so what does is a worker sending a
+    #: second `tool.host` inside the invocation it already has.
     MODEL_ANSWER_HOSTS = frozenset(
         {"llm.generic", "llm.generic_chat_v1", "rag.answer_with_context_v1"}
     )
@@ -3306,12 +3307,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
     def _host_body_name(self, tool_name: str) -> str:
         """Which builtin body a host-tool request runs, or `""` for none.
 
-        One resolution, asked three times: `_run_host_tool` picks its handler
-        with it, planning decides whether a plan may authorize a host call at
-        all, and the broker decides whether what came back is the turn's
-        answer. Two implementations would eventually run one body and describe
-        another - the reason `resolve_executable_handler` exists for the
-        worker bodies.
+        One resolution, asked twice: `_run_host_tool` picks its handler with
+        it, and the broker decides with it whether what came back is the
+        turn's answer. Two implementations would eventually run one body and
+        describe another - the reason `resolve_executable_handler` exists for
+        the worker bodies.
+
+        Not asked by planning, which records the worker body's name as it
+        stands. What a plan authorizes is a name the worker may present, and
+        that is a different question from which parent handler it lands on.
 
         A name only resolves when it lands on a body that runs *here*. A
         seeded deployment stores a spec for every tool, including the ones
