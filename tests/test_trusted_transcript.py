@@ -13,6 +13,7 @@ from what the worker sent back.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from liminallm.service.broker import CapabilityBroker, InvocationContext
@@ -379,6 +380,285 @@ class TestOneOperationLeavesOneEntry:
         transcript.record(ModelTurn(operation_seq=1, content="a"))
         transcript.record(ToolRound(operation_seq=1))
         assert len(transcript.entries) == 2
+
+
+class TestTheRecordIsTheContinuationNotTheAuthority:
+    """Two representations of one model turn, and they answer different
+    questions. The canonical reply is what the model wrote, handles and all,
+    and it is authority for the final answer. The transcript keeps the public
+    one, because that is what the worker continued from and what a rebuilt
+    prompt has to contain."""
+
+    @staticmethod
+    def _cited(engine, monkeypatch, invocation, handle):
+        """A model turn whose tool argument carries a citation handle."""
+        monkeypatch.setattr(
+            engine.llm,
+            "generate_with_tools",
+            lambda *a, **k: {
+                "content": f"looking [cite:{handle}]",
+                "tool_calls": [{
+                    "id": "c1", "name": "web_search",
+                    "arguments": '{"query": "hours [cite:%s]"}' % handle,
+                }],
+                "assistant_message": {
+                    "role": "assistant", "content": f"looking [cite:{handle}]",
+                },
+                "usage": {},
+            },
+            raising=False,
+        )
+
+    def test_the_transcript_holds_no_citation_namespace(
+        self, store, monkeypatch
+    ):
+        engine = get_runtime().workflow
+        registry, invocation, context, broker = _turn(engine, monkeypatch)
+        source = registry.register_source(kind="file", title="m", locator="/m")
+        evidence = registry.add_evidence(source.source_id, text="x")
+        invocation.extend_citations(
+            registry,
+            [{"context_id": None, "source_id": source.source_id,
+              "evidence_id": evidence.evidence_id}],
+        )
+        handle = invocation.citations.handle_for(source.source_id)
+        self._cited(engine, monkeypatch, invocation, handle)
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+
+        turn = context.transcript.entries[0]
+        assert invocation.citations.nonce not in json.dumps(turn.as_dict())
+        # The canonical reply, which is a different record, still has it.
+        assert handle in context.canonical_model_response["content"]
+
+    def test_a_round_carrying_the_public_arguments_is_not_divergent(
+        self, store, monkeypatch
+    ):
+        """The worker executes what it was handed. Comparing that against the
+        canonical arguments would call an obedient worker divergent."""
+        engine = get_runtime().workflow
+        registry, invocation, context, broker = _turn(engine, monkeypatch)
+        source = registry.register_source(kind="file", title="m", locator="/m")
+        evidence = registry.add_evidence(source.source_id, text="x")
+        invocation.extend_citations(
+            registry,
+            [{"context_id": None, "source_id": source.source_id,
+              "evidence_id": evidence.evidence_id}],
+        )
+        handle = invocation.citations.handle_for(source.source_id)
+        self._cited(engine, monkeypatch, invocation, handle)
+        reply = _ask(broker, invocation, "llm.generate_with_tools",
+                     {"messages": [], "tools": []}, 1)
+
+        # What the worker was actually handed, parsed as the worker parses it.
+        handed = json.loads(reply["result"]["tool_calls"][0]["arguments"])
+        assert handle not in handed["query"]
+        _ask(broker, invocation, "tools.round",
+             {"calls": [{"id": "c1", "name": "web_search", "arguments": handed}],
+              "fallback_query": "hours"}, 2)
+        assert context.transcript.rounds()[0].offerable is True
+
+
+class TestTheIdsComeFromTheTurnThatAsked:
+    def test_a_renamed_call_does_not_put_its_own_id_in_the_record(
+        self, store, monkeypatch
+    ):
+        """`calls_match` ignores ids on purpose, so a worker can match on name
+        and arguments while renaming every one. The field that ties a result
+        to the call it answers must not be the worker's."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, calls=[
+            {"id": "real", "name": "web_search", "arguments": '{"query": "hours"}'}
+        ])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        _ask(broker, invocation, "tools.round", {
+            "calls": [
+                {"id": "evil", "name": "web_search", "arguments": {"query": "hours"}}
+            ],
+            "fallback_query": "hours",
+        }, 2)
+
+        round_entry = context.transcript.rounds()[0]
+        assert round_entry.offerable is True
+        result = round_entry.results[0]
+        assert result.submitted_call_id == "evil"
+        assert result.tool_message_id == "real"
+
+
+class TestOneModelTurnAuthorizesOneRound:
+    """Retrieval is not deterministic. A worker repeating a round verbatim
+    would otherwise get a second set of grounded passages - different
+    documents, possibly - carrying the authority of one request."""
+
+    def test_a_second_identical_round_is_not_offerable(
+        self, store, monkeypatch
+    ):
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, calls=[SEARCH])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
+        # Same calls again, with no model turn in between. A different payload
+        # so the ledger does not simply replay the first.
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "again"}, 3)
+
+        assert [r.offerable for r in context.transcript.rounds()] == [True, False]
+
+    def test_a_fresh_model_turn_authorizes_the_next_round(
+        self, store, monkeypatch
+    ):
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, calls=[SEARCH])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
+        _model(engine, monkeypatch, calls=[SEARCH])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 3)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "again"}, 4)
+
+        assert [r.offerable for r in context.transcript.rounds()] == [True, True]
+
+    def test_an_unrequested_round_gets_no_message_ids_either(
+        self, store, monkeypatch
+    ):
+        """There is no request to tie its results to, so there is no message
+        to rebuild. Falling back to the tool name would invent one."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "hours"}, 1)
+        round_entry = context.transcript.rounds()[0]
+        assert round_entry.offerable is False
+        assert round_entry.results[0].tool_message_id == ""
+
+    def test_an_empty_round_answering_nothing_is_not_offerable(
+        self, store, monkeypatch
+    ):
+        """Two empty call lists compare equal, so a check that only compared
+        them would call a round with no request behind it authorized."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [], "fallback_query": "hours"}, 1)
+        assert context.transcript.rounds()[0].offerable is False
+
+    def test_an_answered_turn_is_no_longer_the_unanswered_one(self):
+        transcript = TrustedTranscript()
+        transcript.record(ModelTurn(operation_seq=1, tool_calls=({"name": "t"},)))
+        assert transcript.unanswered_turn() is not None
+        transcript.record(ToolRound(operation_seq=2))
+        assert transcript.unanswered_turn() is None
+
+
+class TestAWorkerCannotRewindItsOwnPosition:
+    """One worker walks its control flow forwards. A rewind is how a
+    compromised one would overwrite parent-side state the parent believes it
+    wrote once."""
+
+    def test_the_same_sequence_twice_is_refused(self, store, monkeypatch):
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, content="one")
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        again = broker._answer(invocation, {
+            "capability": "tools.round", "operation_seq": 1,
+            "payload": {"calls": [SUBMITTED], "fallback_query": "hours"},
+        })
+        assert again["result"]["error"] == "broker_sequence"
+        # And the parent's record still holds one entry for that operation.
+        assert [type(e).__name__ for e in context.transcript.entries] == ["ModelTurn"]
+
+    def test_a_skipped_sequence_is_refused(self, store, monkeypatch):
+        engine = get_runtime().workflow
+        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, content="one")
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        skipped = broker._answer(invocation, {
+            "capability": "llm.generate_with_tools", "operation_seq": 3,
+            "payload": {"messages": [], "tools": []},
+        })
+        assert skipped["result"]["error"] == "broker_sequence"
+
+    def test_a_replacement_worker_counts_from_one_again(
+        self, store, monkeypatch
+    ):
+        """Which is the same forward walk: it replays the ledger up to where
+        it diverges, and the rule must not stand in the way of that."""
+        engine = get_runtime().workflow
+        registry, invocation, _first, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, content="one")
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
+
+        second = InvocationContext(user_id="u", source_registry=registry)
+        replacement = CapabilityBroker(engine, second)
+        one = _ask(replacement, invocation, "llm.generate_with_tools",
+                   {"messages": [], "tools": []}, 1)
+        two = _ask(replacement, invocation, "tools.round",
+                   {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
+        assert one.get("replayed") and two.get("replayed")
+        assert len(second.transcript.entries) == 2
+
+
+class TestNestedStateIsNotSharedWithTheLedger:
+    """Every later attempt reads this record. A stage that edited a nested
+    tool call in place would change what the next attempt is restored to -
+    the same class of defect `CitationTable` had before it was deeply
+    frozen."""
+
+    def test_editing_a_restored_turn_does_not_change_the_committed_one(self):
+        committed = {
+            "kind": "model_turn",
+            "operation_seq": 1,
+            "content": "looking",
+            "tool_calls": [{"id": "c1", "name": "t", "arguments": "{}"}],
+            "assistant_message": {"role": "assistant", "content": "looking"},
+        }
+        first = TrustedTranscript()
+        first.restore([committed])
+        first.entries[0].tool_calls[0]["name"] = "edited"
+        first.entries[0].assistant_message["content"] = "edited"
+
+        second = TrustedTranscript()
+        second.restore([committed])
+        assert second.entries[0].tool_calls[0]["name"] == "t"
+        assert second.entries[0].assistant_message["content"] == "looking"
+
+    def test_exporting_a_turn_does_not_hand_out_its_own_objects(self):
+        turn = ModelTurn(
+            operation_seq=1,
+            tool_calls=({"id": "c1", "name": "t"},),
+            assistant_message={"role": "assistant", "content": "x"},
+        )
+        exported = turn.as_dict()
+        exported["tool_calls"][0]["name"] = "edited"
+        exported["assistant_message"]["content"] = "edited"
+        assert turn.tool_calls[0]["name"] == "t"
+        assert turn.assistant_message["content"] == "x"
+
+    def test_construction_copies_what_it_was_given(self):
+        calls = [{"id": "c1", "name": "t"}]
+        message = {"role": "assistant", "content": "x"}
+        turn = ModelTurn(
+            operation_seq=1, tool_calls=tuple(calls), assistant_message=message
+        )
+        calls[0]["name"] = "edited"
+        message["content"] = "edited"
+        assert turn.tool_calls[0]["name"] == "t"
+        assert turn.assistant_message["content"] == "x"
 
 
 class TestTheRecordSurvivesTheLedger:

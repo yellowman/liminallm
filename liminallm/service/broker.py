@@ -100,6 +100,22 @@ def _is_error(result: Any) -> bool:
     return isinstance(result, dict) and result.get("status") == "error"
 
 
+def _message_id(offered: List[Dict[str, Any]], index: int, name: str) -> str:
+    """The id a rebuilt tool message carries for one call.
+
+    From the model turn that asked, never from the round that answered. The
+    same fallback the worker's own assembly uses - the id or the tool name -
+    so the parent produces the same message without reading it back.
+
+    Empty when nothing offered this call: a round the parent cannot tie to a
+    request has no message to rebuild, and it is already marked unofferable.
+    """
+    if index >= len(offered):
+        return ""
+    call = offered[index]
+    return str(call.get("id") or "") or name
+
+
 @dataclass
 class InvocationContext:
     """Who this execution is for. Never crosses the pipe.
@@ -208,6 +224,10 @@ class CapabilityBroker:
         #: Called as each capability starts, so a streaming caller can say what
         #: the model is doing while it is slow rather than afterwards.
         self._on_capability = on_capability
+        #: The last sequence this broker served. One broker serves one worker,
+        #: and that worker's position only moves forwards; a replacement gets
+        #: a new broker and counts from one again.
+        self._served = 0
 
     # -- the loop ---------------------------------------------------------
 
@@ -318,6 +338,30 @@ class CapabilityBroker:
             withdrawn = self._withdrawn(invocation, capability)
             if withdrawn is not None:
                 return {"ok": True, "result": withdrawn}
+            # One worker walks its own control flow forwards. `BrokerClient`
+            # stamps 1, 2, 3, so anything else is a worker rewinding or
+            # skipping its position - and a rewind is how a compromised one
+            # would overwrite parent-side state the parent believes it wrote
+            # once. A replacement worker gets a fresh broker and counts from
+            # one again, replaying the ledger up to where it diverges, which
+            # is the same forward walk.
+            if operation_seq != self._served + 1:
+                logger.warning(
+                    "capability_sequence_rewind",
+                    invocation_id=invocation.invocation_id,
+                    capability=capability,
+                    operation_seq=operation_seq,
+                    expected=self._served + 1,
+                )
+                return {
+                    "ok": True,
+                    "result": {
+                        "status": "error",
+                        "content": "a capability was requested out of order",
+                        "error": "broker_sequence",
+                    },
+                }
+            self._served = operation_seq
             digest = payload_hash(payload)
             replayed = invocation.ledger.replay(operation_seq, capability, digest)
             if replayed is not None:
@@ -739,9 +783,9 @@ class CapabilityBroker:
         # that only the first attempt takes.
         turn = ModelTurn(
             operation_seq=seq,
-            content=canonical["content"],
-            tool_calls=tuple(dict(call) for call in canonical["tool_calls"]),
-            assistant_message=canonical["assistant_message"],
+            content=public["content"],
+            tool_calls=tuple(dict(call) for call in public["tool_calls"]),
+            assistant_message=public["assistant_message"],
         )
         return CapabilityOutcome(
             public=public,
@@ -797,10 +841,18 @@ class CapabilityBroker:
         # capability layer's question and it answers that one unchanged - but
         # the parent can no longer reconstruct the exchange faithfully, so
         # nothing in it may carry a citation.
-        offered = (self._ctx.canonical_model_response or {}).get("tool_calls") or []
-        offerable = calls_match(
-            offered, [{"name": name, "arguments": args} for _c, name, args in parsed]
+        asked = self._ctx.transcript.unanswered_turn()
+        offerable = asked is not None and calls_match(
+            asked.tool_calls,
+            [{"name": name, "arguments": args} for _c, name, args in parsed],
         )
+        # The ids a reconstructed tool message must carry come from the turn
+        # that asked, not from the round that answered. `calls_match` ignores
+        # ids on purpose - a renamed round is the same calls - so a worker
+        # that matched on name and arguments while renaming every id would
+        # otherwise put its own bytes in the field that ties a result to the
+        # call it answers.
+        offered_calls = list(asked.tool_calls) if offerable and asked else []
         snippets: List[str] = []
         round_bindings: List[Binding] = []
         round_passages: List[GroundedPassage] = []
@@ -841,7 +893,7 @@ class CapabilityBroker:
                     # The rule the worker's own assembly uses, computed here
                     # so the parent need not read it back to rebuild the
                     # message.
-                    tool_message_id=str(call.get("id") or "") or name,
+                    tool_message_id=_message_id(offered_calls, index, name),
                     text=str(results[index]) if index < len(results) else "",
                     spans=by_index.get(index, ()),
                 )

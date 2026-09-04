@@ -29,6 +29,7 @@ provenance vocabulary from growing a tool-calling protocol inside it.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -146,12 +147,26 @@ class ToolRound:
 
 @dataclass(frozen=True)
 class ModelTurn:
-    """One model turn, as the model produced it.
+    """One model turn, in the form the conversation continued from.
 
-    The canonical text, with whatever citation handles it wrote. This is the
-    assistant message a later prompt has to contain, and it is kept here
-    rather than read back from the worker for the same reason the tool
-    results are.
+    The *public* reply, not the canonical one. The worker appends the public
+    assistant message and executes the public tool calls, so that is what the
+    exchange actually proceeded from and what a reconstruction of it has to
+    contain. The canonical reply - the same turn with its citation handles
+    still in it - is kept separately and is authority for the final answer
+    only, which is a different question from what the conversation said.
+
+    Storing canonical here would break both. A round carrying the public
+    arguments would compare unequal to canonical ones and be called divergent
+    although the worker did exactly as asked, and a rebuilt prompt would
+    reinsert intermediate text the worker never continued from - handles and
+    all, past the boundary that exists to keep them off the wire.
+
+    Deeply copied on the way in and out. The dicts inside reach here from the
+    ledger's `parent_state`, which every later attempt reads: a stage that
+    edited a nested tool call in place would change what the next attempt is
+    restored to. Frozen on the outside is not enough, the same way it was not
+    enough for `CitationTable`.
     """
 
     operation_seq: int
@@ -159,13 +174,21 @@ class ModelTurn:
     tool_calls: Tuple[Dict[str, Any], ...] = ()
     assistant_message: Optional[Dict[str, Any]] = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "tool_calls", tuple(deepcopy(dict(c)) for c in self.tool_calls)
+        )
+        object.__setattr__(
+            self, "assistant_message", deepcopy(self.assistant_message)
+        )
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "kind": "model_turn",
             "operation_seq": self.operation_seq,
             "content": self.content,
-            "tool_calls": [dict(call) for call in self.tool_calls],
-            "assistant_message": self.assistant_message,
+            "tool_calls": [deepcopy(dict(call)) for call in self.tool_calls],
+            "assistant_message": deepcopy(self.assistant_message),
         }
 
     @classmethod
@@ -211,6 +234,24 @@ class TrustedTranscript:
 
     def rounds(self) -> List[ToolRound]:
         return [entry for entry in self.entries if isinstance(entry, ToolRound)]
+
+    def unanswered_turn(self) -> Optional[ModelTurn]:
+        """The model turn a round arriving now would be answering, if any.
+
+        The last entry, and only when it is a model turn. A model turn asks
+        for one round: once a round has answered it, that turn is the entry
+        before last and this returns nothing, so a second round claiming the
+        same authority finds none.
+
+        That matters because retrieval is not deterministic. A worker
+        repeating a round verbatim would otherwise get a second set of
+        grounded passages - different documents, possibly - carrying the
+        authority of one request the model made once.
+        """
+        if not self.entries:
+            return None
+        last = self.entries[-1]
+        return last if isinstance(last, ModelTurn) else None
 
     def as_list(self) -> List[Dict[str, Any]]:
         return [entry.as_dict() for entry in self.entries]
