@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import Any, List, Optional, Sequence, Tuple
 
 from liminallm.service.citations import CitationTable
-from liminallm.service.provenance import GroundedSpan
+from liminallm.service.provenance import GroundedSpan, SourceRegistry
 
 #: What separates a passage's text from the marker offered for it. One space,
 #: and the marker inline at the end of the grounded run rather than on a line
@@ -86,6 +86,43 @@ def _eligible(table: CitationTable, span: GroundedSpan) -> Optional[str]:
     return handle
 
 
+def _covers_its_evidence(
+    registry: SourceRegistry, text: str, span: GroundedSpan
+) -> bool:
+    """Whether the run this span points at is the passage it names.
+
+    The relation being valid is a different question from the offsets being
+    right, and a span can pass the first while failing the second. Source A
+    has a handle, passage A belongs to source A, and the offsets cover source
+    B's text: every individual check succeeds and the model is shown B's
+    sentence with A's name after it. That is the failure this module exists
+    to prevent, arriving through the one door the relation check does not
+    watch.
+
+    So the offer gate measures the placement itself rather than inheriting it
+    from the producers. S5.11 witnesses that they render and record together,
+    and this is where those records become model input - the last point at
+    which a wrong offset is still only a wrong offset.
+
+    Containment, not equality. A producer wraps its evidence in text of the
+    parent's own: an untrusted-data envelope, a `source:` header, a result
+    number. The span covers the rendered run, and the passage sits inside it.
+
+    Empty evidence is refused. `""` is contained in every string, so a passage
+    with no text would be placeable anywhere. `add_evidence` will not record
+    one, which makes this guard deliberately unkillable by mutation - kept for
+    the same reason the equivalent guards in `build_citation_table` are, at
+    the same kind of gate: it is redundant because of an invariant this
+    function does not own.
+    """
+    evidence = registry.get_evidence(span.evidence_id)
+    if evidence is None or evidence.source_id != span.source_id:
+        return False
+    if not evidence.text:
+        return False
+    return evidence.text in text[span.start : span.end]
+
+
 def _placeable(text: str, span: GroundedSpan) -> bool:
     """Whether this span describes a run of `text` a marker can follow.
 
@@ -106,6 +143,7 @@ def label_passage(
     text: str,
     spans: Sequence[GroundedSpan],
     table: CitationTable,
+    registry: SourceRegistry,
 ) -> str:
     """`text` with a citation marker after each passage that has earned one.
 
@@ -114,15 +152,20 @@ def label_passage(
     in front of it, so a model that copies one is naming the passage it was
     reading.
 
+    Three questions of every span, and all three have to answer yes. Is this a
+    position in this text; does the run at that position contain the passage
+    the span names; may that passage be cited. The registry answers the
+    second, which is why it is a parameter: the table says what a source is
+    called and cannot say where its text is.
+
     Right to left, so that inserting a marker cannot move a position not yet
     used. Left to right needs every later offset shifted by the width of every
     marker already written, which is a second calculation that has to agree
     with the first, and the two disagree the first time a span is skipped.
 
-    One handle per source, from the table, so the same document cited from two
-    passages is named identically in both. A span whose relation is not
-    eligible, and one whose offsets do not describe this text, get no marker at
-    all - never a guessed position.
+    One handle per source, from the table, so the same document read in two
+    passages is named identically in both. A span that fails any of the three
+    gets no marker at all - never a guessed position.
 
     Returns a new string and reads its inputs. The passage records, the
     transcript entries and the base prompt snapshot are all parent state that
@@ -132,6 +175,8 @@ def label_passage(
     placements: List[Tuple[int, str]] = []
     for span in spans:
         if not _placeable(text, span):
+            continue
+        if not _covers_its_evidence(registry, text, span):
             continue
         handle = _eligible(table, span)
         if handle is None:

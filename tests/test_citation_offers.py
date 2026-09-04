@@ -54,13 +54,50 @@ def _table(*titles, nonce=NONCE):
     return registry, bindings, build_citation_table(registry, bindings, nonce=nonce)
 
 
-def _span(registry, table, source_id, text=TEXT, covered=None):
+def _one_source_two_passages(nonce=NONCE):
+    """One document read in two places: two passages of one file.
+
+    What the shared-handle rule is actually about. Two spans over parts of a
+    single passage is a different thing, and under the placement rule neither
+    of them covers what it names.
+    """
+    registry = SourceRegistry()
+    source = registry.register_source(
+        kind="file", title="a.md", locator="/files/a.md"
+    )
+    bindings = [
+        binding(source.source_id, registry.add_evidence(
+            source.source_id, text=body).evidence_id)
+        for body in (ALPHA, BETA)
+    ]
+    return registry, build_citation_table(registry, bindings, nonce=nonce)
+
+
+def _handed_table(*, cites, evidence, nonce=NONCE):
+    """A table built by hand rather than by the builder.
+
+    `build_citation_table` and `extend_citation_table` both resolve every
+    entry against the registry, so neither produces one of these. That is the
+    point: the offer gate is handed a table and must not assume the builder
+    made it - the same reason the builder itself re-checks a table it inherits.
+    """
+    handle = f"{nonce}-1"
+    return CitationTable(
+        nonce=nonce,
+        by_handle={handle: cites},
+        by_source={cites: handle},
+        evidence={cites: tuple(evidence)},
+    )
+
+
+def _span(registry, table, source_id, text=TEXT, covered=None, evidence_id=None):
     """A span over `covered` in `text`, naming that source's own evidence."""
     body = covered if covered is not None else (
         ALPHA if source_id == "src_1" else BETA
     )
     start = text.index(body)
-    (evidence_id,) = table.evidence_for(source_id)
+    if evidence_id is None:
+        (evidence_id,) = table.evidence_for(source_id)
     return GroundedSpan(
         start=start,
         end=start + len(body),
@@ -81,7 +118,7 @@ class TestAMarkerFollowsThePassageItNames:
         registry, _bindings, table = _table("a.md")
         span = _span(registry, table, "src_1")
 
-        labelled = label_passage(TEXT, [span], table)
+        labelled = label_passage(TEXT, [span], table, registry)
 
         assert "400 hours [cite:K7Q2ABCD-1]\n" in labelled
 
@@ -89,7 +126,7 @@ class TestAMarkerFollowsThePassageItNames:
         registry, _bindings, table = _table("a.md")
         span = _span(registry, table, "src_1")
 
-        labelled = label_passage(TEXT, [span], table)
+        labelled = label_passage(TEXT, [span], table, registry)
 
         marker = handle_marker(table.handle_for("src_1"))
         assert f"{ALPHA}{MARKER_SEPARATOR}{marker}" in labelled
@@ -105,7 +142,7 @@ class TestAMarkerFollowsThePassageItNames:
             _span(registry, table, "src_2"),
         ]
 
-        labelled = label_passage(TEXT, spans, table)
+        labelled = label_passage(TEXT, spans, table, registry)
 
         for source_id, body in (("src_1", ALPHA), ("src_2", BETA)):
             marker = handle_marker(table.handle_for(source_id))
@@ -121,23 +158,26 @@ class TestAMarkerFollowsThePassageItNames:
             _span(registry, table, "src_2"),
         ]
 
-        assert label_passage(TEXT, spans, table) == label_passage(
-            TEXT, list(reversed(spans)), table
+        assert label_passage(TEXT, spans, table, registry) == label_passage(
+            TEXT, list(reversed(spans)), table, registry
         )
 
     def test_one_source_read_in_two_places_is_named_once(self):
         """Not two handles. The model is shown one document under one name,
-        so a claim resting on either half cites the same source."""
-        registry, _bindings, table = _table("a.md")
-        first = _span(registry, table, "src_1", covered="the inspection")
-        second = _span(registry, table, "src_1", covered="400 hours")
+        so a claim resting on either passage cites the same source."""
+        registry, table = _one_source_two_passages()
+        first, second = table.evidence_for("src_1")
+        spans = [
+            _span(registry, table, "src_1", covered=ALPHA, evidence_id=first),
+            _span(registry, table, "src_1", covered=BETA, evidence_id=second),
+        ]
 
-        labelled = label_passage(TEXT, [first, second], table)
+        labelled = label_passage(TEXT, spans, table, registry)
 
         marker = handle_marker(table.handle_for("src_1"))
         assert labelled.count(marker) == 2
-        assert f"the inspection{MARKER_SEPARATOR}{marker}" in labelled
-        assert f"400 hours{MARKER_SEPARATOR}{marker}" in labelled
+        assert f"{ALPHA}{MARKER_SEPARATOR}{marker}" in labelled
+        assert f"{BETA}{MARKER_SEPARATOR}{marker}" in labelled
 
 
 class TestWhatEarnsNoNameGetsNone:
@@ -156,7 +196,7 @@ class TestWhatEarnsNoNameGetsNone:
             evidence_id="ev_2",
         )
 
-        assert label_passage(TEXT, [span], table) == TEXT
+        assert label_passage(TEXT, [span], table, registry) == TEXT
 
     def test_a_passage_filed_under_another_source_is_not_named(self):
         """The relation, not just the source. `src_1` has a handle and `ev_2`
@@ -171,7 +211,7 @@ class TestWhatEarnsNoNameGetsNone:
             evidence_id=foreign,
         )
 
-        assert label_passage(TEXT, [span], table) == TEXT
+        assert label_passage(TEXT, [span], table, registry) == TEXT
 
     @pytest.mark.parametrize(
         "start,end",
@@ -189,13 +229,14 @@ class TestWhatEarnsNoNameGetsNone:
             start=start, end=end, source_id="src_1", evidence_id=evidence_id
         )
 
-        assert label_passage(TEXT, [span], table) == TEXT
+        assert label_passage(TEXT, [span], table, registry) == TEXT
 
     def test_a_turn_with_no_handles_shows_no_markers(self):
+        registry, _bindings, built = _table("a.md")
         empty = CitationTable(nonce=NONCE)
-        span = GroundedSpan(start=0, end=6, source_id="src_1", evidence_id="ev_1")
+        span = _span(registry, built, "src_1")
 
-        assert label_passage(TEXT, [span], empty) == TEXT
+        assert label_passage(TEXT, [span], empty, registry) == TEXT
 
     def test_evidence_filed_under_a_source_with_no_handle_names_nothing(self):
         """A table whose two maps disagree.
@@ -204,18 +245,119 @@ class TestWhatEarnsNoNameGetsNone:
         refuses evidence filed under a source the table does not cite - so this
         is a table arriving from somewhere else. That is the case an offer gate
         must not inherit an upstream invariant for: reading the passage
-        relation alone would find `ev_1` filed under `src_1` and label it with
-        a name the turn never issued.
+        relation alone would find the passage filed under `src_1` and label it
+        with a name the turn never issued.
+
+        Everything else about this span is correct - the registry holds the
+        passage, it belongs to `src_1`, and the offsets cover it - so the
+        missing handle is the only thing that can refuse it.
         """
-        table = CitationTable(nonce=NONCE, evidence={"src_1": ("ev_1",)})
+        registry, _bindings, built = _table("a.md")
+        (evidence_id,) = built.evidence_for("src_1")
+        table = CitationTable(nonce=NONCE, evidence={"src_1": (evidence_id,)})
+        span = _span(registry, built, "src_1")
+
+        assert label_passage(TEXT, [span], table, registry) == TEXT
+
+
+class TestTheSpanMustCoverThePassageItNames:
+    """The relation being valid and the offsets being right are two different
+    questions, and a span can pass the first while failing the second.
+
+    `GroundedSpan` is parent-owned and the producers are witnessed, so this is
+    not a worker reaching anything. It is the offer gate declining to inherit
+    a placement invariant it does not own, at the last point where a wrong
+    offset is still only a wrong offset rather than a citation the model was
+    taught.
+    """
+
+    def test_a_valid_relation_over_another_sources_text_is_not_named(self):
+        """The hole this class closes. Individually:
+
+            the offsets are inside the text      yes
+            `src_1` has a handle                 yes
+            its passage is eligible for `src_1`  yes
+
+        and the run those offsets cover is `src_2`'s sentence. Labelling it
+        shows the model 800 hours under the name of the document that says
+        400 - a legitimate source name on the wrong text, which is exactly
+        what this module says it prevents.
+        """
+        registry, _bindings, table = _table("a.md", "b.md")
+        (own,) = table.evidence_for("src_1")
+        span = GroundedSpan(
+            start=TEXT.index(BETA),
+            end=TEXT.index(BETA) + len(BETA),
+            source_id="src_1",
+            evidence_id=own,
+        )
+
+        assert label_passage(TEXT, [span], table, registry) == TEXT
+
+    def test_a_span_covering_half_its_passage_is_not_named(self):
+        """A truncated span names a claim the passage only partly supports,
+        and the marker would sit in the middle of the sentence it came
+        from."""
+        registry, _bindings, table = _table("a.md")
+        span = _span(registry, table, "src_1", covered="the inspection interval")
+
+        assert label_passage(TEXT, [span], table, registry) == TEXT
+
+    def test_an_envelope_around_the_passage_still_names_it(self):
+        """Containment, not equality. Every producer wraps its evidence in
+        text of the parent's own - an untrusted-data envelope, a `source:`
+        header, a result number - and the span covers the rendered run."""
+        registry, _bindings, table = _table("a.md")
+        wrapped = f"[a.md]\n{ALPHA}"
+        span = _span(registry, table, "src_1", covered=wrapped)
+
+        labelled = label_passage(TEXT, [span], table, registry)
+
+        marker = handle_marker(table.handle_for("src_1"))
+        assert f"{wrapped}{MARKER_SEPARATOR}{marker}" in labelled
+
+    def test_a_passage_the_registry_does_not_hold_is_not_named(self):
+        """A table that says a passage is eligible, and a registry with no
+        such passage.
+
+        The table alone cannot answer this: it stores evidence ids, so it can
+        list one that resolves to nothing. Reading only the table would find
+        the id eligible for a source that has a handle and place a marker
+        against text nothing was ever recorded for.
+        """
+        registry, _bindings, _built = _table("a.md")
+        table = _handed_table(cites="src_1", evidence=("ev_404",))
         span = GroundedSpan(
             start=TEXT.index(ALPHA),
             end=TEXT.index(ALPHA) + len(ALPHA),
             source_id="src_1",
-            evidence_id="ev_1",
+            evidence_id="ev_404",
         )
 
-        assert label_passage(TEXT, [span], table) == TEXT
+        assert label_passage(TEXT, [span], table, registry) == TEXT
+
+    def test_a_passage_the_table_files_under_the_wrong_source_is_not_named(
+        self,
+    ):
+        """The registry is the authority on which source a passage belongs to.
+
+        Here the table has been handed a passage of `src_2` filed under
+        `src_1`, so the eligibility check agrees with itself and is wrong. The
+        offsets are right for that passage, which is what makes it dangerous:
+        the marker would land on the sentence the passage really is, under the
+        other document's name.
+        """
+        registry, _bindings, built = _table("a.md", "b.md")
+        (foreign,) = built.evidence_for("src_2")
+        table = _handed_table(cites="src_1", evidence=(foreign,))
+        span = GroundedSpan(
+            start=TEXT.index(BETA),
+            end=TEXT.index(BETA) + len(BETA),
+            source_id="src_1",
+            evidence_id=foreign,
+        )
+
+        assert label_passage(TEXT, [span], table, registry) == TEXT
 
 
 class TestTheRepresentationIsOneTheRestOfTheSystemAgreesWith:
@@ -230,7 +372,7 @@ class TestTheRepresentationIsOneTheRestOfTheSystemAgreesWith:
             _span(registry, table, "src_2"),
         ]
 
-        labelled = label_passage(TEXT, spans, table)
+        labelled = label_passage(TEXT, spans, table, registry)
 
         assert labelled != TEXT
         assert strip_citations(labelled) == TEXT
@@ -243,7 +385,7 @@ class TestTheRepresentationIsOneTheRestOfTheSystemAgreesWith:
         registry, _bindings, table = _table("a.md")
         span = _span(registry, table, "src_1")
 
-        labelled = label_passage(TEXT, [span], table)
+        labelled = label_passage(TEXT, [span], table, registry)
 
         found = validate_citations(labelled, table)
         assert [item.source_id for item in found] == ["src_1"]
@@ -258,7 +400,7 @@ class TestNothingIsEditedInPlace:
         span = _span(registry, table, "src_1")
         spans = [span]
 
-        labelled = label_passage(TEXT, spans, table)
+        labelled = label_passage(TEXT, spans, table, registry)
 
         assert labelled != TEXT
         assert spans == [span]
@@ -275,8 +417,8 @@ class TestNothingIsEditedInPlace:
             _span(registry, table, "src_2"),
         ]
 
-        first = label_passage(TEXT, spans, table)
-        second = label_passage(TEXT, spans, table)
+        first = label_passage(TEXT, spans, table, registry)
+        second = label_passage(TEXT, spans, table, registry)
 
         assert first == second
 
