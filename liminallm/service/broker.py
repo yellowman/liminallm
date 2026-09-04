@@ -58,6 +58,13 @@ from liminallm.service.provenance import (
 )
 from liminallm.service.sandbox import tool_network_guard
 from liminallm.service.tool_worker import FrameBudget
+from liminallm.service.transcript import (
+    ModelTurn,
+    ToolRound,
+    TrustedToolResult,
+    TrustedTranscript,
+    calls_match,
+)
 from liminallm.service.wire import WireError, recv_frame, send_frame
 
 logger = get_logger(__name__)
@@ -140,6 +147,13 @@ class InvocationContext:
     #: bindings and for the same reason, and restored from the ledger on a
     #: replay so a replacement attempt inherits what the first one rendered.
     grounded_passages: List[GroundedPassage] = field(default_factory=list)
+    #: What the parent did, in order: its own copy of the conversation the
+    #: worker is driving. Append-only and deduped by operation sequence, so a
+    #: replayed operation restores its entry rather than adding a second copy
+    #: of one exchange. This is what a later stage builds model input from,
+    #: because a message that carries a citation has to be one the parent
+    #: constructed rather than one the worker sent back.
+    transcript: TrustedTranscript = field(default_factory=TrustedTranscript)
 
 
 class CapabilityBroker:
@@ -475,6 +489,7 @@ class CapabilityBroker:
         grounds: Optional[List[Dict[str, Optional[str]]]],
         spans: Optional[List[GroundedSpan]] = None,
         passages: Optional[List[GroundedPassage]] = None,
+        transcript: Optional[List[Dict[str, Any]]] = None,
     ) -> CapabilityOutcome:
         """The reply, and beside it what the parent learned by serving it.
 
@@ -502,6 +517,8 @@ class CapabilityBroker:
             )
         if kept:
             state["grounded_passages"] = [passage.as_dict() for passage in kept]
+        if transcript:
+            state["transcript"] = transcript
         return CapabilityOutcome(public=public, parent_state=state or None)
 
     def _with_findings(
@@ -581,6 +598,11 @@ class CapabilityBroker:
         # places and both are real positions in two different strings.
         for passage in parent_state.get("grounded_passages") or []:
             self._ctx.grounded_passages.append(GroundedPassage.from_dict(passage))
+        # Deduped by operation, unlike the passages above: those are positions
+        # in two different strings and both are real, while this is one
+        # operation's entry and an operation has one outcome however many
+        # attempts replay it.
+        self._ctx.transcript.restore(parent_state.get("transcript") or [])
 
     # -- retrieval, notes, history ----------------------------------------
 
@@ -652,7 +674,7 @@ class CapabilityBroker:
     # -- the model --------------------------------------------------------
 
     def _llm_generate_with_tools(
-        self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
+        self, invocation: Invocation, seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
         """One model turn, in two representations.
 
@@ -705,12 +727,31 @@ class CapabilityBroker:
         # rather than left for a later reader to simplify away: what it
         # guards is the next field, not this one.
         assert_scrubbed(public, nonce)
+        # Two records of one turn, and they are not redundant. The
+        # canonical response is replacement state, because the final answer's
+        # citations come from the last model turn and nothing else. The
+        # transcript entry is append-only, because the prompt of the *next*
+        # model turn contains this one and replacement cannot say so.
+        #
+        # Both travel in `parent_state` and neither is applied here: the
+        # broker folds that in on the way out whether the handler ran or the
+        # ledger replayed it, so recording directly would be a second path
+        # that only the first attempt takes.
+        turn = ModelTurn(
+            operation_seq=seq,
+            content=canonical["content"],
+            tool_calls=tuple(dict(call) for call in canonical["tool_calls"]),
+            assistant_message=canonical["assistant_message"],
+        )
         return CapabilityOutcome(
             public=public,
             # What the worker must not see, kept where a replay can restore
             # it: the answer as the model wrote it, which is the only copy
             # any citation can honestly be read out of.
-            parent_state={"canonical_model_response": canonical},
+            parent_state={
+                "canonical_model_response": canonical,
+                "transcript": [turn.as_dict()],
+            },
         )
 
     # -- one round of the agent loop --------------------------------------
@@ -751,6 +792,15 @@ class CapabilityBroker:
                 conversation_id=self._ctx.conversation_id,
                 user_id=self._ctx.user_id,
             )
+        # Whether this is the round the previous model turn asked for.
+        # A round that is not still runs - what a worker may request is the
+        # capability layer's question and it answers that one unchanged - but
+        # the parent can no longer reconstruct the exchange faithfully, so
+        # nothing in it may carry a citation.
+        offered = (self._ctx.canonical_model_response or {}).get("tool_calls") or []
+        offerable = calls_match(
+            offered, [{"name": name, "arguments": args} for _c, name, args in parsed]
+        )
         snippets: List[str] = []
         round_bindings: List[Binding] = []
         round_passages: List[GroundedPassage] = []
@@ -772,6 +822,32 @@ class CapabilityBroker:
             passages=round_passages,
         )
         after = list(invocation.session.get("artifacts") or [])
+        # Every call, including the ones that grounded nothing: this record
+        # exists so a tool message can be rebuilt without asking the worker
+        # what happened, and a gap in the middle of a round is as much a gap
+        # as a wrong entry.
+        by_index = {
+            passage.call_index: passage.spans for passage in round_passages
+        }
+        round_entry = ToolRound(
+            operation_seq=seq,
+            offerable=offerable,
+            results=tuple(
+                TrustedToolResult(
+                    operation_seq=seq,
+                    call_index=index,
+                    tool_name=name,
+                    submitted_call_id=str(call.get("id") or ""),
+                    # The rule the worker's own assembly uses, computed here
+                    # so the parent need not read it back to rebuild the
+                    # message.
+                    tool_message_id=str(call.get("id") or "") or name,
+                    text=str(results[index]) if index < len(results) else "",
+                    spans=by_index.get(index, ()),
+                )
+                for index, (call, name, _args) in enumerate(parsed)
+            ),
+        )
         # A round is one committed operation, so its grounding is committed
         # with it and comes back on a replay by the same route a single
         # retrieval's does.
@@ -784,6 +860,7 @@ class CapabilityBroker:
             },
             round_bindings,
             passages=round_passages,
+            transcript=[round_entry.as_dict()],
         )
 
     def _tool_host(
