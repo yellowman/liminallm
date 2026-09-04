@@ -44,6 +44,12 @@ from liminallm.service import (
 from liminallm.service import attachments as attachments_service
 from liminallm.service import notes as notes_service
 from liminallm.service.broker import CapabilityBroker, InvocationContext
+from liminallm.service.citation_offers import (
+    CITATION_INSTRUCTION,
+    OfferRender,
+    choose_offers,
+    label_snippets,
+)
 from liminallm.service.citations import transfer_citations
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
@@ -1946,6 +1952,91 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
         return aligned
 
+    def _offered_context(
+        self,
+        invocation: Optional[Invocation],
+        registry: Optional[SourceRegistry],
+        snippets: List[str],
+        aligned: Sequence[Optional[Binding]],
+        *,
+        prompt: str,
+        adapters: List[dict],
+        history: List[Any],
+    ) -> Tuple[List[str], Optional[str]]:
+        """The context snippets as the model will see them, and the rule.
+
+        The automatic route's whole prompt is these snippets plus the
+        question, so labelling them is the entire offer: there is no
+        transcript to rebuild and no worker message list to distrust. What it
+        shares with the agent seam is the arithmetic - speculate, render,
+        price the prepared form, commit only what a marker reached, render
+        once more from the committed table, and refuse if the two disagree.
+
+        Returns the snippets unchanged and no instruction whenever citations
+        cannot be carried, which is also what the gate does. A model told to
+        copy markers and shown none is being asked about something that is
+        not there.
+
+        `aligned` is what makes this safe to do positionally: one entry per
+        snippet, `None` for the parent's own digest and recall window. Those
+        are summaries of the conversation rather than documents, and a marker
+        on one would offer the model a citation for text no source said.
+
+        The budget is not applied again afterwards. Pruning here would drop a
+        snippet out of a prompt that was already priced with it, and the
+        handles committed for it would then name text the model never read.
+        A prompt that cannot afford its markers gives them up whole instead.
+        """
+        if (
+            not self.CITATION_OFFERS_ENABLED
+            or invocation is None
+            or registry is None
+        ):
+            return list(snippets), None
+
+        def render(table) -> OfferRender:
+            labelled, markers, placed = label_snippets(
+                snippets, aligned, table, registry
+            )
+            messages, _adapters = self.llm._prepare_generation(
+                prompt, adapters, labelled, history,
+                instruction=CITATION_INSTRUCTION,
+            )
+            return OfferRender(
+                messages=messages, markers=tuple(markers), placed=tuple(placed)
+            )
+
+        choice = choose_offers(
+            registry=registry,
+            committed=invocation.citations,
+            candidates=[found for found in aligned if found],
+            render=render,
+            counter=self.llm.token_counter(),
+            budget=self.prompt_budget(),
+        )
+        if not choice.fits:
+            # Measured equivalent today, and kept for the same reason the
+            # broker keeps its twin: a `fits` false choice carries no
+            # messages, so the comparison below would refuse it anyway. What
+            # this line adds is that the two refusals stay different facts -
+            # a prompt with no room for markers, and a namespace that moved -
+            # rather than one branch standing in for both.
+            return list(snippets), None
+        table = invocation.extend_citations(registry, list(choice.granted))
+        labelled, _markers, _placed = label_snippets(
+            snippets, aligned, table, registry
+        )
+        final, _adapters = self.llm._prepare_generation(
+            prompt, adapters, labelled, history, instruction=CITATION_INSTRUCTION,
+        )
+        if final != choice.messages:
+            # The committed table did not reproduce the prompt priced from its
+            # speculative twin - a branch that took the numbers this one
+            # reserved, since the table belongs to the invocation and branches
+            # run concurrently. What would go is not what was measured.
+            return list(snippets), None
+        return labelled, CITATION_INSTRUCTION
+
     @staticmethod
     def _merge_bindings(
         collected: List[Dict[str, str]],
@@ -3308,6 +3399,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         inputs: Dict[str, Any],
         *,
         context: InvocationContext,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         """Run a builtin whose body still belongs in the parent.
 
@@ -3332,6 +3424,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             context.tenant_id,
             source_registry=context.source_registry,
             bindings_sink=context.provenance_bindings,
+            invocation=invocation,
         )
 
     #: The host bodies whose result is the turn's answer.
@@ -4327,6 +4420,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         message = (
             inputs.get("message") or inputs.get("prompt") or inputs.get("text") or ""
@@ -4367,24 +4461,36 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # After the budget, never before it: a chunk the pruner dropped never
         # reached the model, and registering it would make it an eligible
         # citation target for an answer it did not ground.
-        self._record_grounding(
+        aligned = self._record_grounding(
             source_registry, ctx_chunks, context_snippets,
             leading=leading, sink=bindings_sink,
         )
+        shown, instruction = self._offered_context(
+            invocation, source_registry, context_snippets, aligned,
+            prompt=message or "", adapters=adapters, history=history,
+        )
+        # Passed only when there is one, so a turn that offers nothing calls
+        # exactly the signature it always called. What is calibrated below and
+        # returned to the caller stays the unlabelled text: the markers are
+        # prompt mechanics, and a snippet is not longer for having been shown
+        # with one.
+        offer = {"instruction": instruction} if instruction else {}
         try:
             resp = self.llm.generate(
                 message or "",
                 adapters=adapters,
-                context_snippets=context_snippets,
+                context_snippets=shown,
                 history=history,
                 user_id=user_id,
+                **offer,
             )
         except TypeError:
             resp = self.llm.generate(
                 message or "",
                 adapters=adapters,
-                context_snippets=context_snippets,
+                context_snippets=shown,
                 history=history,
+                **offer,
             )
         # The provider just told us exactly how many prompt tokens it counted;
         # that is ground truth for calibrating our estimate.
@@ -4440,6 +4546,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         question = inputs.get("question") or inputs.get("message") or ""
         ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
@@ -4453,23 +4560,30 @@ class WorkflowEngine(WorkflowStreamingMixin):
         snippets = [c.content for c in chunks]
         # No budgeting between here and the model: every retrieved chunk is
         # sent, so every one of them grounded the answer.
-        self._record_grounding(
+        aligned = self._record_grounding(
             source_registry, chunks, snippets, leading=0, sink=bindings_sink,
         )
+        shown, instruction = self._offered_context(
+            invocation, source_registry, snippets, aligned,
+            prompt=question or "", adapters=adapters, history=history,
+        )
+        offer = {"instruction": instruction} if instruction else {}
         try:
             resp = self.llm.generate(
                 question or "",
                 adapters=adapters,
-                context_snippets=snippets,
+                context_snippets=shown,
                 history=history,
                 user_id=user_id,
+                **offer,
             )
         except TypeError:
             resp = self.llm.generate(
                 question or "",
                 adapters=adapters,
-                context_snippets=snippets,
+                context_snippets=shown,
                 history=history,
+                **offer,
             )
         return {
             "content": resp["content"],
@@ -4491,6 +4605,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         message = inputs.get("message") or user_message or ""
         lowered = message.lower()
@@ -4512,6 +4627,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         prompt = inputs.get("message") or inputs.get("prompt") or ""
         resp = self.llm.generate(
@@ -4536,6 +4652,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         return {"content": inputs.get("message", ""), "usage": {}, "status": "end"}
 

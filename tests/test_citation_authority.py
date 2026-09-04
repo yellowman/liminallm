@@ -15,6 +15,7 @@ import random
 import string
 import uuid
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
@@ -35,6 +36,8 @@ from liminallm.service.provenance import (
     binding,
 )
 from liminallm.service.runtime import get_runtime
+from liminallm.service import workflow as workflow_module
+from liminallm.storage.models import KnowledgeChunk
 from tests.mcpfixture import allow_local
 
 NONCE = "K7Q2ABCD"
@@ -1669,3 +1672,288 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
 
         assert "[cite:" not in json.dumps(seen["messages"])
         assert not invocation.citations
+
+
+class TestTheAutomaticRouteOffersItsOwnSnippets:
+    """The retrieval route has no transcript and no worker: the whole prompt
+    is the retrieved snippets plus the question. So labelling the snippets is
+    the entire offer, and the same arithmetic still applies - speculate,
+    price the prepared prompt, commit only what a marker reached, render once
+    more from the table that was committed.
+    """
+
+    QUESTION = "how long between services"
+
+    @staticmethod
+    def _retrieval(engine, monkeypatch, *, offers, contents):
+        """A context retrieval that returns exactly these chunks."""
+        if offers is not None:
+            monkeypatch.setattr(
+                type(engine), "CITATION_OFFERS_ENABLED", offers, raising=False
+            )
+        chunks = [
+            KnowledgeChunk(
+                context_id="ctx",
+                fs_path=f"/files/manual{index}.md",
+                content=content,
+                embedding=[],
+                chunk_index=index,
+            )
+            for index, content in enumerate(contents)
+        ]
+        monkeypatch.setattr(
+            engine, "rag", SimpleNamespace(retrieve=lambda *a, **k: chunks)
+        )
+        monkeypatch.setattr(engine, "_validate_context_scope", lambda ids, **k: ["ctx"])
+        monkeypatch.setattr(engine, "_resolve_context_ids", lambda a, b: ["ctx"])
+        return chunks
+
+    @staticmethod
+    def _capturing(engine, monkeypatch):
+        """The real preparation, recorded. `generate` is what the route calls,
+        and it is the one place both the snippets and the instruction meet -
+        so the double runs the service's own builder rather than inventing a
+        prompt shape of its own."""
+        seen: dict = {}
+
+        def _generate(prompt, adapters=None, context_snippets=None, history=None,
+                      *, user_id=None, instruction=None):
+            messages, _adapters = engine.llm._prepare_generation(
+                prompt, adapters or [], list(context_snippets or []), history,
+                instruction=instruction,
+            )
+            seen["messages"] = deepcopy(messages)
+            seen["snippets"] = list(context_snippets or [])
+            seen["instruction"] = instruction
+            return {"content": ANSWER, "usage": {}}
+
+        monkeypatch.setattr(engine.llm, "generate", _generate, raising=False)
+        return seen
+
+    @staticmethod
+    def _invocation(engine):
+        return engine.invocations.open(
+            uuid.uuid4().hex, tool="llm.generic", user_id="u", tenant_id=None
+        )
+
+    def _run(self, engine, *, registry, invocation):
+        return engine._tool_llm_generic(
+            {"message": self.QUESTION}, [], [], "ctx", None, self.QUESTION,
+            "u", None,
+            source_registry=registry, bindings_sink=[], invocation=invocation,
+        )
+
+    def test_with_the_gate_off_nothing_is_labelled_and_nothing_is_said(
+        self, store, monkeypatch
+    ):
+        """Production. The snippet reaches the model as retrieval wrote it."""
+        engine = get_runtime().workflow
+        self._retrieval(engine, monkeypatch, offers=False, contents=[ANSWER])
+        seen = self._capturing(engine, monkeypatch)
+        registry = SourceRegistry()
+        invocation = self._invocation(engine)
+
+        self._run(engine, registry=registry, invocation=invocation)
+
+        assert seen["snippets"] == [ANSWER]
+        assert seen["instruction"] is None
+        assert not invocation.citations
+
+    def test_the_engine_as_it_ships_offers_nothing(self, store, monkeypatch):
+        """The shipped default, read off the engine rather than off a patch."""
+        engine = get_runtime().workflow
+        self._retrieval(engine, monkeypatch, offers=None, contents=[ANSWER])
+        seen = self._capturing(engine, monkeypatch)
+        registry = SourceRegistry()
+        invocation = self._invocation(engine)
+
+        self._run(engine, registry=registry, invocation=invocation)
+
+        assert seen["snippets"] == [ANSWER]
+        assert seen["instruction"] is None
+        assert not invocation.citations
+
+    def test_a_retrieved_snippet_is_shown_with_its_marker(
+        self, store, monkeypatch
+    ):
+        """The offer, end to end: a handle exists, the marker follows the
+        passage it names, and the rule that explains it is in the system
+        block rather than welded onto the question."""
+        engine = get_runtime().workflow
+        self._retrieval(engine, monkeypatch, offers=True, contents=[ANSWER])
+        seen = self._capturing(engine, monkeypatch)
+        registry = SourceRegistry()
+        invocation = self._invocation(engine)
+
+        result = self._run(engine, registry=registry, invocation=invocation)
+
+        handle = invocation.citations.handle_for("src_1")
+        assert handle, dict(invocation.citations.by_source)
+        assert seen["snippets"] == [f"{ANSWER} [cite:{handle}]"]
+        assert seen["instruction"] == CITATION_INSTRUCTION
+        system = seen["messages"][0]
+        assert system["role"] == "system"
+        assert CITATION_INSTRUCTION in system["content"]
+        assert CITATION_INSTRUCTION not in json.dumps(
+            [m for m in seen["messages"] if m.get("role") == "user"]
+        )
+        # What the node reports is still the text, not the prompt mechanics.
+        assert result["context_snippets"] == [ANSWER]
+
+    def test_the_parents_own_summaries_are_never_labelled(
+        self, store, monkeypatch
+    ):
+        """The digest and the recall window are the parent describing the
+        conversation, not a document. A marker on one would offer the model a
+        citation for text no source said."""
+        engine = get_runtime().workflow
+        self._retrieval(engine, monkeypatch, offers=True, contents=[ANSWER])
+        seen = self._capturing(engine, monkeypatch)
+        monkeypatch.setattr(engine, "_digest_snippet", lambda *a, **k: "Earlier: hi")
+        monkeypatch.setattr(
+            engine, "_recall_snippet", lambda *a, **k: "Recalled: also hi"
+        )
+        registry = SourceRegistry()
+        invocation = self._invocation(engine)
+
+        self._run(engine, registry=registry, invocation=invocation)
+
+        handle = invocation.citations.handle_for("src_1")
+        assert seen["snippets"] == [
+            "Earlier: hi", "Recalled: also hi", f"{ANSWER} [cite:{handle}]",
+        ]
+
+    def test_what_the_backend_receives_is_what_was_priced(
+        self, store, monkeypatch
+    ):
+        """Tree equality. The preview and the call are the same builder over
+        the same input, so a prompt measured under one shape and sent under
+        another is the defect this catches."""
+        engine = get_runtime().workflow
+        self._retrieval(engine, monkeypatch, offers=True, contents=[ANSWER])
+        seen = self._capturing(engine, monkeypatch)
+        priced: dict = {}
+        real = workflow_module.choose_offers
+
+        def _spy(**kwargs):
+            choice = real(**kwargs)
+            priced["messages"] = deepcopy(choice.messages)
+            return choice
+
+        monkeypatch.setattr(workflow_module, "choose_offers", _spy)
+        registry = SourceRegistry()
+        invocation = self._invocation(engine)
+
+        self._run(engine, registry=registry, invocation=invocation)
+
+        assert seen["messages"] == priced["messages"]
+
+    def test_a_prompt_with_no_room_for_markers_is_sent_without_them(
+        self, store, monkeypatch
+    ):
+        """The offers go, the turn does not. What is left is the prompt the
+        route would have built anyway - no markers, and no rule about them.
+
+        The budget is measured, not picked: exactly what the unlabelled
+        prompt costs. Anything smaller is refused by the pruner before the
+        offers are reached, and would witness a different rule.
+        """
+        engine = get_runtime().workflow
+        self._retrieval(engine, monkeypatch, offers=True, contents=[ANSWER])
+        seen = self._capturing(engine, monkeypatch)
+        bare, _adapters = engine.llm._prepare_generation(
+            self.QUESTION, [], [ANSWER], []
+        )
+        exact = engine.llm.token_counter().count_messages(bare)
+        monkeypatch.setattr(engine, "prompt_budget", lambda: exact)
+        registry = SourceRegistry()
+        invocation = self._invocation(engine)
+
+        self._run(engine, registry=registry, invocation=invocation)
+
+        assert seen["snippets"] == [ANSWER]
+        assert seen["instruction"] is None
+        assert not invocation.citations
+
+    def test_a_namespace_that_moved_under_the_price_sends_neither_prompt(
+        self, store, monkeypatch
+    ):
+        """A branch that commits between the pricing and the commit takes the
+        numbers this one reserved. What would render then is a prompt nobody
+        measured, so the snippets go unlabelled instead."""
+        engine = get_runtime().workflow
+        self._retrieval(engine, monkeypatch, offers=True, contents=[ANSWER])
+        seen = self._capturing(engine, monkeypatch)
+        registry = SourceRegistry()
+        invocation = self._invocation(engine)
+        rival = registry.register_source(
+            kind="file", title="other.md", locator="/files/other.md"
+        )
+        rival_evidence = registry.add_evidence(rival.source_id, text="unrelated")
+        real = workflow_module.choose_offers
+
+        def _racing(**kwargs):
+            choice = real(**kwargs)
+            invocation.extend_citations(
+                registry, [binding(rival.source_id, rival_evidence.evidence_id)]
+            )
+            return choice
+
+        monkeypatch.setattr(workflow_module, "choose_offers", _racing)
+
+        self._run(engine, registry=registry, invocation=invocation)
+
+        assert seen["snippets"] == [ANSWER]
+        assert seen["instruction"] is None
+
+    def test_the_body_gets_its_invocation_through_the_host_call(
+        self, store, monkeypatch
+    ):
+        """The route reached the way production reaches it.
+
+        Every other witness here calls the body directly, so all of them
+        would still pass if the broker never handed it the invocation - and
+        production would then offer nothing, silently, with the flag on. This
+        one goes through `tool.host`, where the invocation actually lives.
+        """
+        engine = get_runtime().workflow
+        self._retrieval(engine, monkeypatch, offers=True, contents=[ANSWER])
+        seen = self._capturing(engine, monkeypatch)
+        registry = SourceRegistry()
+        invocation = self._invocation(engine)
+        context = InvocationContext(user_id="u", source_registry=registry)
+        context.remember_host_call("llm.generic", {"message": self.QUESTION})
+        broker = CapabilityBroker(engine, context)
+
+        broker._answer(invocation, {
+            "capability": "tool.host", "operation_seq": 1,
+            "payload": {
+                "tool": "llm.generic", "inputs": {"message": self.QUESTION},
+            },
+        })
+
+        handle = invocation.citations.handle_for("src_1")
+        assert handle, dict(invocation.citations.by_source)
+        assert seen["snippets"] == [f"{ANSWER} [cite:{handle}]"]
+        assert seen["instruction"] == CITATION_INSTRUCTION
+
+    def test_the_rag_route_offers_on_the_same_terms(self, store, monkeypatch):
+        """`rag.answer_with_context_v1` is the same shape - retrieve, ground,
+        generate - and a fix that stopped at `llm.generic` would leave the
+        other answering host uncitable."""
+        engine = get_runtime().workflow
+        self._retrieval(engine, monkeypatch, offers=True, contents=[ANSWER])
+        seen = self._capturing(engine, monkeypatch)
+        registry = SourceRegistry()
+        invocation = self._invocation(engine)
+
+        engine._tool_rag_answer(
+            {"question": self.QUESTION}, [], [], "ctx", None, self.QUESTION,
+            "u", None,
+            source_registry=registry, bindings_sink=[], invocation=invocation,
+        )
+
+        handle = invocation.citations.handle_for("src_1")
+        assert handle, dict(invocation.citations.by_source)
+        assert seen["snippets"] == [f"{ANSWER} [cite:{handle}]"]
+        assert seen["instruction"] == CITATION_INSTRUCTION

@@ -88,13 +88,24 @@ class LLMService:
         adapters: List[dict],
         context_snippets: List[str],
         history: Optional[List[Message]] = None,
+        *,
+        instruction: Optional[str] = None,
     ) -> tuple[List[dict], List[dict]]:
         """Prepare messages and adapters for generation.
+
+        `instruction` is caller-owned system text - how to write the answer
+        this prompt is asking for. It goes on the end of the service's own
+        system block, not into the user's message: the user prompt is what
+        the person asked, and a rule appended to it reads to the model as
+        part of the question and comes back quoted in the answer.
 
         Returns:
             Tuple of (messages, normalized_adapters) ready for the backend.
         """
-        messages = [{"role": "system", "content": "You are a concise assistant."}]
+        system = "You are a concise assistant."
+        if instruction:
+            system = f"{system}\n\n{instruction}"
+        messages = [{"role": "system", "content": system}]
         if history:
             for msg in history:
                 messages.append({"role": msg.role, "content": msg.content})
@@ -113,9 +124,10 @@ class LLMService:
         history: Optional[List[Message]] = None,
         *,
         user_id: Optional[str] = None,
+        instruction: Optional[str] = None,
     ) -> dict:
         messages, normalized_adapters = self._prepare_generation(
-            prompt, adapters, context_snippets, history
+            prompt, adapters, context_snippets, history, instruction=instruction
         )
         return self.backend.generate(messages, normalized_adapters, user_id=user_id)
 

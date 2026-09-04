@@ -1282,7 +1282,8 @@ class CapabilityBroker:
         # and this line is running bytes nobody checked, on the call whose
         # result becomes authority.
         canonical = self._engine._run_host_tool(
-            self._ctx.host_body, deepcopy(self._ctx.host_inputs), context=self._ctx
+            self._ctx.host_body, deepcopy(self._ctx.host_inputs),
+            context=self._ctx, invocation=invocation,
         )
         nonce = invocation.citations.nonce
         if invocation.citations:
