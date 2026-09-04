@@ -19,10 +19,33 @@ rendered.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from liminallm.service.citations import CitationTable
-from liminallm.service.provenance import GroundedSpan, SourceRegistry
+from liminallm.service.citations import CitationTable, extend_citation_table
+from liminallm.service.provenance import (
+    Binding,
+    GroundedSpan,
+    ProvenanceError,
+    SourceRegistry,
+)
+from liminallm.service.transcript import ModelTurn, ToolRound, TrustedTranscript
+
+#: What the model is told about the markers it is being shown.
+#:
+#: Parent-owned and carrying no real handle: a handle in the instruction would
+#: be one the model could copy without having read anything.
+#:
+#: Two sentences because the second is not implied by the first. "Copy the
+#: marker" says what to do with one that is there; a model that has understood
+#: the shape can also produce a well-formed one for a source it likes, and
+#: that marker resolves - the namespace is this turn's, and the source may
+#: genuinely be citable. It just was not what the passage said.
+CITATION_INSTRUCTION = (
+    "When a supporting passage includes a citation marker, copy that exact "
+    "marker after claims based on that passage. Never invent or alter "
+    "citation markers."
+)
 
 #: What separates a passage's text from the marker offered for it. One space,
 #: and the marker inline at the end of the grounded run rather than on a line
@@ -67,6 +90,108 @@ def marker_cost(counter: Any, marker: str) -> int:
     if getattr(counter, "exact", False):
         return counted
     return max(counted, len(marker.encode("ascii")))
+
+
+def marker_surcharge(counter: Any, markers: Sequence[str]) -> int:
+    """What the message count is short by, over these markers.
+
+    A surcharge and not a cost. The markers are already inside the messages
+    the counter was given, so it has priced each one once; adding
+    `marker_cost` on top would charge twice. What is added is only the
+    difference between the conservative price and the one the counter gave -
+    zero for every marker when the counter is exact.
+    """
+    return sum(
+        max(0, marker_cost(counter, marker) - counter.count(marker))
+        for marker in markers
+    )
+
+
+@dataclass(frozen=True)
+class OfferChoice:
+    """What one model call may offer, rendered and priced.
+
+    `fits` false is the terminal condition: not "these offers did not fit"
+    but "this prompt does not fit even offering nothing new", which is a
+    property of the assembly rather than of a candidate. The caller sends the
+    unlabelled prompt and stops offering for the rest of it.
+    """
+
+    table: CitationTable
+    messages: List[dict]
+    markers: Tuple[str, ...]
+    tokens: int
+    granted: Tuple[Binding, ...]
+    fits: bool
+
+
+def _already_offered(table: CitationTable, entry: Binding) -> bool:
+    source_id = str(entry.get("source_id") or "")
+    return table.handle_for(source_id) is not None and str(
+        entry.get("evidence_id") or ""
+    ) in table.evidence_for(source_id)
+
+
+def choose_offers(
+    *,
+    registry: SourceRegistry,
+    committed: CitationTable,
+    candidates: Sequence[Binding],
+    render: Callable[[CitationTable], Tuple[List[Dict[str, Any]], List[str]]],
+    counter: Any,
+    budget: int,
+) -> OfferChoice:
+    """The largest prefix of `candidates` whose prompt still fits.
+
+    Speculative throughout. `extend_citation_table` is pure, so a candidate
+    table can be built, rendered and priced without any of it becoming the
+    invocation's - which matters because a source that loses the budget
+    decision must not come out of it holding a handle. The caller commits the
+    survivors afterwards and renders once more from the table it actually got.
+
+    The unit is the relation, not the occurrence. Committing one passage
+    labels every span that names it on the next render, so choosing per
+    occurrence would describe a state the second materialization cannot
+    reproduce.
+
+    Nothing already committed is withheld. Those handles are in text the model
+    has already read, and taking one back would leave a marker in the
+    conversation resolving to a source the table no longer offers. They are
+    the floor: when the prompt does not fit with only those, there is nothing
+    left to give up and the answer is that citations cannot be carried here.
+
+    Withheld from the end, so priority is the caller's to express by ordering.
+    """
+    required = [entry for entry in candidates if _already_offered(committed, entry)]
+    fresh = [
+        entry for entry in candidates if not _already_offered(committed, entry)
+    ]
+    while True:
+        offered = required + fresh
+        table = extend_citation_table(registry, committed, offered)
+        messages, markers = render(table)
+        tokens = counter.count_messages(messages) + marker_surcharge(
+            counter, markers
+        )
+        if tokens <= budget:
+            return OfferChoice(
+                table=table,
+                messages=messages,
+                markers=tuple(markers),
+                tokens=tokens,
+                granted=tuple(offered),
+                fits=True,
+            )
+        if not fresh:
+            return OfferChoice(
+                table=committed,
+                messages=[],
+                markers=(),
+                tokens=tokens,
+                granted=(),
+                fits=False,
+            )
+        fresh.pop()
 
 
 def _eligible(table: CitationTable, span: GroundedSpan) -> Optional[str]:
@@ -192,3 +317,157 @@ def label_passage(
             labelled[:offset] + MARKER_SEPARATOR + marker + labelled[offset:]
         )
     return labelled
+
+
+def _labelled_with_markers(
+    text: str,
+    spans: Sequence[GroundedSpan],
+    table: CitationTable,
+    registry: SourceRegistry,
+) -> Tuple[str, List[str]]:
+    """`label_passage`, and the markers it actually placed.
+
+    The budget needs the second half. Which spans earned a marker is decided
+    inside the labelling and not by the caller - a span can be eligible and
+    still be dropped for its offsets - so counting what was offered would
+    price markers that are not in the text.
+    """
+    labelled = label_passage(text, spans, table, registry)
+    markers = [
+        handle_marker(handle)
+        for handle in (
+            _eligible(table, span)
+            for span in spans
+            if _placeable(text, span) and _covers_its_evidence(registry, text, span)
+        )
+        if handle is not None
+    ]
+    return labelled, markers
+
+
+def label_snippets(
+    snippets: Sequence[str],
+    grounds: Sequence[Optional[Binding]],
+    table: CitationTable,
+    registry: SourceRegistry,
+) -> Tuple[List[str], List[str]]:
+    """Context snippets with their markers, and the markers placed.
+
+    The automatic retrieval route has no spans, because it needs none: a
+    snippet *is* a passage, so the run a marker follows is the whole string.
+    Building that span here rather than giving this route a rendering rule of
+    its own keeps one placement contract - the same eligibility, the same
+    containment check, the same separator - and means a snippet that does not
+    contain the passage it is filed under gets no marker on this path either.
+
+    `grounds` is the aligned vector: one entry per snippet, `None` where the
+    snippet is the parent's own digest or recall window rather than a
+    document. A length mismatch would silently attach markers to the wrong
+    snippets, so it is refused rather than zipped.
+    """
+    if len(grounds) != len(snippets):
+        raise ProvenanceError(
+            "grounding is not aligned: "
+            f"{len(grounds)} entries for {len(snippets)} snippets"
+        )
+    labelled: List[str] = []
+    placed: List[str] = []
+    for snippet, ground in zip(snippets, grounds):
+        if not ground:
+            labelled.append(snippet)
+            continue
+        span = GroundedSpan(
+            start=0,
+            end=len(snippet),
+            source_id=str(ground.get("source_id") or ""),
+            evidence_id=str(ground.get("evidence_id") or ""),
+        )
+        text, markers = _labelled_with_markers(snippet, [span], table, registry)
+        labelled.append(text)
+        placed.extend(markers)
+    return labelled, placed
+
+
+def instruct(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The messages with the citation instruction added to the system block.
+
+    Appended to the first system message rather than inserted as one of its
+    own. A second system message is a second thing for a small model to weigh
+    against the first, and this instruction is about how to write the answer
+    the rest of that block is asking for.
+
+    A conversation with no system message gets one. That is not a shape the
+    agent path produces - it always builds a system block - so it is the
+    plain-list case, and the instruction has to land somewhere.
+    """
+    prepared = [dict(message) for message in messages or []]
+    for message in prepared:
+        if message.get("role") == "system":
+            body = str(message.get("content") or "")
+            message["content"] = (
+                f"{body}\n\n{CITATION_INSTRUCTION}" if body else CITATION_INSTRUCTION
+            )
+            return prepared
+    prepared.insert(0, {"role": "system", "content": CITATION_INSTRUCTION})
+    return prepared
+
+
+def rebuild_agent_messages(
+    initial_messages: Sequence[Dict[str, Any]],
+    transcript: TrustedTranscript,
+    table: CitationTable,
+    registry: SourceRegistry,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """The conversation so far, from parent state only, with its offers in it.
+
+    The worker assembles a message list of its own and sends it with every
+    model call, and every message in it describes something the parent did.
+    That was fine while nothing in it carried authority. It stops being fine
+    the moment a tool result carries a citation marker: the marker would be in
+    bytes the untrusted half chose, beside prose it also chose, and the model
+    would be answering a conversation the parent cannot vouch for.
+
+    So this is built from the base prompt the parent kept and the record it
+    wrote as the turn ran - never from `payload["messages"]`.
+
+    Only offerable rounds contribute. A round whose calls were not the calls
+    the previous model turn asked for cannot be reconstructed faithfully - its
+    results may not even have a trustworthy `tool_call_id` - so it is left out
+    of the reconstruction entirely rather than included unlabelled. The
+    assembly has already lost its citation authority by then; this is what
+    stops the parent asserting a conversation shape it cannot support.
+
+    Model turns go in as they are. They are the public reply the worker
+    continued from, and they carry no namespace by construction.
+    """
+    messages = [dict(message) for message in initial_messages or []]
+    markers: List[str] = []
+    for entry in transcript.entries:
+        if isinstance(entry, ModelTurn):
+            if entry.assistant_message is not None:
+                messages.append(dict(entry.assistant_message))
+            else:
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": entry.content,
+                        "tool_calls": [dict(call) for call in entry.tool_calls],
+                    }
+                )
+            continue
+        if not isinstance(entry, ToolRound) or not entry.offerable:
+            continue
+        for result in entry.results:
+            text, placed = _labelled_with_markers(
+                result.text, result.spans, table, registry
+            )
+            markers.extend(placed)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": result.tool_message_id,
+                    "name": result.tool_name,
+                    "content": text,
+                }
+            )
+    return messages, markers

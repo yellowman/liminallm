@@ -14,18 +14,35 @@ from __future__ import annotations
 import pytest
 
 from liminallm.service.citation_offers import (
+    CITATION_INSTRUCTION,
     MARKER_SEPARATOR,
+    choose_offers,
     handle_marker,
+    instruct,
     label_passage,
+    label_snippets,
     marker_cost,
+    marker_surcharge,
+    rebuild_agent_messages,
 )
 from liminallm.service.citations import (
     CitationTable,
     build_citation_table,
     strip_citations,
 )
-from liminallm.service.provenance import GroundedSpan, SourceRegistry, binding
+from liminallm.service.provenance import (
+    GroundedSpan,
+    ProvenanceError,
+    SourceRegistry,
+    binding,
+)
 from liminallm.service.token_counting import TokenCounter
+from liminallm.service.transcript import (
+    ModelTurn,
+    ToolRound,
+    TrustedToolResult,
+    TrustedTranscript,
+)
 
 NONCE = "K7Q2ABCD"
 
@@ -487,3 +504,323 @@ class TestAHandleIsNotBudgetedAsProse:
 
         assert marker_cost(counter, marker) == counter.count(marker)
         assert marker_cost(counter, marker) < len(marker)
+
+
+ALPHA_B = "the alpha passage says four hundred hours"
+BETA_B = "the beta passage says eight hundred hours"
+GAMMA_B = "the gamma passage says twelve hundred hours"
+
+
+def _three():
+    """Three citable sources, in retrieval order."""
+    registry = SourceRegistry()
+    bindings = []
+    for title, body in (("a.md", ALPHA_B), ("b.md", BETA_B), ("c.md", GAMMA_B)):
+        source = registry.register_source(
+            kind="file", title=title, locator=f"/files/{title}"
+        )
+        evidence = registry.add_evidence(source.source_id, text=body)
+        bindings.append(binding(source.source_id, evidence.evidence_id))
+    return registry, bindings
+
+
+def _snippet_render(registry, snippets, grounds):
+    """The automatic route's shape: label the snippets, one message."""
+
+    def render(table):
+        labelled, markers = label_snippets(snippets, grounds, table, registry)
+        return [{"role": "user", "content": "\n".join(labelled)}], markers
+
+    return render
+
+
+class TestABudgetIsPaidByWithholdingOffersNotContext:
+    def test_every_offer_is_granted_when_they_fit(self):
+        registry, bindings = _three()
+        snippets = [ALPHA_B, BETA_B, GAMMA_B]
+        counter = TokenCounter(model="no-tokenizer")
+
+        choice = choose_offers(
+            registry=registry,
+            committed=CitationTable(nonce=NONCE),
+            candidates=bindings,
+            render=_snippet_render(registry, snippets, bindings),
+            counter=counter,
+            budget=10_000,
+        )
+
+        assert choice.fits
+        assert len(choice.granted) == 3
+        assert len(choice.markers) == 3
+
+    def test_the_lowest_priority_offer_is_withheld_first(self):
+        """The context stays whole. What gives way is the newest offer, from
+        the end, so ordering is how a caller says what matters."""
+        registry, bindings = _three()
+        snippets = [ALPHA_B, BETA_B, GAMMA_B]
+        counter = TokenCounter(model="no-tokenizer")
+        render = _snippet_render(registry, snippets, bindings)
+        whole = choose_offers(
+            registry=registry, committed=CitationTable(nonce=NONCE),
+            candidates=bindings, render=render, counter=counter, budget=10_000,
+        )
+
+        choice = choose_offers(
+            registry=registry,
+            committed=CitationTable(nonce=NONCE),
+            candidates=bindings,
+            render=render,
+            counter=counter,
+            # One marker's worth less than the prompt that carried three.
+            budget=whole.tokens - 1,
+        )
+
+        assert choice.fits
+        assert len(choice.granted) == 2
+        body = choice.messages[0]["content"]
+        # Every snippet is still there, whole...
+        for snippet in snippets:
+            assert snippet in body
+        # ...and the one that lost is simply unnamed.
+        assert GAMMA_B + MARKER_SEPARATOR not in body
+
+    def test_a_prompt_that_does_not_fit_with_nothing_new_gives_up(self):
+        registry, bindings = _three()
+        snippets = [ALPHA_B, BETA_B, GAMMA_B]
+
+        choice = choose_offers(
+            registry=registry,
+            committed=CitationTable(nonce=NONCE),
+            candidates=bindings,
+            render=_snippet_render(registry, snippets, bindings),
+            counter=TokenCounter(model="no-tokenizer"),
+            budget=1,
+        )
+
+        assert not choice.fits
+        assert choice.granted == ()
+        assert choice.messages == []
+
+    def test_a_committed_offer_is_never_withheld(self):
+        """Its handle is already in text the model has read. Taking it back
+        would leave a marker resolving to a source the table stopped
+        offering."""
+        registry, bindings = _three()
+        snippets = [ALPHA_B, BETA_B, GAMMA_B]
+        committed = build_citation_table(registry, bindings[:2], nonce=NONCE)
+
+        choice = choose_offers(
+            registry=registry,
+            committed=committed,
+            candidates=bindings,
+            render=_snippet_render(registry, snippets, bindings),
+            counter=TokenCounter(model="no-tokenizer"),
+            budget=1,
+        )
+
+        # Nothing fits at that budget, so the assembly gives up rather than
+        # withdrawing what it already offered.
+        assert not choice.fits
+        assert committed.handle_for("src_1") and committed.handle_for("src_2")
+
+    def test_a_committed_offer_is_still_offered_and_still_labelled(self):
+        """The other half of never withholding one. A handle the model has
+        already read has to keep appearing against its passage, or the next
+        prompt shows the same document unnamed and the marker in the earlier
+        turn resolves to nothing the model can see."""
+        registry, bindings = _three()
+        snippets = [ALPHA_B, BETA_B, GAMMA_B]
+        committed = build_citation_table(registry, bindings[:2], nonce=NONCE)
+
+        choice = choose_offers(
+            registry=registry,
+            committed=committed,
+            candidates=bindings,
+            render=_snippet_render(registry, snippets, bindings),
+            counter=TokenCounter(model="no-tokenizer"),
+            budget=10_000,
+        )
+
+        assert choice.fits
+        assert len(choice.granted) == 3
+        body = choice.messages[0]["content"]
+        for source_id, passage in (("src_1", ALPHA_B), ("src_2", BETA_B)):
+            marker = handle_marker(committed.handle_for(source_id))
+            assert f"{passage} {marker}" in body, source_id
+
+    def test_nothing_is_minted_by_being_considered(self):
+        """The whole point of the speculative pass: a source that loses the
+        budget decision must not come out of it holding a handle."""
+        registry, bindings = _three()
+        snippets = [ALPHA_B, BETA_B, GAMMA_B]
+        committed = CitationTable(nonce=NONCE)
+
+        choose_offers(
+            registry=registry, committed=committed, candidates=bindings,
+            render=_snippet_render(registry, snippets, bindings),
+            counter=TokenCounter(model="no-tokenizer"), budget=10_000,
+        )
+
+        assert not committed, "the caller's table was extended in place"
+
+
+class TestTheMarkersAreNotChargedTwice:
+    def test_the_surcharge_is_only_what_the_count_was_short_by(self):
+        counter = TokenCounter(model="no-tokenizer")
+        marker = handle_marker(f"{NONCE}-1")
+
+        surcharge = marker_surcharge(counter, [marker, marker])
+
+        assert surcharge == 2 * (marker_cost(counter, marker) - counter.count(marker))
+        assert surcharge < 2 * marker_cost(counter, marker)
+
+    def test_an_exact_counter_adds_nothing(self):
+        counter = TokenCounter(model="local", tokenizer=_Tokenizer())
+        assert marker_surcharge(counter, [handle_marker(f"{NONCE}-1")] * 3) == 0
+
+
+class TestASnippetIsItsOwnPassage:
+    def test_a_snippet_is_named_and_a_summary_is_not(self):
+        """The automatic route has no spans because it needs none. The
+        aligned vector says which snippets are documents; the digest and the
+        recall window are the parent's own and get no marker."""
+        registry, bindings = _three()
+        snippets = ["a digest of older turns", ALPHA_B, BETA_B]
+        grounds = [None, bindings[0], bindings[1]]
+        table = build_citation_table(registry, bindings[:2], nonce=NONCE)
+
+        labelled, markers = label_snippets(snippets, grounds, table, registry)
+
+        assert labelled[0] == "a digest of older turns"
+        assert labelled[1] == f"{ALPHA_B} {handle_marker(table.handle_for('src_1'))}"
+        assert labelled[2] == f"{BETA_B} {handle_marker(table.handle_for('src_2'))}"
+        assert len(markers) == 2
+
+    def test_a_snippet_that_is_not_its_passage_is_not_named(self):
+        """The same placement rule as everywhere else: the run a marker
+        follows has to contain the passage it names."""
+        registry, bindings = _three()
+        table = build_citation_table(registry, bindings, nonce=NONCE)
+
+        labelled, markers = label_snippets(
+            ["a paraphrase of the alpha passage"], [bindings[0]], table, registry
+        )
+
+        assert labelled == ["a paraphrase of the alpha passage"]
+        assert markers == []
+
+    def test_a_vector_of_the_wrong_length_is_refused(self):
+        """Zipping would attach every marker after the gap to the wrong
+        snippet, which is the failure the aligned vector exists to prevent."""
+        registry, bindings = _three()
+        table = build_citation_table(registry, bindings, nonce=NONCE)
+
+        with pytest.raises(ProvenanceError):
+            label_snippets([ALPHA_B, BETA_B], [bindings[0]], table, registry)
+
+
+class TestTheAgentPromptIsRebuiltFromParentStateAlone:
+    @staticmethod
+    def _transcript(registry, bindings, *, offerable=True):
+        transcript = TrustedTranscript()
+        transcript.record(ModelTurn(
+            operation_seq=1,
+            content="looking that up",
+            tool_calls=({"id": "c1", "name": "file_search",
+                         "arguments": '{"query": "hours"}'},),
+        ))
+        transcript.record(ToolRound(
+            operation_seq=2,
+            offerable=offerable,
+            results=(TrustedToolResult(
+                operation_seq=2,
+                call_index=0,
+                tool_name="file_search",
+                # Deliberately different: the id the worker relayed is not
+                # the one the parent computed, and the rebuilt message must
+                # carry the parent's.
+                submitted_call_id="worker-chosen",
+                tool_message_id="c1",
+                text=f"[a.md]\n{ALPHA_B}",
+                spans=(GroundedSpan(
+                    start=len("[a.md]\n"),
+                    end=len("[a.md]\n") + len(ALPHA_B),
+                    source_id="src_1",
+                    evidence_id=bindings[0]["evidence_id"],
+                ),),
+            ),),
+        ))
+        return transcript
+
+    def test_the_base_prompt_the_turns_and_the_results_are_all_there(self):
+        registry, bindings = _three()
+        table = build_citation_table(registry, bindings[:1], nonce=NONCE)
+        base = [
+            {"role": "system", "content": "answer from the sources"},
+            {"role": "user", "content": "how long"},
+        ]
+
+        messages, markers = rebuild_agent_messages(
+            base, self._transcript(registry, bindings), table, registry
+        )
+
+        assert [m["role"] for m in messages] == [
+            "system", "user", "assistant", "tool",
+        ]
+        assert messages[3]["tool_call_id"] == "c1"
+        assert messages[3]["name"] == "file_search"
+        marker = handle_marker(table.handle_for("src_1"))
+        assert messages[3]["content"] == f"[a.md]\n{ALPHA_B} {marker}"
+        assert markers == [marker]
+
+    def test_a_divergent_round_is_left_out_entirely(self):
+        """Not included unlabelled. Its results may not even carry a
+        trustworthy `tool_call_id`, so asserting the exchange happened that
+        way is a shape the parent cannot support."""
+        registry, bindings = _three()
+        table = build_citation_table(registry, bindings[:1], nonce=NONCE)
+
+        messages, markers = rebuild_agent_messages(
+            [{"role": "user", "content": "how long"}],
+            self._transcript(registry, bindings, offerable=False),
+            table,
+            registry,
+        )
+
+        assert [m["role"] for m in messages] == ["user", "assistant"]
+        assert markers == []
+
+    def test_nothing_the_worker_sent_is_in_it(self):
+        """The property the whole reconstruction exists for, stated as a
+        witness: a transcript and a base prompt are the only inputs, so there
+        is no argument through which worker bytes could arrive."""
+        import inspect
+
+        parameters = set(inspect.signature(rebuild_agent_messages).parameters)
+        assert parameters == {
+            "initial_messages", "transcript", "table", "registry",
+        }
+
+
+class TestTheInstructionIsTheParentsOwn:
+    def test_it_joins_the_system_block(self):
+        messages = instruct([
+            {"role": "system", "content": "answer from the sources"},
+            {"role": "user", "content": "how long"},
+        ])
+
+        assert messages[0]["content"].endswith(CITATION_INSTRUCTION)
+        assert messages[0]["content"].startswith("answer from the sources")
+        assert [m["role"] for m in messages] == ["system", "user"]
+
+    def test_it_carries_no_real_handle(self):
+        """A handle in the instruction is one the model could copy without
+        having read anything."""
+        assert "[cite:" not in CITATION_INSTRUCTION
+
+    def test_the_caller_s_messages_are_not_edited(self):
+        original = [{"role": "system", "content": "answer from the sources"}]
+        instruct(original)
+        assert original == [
+            {"role": "system", "content": "answer from the sources"}
+        ]
