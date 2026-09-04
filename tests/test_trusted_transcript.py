@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import uuid
 
+from liminallm.service import taint
 from liminallm.service.broker import CapabilityBroker, InvocationContext
 from liminallm.service.invocation import InvocationRegistry
 from liminallm.service.provenance import SourceRegistry
@@ -589,6 +590,63 @@ class TestAWorkerCannotRewindItsOwnPosition:
             "payload": {"messages": [], "tools": []},
         })
         assert skipped["result"]["error"] == "broker_sequence"
+
+    def test_a_withdrawn_capability_still_spends_its_position(
+        self, store, monkeypatch
+    ):
+        """The client counted the request before sending it. A position not
+        spent here is a position an honest worker's next request is refused
+        for."""
+        engine = get_runtime().workflow
+        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, content="one")
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+
+        taint.record_findings(
+            invocation.session, [{"type": "override-instructions"}]
+        )
+        withdrawn = _ask(broker, invocation, "web.fetch",
+                         {"url": "https://x.example"}, 2)
+        assert "REFUSED" in str(withdrawn["result"]), withdrawn
+
+        following = _ask(broker, invocation, "llm.generate_with_tools",
+                         {"messages": [], "tools": []}, 3)
+        assert following["result"].get("error") != "broker_sequence"
+
+    def test_a_live_request_cannot_reoccupy_a_withdrawn_position(
+        self, store, monkeypatch
+    ):
+        """The other half of the same rule. A position left unspent is a
+        position a second, live request can take."""
+        engine = get_runtime().workflow
+        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
+        taint.record_findings(
+            invocation.session, [{"type": "override-instructions"}]
+        )
+        _ask(broker, invocation, "web.fetch", {"url": "https://x.example"}, 1)
+        _model(engine, monkeypatch, content="one")
+        again = broker._answer(invocation, {
+            "capability": "llm.generate_with_tools",
+            "operation_seq": 1,
+            "payload": {"messages": [], "tools": []},
+        })
+        assert again["result"]["error"] == "broker_sequence"
+
+    def test_an_unknown_capability_spends_its_position_too(
+        self, store, monkeypatch
+    ):
+        """The contract is about positions, not about which capabilities
+        exist. This pins it generally rather than for withdrawal alone."""
+        engine = get_runtime().workflow
+        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
+        broker._answer(invocation, {
+            "capability": "no.such.capability", "operation_seq": 1, "payload": {},
+        })
+        _model(engine, monkeypatch, content="one")
+        following = _ask(broker, invocation, "llm.generate_with_tools",
+                         {"messages": [], "tools": []}, 2)
+        assert following["result"].get("error") != "broker_sequence"
 
     def test_a_replacement_worker_counts_from_one_again(
         self, store, monkeypatch

@@ -332,19 +332,26 @@ class CapabilityBroker:
             # ordering is the control: after the handler runs, "revoked" is a
             # description of something that already happened.
             invocation.check_live()
-            handler = self._handlers().get(capability)
-            if handler is None:
-                raise UnknownCapability(capability)
-            withdrawn = self._withdrawn(invocation, capability)
-            if withdrawn is not None:
-                return {"ok": True, "result": withdrawn}
             # One worker walks its own control flow forwards. `BrokerClient`
-            # stamps 1, 2, 3, so anything else is a worker rewinding or
-            # skipping its position - and a rewind is how a compromised one
-            # would overwrite parent-side state the parent believes it wrote
-            # once. A replacement worker gets a fresh broker and counts from
-            # one again, replaying the ledger up to where it diverges, which
-            # is the same forward walk.
+            # stamps a sequence on every request it sends - 1, 2, 3 - so
+            # anything else is a worker rewinding or skipping its position,
+            # and a rewind is how a compromised one would overwrite
+            # parent-side state the parent believes it wrote once.
+            #
+            # Ahead of every other check, because the client counted the
+            # request before sending it: a position is spent whether the
+            # capability turns out to be withdrawn, unknown, replayed,
+            # successful or failed. Consuming it only on the paths that reach
+            # a handler would both refuse the next request from an honest
+            # worker whose last one was withdrawn, and leave the withdrawn
+            # position free for a second, live request to occupy.
+            #
+            # The one thing that does not spend a position is a request
+            # refused for its sequence, which never had one to spend.
+            #
+            # A replacement worker gets a fresh broker and counts from one
+            # again, replaying the ledger up to where it diverges. That is
+            # the same forward walk and this does not stand in its way.
             if operation_seq != self._served + 1:
                 logger.warning(
                     "capability_sequence_rewind",
@@ -362,6 +369,12 @@ class CapabilityBroker:
                     },
                 }
             self._served = operation_seq
+            handler = self._handlers().get(capability)
+            if handler is None:
+                raise UnknownCapability(capability)
+            withdrawn = self._withdrawn(invocation, capability)
+            if withdrawn is not None:
+                return {"ok": True, "result": withdrawn}
             digest = payload_hash(payload)
             replayed = invocation.ledger.replay(operation_seq, capability, digest)
             if replayed is not None:
