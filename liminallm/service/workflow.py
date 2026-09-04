@@ -3423,6 +3423,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
     HISTORY_SEARCH_SCHEMA = agent_tools.HISTORY_SEARCH_SCHEMA
     NOTE_SEARCH_SCHEMA = agent_tools.NOTE_SEARCH_SCHEMA
 
+    #: Whether the model is shown citation markers at all.
+    #:
+    #: Off, and the whole citation transformation is skipped rather than
+    #: performed and undone: no speculative table, no instruction, no labels,
+    #: no reconstruction standing in for the worker's messages, no handles
+    #: committed. What the production model is sent is byte-for-byte what it
+    #: was sent before any of this existed, which is a claim worth being able
+    #: to make plainly.
+    #:
+    #: A populated `CitationTable` is not this gate. Every turn mints a
+    #: namespace whether or not anything is offered, so reading one as
+    #: "offers are on" would turn the feature on for every turn that grounded
+    #: anything.
+    CITATION_OFFERS_ENABLED = False
+
     MAX_AGENT_ROUNDS = 3
     # Leave headroom under the node timeout for the final model turn.
     AGENT_DEADLINE_SECONDS = 45.0
