@@ -39,7 +39,7 @@ from __future__ import annotations
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
 from liminallm.service.citations import assert_scrubbed, scrub_namespace
@@ -187,6 +187,22 @@ class InvocationContext:
     #: schemas are model input for the same reason and are kept for it.
     initial_messages: Tuple[Dict[str, Any], ...] = ()
     initial_tools: Tuple[Dict[str, Any], ...] = ()
+    #: The one host body this invocation authorized, and the exact inputs it
+    #: authorized for it. Empty when the plan is not a host-tool plan at all.
+    #:
+    #: Authority, for the same reason the base prompt above is. A `tool.host`
+    #: request names a body and carries its inputs, and both arrive from the
+    #: worker: without this the parent would run the body the worker chose,
+    #: ask the model the question the worker wrote, and then keep the answer
+    #: as the one a citation is read out of. An agent worker asking for
+    #: `llm.generic` is the sharp form, and a `llm.generic` worker rewriting
+    #: its own `message` is the quiet one.
+    #:
+    #: Recorded before the plan crosses, and used *instead of* what comes
+    #: back rather than to check it - a comparison that passes and then runs
+    #: the worker's copy is one refactor away from running the wrong bytes.
+    host_body: str = ""
+    host_inputs: Dict[str, Any] = field(default_factory=dict)
     #: Whether anything in this assembly may still carry a citation.
     #:
     #: False from the first round whose calls were not the calls the previous
@@ -220,6 +236,16 @@ class InvocationContext:
         """
         self.initial_messages = tuple(deepcopy(dict(m)) for m in messages or ())
         self.initial_tools = tuple(deepcopy(dict(t)) for t in tools or ())
+
+    def remember_host_call(self, body: str, inputs: Mapping[str, Any]) -> None:
+        """Authorize one host body, with one set of inputs, for this plan.
+
+        Copied on the way in, like the base prompt and for the same reason:
+        the plan the worker reads and this record stop being the same objects
+        the moment they are written.
+        """
+        self.host_body = str(body or "")
+        self.host_inputs = deepcopy(dict(inputs or {}))
 
 
 class CapabilityBroker:
@@ -835,20 +861,27 @@ class CapabilityBroker:
             "usage": response.get("usage") or {},
         }
         nonce = invocation.citations.nonce
-        public = scrub_namespace(canonical, nonce)
-        # Belt and braces, on the whole serialized reply: a model-controlled
-        # field added later is model-controlled the moment it exists, and a
-        # check that listed today's keys would keep passing while a new one
-        # carried the handle straight across.
-        #
-        # No reply the scrubber handled can reach it: that reaches every JSON
-        # shape able to hold a string, an object of any other type does not
-        # cross at all - `send_frame` refuses one rather than sending its
-        # repr - and the two agree on what counts as an occurrence. So this
-        # call is deliberately unkillable by mutation, and is recorded here
-        # rather than left for a later reader to simplify away: what it
-        # guards is the next field, not this one.
-        assert_scrubbed(public, nonce)
+        if invocation.citations:
+            public = scrub_namespace(canonical, nonce)
+            # Belt and braces, on the whole serialized reply: a
+            # model-controlled field added later is model-controlled the
+            # moment it exists, and a check that listed today's keys would
+            # keep passing while a new one carried the handle straight across.
+            #
+            # No reply the scrubber handled can reach it: that reaches every
+            # JSON shape able to hold a string, an object of any other type
+            # does not cross at all - `send_frame` refuses one rather than
+            # sending its repr - and the two agree on what counts as an
+            # occurrence. So this call is deliberately unkillable by mutation,
+            # and is recorded here rather than left for a later reader to
+            # simplify away: what it guards is the next field, not this one.
+            assert_scrubbed(public, nonce)
+        else:
+            # An invocation that issued no handle never showed the model this
+            # namespace, so there is nothing of it in the reply to remove and
+            # removing anything would be editing an answer on the strength of
+            # a coincidence. The same rule `tool.host` follows.
+            public = deepcopy(canonical)
         # Two records of one turn, and they are not redundant. The
         # canonical response is replacement state, because the final answer's
         # citations come from the last model turn and nothing else. The
@@ -1020,19 +1053,58 @@ class CapabilityBroker:
         transfer compare the user's answer against a class label.
         """
         invocation.check_live()
-        name = str(payload.get("tool") or "")
+        # On the name as planned, not on what it resolves to. Resolution is
+        # `_run_host_tool`'s job and it happens below on the parent's copy;
+        # what is being decided here is only whether this request is the one
+        # the plan authorized.
+        #
+        # The emptiness check is measured redundant: with nothing recorded,
+        # every real body name already fails the comparison below, and the one
+        # request that would slip past it names no body and reaches none.
+        # Kept because "an invocation that authorized nothing authorizes
+        # nothing" is the property, and an authority gate is the wrong place
+        # to leave that to be re-derived from how a comparison happens to
+        # behave against an empty string.
+        if (
+            not self._ctx.host_body
+            or str(payload.get("tool") or "") != self._ctx.host_body
+            or dict(payload.get("inputs") or {}) != self._ctx.host_inputs
+        ):
+            return {
+                "status": "error",
+                "content": "this invocation authorized no such host call",
+                "error": "host_call_unauthorized",
+            }
+        # The parent's body and the parent's inputs, not the ones just
+        # checked. Measured equivalent, necessarily: the comparison above just
+        # established that the two are equal, so no mutation of this line
+        # alone can change an outcome. It takes two - loosen the comparison,
+        # and this line is running bytes nobody checked, on the call whose
+        # result becomes authority.
         canonical = self._engine._run_host_tool(
-            name, payload.get("inputs") or {}, context=self._ctx
+            self._ctx.host_body, deepcopy(self._ctx.host_inputs), context=self._ctx
         )
         nonce = invocation.citations.nonce
-        public = scrub_namespace(canonical, nonce)
-        # Unkillable by mutation, like the one on the agent path and for the
-        # same reason: the scrub above is what removes the namespace, so this
-        # can only fire when the scrub is wrong. That is exactly when nobody
-        # would be looking, and this is the last statement before the reply
-        # crosses.
-        assert_scrubbed(public, nonce)
-        if self._engine._host_body_name(name) not in self._engine.MODEL_ANSWER_HOSTS:
+        if invocation.citations:
+            public = scrub_namespace(canonical, nonce)
+            # Unkillable by mutation, like the one on the agent path and for
+            # the same reason: the scrub above is what removes the namespace,
+            # so this can only fire when the scrub is wrong. That is exactly
+            # when nobody would be looking, and this is the last statement
+            # before the reply crosses.
+            assert_scrubbed(public, nonce)
+        else:
+            # No handle was ever issued, so the model was never shown this
+            # namespace and cannot have written it. Scrubbing anyway would
+            # edit an answer for a namespace nobody offered - which is what
+            # "the gate being off changes nothing" has to mean to be worth
+            # saying. Copied so the worker's reply and the parent's record
+            # still share no structure.
+            public = deepcopy(canonical)
+        if (
+            self._engine._host_body_name(self._ctx.host_body)
+            not in self._engine.MODEL_ANSWER_HOSTS
+        ):
             return CapabilityOutcome(public=public)
         # A failed body records nothing: `_answer` fails the ledger entry
         # instead of committing it, so the parent_state below is dropped with

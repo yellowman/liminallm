@@ -3045,6 +3045,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         plan: Dict[str, Any] = {"inputs": dict(inputs or {}), "message": user_message}
         worker_tool = self._resolve_worker_tool(tool_name, tool_spec)
         if worker_tool != "agent.files_v1":
+            # The one host call this plan authorizes: its own body, with its
+            # own inputs. A worker whose body runs in the worker never sends
+            # `tool.host` at all, and one that does gets its own name back -
+            # which resolves to no host body, so it reaches nothing. What it
+            # cannot do is name a different body.
+            context.remember_host_call(worker_tool, plan["inputs"])
             return worker_tool, plan, context, ""
 
         # The agent loop's prompt is assembled here because assembling it reads
@@ -3087,6 +3093,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # the sink from the prompt it actually builds - which is a
             # different assembly with its own budget.
             fallback = {"inputs": {**dict(inputs or {}), "message": message}}
+            # The context reaches the worker from here too, so the fallback
+            # authorizes its own host call. Without this the abandoned agent
+            # plan would leave an invocation that runs `llm.generic` and has
+            # authorized nothing, and every honest fallback would be refused.
+            context.remember_host_call("llm.generic", fallback["inputs"])
             return "llm.generic", fallback, context, preamble
         # Past the fallback, so this plan is the one that answers. On the
         # context rather than in the plan: a worker that could name what
@@ -3295,16 +3306,30 @@ class WorkflowEngine(WorkflowStreamingMixin):
     def _host_body_name(self, tool_name: str) -> str:
         """Which builtin body a host-tool request runs, or `""` for none.
 
-        One resolution, asked twice: `_run_host_tool` uses it to pick the
-        handler, and the broker uses it to decide whether what came back is
-        the turn's answer. Two implementations would eventually run one body
-        and describe another - the reason `resolve_executable_handler` exists
-        for the worker bodies.
+        One resolution, asked three times: `_run_host_tool` picks its handler
+        with it, planning decides whether a plan may authorize a host call at
+        all, and the broker decides whether what came back is the turn's
+        answer. Two implementations would eventually run one body and describe
+        another - the reason `resolve_executable_handler` exists for the
+        worker bodies.
+
+        A name only resolves when it lands on a body that runs *here*. A
+        seeded deployment stores a spec for every tool, including the ones
+        whose bodies run in the worker, and those specs name their own tool as
+        their handler - so returning whatever the spec says would answer
+        `web.search_v1` for a body this side never runs.
+
+        That last rule is measured unkillable: both callers look the answer up
+        in the same table, so a worker body's name and the empty string reach
+        the same nothing. It is a statement about what this function means
+        rather than about what it currently changes, and the next caller to
+        read it as "is this a host body" is the one it is for.
         """
-        if tool_name in self._builtin_tool_handlers():
+        handlers = self._builtin_tool_handlers()
+        if tool_name in handlers:
             return tool_name
-        spec = self.tool_registry.get(tool_name) or {}
-        return str(spec.get("handler") or "")
+        resolved = str((self.tool_registry.get(tool_name) or {}).get("handler") or "")
+        return resolved if resolved in handlers else ""
 
     def _builtin_tool_handlers(
         self,
@@ -3748,6 +3773,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 pass
         mcp_tools = self._discover_mcp_tools()
         tools.extend(tool.spec() for tool in mcp_tools.values())
+        # The builtin schemas above are module-level dicts appended by
+        # reference, so every turn in this process was offering the same
+        # objects. Nothing edits a plan's tools today, and this is now
+        # authority - `remember_base_prompt` keeps these as what the model was
+        # shown - so a plan gets its own copies rather than a shared one that
+        # any later in-process edit would change for every turn after it.
+        tools = [copy.deepcopy(tool) for tool in tools]
 
         instructions = [
             "You are a concise assistant.",

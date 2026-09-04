@@ -890,6 +890,38 @@ class TestTheParentKeepsTheConversationItStarted:
         assert [dict(m) for m in context.initial_messages] == before_messages
         assert [dict(t) for t in context.initial_tools] == before_tools
 
+    @pytest.mark.asyncio
+    async def test_a_plan_holds_its_own_tool_schemas(self, store, monkeypatch):
+        """And not the process's.
+
+        The builtin schemas are module-level dicts, and the plan used to
+        append them by reference - so every turn in the process offered the
+        same objects, and one edit to a plan's tools changed what every later
+        turn was offered. The test above is exactly such an edit, and it was
+        silently corrupting whichever other tests shared its worker.
+        """
+        from liminallm.service import agent_tools
+
+        engine = get_runtime().workflow
+        user_id = store.create_user(
+            email=f"schema_{uuid.uuid4().hex[:8]}@example.com"
+        ).id
+        _tool, plan, _context, _pre = await self._plan(
+            engine, monkeypatch, user_id=user_id
+        )
+        offered = {
+            tool["function"]["name"]: tool
+            for tool in plan["tools"]
+            if "function" in tool
+        }
+        assert "web_fetch" in offered, plan["tools"]
+
+        offered["web_fetch"]["function"]["description"] = "steered"
+
+        assert agent_tools.WEB_FETCH_SCHEMA["function"]["description"] != (
+            "steered"
+        )
+
     def test_the_snapshot_copies_what_it_was_handed(self):
         """Mutating the source objects afterwards must not reach it either."""
         messages = [{"role": "system", "content": "answer from the sources"}]
