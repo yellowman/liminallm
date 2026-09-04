@@ -32,6 +32,7 @@ from liminallm.service.citations import (
     strip_citations,
 )
 from liminallm.service.provenance import (
+    GroundedMessage,
     GroundedSpan,
     ProvenanceError,
     SourceRegistry,
@@ -775,7 +776,7 @@ class TestTheAgentPromptIsRebuiltFromParentStateAlone:
         ]
 
         messages, markers, placed = rebuild_agent_messages(
-            base, self._transcript(registry, bindings), table, registry
+            base, (), self._transcript(registry, bindings), table, registry
         )
 
         assert [m["role"] for m in messages] == [
@@ -788,6 +789,69 @@ class TestTheAgentPromptIsRebuiltFromParentStateAlone:
         assert markers == [marker]
         assert placed == [("src_1", bindings[0]["evidence_id"])]
 
+    def test_the_base_prompt_is_labelled_from_the_parents_own_positions(self):
+        """The first model call of an agent turn. Its grounding is all in the
+        message the planner built, so without this the turn could offer
+        nothing until it ran a search for context it had already retrieved."""
+        registry, bindings = _three()
+        table = build_citation_table(registry, bindings[:1], nonce=NONCE)
+        content = f"answer from the sources\n\nContext: {ALPHA_B}"
+        base = [{"role": "system", "content": content}]
+        start = content.index(ALPHA_B)
+        grounded = [GroundedMessage(
+            message_index=0,
+            text=content,
+            spans=(GroundedSpan(
+                start=start,
+                end=start + len(ALPHA_B),
+                source_id="src_1",
+                evidence_id=bindings[0]["evidence_id"],
+            ),),
+        )]
+
+        messages, markers, placed = rebuild_agent_messages(
+            base, grounded, TrustedTranscript(), table, registry
+        )
+
+        marker = handle_marker(table.handle_for("src_1"))
+        assert messages[0]["content"] == f"{content} {marker}"
+        assert markers == [marker]
+        assert placed == [("src_1", bindings[0]["evidence_id"])]
+
+    def test_a_message_that_changed_is_not_relabelled_by_searching(self):
+        """The offsets mean nothing against a different string. A reader that
+        adjusted them, or looked for a new position, would put the marker
+        somewhere nothing measured - so the message goes in unlabelled and
+        what grounded it is simply not offered here."""
+        registry, bindings = _three()
+        table = build_citation_table(registry, bindings[:1], nonce=NONCE)
+        measured = f"answer\n\nContext: {ALPHA_B}"
+        start = measured.index(ALPHA_B)
+        grounded = [GroundedMessage(
+            message_index=0,
+            text=measured,
+            spans=(GroundedSpan(
+                start=start,
+                end=start + len(ALPHA_B),
+                source_id="src_1",
+                evidence_id=bindings[0]["evidence_id"],
+            ),),
+        )]
+        # The same snippet, one word earlier in the message.
+        changed = f"answer now\n\nContext: {ALPHA_B}"
+
+        messages, markers, placed = rebuild_agent_messages(
+            [{"role": "system", "content": changed}],
+            grounded,
+            TrustedTranscript(),
+            table,
+            registry,
+        )
+
+        assert messages[0]["content"] == changed
+        assert markers == []
+        assert placed == []
+
     def test_a_divergent_round_is_left_out_entirely(self):
         """Not included unlabelled. Its results may not even carry a
         trustworthy `tool_call_id`, so asserting the exchange happened that
@@ -797,6 +861,7 @@ class TestTheAgentPromptIsRebuiltFromParentStateAlone:
 
         messages, markers, placed = rebuild_agent_messages(
             [{"role": "user", "content": "how long"}],
+            (),
             self._transcript(registry, bindings, offerable=False),
             table,
             registry,
@@ -814,7 +879,11 @@ class TestTheAgentPromptIsRebuiltFromParentStateAlone:
 
         parameters = set(inspect.signature(rebuild_agent_messages).parameters)
         assert parameters == {
-            "initial_messages", "transcript", "table", "registry",
+            "initial_messages",
+            "initial_grounded_messages",
+            "transcript",
+            "table",
+            "registry",
         }
 
 
@@ -1009,7 +1078,7 @@ class TestTheMaterializerSharesNothingWithTrustedState:
         base = [{"role": "system", "content": "answer", "meta": {"kept": True}}]
 
         messages, _markers, _placed = rebuild_agent_messages(
-            base, transcript, table, registry
+            base, (), transcript, table, registry
         )
 
         messages[0]["meta"]["kept"] = "steered"
@@ -1037,7 +1106,7 @@ class TestTheMaterializerSharesNothingWithTrustedState:
         ))
 
         messages, _markers, _placed = rebuild_agent_messages(
-            [], transcript, table, registry
+            [], (), transcript, table, registry
         )
         messages[0]["tool_calls"][0]["function"]["arguments"] = "steered"
 

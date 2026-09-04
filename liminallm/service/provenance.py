@@ -129,6 +129,37 @@ class GroundedSpan:
 
 
 @dataclass(frozen=True)
+class GroundedMessage:
+    """Where evidence sits inside one message of the prompt the parent built.
+
+    A sibling of `GroundedPassage`, not a variant of it. A passage is one
+    producer's output and is identified by the call that made it; this is a
+    position in an assembled conversation, identified by which message it is.
+    Folding them together would give each the other's ambiguity - a passage
+    needs no message index, and a message has no call to name.
+
+    Why the selected context needs one at all: it is folded into the system
+    block as the prompt is written, so by the time anything wants to label it
+    the snippets are inside a larger string with no record of where. Finding
+    them again by searching is the failure this whole layer avoids - two
+    identical snippets, one snippet inside another, a snippet containing the
+    separator, or the digest quoting the same text all make a search land in
+    the wrong place. So the offsets are measured while the string is being
+    assembled and kept.
+
+    `text` is carried beside the index for the same reason `GroundedPassage`
+    carries it: offsets mean nothing without the exact string they were
+    measured in. It is also the gate. A reader that finds the message no
+    longer equal to this text must not adjust the offsets or search for a new
+    position - it under-offers instead.
+    """
+
+    message_index: int
+    text: str
+    spans: Tuple[GroundedSpan, ...] = ()
+
+
+@dataclass(frozen=True)
 class GroundedPassage:
     """One producer's finished text, and where its evidence sits inside it.
 

@@ -72,6 +72,7 @@ from liminallm.service.node_attempt import (
 )
 from liminallm.service.provenance import (
     Binding,
+    GroundedMessage,
     GroundedPassage,
     GroundedSpan,
     ProvenanceError,
@@ -3061,6 +3062,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         explicit_ids, grounding, ctx_chunks = self._explicit_context_grounding(
             message, context_id, user_id=user_id, tenant_id=tenant_id
         )
+        context_ranges: List[Tuple[int, int]] = []
         messages, tools, preamble, mcp_tools, grounded = self._build_agent_context(
             message,
             attachments,
@@ -3069,19 +3071,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
             conversation_id,
             explicit_context_ids=explicit_ids,
             grounding=grounding,
+            context_ranges=context_ranges,
         )
         # Computed from `grounded`, the subset that survived budgeting, but
-        # held locally until this plan is known to be the answer path. Flat:
-        # `provenance_bindings` is the set of relations the turn may cite, and
-        # the aligned vector's positions belong to a snippet list this does
-        # not carry.
-        agent_bindings = [
-            found
-            for found in self._record_grounding(
-                source_registry, ctx_chunks, grounded, leading=0
-            )
-            if found
-        ]
+        # held locally until this plan is known to be the answer path.
+        aligned = self._record_grounding(
+            source_registry, ctx_chunks, grounded, leading=0
+        )
+        # Flat: `provenance_bindings` is the set of relations the turn may
+        # cite, and the aligned vector's positions belong to a snippet list it
+        # does not carry.
+        agent_bindings = [found for found in aligned if found]
+        # The positions do get kept, married to their relations here because
+        # this is the only place that holds both: the builder measured where
+        # each snippet landed and the registration says what each one is.
+        initial_grounded = self._initial_grounding(messages, aligned, context_ranges)
         # On the context, never in the plan: the plan is what the worker reads.
         context.mcp_tools = mcp_tools
         if not tools or not self.llm.supports_tools:
@@ -3107,7 +3111,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # from the objects budgeting produced rather than rebuilt later from
         # sources that can move. It copies on the way in, so what the plan
         # carries below and what the parent keeps are already separate.
-        context.remember_base_prompt(messages, tools)
+        context.remember_base_prompt(
+            messages, tools, grounded_messages=initial_grounded
+        )
         plan.update(
             {
                 "messages": messages,
@@ -3123,6 +3129,47 @@ class WorkflowEngine(WorkflowStreamingMixin):
             }
         )
         return worker_tool, plan, context, ""
+
+    @staticmethod
+    def _initial_grounding(
+        messages: Sequence[Dict[str, Any]],
+        aligned: Sequence[Optional[Binding]],
+        ranges: Sequence[Tuple[int, int]],
+    ) -> Tuple[GroundedMessage, ...]:
+        """Where the selected context sits in the prompt, and what each piece is.
+
+        The builder measured the positions and the registration named the
+        relations; this is the only place holding both. The system message is
+        index 0 because that is where the builder puts it.
+
+        A mismatch loses the citations, not the turn. The two lists describe
+        the same snippets and are produced two statements apart, so a
+        disagreement is a programming error - but the cost of refusing here
+        would be a failed answer, and the cost of continuing is an answer that
+        carries no markers. Under-offering is the safe direction, and a turn
+        the user still gets is the better failure.
+        """
+        if not messages or not ranges or len(aligned) != len(ranges):
+            return ()
+        spans = tuple(
+            GroundedSpan(
+                start=start,
+                end=end,
+                source_id=str(ground.get("source_id") or ""),
+                evidence_id=str(ground.get("evidence_id") or ""),
+            )
+            for (start, end), ground in zip(ranges, aligned)
+            if ground
+        )
+        if not spans:
+            return ()
+        return (
+            GroundedMessage(
+                message_index=0,
+                text=str(messages[0].get("content") or ""),
+                spans=spans,
+            ),
+        )
 
     def _resolve_worker_tool(
         self, tool_name: str, tool_spec: Optional[dict] = None
@@ -3720,10 +3767,16 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         explicit_context_ids: Optional[Sequence[str]] = None,
         grounding: Optional[Sequence[str]] = None,
+        context_ranges: Optional[List[Tuple[int, int]]] = None,
     ) -> Tuple[
         List[dict], List[dict], str, Dict[str, "mcp_client.RemoteTool"], List[str]
     ]:
         """Messages, offered tools, the preamble, remote tools, and grounding.
+
+        `context_ranges` is filled, when given, with where each surviving
+        snippet landed in the system message - a sink rather than a return
+        value, the way every producer in this codebase reports positions,
+        so the callers that want only the prompt are untouched.
 
         The remote tools come back separately from their specs because the two
         halves go to different places: the specs are part of the plan the
@@ -3831,8 +3884,23 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # assembles: both of those stand in for turns the model can no longer
         # read, so they survive pruning longest. Same "Context:" shape the
         # plain path injects, so a model that learned one reads the other.
+        #
+        # Written a snippet at a time so the offsets can be measured as the
+        # string is assembled. A later stage that wanted to label these would
+        # otherwise have to search for them, and a search lands in the wrong
+        # place for four reachable shapes: two identical snippets, one snippet
+        # inside another, a snippet that itself contains `" | "`, and a digest
+        # quoting the text it is summarizing. The join produces the same
+        # string either way.
         if kept:
-            system_content += "\n\nContext: " + " | ".join(kept)
+            system_content += "\n\nContext: "
+            for index, snippet in enumerate(kept):
+                if index:
+                    system_content += " | "
+                start = len(system_content)
+                system_content += snippet
+                if context_ranges is not None:
+                    context_ranges.append((start, len(system_content)))
         messages: List[dict] = [{"role": "system", "content": system_content}]
         for msg in history:
             role = getattr(msg, "role", None)

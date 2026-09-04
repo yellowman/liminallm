@@ -23,7 +23,7 @@ import time
 import uuid
 from contextlib import aclosing
 from functools import partial
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from liminallm.logging import log_routing_trace, log_workflow_trace
 from liminallm.service.broker import InvocationContext
@@ -1006,11 +1006,13 @@ class WorkflowStreamingMixin:
         # this line. It stays because a synchronous network call in an
         # `async def` is a stall waiting for a caller to change, not because a
         # measurement demands it.
+        context_ranges: List[Tuple[int, int]] = []
         messages, tools, _, mcp_tools, grounded = await asyncio.to_thread(
             partial(
                 self._build_agent_context,
                 explicit_context_ids=explicit_ids,
                 grounding=grounding,
+                context_ranges=context_ranges,
             ),
             message, attachments, history, user_id, conversation_id,
         )
@@ -1018,15 +1020,15 @@ class WorkflowStreamingMixin:
         # held locally until this assembly is known to be the answer path.
         # Committed to the sink below, and never sent in the plan: the worker
         # must not be able to name what supported the answer.
+        aligned = self._record_grounding(
+            source_registry, ctx_chunks, grounded, leading=0
+        )
         # Flat: the sink holds relations, and the aligned vector's positions
         # belong to a snippet list this does not carry.
-        agent_bindings = [
-            found
-            for found in self._record_grounding(
-                source_registry, ctx_chunks, grounded, leading=0
-            )
-            if found
-        ]
+        agent_bindings = [found for found in aligned if found]
+        # The positions are kept too, married to their relations here for the
+        # same reason as on the blocking path.
+        initial_grounded = self._initial_grounding(messages, aligned, context_ranges)
         # What the worker's own searches record, kept beside the assembly's
         # rather than in the caller's sink. If this path abandons the
         # assembly for the plain fallback, streams a partial answer, or fails,
@@ -1100,7 +1102,9 @@ class WorkflowStreamingMixin:
             # The parent's own copy of the prompt it is about to hand over,
             # kept before the plan crosses. The streamed path finishes the
             # turn itself, so it needs this at least as much as the batch one.
-            stream_context.remember_base_prompt(messages, tools)
+            stream_context.remember_base_prompt(
+                messages, tools, grounded_messages=initial_grounded
+            )
             result = await asyncio.wait_for(
                 asyncio.to_thread(
                     self._serve_invocation,

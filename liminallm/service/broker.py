@@ -52,6 +52,7 @@ from liminallm.service.invocation import (
 )
 from liminallm.service.provenance import (
     Binding,
+    GroundedMessage,
     GroundedPassage,
     GroundedSpan,
     SourceRegistry,
@@ -187,6 +188,17 @@ class InvocationContext:
     #: schemas are model input for the same reason and are kept for it.
     initial_messages: Tuple[Dict[str, Any], ...] = ()
     initial_tools: Tuple[Dict[str, Any], ...] = ()
+    #: Where the selected context sits inside that base prompt, and what each
+    #: piece is. Measured while the prompt was written rather than searched
+    #: for afterwards - by then the snippets are inside one system block, and
+    #: a search lands in the wrong place for two identical snippets, one
+    #: inside another, one containing the separator, or a digest quoting the
+    #: text it summarizes.
+    #:
+    #: Without this the first model call of an agent turn could offer nothing:
+    #: its grounding is all in the message the parent built before any tool
+    #: ran, and the reconstruction would copy that message through unlabelled.
+    initial_grounded_messages: Tuple[GroundedMessage, ...] = ()
     #: The one body name this invocation's plan may present through
     #: `tool.host`, and the exact inputs it may present with it.
     #:
@@ -231,7 +243,10 @@ class InvocationContext:
     citations_intact: bool = True
 
     def remember_base_prompt(
-        self, messages: Sequence[Any], tools: Sequence[Any]
+        self,
+        messages: Sequence[Any],
+        tools: Sequence[Any],
+        grounded_messages: Sequence[GroundedMessage] = (),
     ) -> None:
         """Keep the exact prompt this invocation starts from.
 
@@ -242,6 +257,7 @@ class InvocationContext:
         """
         self.initial_messages = tuple(deepcopy(dict(m)) for m in messages or ())
         self.initial_tools = tuple(deepcopy(dict(t)) for t in tools or ())
+        self.initial_grounded_messages = tuple(grounded_messages or ())
 
     def remember_host_call(self, body: str, inputs: Mapping[str, Any]) -> None:
         """Authorize one host body, with one set of inputs, for this plan.

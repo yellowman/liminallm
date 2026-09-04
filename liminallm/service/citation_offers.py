@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from liminallm.service.citations import CitationTable, extend_citation_table
 from liminallm.service.provenance import (
     Binding,
+    GroundedMessage,
     GroundedSpan,
     ProvenanceError,
     SourceRegistry,
@@ -484,6 +485,7 @@ def instruct(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def rebuild_agent_messages(
     initial_messages: Sequence[Dict[str, Any]],
+    initial_grounded_messages: Sequence[GroundedMessage],
     transcript: TrustedTranscript,
     table: CitationTable,
     registry: SourceRegistry,
@@ -509,10 +511,36 @@ def rebuild_agent_messages(
 
     Model turns go in as they are. They are the public reply the worker
     continued from, and they carry no namespace by construction.
+
+    The base prompt is labelled too, from the positions the parent measured as
+    it wrote that prompt. Without it the first model call of an agent turn
+    could offer nothing at all: its grounding is entirely in the message built
+    before any tool ran, so every turn would need a search before it could
+    cite the context the planner had already retrieved.
+
+    Those positions are honoured only against the exact string they were
+    measured in. A message that no longer equals the recorded text is not
+    searched for a new position and its offsets are not adjusted - it goes in
+    unlabelled, and whatever grounded it is simply not offered here.
     """
-    messages = [deepcopy(dict(message)) for message in initial_messages or []]
+    grounded_at = {
+        record.message_index: record
+        for record in initial_grounded_messages or ()
+    }
+    messages: List[Dict[str, Any]] = []
     markers: List[str] = []
     placed: List[Tuple[str, str]] = []
+    for index, message in enumerate(initial_messages or []):
+        rebuilt = deepcopy(dict(message))
+        record = grounded_at.get(index)
+        if record is not None and str(rebuilt.get("content") or "") == record.text:
+            text, placed_markers, placed_here = _labelled_with_markers(
+                record.text, record.spans, table, registry
+            )
+            rebuilt["content"] = text
+            markers.extend(placed_markers)
+            placed.extend(placed_here)
+        messages.append(rebuilt)
     for entry in transcript.entries:
         if isinstance(entry, ModelTurn):
             if entry.assistant_message is not None:

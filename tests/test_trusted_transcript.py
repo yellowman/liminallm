@@ -22,7 +22,7 @@ import pytest
 from liminallm.service import taint
 from liminallm.service.broker import CapabilityBroker, InvocationContext
 from liminallm.service.invocation import InvocationRegistry
-from liminallm.service.provenance import SourceRegistry
+from liminallm.service.provenance import SourceRegistry, binding
 from liminallm.service.runtime import get_runtime
 from liminallm.service.transcript import (
     ModelTurn,
@@ -1061,3 +1061,126 @@ class TestNoneOfItCrossesThePipe:
         for leak in ("transcript", "call_index", "operation_seq", "offerable",
                      "src_", "tool_message_id"):
             assert leak not in serialized, leak
+
+
+class TestTheParentRecordsWhereTheSelectedContextLanded:
+    """The first model call of an agent turn has all its grounding inside the
+    system message the planner built, folded into one `Context:` block before
+    any tool ran. Nothing could label it without knowing where each snippet
+    went, and a later search for them is wrong in four reachable shapes.
+
+    So the offsets are measured while the block is written. These witnesses
+    are the shapes a search gets wrong.
+    """
+
+    @staticmethod
+    def _ranges(engine, monkeypatch, snippets, user_id):
+        ranges: list = []
+        messages, _tools, _pre, _mcp, kept = engine._build_agent_context(
+            "how long",
+            [],
+            [],
+            user_id,
+            None,
+            explicit_context_ids=["ctx"],
+            grounding=snippets,
+            context_ranges=ranges,
+        )
+        return messages[0]["content"], kept, ranges
+
+    @pytest.mark.parametrize(
+        "snippets,why",
+        [
+            (["the same text", "the same text"], "two identical snippets"),
+            (["four hundred", "it says four hundred hours"], "one inside another"),
+            (["alpha | beta", "gamma"], "a snippet containing the separator"),
+            (["four hundred hours", "four hundred"], "a suffix of the first"),
+        ],
+    )
+    def test_every_snippet_is_measured_where_it_was_written(
+        self, store, monkeypatch, snippets, why
+    ):
+        engine = get_runtime().workflow
+        user_id = store.create_user(
+            email=f"rng_{uuid.uuid4().hex[:8]}@example.com"
+        ).id
+
+        content, kept, ranges = self._ranges(engine, monkeypatch, snippets, user_id)
+
+        assert kept == snippets, "the budget dropped one; the shape is untested"
+        assert len(ranges) == len(snippets)
+        # Each range covers its own snippet...
+        assert [content[start:end] for start, end in ranges] == snippets
+        # ...and they are distinct runs, in order, that do not overlap. This
+        # is the half a search cannot promise: `find` returns the *first*
+        # occurrence, so two identical snippets, or one that is a suffix of
+        # another, both land on the same offsets and read correctly while
+        # naming the same run twice.
+        for (start, end), (next_start, _next_end) in zip(ranges, ranges[1:]):
+            assert start < end <= next_start, (ranges, why)
+
+    def test_the_block_reads_exactly_as_it_did_before(self, store, monkeypatch):
+        """Measuring must not change the prompt. The incremental write has to
+        produce the same string the join produced."""
+        engine = get_runtime().workflow
+        user_id = store.create_user(
+            email=f"blk_{uuid.uuid4().hex[:8]}@example.com"
+        ).id
+        snippets = ["alpha said four hundred", "beta said eight hundred"]
+
+        content, kept, _ranges = self._ranges(
+            engine, monkeypatch, snippets, user_id
+        )
+
+        assert content.endswith("\n\nContext: " + " | ".join(kept))
+
+    def test_the_positions_are_married_to_what_each_snippet_is(self):
+        """The two halves meet once: the builder measured where, the
+        registration said what."""
+        registry = SourceRegistry()
+        source = registry.register_source(
+            kind="file", title="a.md", locator="/files/a.md"
+        )
+        evidence = registry.add_evidence(source.source_id, text="alpha")
+        ground = binding(source.source_id, evidence.evidence_id)
+        messages = [{"role": "system", "content": "prelude\n\nContext: alpha"}]
+        engine = get_runtime().workflow
+
+        grounded = engine._initial_grounding(
+            messages, [None, ground], [(0, 7), (20, 25)]
+        )
+
+        assert len(grounded) == 1
+        record = grounded[0]
+        assert record.message_index == 0
+        assert record.text == messages[0]["content"]
+        assert [(s.start, s.end, s.source_id) for s in record.spans] == [
+            (20, 25, source.source_id)
+        ]
+
+    def test_a_disagreement_loses_the_citations_and_not_the_turn(self):
+        """The two lists describe the same snippets and are built two
+        statements apart, so a mismatch is a programming error - but refusing
+        here would cost the user an answer, and under-offering costs a
+        marker."""
+        engine = get_runtime().workflow
+        messages = [{"role": "system", "content": "prelude"}]
+
+        registry = SourceRegistry()
+        source = registry.register_source(
+            kind="file", title="a.md", locator="/files/a.md"
+        )
+        evidence = registry.add_evidence(source.source_id, text="alpha")
+        ground = binding(source.source_id, evidence.evidence_id)
+
+        # Two relations and one position: zipping would silently describe the
+        # first and drop the second, so the whole record is refused.
+        assert engine._initial_grounding(
+            messages, [ground, ground], [(0, 3)]
+        ) == ()
+        # One relation and two positions: the same disagreement the other way.
+        assert engine._initial_grounding(
+            messages, [ground], [(0, 3), (4, 7)]
+        ) == ()
+        assert engine._initial_grounding(messages, [], []) == ()
+        assert engine._initial_grounding([], [ground], [(0, 3)]) == ()
