@@ -155,11 +155,10 @@ def run_web_fetch(
     # The whole page is the evidence here, so there is one span and it covers
     # the body inside the envelope - not the envelope, whose words are this
     # system's about the page rather than the page.
-    body = GroundedText()
+    body = GroundedText(transform=web.neutralize_markers)
     body.add(page["text"], grounds[0] if grounds else None)
-    text, spans = body.render(
-        lambda inner: web.wrap_untrusted(inner, source=header, findings=findings)
-    )
+    prefix, suffix = web.untrusted_envelope(source=header, findings=findings)
+    text, spans = body.render(prefix, suffix)
     if spans_sink is not None:
         spans_sink.extend(spans)
     return (text, findings)

@@ -3968,7 +3968,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 self._merge_bindings(bindings, seen, [
                     binding for sink in binding_sinks for binding in sink
                 ])
-            self._collect_passages(passages, results, span_sinks)
+            self._collect_passages(
+                passages, results, span_sinks, parsed, operation_seq
+            )
             return results
         round_bindings = bindings if bindings is not None else []
         serial_spans: List[List[GroundedSpan]] = [[] for _ in parsed]
@@ -3976,7 +3978,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
             run_one(index, name, args, snippets, round_bindings, serial_spans[index])
             for index, (_, name, args) in enumerate(parsed)
         ]
-        self._collect_passages(passages, results, serial_spans)
+        self._collect_passages(
+            passages, results, serial_spans, parsed, operation_seq
+        )
         return results
 
     @staticmethod
@@ -3984,19 +3988,36 @@ class WorkflowEngine(WorkflowStreamingMixin):
         passages: Optional[List[GroundedPassage]],
         results: List[str],
         span_sinks: List[List[GroundedSpan]],
+        parsed: List[tuple],
+        operation_seq: int,
     ) -> None:
         """One passage per call that grounded something, in call order.
 
         Per result rather than per round: an offset means nothing without the
         string it indexes, and a round returns one string per call.
+
+        Named by the call, not by its text. Two calls can return the same
+        string from different sources, and the worker chooses the order it
+        sends those results back in - so a later stage matching by text could
+        not tell them apart, and matching by position would trust an order the
+        untrusted side controls. `call_index` is the position this parent
+        dispatched, which is what a replay reproduces.
         """
         if passages is None:
             return
-        for result, spans in zip(results, span_sinks):
-            if spans:
-                passages.append(
-                    GroundedPassage(text=str(result), spans=tuple(spans))
+        for index, (result, spans) in enumerate(zip(results, span_sinks)):
+            if not spans:
+                continue
+            call = parsed[index][0] if index < len(parsed) else {}
+            passages.append(
+                GroundedPassage(
+                    text=str(result),
+                    spans=tuple(spans),
+                    operation_seq=operation_seq,
+                    call_index=index,
+                    tool_call_id=str(call.get("id") or "") or None,
                 )
+            )
 
     @staticmethod
     def _parse_tool_arguments(call: Dict[str, Any]) -> Dict[str, Any]:

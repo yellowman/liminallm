@@ -31,7 +31,7 @@ from liminallm.service.provenance import (
     binding,
 )
 from liminallm.service.runtime import get_runtime
-from liminallm.service.web import UNTRUSTED_OPEN
+from liminallm.service.web import UNTRUSTED_OPEN, neutralize_markers
 
 RESULTS = [
     {"title": "Alpha", "url": "https://a.example", "snippet": "four hundred hours"},
@@ -94,22 +94,20 @@ class TestABuilderMeasuresWhatItAssembles:
         _text, spans = _built()
         assert [s.source_id for s in spans] == ["src_1", "src_2"]
 
-    def test_the_envelope_moves_the_offsets_with_it(self):
-        """A caller that wrapped afterwards would leave every offset short by
-        the length of the header."""
+    def test_the_envelope_moves_the_offsets_by_its_own_length(self):
+        """Known, not searched for. A caller that wrapped afterwards would
+        leave every offset short by the length of the header."""
         body = GroundedText()
         body.add("one", binding("src_1", "ev_1"))
-        text, spans = body.render(
-            lambda inner: f"{UNTRUSTED_OPEN}\n{inner}\n[end]"
-        )
+        text, spans = body.render(f"{UNTRUSTED_OPEN}\n", "\n[end]")
         assert text.startswith(UNTRUSTED_OPEN)
         assert text[spans[0].start : spans[0].end] == "one"
 
     def test_a_control_token_forming_across_a_seam_drops_the_spans(self):
         """`<` ending one piece and `tool_call>` beginning the next form a tag
-        no single piece contained. Neutralizing the whole moves everything, so
+        no single piece contained. Transforming the whole moves everything, so
         the render keeps no offsets rather than wrong ones."""
-        body = GroundedText()
+        body = GroundedText(transform=neutralize_markers)
         body.add("ends with <", binding("src_1", "ev_1"))
         body.add("\n\ntool_call> starts", binding("src_2", "ev_2"))
         text, spans = body.render()
@@ -117,24 +115,25 @@ class TestABuilderMeasuresWhatItAssembles:
         assert spans == ()
 
     def test_a_marker_inside_one_piece_is_defanged_without_losing_the_span(self):
-        """Per-piece neutralization is what makes the offsets right. A piece
-        neutralized only at the end would have been measured before it
+        """Per-piece transformation is what makes the offsets right. A piece
+        transformed only at the end would have been measured before it
         changed length."""
-        body = GroundedText()
+        body = GroundedText(transform=neutralize_markers)
         body.add("safe ")
         body.add(f"before {UNTRUSTED_OPEN} after", binding("src_1", "ev_1"))
         text, spans = body.render()
         assert UNTRUSTED_OPEN not in text
         assert text[spans[0].start : spans[0].end] == "before [filtered] after"
 
-    def test_an_envelope_that_rewrites_the_body_drops_the_spans(self):
-        """The offsets described the body as it was handed over. A wrapper
-        that alters it leaves them describing nothing."""
+    def test_without_a_transform_the_text_is_left_exactly_as_given(self):
+        """The builder measures positions; it does not own anyone's
+        sanitization. A producer whose contract does not rewrite its text must
+        not start rewriting it because provenance passed through here."""
         body = GroundedText()
-        body.add("one", binding("src_1", "ev_1"))
-        text, spans = body.render(lambda inner: inner.replace("one", "ONE!"))
-        assert text == "ONE!"
-        assert spans == ()
+        body.add("before <tool_call> after", binding("src_1", "ev_1"))
+        text, spans = body.render()
+        assert text == "before <tool_call> after"
+        assert text[spans[0].start : spans[0].end] == text
 
 
 class _Chunk:
@@ -155,6 +154,18 @@ class _Rag:
 
     def retrieve(self, *args, **kwargs):
         return list(self._chunks)
+
+
+class _Note:
+    """The attributes the notes renderer and recorder actually read."""
+
+    def __init__(self, title, content):
+        import datetime
+
+        self.id = uuid.uuid4().hex
+        self.title = title
+        self.content = content
+        self.updated_at = datetime.datetime(2026, 9, 3)
 
 
 class _Message:
@@ -305,6 +316,166 @@ class TestARoundKeepsOneRecordPerCall:
         assert len(fetched) == 1
         span = fetched[0].spans[0]
         assert fetched[0].text[span.start : span.end] == "the page body"
+
+
+class TestARecordAgreesWithWhatTheTurnRegistered:
+    """The string a span covers must hold the evidence the turn recorded.
+    Otherwise the citation table says the model was grounded by text it never
+    read in that form."""
+
+    def test_file_search_does_not_rewrite_what_it_registered(self):
+        """The builder is a position builder. File contents are not hostile
+        web text and their contract does not neutralize markers, so a chunk
+        holding a literal control token reaches the model as written."""
+        from liminallm.service import agent_tools
+        from liminallm.service.rag import register_retrieved_chunks
+
+        registry = SourceRegistry()
+        chunks = [_Chunk("/files/a.md", "before <tool_call> after")]
+        spans: list = []
+        text, _snips, _chunks = agent_tools.run_file_search(
+            "q", 4, ["ctx"], rag=_Rag(chunks), user_id="u", tenant_id=None,
+            ground=lambda scoped: register_retrieved_chunks(registry, scoped),
+            spans_sink=spans,
+        )
+        evidence = registry.evidence[0].text
+        assert evidence == "before <tool_call> after"
+        assert evidence in text[spans[0].start : spans[0].end], text
+
+    def test_a_note_is_not_rewritten_either(self):
+        from liminallm.service import notes as notes_service
+
+        registry = SourceRegistry()
+        results = [(_Note("Kept", "before <tool_call> after"), 1.0)]
+        grounds = notes_service.note_grounds(registry, results)
+        text, spans = notes_service.format_note_results(results, grounds)
+        assert registry.evidence[0].text in text[spans[0].start : spans[0].end]
+        assert "<tool_call>" in text
+
+    def test_a_searched_snippet_is_registered_as_the_model_reads_it(self):
+        """Web text is the other way round: its contract does neutralize, so
+        the evidence has to be recorded from the neutralized form."""
+        from liminallm.service import web
+
+        registry = SourceRegistry()
+        results = [{"title": "T", "url": "https://e.example",
+                    "snippet": "before <tool_call> after"}]
+        grounds = web.search_grounds(registry, results)
+        text, spans, _findings = web.format_search_results("q", results, grounds)
+        assert registry.evidence[0].text == "before [filtered] after"
+        assert registry.evidence[0].text in text[spans[0].start : spans[0].end]
+
+
+class TestTheEnvelopeSaysWhereItPutTheBody:
+    def test_a_page_whose_body_is_its_own_url_is_not_confused_with_the_header(
+        self,
+    ):
+        """The header carries the source label, so the body's text can appear
+        in it too. Searching the finished string finds this system's words
+        about the page first."""
+        from liminallm.service import agent_tools, web
+
+        class _Settings:
+            web_tools_enabled = True
+            web_search_provider = "x"
+            web_search_api_key = "k"
+            web_search_engine_id = ""
+            web_fetch_timeout = 5.0
+            web_fetch_max_bytes = 1000
+            web_fetch_allow_private = False
+            tool_network_proxy_url = None
+
+        class _Logger:
+            @staticmethod
+            def info(*args, **kwargs):
+                return None
+
+        url = "https://p.example"
+        original = web.fetch_url
+        web.fetch_url = lambda *a, **k: {
+            "url": url, "title": "Page", "text": url, "findings": [],
+        }
+        try:
+            registry = SourceRegistry()
+            bindings: list = []
+            spans: list = []
+            text, _findings = agent_tools.run_web_fetch(
+                url, settings=_Settings(), logger=_Logger(),
+                source_registry=registry, bindings_sink=bindings,
+                spans_sink=spans,
+            )
+        finally:
+            web.fetch_url = original
+
+        occurrences = [
+            at for at in range(len(text)) if text.startswith(url, at)
+        ]
+        assert len(occurrences) == 2, occurrences
+        # The body, which is the last one - not the source header.
+        assert spans[0].start == occurrences[-1], (spans[0].start, occurrences)
+
+
+class TestARoundNamesTheCallEachPassageCameFrom:
+    """Two calls can return the same string from different sources, and the
+    worker chooses the order it sends them back in. Text cannot tell them
+    apart and position trusts the untrusted side, so the parent keeps its own
+    record of which call produced which passage."""
+
+    def test_identical_results_from_two_sources_stay_distinguishable(
+        self, store, monkeypatch
+    ):
+        engine = get_runtime().workflow
+        registry = SourceRegistry()
+        calls = {"n": 0}
+
+        def _search(query, limit, **kwargs):
+            calls["n"] += 1
+            index = calls["n"]
+            source = registry.register_source(
+                kind="file", title=f"m{index}.md", locator=f"/files/{index}"
+            )
+            evidence = registry.add_evidence(source.source_id, text="400 hours")
+            ground = binding(source.source_id, evidence.evidence_id)
+            body = GroundedText()
+            body.add("400 hours", ground)
+            text, spans = body.render()
+            if kwargs.get("bindings_sink") is not None:
+                kwargs["bindings_sink"].append(ground)
+            if kwargs.get("spans_sink") is not None:
+                kwargs["spans_sink"].extend(spans)
+            return text, [], [], {}
+
+        monkeypatch.setattr(engine, "_run_file_search", _search)
+        passages: list = []
+        results = engine._run_round_tools(
+            [
+                ({"id": "A", "name": "file_search"}, "file_search", {"query": "x"}),
+                ({"id": "B", "name": "file_search"}, "file_search", {"query": "y"}),
+            ],
+            conversation_id=None, context_id=None, user_id="u", tenant_id=None,
+            session={}, snippets=[], fallback_query="x", operation_seq=7,
+            source_registry=registry, bindings=[], passages=passages,
+        )
+
+        # The two results are the same string, so nothing about the text
+        # separates them.
+        assert results == ["400 hours", "400 hours"]
+        assert len({p.text for p in passages}) == 1
+        # The parent's own record does.
+        assert [p.call_index for p in passages] == [0, 1]
+        assert [p.tool_call_id for p in passages] == ["A", "B"]
+        assert {p.operation_seq for p in passages} == {7}
+        assert len({p.spans[0].source_id for p in passages}) == 2
+
+    def test_the_call_identity_survives_the_ledger_round_trip(self):
+        passage = GroundedPassage(
+            text="400 hours",
+            spans=(GroundedSpan(0, 9, "src_1", "ev_1"),),
+            operation_seq=7,
+            call_index=1,
+            tool_call_id="B",
+        )
+        assert GroundedPassage.from_dict(passage.as_dict()) == passage
 
 
 class TestAParallelRoundKeepsItsCallsApart:
@@ -503,21 +674,6 @@ class TestEveryProducerRecordsPositions:
         """A note with no title is shown and cannot be cited, so it takes the
         same alignment as an untitled search result."""
         from liminallm.service import notes as notes_service
-
-        class _Note:
-            def __init__(self, title, content):
-                self.id = uuid.uuid4().hex
-                self.title = title
-                self.content = content
-
-                class _When:
-                    @staticmethod
-                    def date():
-                        import datetime
-
-                        return datetime.date(2026, 9, 3)
-
-                self.updated_at = _When()
 
         registry = SourceRegistry()
         results = [

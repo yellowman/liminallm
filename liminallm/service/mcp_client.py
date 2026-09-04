@@ -47,7 +47,7 @@ from liminallm.service.sandbox import tool_network_guard
 from liminallm.service.web import (
     neutralize_markers,
     scan_for_injection,
-    wrap_untrusted,
+    untrusted_envelope,
 )
 
 logger = get_logger(__name__)
@@ -503,15 +503,13 @@ async def call(
     # The whole result is the evidence, so there is one span and it covers the
     # body inside the envelope - not the envelope, whose words are this
     # system's about the server rather than the server's.
-    body = GroundedText()
+    body = GroundedText(transform=neutralize_markers)
     body.add(shown, grounds[0] if grounds else None)
-    text, spans = body.render(
-        lambda inner: wrap_untrusted(
-            inner,
-            source=f"MCP server {tool.server_name} :: {tool.remote_name}",
-            findings=findings,
-        )
+    prefix, suffix = untrusted_envelope(
+        source=f"MCP server {tool.server_name} :: {tool.remote_name}",
+        findings=findings,
     )
+    text, spans = body.render(prefix, suffix)
     if spans_sink is not None:
         spans_sink.extend(spans)
     return text
