@@ -2912,34 +2912,40 @@ class WorkflowEngine(WorkflowStreamingMixin):
         succeeded = sanitized.get("status") != "error"
         if succeeded and context.provenance_bindings:
             sanitized["provenance_bindings"] = list(context.provenance_bindings)
-        # Citations, on the same terms and from the same side. The canonical
-        # response exists because this assembly made `llm.generate_with_tools`
-        # broker calls, so the transfer is gated on the resolved worker body.
+        # Citations, on the same terms and from the same side. A canonical
+        # response exists for the bodies that produce the turn's answer - the
+        # agent loop through `llm.generate_with_tools`, and the plain and
+        # retrieval bodies through `tool.host` - so the transfer is gated on
+        # the resolved body being one of them.
         #
-        # Both parts of that gate are deliberately unkillable by mutation, and
-        # are here for what they refuse next rather than for anything today:
+        # The body gate is not a formality. The intent classifier is a model
+        # call whose result reaches this seam like any other, and it answers a
+        # routing question rather than the user's: it records no canonical
+        # response, and naming the set here says which results may become
+        # citable rather than leaving it to be inferred from what happens to
+        # be filled in.
         #
-        # * no other body calls that capability, so a non-agent tool has no
-        #   canonical response and would transfer nothing anyway. Named
-        #   explicitly so that a later host tool filling in similarly named
-        #   state does not inherit a protocol nobody wrote it for.
-        # * `stream_final` never arrives here at all: that path calls
-        #   `_serve_invocation` directly and streams its own final turn. Its
-        #   worker `content` is the last *tool* round's text, which can equal
-        #   the canonical public text exactly - measured, not assumed - so a
-        #   refactor routing streaming through this seam would attach
-        #   citations to an answer that had not been written yet.
+        # `stream_final` never arrives here at all: that path calls
+        # `_serve_invocation` directly and streams its own final turn. Its
+        # worker `content` is the last *tool* round's text, which can equal
+        # the canonical public text exactly - measured, not assumed - so a
+        # refactor routing streaming through this seam would attach citations
+        # to an answer that had not been written yet. Deliberately unkillable,
+        # and kept for what it refuses next.
         #
-        # `citations_intact` is the third part and is not like the other two:
-        # it refuses something reachable today. Once a round of this assembly
-        # diverged from the turn that asked for it, the parent can no longer
-        # say what conversation the final answer was written in - so an
-        # answer quoting a handle from an earlier, honest round is a handle
-        # the model wrote in a prompt the worker composed. Exact matching
-        # accepts it, because the model did write it; this is what does not.
+        # `citations_intact` refuses something reachable today. Once a round
+        # of this assembly diverged from the turn that asked for it, the
+        # parent can no longer say what conversation the final answer was
+        # written in - so an answer quoting a handle from an earlier, honest
+        # round is a handle the model wrote in a prompt the worker composed.
+        # Exact matching accepts it, because the model did write it; this is
+        # what does not.
         if (
             succeeded
-            and worker_tool == "agent.files_v1"
+            and (
+                worker_tool == "agent.files_v1"
+                or worker_tool in self.MODEL_ANSWER_HOSTS
+            )
             and not plan.get("stream_final")
             and context.citations_intact
         ):
@@ -3254,10 +3260,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         than none. The worker process, its rlimits, the ledger and the liveness
         check all still apply; only the body runs here.
         """
-        handler = self._builtin_tool_handlers().get(tool_name)
-        if handler is None:
-            spec = self.tool_registry.get(tool_name) or {}
-            handler = self._builtin_tool_handlers().get(spec.get("handler"))
+        handler = self._builtin_tool_handlers().get(self._host_body_name(tool_name))
         if handler is None:
             return {"status": "error", "content": f"unknown tool {tool_name}"}
         return handler(
@@ -3272,6 +3275,36 @@ class WorkflowEngine(WorkflowStreamingMixin):
             source_registry=context.source_registry,
             bindings_sink=context.provenance_bindings,
         )
+
+    #: The host bodies whose result is the turn's answer.
+    #:
+    #: Only these record a canonical model response. Every host body is
+    #: scrubbed on the way out, because any of them may carry text the model
+    #: wrote; the question this set answers is narrower - which one produced
+    #: the reply a citation could honestly be read out of.
+    #:
+    #: `canonical_model_response` is replacement state, so the cost of a body
+    #: being wrongly in this set is not that its own result becomes citable.
+    #: It is that a node running after the answer overwrites it, and the real
+    #: answer loses citations it had earned. A workflow that classifies an
+    #: intent after answering is enough to reach that.
+    MODEL_ANSWER_HOSTS = frozenset(
+        {"llm.generic", "llm.generic_chat_v1", "rag.answer_with_context_v1"}
+    )
+
+    def _host_body_name(self, tool_name: str) -> str:
+        """Which builtin body a host-tool request runs, or `""` for none.
+
+        One resolution, asked twice: `_run_host_tool` uses it to pick the
+        handler, and the broker uses it to decide whether what came back is
+        the turn's answer. Two implementations would eventually run one body
+        and describe another - the reason `resolve_executable_handler` exists
+        for the worker bodies.
+        """
+        if tool_name in self._builtin_tool_handlers():
+            return tool_name
+        spec = self.tool_registry.get(tool_name) or {}
+        return str(spec.get("handler") or "")
 
     def _builtin_tool_handlers(
         self,

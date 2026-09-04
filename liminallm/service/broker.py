@@ -995,11 +995,49 @@ class CapabilityBroker:
 
     def _tool_host(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Run a builtin tool body that still lives in the parent."""
+    ) -> CapabilityOutcome:
+        """Run a builtin tool body that still lives in the parent.
+
+        Two of these bodies are model calls whose result is the turn's answer,
+        so this is the same boundary `llm.generate_with_tools` has and it is
+        drawn the same way. The body runs here and its result has crossed
+        nothing yet: the parent keeps what the model wrote, and the worker
+        gets that with this turn's namespace taken out of it.
+
+        Without the split the plain answer path could not be offered handles
+        at all. The model would write `[cite:K7Q2ABCD-1]`, the body would
+        return it, and it would cross the pipe intact - and with no canonical
+        copy kept there would be nothing to read a citation out of afterwards.
+
+        Every body is scrubbed, not only the two. A body added later is
+        model-adjacent the moment somebody writes it, and a boundary that
+        works by listing which results to clean is a boundary that stops
+        working quietly.
+
+        Only the two are kept as canonical. `canonical_model_response` is
+        replacement state for one answer, and the intent classifier's routing
+        decision is not one: filing it there would make the next citation
+        transfer compare the user's answer against a class label.
+        """
         invocation.check_live()
-        return self._engine._run_host_tool(
-            str(payload.get("tool") or ""),
-            payload.get("inputs") or {},
-            context=self._ctx,
+        name = str(payload.get("tool") or "")
+        canonical = self._engine._run_host_tool(
+            name, payload.get("inputs") or {}, context=self._ctx
+        )
+        nonce = invocation.citations.nonce
+        public = scrub_namespace(canonical, nonce)
+        # Unkillable by mutation, like the one on the agent path and for the
+        # same reason: the scrub above is what removes the namespace, so this
+        # can only fire when the scrub is wrong. That is exactly when nobody
+        # would be looking, and this is the last statement before the reply
+        # crosses.
+        assert_scrubbed(public, nonce)
+        if self._engine._host_body_name(name) not in self._engine.MODEL_ANSWER_HOSTS:
+            return CapabilityOutcome(public=public)
+        # A failed body records nothing: `_answer` fails the ledger entry
+        # instead of committing it, so the parent_state below is dropped with
+        # it and no answer that errored becomes citable.
+        return CapabilityOutcome(
+            public=public,
+            parent_state={"canonical_model_response": canonical},
         )

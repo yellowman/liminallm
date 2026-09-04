@@ -24,6 +24,7 @@ from liminallm.service.citations import (
     scrub_positions,
     transfer_citations,
 )
+from liminallm.service.broker import CapabilityBroker, InvocationContext
 from liminallm.service.provenance import SourceRegistry, binding
 from liminallm.service.runtime import get_runtime
 from tests.mcpfixture import allow_local
@@ -461,33 +462,47 @@ class TestThroughTheRealAgentLoop:
 
 
 class TestTheGateIsTheResolvedWorkerBody:
-    @pytest.mark.asyncio
-    async def test_a_non_agent_tool_transfers_no_citations(
+    def test_a_builtin_resolves_to_itself_with_nothing_persisted(
         self, store, monkeypatch
     ):
-        """`llm.generic` never makes `llm.generate_with_tools` broker calls,
-        so it has no canonical response. Gated on the resolved body anyway,
-        so a later host tool filling in similar state inherits nothing."""
-        engine = get_runtime().workflow
-        registry, invocation = self._seed_generic(engine, monkeypatch)
-        result = await engine._invoke_tool(
-            "llm.generic",
-            {"message": "how long"},
-            [],
-            [],
-            None,
-            uuid.uuid4().hex,
-            "how long",
-            source_registry=registry,
-            user_id="u",
-            tenant_id=None,
-            invocation=invocation,
-        )
-        assert result.get("status") != "error", result
-        assert not result.get("validated_citations")
+        """What the sidecar decision is made about.
 
-    @staticmethod
-    def _seed_generic(engine, monkeypatch):
+        The answer has to be the body that actually runs - the same
+        resolution `_run_host_tool` picks its handler with, asked once so the
+        two cannot name different bodies.
+
+        With an empty registry, because that is where the two halves of the
+        resolution come apart. A seeded deployment stores a spec for every
+        builtin whose `handler` is its own name, so the spec lookup alone
+        answers correctly and the literal-name branch looks redundant; before
+        anything is seeded it is the only branch that finds the body.
+        """
+        engine = get_runtime().workflow
+        monkeypatch.setattr(engine, "tool_registry", {})
+
+        assert engine._host_body_name("llm.generic") == "llm.generic"
+        assert engine._host_body_name("nothing.at.all") == ""
+
+    def test_an_alias_resolves_to_the_body_behind_it(self, store, monkeypatch):
+        engine = get_runtime().workflow
+        monkeypatch.setattr(
+            engine, "tool_registry", {"my.answerer": {"handler": "llm.generic"}}
+        )
+
+        assert engine._host_body_name("my.answerer") == "llm.generic"
+
+    def test_a_later_routing_node_does_not_displace_the_answer(
+        self, store, monkeypatch
+    ):
+        """Why the set is narrow.
+
+        `canonical_model_response` is replacement state, so a body wrongly
+        counted as the turn's answer does not merely become citable itself -
+        it overwrites the answer that came before it. A workflow that
+        classifies an intent after answering reaches that, and the real
+        answer loses citations it had already earned.
+        """
+        engine = get_runtime().workflow
         registry, bindings = _registry()
         invocation = engine.invocations.open(
             uuid.uuid4().hex, tool="llm.generic", user_id="u", tenant_id=None
@@ -497,10 +512,47 @@ class TestTheGateIsTheResolvedWorkerBody:
         monkeypatch.setattr(
             engine.llm,
             "generate",
-            lambda *a, **k: {
-                "content": f"{ANSWER} [cite:{handle}]",
-                "usage": {},
+            lambda *a, **k: {"content": f"{ANSWER} [cite:{handle}]", "usage": {}},
+            raising=False,
+        )
+        context = InvocationContext(user_id="u", source_registry=registry)
+        broker = CapabilityBroker(engine, context)
+
+        broker._answer(invocation, {
+            "capability": "tool.host", "operation_seq": 1,
+            "payload": {"tool": "llm.generic", "inputs": {"message": "how long"}},
+        })
+        assert context.canonical_model_response["content"] == (
+            f"{ANSWER} [cite:{handle}]"
+        )
+
+        routing = broker._answer(invocation, {
+            "capability": "tool.host", "operation_seq": 2,
+            "payload": {
+                "tool": "llm.intent_classifier_v1",
+                "inputs": {"message": "how long"},
             },
+        })
+
+        assert routing["ok"], routing
+        assert routing["result"] == {"intent": "analysis"}, routing
+        assert context.canonical_model_response["content"] == (
+            f"{ANSWER} [cite:{handle}]"
+        ), "a routing node overwrote the answer's canonical copy"
+
+    @staticmethod
+    def _seed_generic(engine, monkeypatch, answer=None, tool="llm.generic"):
+        registry, bindings = _registry()
+        invocation = engine.invocations.open(
+            uuid.uuid4().hex, tool=tool, user_id="u", tenant_id=None
+        )
+        invocation.extend_citations(registry, bindings)
+        handle = invocation.citations.handle_for("src_1")
+        text = answer if answer is not None else f"{ANSWER} [cite:{handle}]"
+        monkeypatch.setattr(
+            engine.llm,
+            "generate",
+            lambda *a, **k: {"content": text, "usage": {}},
             raising=False,
         )
         return registry, invocation
@@ -541,6 +593,151 @@ class TestTheGateIsTheResolvedWorkerBody:
         )
         assert result.get("status") == "error"
         assert not result.get("validated_citations")
+
+
+class TestThePlainAnswerHasTheSameWireBoundary:
+    """`llm.generic` and `rag.answer_with_context_v1` run behind `tool.host`,
+    which returned the body's result to the worker exactly as the body built
+    it. So a model answer carrying a handle crossed the pipe with the handle
+    in it, and the parent kept no copy to read a citation out of afterwards.
+
+    The agent path has had both halves since the wire commit. These are the
+    same two halves for the route that answers without tools.
+    """
+
+    @staticmethod
+    async def _run(engine, registry, invocation, tool="llm.generic"):
+        return await engine._invoke_tool(
+            tool,
+            {"message": "how long", "question": "how long"},
+            [],
+            [],
+            None,
+            uuid.uuid4().hex,
+            "how long",
+            source_registry=registry,
+            user_id="u",
+            tenant_id=None,
+            invocation=invocation,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool", ["llm.generic", "rag.answer_with_context_v1"]
+    )
+    async def test_the_namespace_does_not_cross_and_the_parent_keeps_it(
+        self, store, monkeypatch, tool
+    ):
+        engine = get_runtime().workflow
+        registry, invocation = TestTheGateIsTheResolvedWorkerBody._seed_generic(
+            engine, monkeypatch, tool=tool
+        )
+        nonce = invocation.citations.nonce
+        handle = invocation.citations.handle_for("src_1")
+
+        result = await self._run(engine, registry, invocation, tool=tool)
+
+        assert result.get("status") != "error", result
+        # What crossed carries no representation of the namespace...
+        assert nonce not in json.dumps(result, default=repr)
+        assert result.get("content") == ANSWER, repr(result.get("content"))
+        # ...and the parent still holds the answer the model actually wrote.
+        assert result.get("validated_citations") == [
+            {
+                "source_id": "src_1",
+                "canonical_start": len(ANSWER) + 1,
+                "canonical_end": len(ANSWER) + 1 + len(f"[cite:{handle}]"),
+                "public_offset": len(ANSWER),
+            }
+        ], result.get("validated_citations")
+
+    @pytest.mark.asyncio
+    async def test_a_worker_that_changed_one_byte_transfers_nothing(
+        self, store, monkeypatch
+    ):
+        """The same rule as the agent path, on the same terms: what came back
+        must be the answer the model wrote, scrubbed."""
+        engine = get_runtime().workflow
+        registry, invocation = TestTheGateIsTheResolvedWorkerBody._seed_generic(
+            engine, monkeypatch
+        )
+        real = engine.tool_postflight
+
+        def _rewrite(result, *args, **kwargs):
+            result = dict(result)
+            result["content"] = "800 hours."
+            return real(result, *args, **kwargs)
+
+        monkeypatch.setattr(engine, "tool_postflight", _rewrite)
+
+        result = await self._run(engine, registry, invocation)
+
+        assert result.get("content") == "800 hours."
+        assert not result.get("validated_citations"), result
+
+    @pytest.mark.asyncio
+    async def test_an_answer_with_no_handle_crosses_byte_for_byte(
+        self, store, monkeypatch
+    ):
+        """What the production gate being off looks like today. The nonce is
+        minted every turn and the scrub removes only that namespace, so an
+        answer the model wrote without a marker reaches the worker exactly as
+        it was written."""
+        engine = get_runtime().workflow
+        plain = "The inspection interval is 400 hours."
+        registry, invocation = TestTheGateIsTheResolvedWorkerBody._seed_generic(
+            engine, monkeypatch, answer=plain
+        )
+
+        result = await self._run(engine, registry, invocation)
+
+        assert result.get("content") == plain
+        assert not result.get("validated_citations"), result
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_host_call_restores_the_canonical_answer(
+        self, store, monkeypatch
+    ):
+        """The canonical copy is committed beside the reply, so a replacement
+        attempt replaying the public answer gets the parent's copy back rather
+        than rerunning the model or losing it."""
+        engine = get_runtime().workflow
+        registry, invocation = TestTheGateIsTheResolvedWorkerBody._seed_generic(
+            engine, monkeypatch
+        )
+        handle = invocation.citations.handle_for("src_1")
+        context = InvocationContext(user_id="u", source_registry=registry)
+        broker = CapabilityBroker(engine, context)
+        request = {
+            "capability": "tool.host",
+            "operation_seq": 1,
+            "payload": {"tool": "llm.generic", "inputs": {"message": "how long"}},
+        }
+        first = broker._answer(invocation, request)
+        assert first["ok"], first
+        assert context.canonical_model_response["content"] == (
+            f"{ANSWER} [cite:{handle}]"
+        )
+
+        # A replacement attempt: a fresh context and broker over the same
+        # ledger. The body does not run again - the model is removed to prove
+        # it.
+        monkeypatch.setattr(
+            engine.llm,
+            "generate",
+            lambda *a, **k: pytest.fail("the replayed body ran again"),
+            raising=False,
+        )
+        replacement = InvocationContext(user_id="u", source_registry=registry)
+        replayed = CapabilityBroker(engine, replacement)._answer(
+            invocation, request
+        )
+
+        assert replayed.get("replayed") is True, replayed
+        assert replayed["result"]["content"] == ANSWER
+        assert replacement.canonical_model_response == (
+            context.canonical_model_response
+        )
 
 
 class TestTheStreamedAnswerIsNotThisWorkersToCite:
