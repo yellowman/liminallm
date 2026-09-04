@@ -1071,6 +1071,30 @@ class WorkflowStreamingMixin:
             # final turn offers no tools, so there is no model-chosen control
             # flow left in it to contain, and this side streams it.
             traces: List[dict] = []
+            stream_context = InvocationContext(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                context_id=context_id,
+                adapters=list(adapters or []),
+                history=list(history or []),
+                user_message=user_message,
+                # The turn's registry by reference, so the streamed path
+                # records into the same one as the rest of it. No bindings
+                # sent: the worker is never told what supported the answer.
+                # This is the collector the broker writes into when it serves
+                # a search.
+                source_registry=source_registry,
+                provenance_bindings=capability_bindings,
+                # On the context, never in the plan below: the plan is what
+                # the worker reads, and an entry there carries the server's
+                # URL and its taint class.
+                mcp_tools=mcp_tools,
+            )
+            # The parent's own copy of the prompt it is about to hand over,
+            # kept before the plan crosses. The streamed path finishes the
+            # turn itself, so it needs this at least as much as the batch one.
+            stream_context.remember_base_prompt(messages, tools)
             result = await asyncio.wait_for(
                 asyncio.to_thread(
                     self._serve_invocation,
@@ -1090,26 +1114,7 @@ class WorkflowStreamingMixin:
                         # it used, not only what a tool fetched.
                         "context_snippets": list(grounded),
                     },
-                    InvocationContext(
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        conversation_id=conversation_id,
-                        context_id=context_id,
-                        adapters=list(adapters or []),
-                        history=list(history or []),
-                        user_message=user_message,
-                        # The turn's registry by reference, so the streamed
-                        # path records into the same one as the rest of it.
-                        # No bindings sent: the worker is never told what
-                        # supported the answer. This is the collector the
-                        # broker writes into when it serves a search.
-                        source_registry=source_registry,
-                        provenance_bindings=capability_bindings,
-                        # On the context, never in the plan above: the plan is
-                        # what the worker reads, and an entry there carries the
-                        # server's URL and its taint class.
-                        mcp_tools=mcp_tools,
-                    ),
+                    stream_context,
                     self._worker_limits(self.tool_registry.get("agent.files_v1")),
                     on_capability=traces.append,
                     expected_attempt=(

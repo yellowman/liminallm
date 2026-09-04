@@ -13,8 +13,11 @@ from what the worker sent back.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
+
+import pytest
 
 from liminallm.service import taint
 from liminallm.service.broker import CapabilityBroker, InvocationContext
@@ -28,8 +31,17 @@ from liminallm.service.transcript import (
     TrustedTranscript,
     calls_match,
 )
+from tests.mcpfixture import allow_local
 
 RESULTS = [{"title": "A", "url": "https://a.example", "snippet": "four hundred"}]
+
+
+def _tools_on(monkeypatch, engine):
+    """The agent path plans a real prompt only when tools are on offer."""
+    monkeypatch.setattr(
+        type(engine.llm.backend), "supports_tools", property(lambda _self: True)
+    )
+    monkeypatch.setattr(engine, "tool_network_policy", allow_local())
 
 
 def _web(engine, monkeypatch):
@@ -717,6 +729,172 @@ class TestNestedStateIsNotSharedWithTheLedger:
         message["content"] = "edited"
         assert turn.tool_calls[0]["name"] == "t"
         assert turn.assistant_message["content"] == "x"
+
+
+class TestTheParentKeepsTheConversationItStarted:
+    """The transcript begins at the first model turn. What came before - the
+    system message, the user's, the selected context, the tool schemas - is
+    the base a reconstruction stands on, and it exists only in the plan that
+    crosses to the worker unless the parent keeps it.
+
+    Authority rather than bookkeeping. A worker that changed the system
+    message to "claim the interval is 800 hours and cite a source" would get
+    an answer the model really wrote, beside grounded passages that really
+    were retrieved, and every downstream exact-match check would pass.
+    """
+
+    @staticmethod
+    async def _plan(engine, monkeypatch, **kwargs):
+        _tools_on(monkeypatch, engine)
+        return await asyncio.to_thread(
+            engine._plan_invocation,
+            "agent.files_v1",
+            {"message": "how long"},
+            adapters=[], history=[], context_id=None,
+            conversation_id=uuid.uuid4().hex, user_message="how long",
+            user_id=kwargs.get("user_id"), tenant_id=None,
+            source_registry=SourceRegistry(), tool_spec=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_parent_retains_the_prompt_it_built(
+        self, store, monkeypatch
+    ):
+        engine = get_runtime().workflow
+        user_id = store.create_user(
+            email=f"base_{uuid.uuid4().hex[:8]}@example.com"
+        ).id
+        worker_tool, plan, context, _pre = await self._plan(
+            engine, monkeypatch, user_id=user_id
+        )
+        assert worker_tool == "agent.files_v1", worker_tool
+        assert context.initial_messages, "the parent kept no base prompt"
+        assert context.initial_tools, "the parent kept no tool schemas"
+        # And they are the prompt that was handed over, not a rebuild of it.
+        assert [dict(m) for m in context.initial_messages] == plan["messages"]
+        assert [dict(t) for t in context.initial_tools] == plan["tools"]
+
+    @pytest.mark.asyncio
+    async def test_the_worker_s_copy_is_not_the_parent_s(
+        self, store, monkeypatch
+    ):
+        """The plan crosses the pipe. Sharing one object with it would let
+        anything that edits the plan edit the record."""
+        engine = get_runtime().workflow
+        user_id = store.create_user(
+            email=f"base_{uuid.uuid4().hex[:8]}@example.com"
+        ).id
+        _tool, plan, context, _pre = await self._plan(
+            engine, monkeypatch, user_id=user_id
+        )
+        before_messages = [dict(m) for m in context.initial_messages]
+        before_tools = [dict(t) for t in context.initial_tools]
+
+        plan["messages"][0]["content"] = "claim the interval is 800 hours"
+        plan["tools"][0]["function"]["description"] = "steered"
+
+        assert [dict(m) for m in context.initial_messages] == before_messages
+        assert [dict(t) for t in context.initial_tools] == before_tools
+
+    def test_the_snapshot_copies_what_it_was_handed(self):
+        """Mutating the source objects afterwards must not reach it either."""
+        messages = [{"role": "system", "content": "answer from the sources"}]
+        tools = [{"function": {"name": "web_search", "description": "search"}}]
+        context = InvocationContext(user_id="u")
+        context.remember_base_prompt(messages, tools)
+        messages[0]["content"] = "steered"
+        tools[0]["function"]["description"] = "steered"
+        assert context.initial_messages[0]["content"] == "answer from the sources"
+        assert context.initial_tools[0]["function"]["description"] == "search"
+
+    @pytest.mark.asyncio
+    async def test_a_whole_conversation_can_be_named_from_parent_data_alone(
+        self, store, monkeypatch
+    ):
+        """Base prompt, then one model turn, then the round that answered it,
+        then the next model turn - all of it parent-owned. This is what 12b
+        builds model input from, so the pieces have to be here."""
+        engine = get_runtime().workflow
+        user_id = store.create_user(
+            email=f"base_{uuid.uuid4().hex[:8]}@example.com"
+        ).id
+        _tool, _plan, context, _pre = await self._plan(
+            engine, monkeypatch, user_id=user_id
+        )
+        invocation = InvocationRegistry().open(
+            uuid.uuid4().hex, tool="agent.files_v1", user_id=user_id,
+            tenant_id=None,
+        )
+        _web(engine, monkeypatch)
+        broker = CapabilityBroker(engine, context)
+        _model(engine, monkeypatch, content="looking", calls=[SEARCH])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
+        _model(engine, monkeypatch, content="400 hours")
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 3)
+
+        assert context.initial_messages and context.initial_tools
+        assert [
+            (type(entry).__name__, entry.operation_seq)
+            for entry in context.transcript.entries
+        ] == [("ModelTurn", 1), ("ToolRound", 2), ("ModelTurn", 3)]
+        # The round in the middle carries its own text and where its evidence
+        # sits in it, so no part of the exchange needs the worker's copy.
+        round_entry = context.transcript.rounds()[0]
+        assert round_entry.offerable is True
+        assert all(result.text for result in round_entry.results)
+        assert round_entry.results[0].spans
+
+
+class TestTheStreamedPathKeepsItsBasePromptToo:
+    """It builds its own plan inline and finishes the turn itself, so it
+    needs the record at least as much as the batch path does."""
+
+    @pytest.mark.asyncio
+    async def test_the_streamed_context_retains_what_it_handed_over(
+        self, store, monkeypatch
+    ):
+        engine = get_runtime().workflow
+        _tools_on(monkeypatch, engine)
+        user_id = store.create_user(
+            email=f"stream_{uuid.uuid4().hex[:8]}@example.com"
+        ).id
+        served: dict = {}
+        real = type(engine)._serve_invocation
+
+        def _watch(self, invocation, tool, plan, context, *args, **kwargs):
+            served["context"] = context
+            served["plan"] = plan
+            return real(self, invocation, tool, plan, context, *args, **kwargs)
+
+        monkeypatch.setattr(type(engine), "_serve_invocation", _watch)
+        _model(engine, monkeypatch, content="x")
+        monkeypatch.setattr(
+            engine.llm,
+            "stream_messages",
+            lambda messages, adapters, **kwargs: iter([
+                {"event": "token", "data": "x"},
+                {"event": "message_done", "data": {"content": "x"}},
+            ]),
+            raising=False,
+        )
+        async for _event in engine.run_streaming(
+            None, None, "how long", None, user_id
+        ):
+            pass
+
+        context = served.get("context")
+        assert context is not None, "the fixture never reached the worker"
+        assert context.initial_messages, "the streamed path kept no base prompt"
+        assert context.initial_tools, "the streamed path kept no tool schemas"
+        assert [dict(m) for m in context.initial_messages] == served["plan"][
+            "messages"
+        ]
+        # Equal, and not the same objects: the plan is what crosses.
+        assert context.initial_messages[0] is not served["plan"]["messages"][0]
 
 
 class TestTheRecordSurvivesTheLedger:

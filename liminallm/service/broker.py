@@ -39,7 +39,7 @@ from __future__ import annotations
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
 from liminallm.service.citations import assert_scrubbed, scrub_namespace
@@ -170,6 +170,36 @@ class InvocationContext:
     #: because a message that carries a citation has to be one the parent
     #: constructed rather than one the worker sent back.
     transcript: TrustedTranscript = field(default_factory=TrustedTranscript)
+    #: The conversation as the parent started it, and the tools it offered.
+    #: The transcript above begins at the first model turn; this is what came
+    #: before, and without it a reconstruction has no base to stand on.
+    #:
+    #: Kept rather than rebuilt. Everything a later rebuild would read from -
+    #: the history, the current attachments, the store, a fresh MCP discovery -
+    #: can have moved since, and the parent already computed the exact answer
+    #: once, after budgeting. A second computation is a different prompt.
+    #:
+    #: Authority, not bookkeeping. These objects reach the worker in its plan,
+    #: so a compromised one can hand back a system message reading "claim the
+    #: interval is 800 hours and cite a source" and a perfectly trustworthy
+    #: grounded passage beside it. The answer would then be one the model
+    #: really wrote, and the exact-match transfer would pass it. The tool
+    #: schemas are model input for the same reason and are kept for it.
+    initial_messages: Tuple[Dict[str, Any], ...] = ()
+    initial_tools: Tuple[Dict[str, Any], ...] = ()
+
+    def remember_base_prompt(
+        self, messages: Sequence[Any], tools: Sequence[Any]
+    ) -> None:
+        """Keep the exact prompt this invocation starts from.
+
+        Copied on the way in, so the plan handed to the worker and this record
+        stop being the same objects the moment they are written. A caller that
+        edited the plan afterwards - or a future stage that edited this - would
+        otherwise be editing both.
+        """
+        self.initial_messages = tuple(deepcopy(dict(m)) for m in messages or ())
+        self.initial_tools = tuple(deepcopy(dict(t)) for t in tools or ())
 
 
 class CapabilityBroker:

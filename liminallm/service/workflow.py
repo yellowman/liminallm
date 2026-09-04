@@ -3036,6 +3036,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # context rather than in the plan: a worker that could name what
         # supported the answer could name a source it never read.
         context.provenance_bindings = agent_bindings
+        # The parent's own copy of what it is about to hand over, taken
+        # from the objects budgeting produced rather than rebuilt later from
+        # sources that can move. It copies on the way in, so what the plan
+        # carries below and what the parent keeps are already separate.
+        context.remember_base_prompt(messages, tools)
         plan.update(
             {
                 "messages": messages,
