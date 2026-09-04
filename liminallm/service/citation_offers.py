@@ -12,13 +12,16 @@ correctly. Both are wrong; only the first is a hole in the gate, and mixing
 prompt mechanics into the gate is how a reader stops being able to see which
 one they are reading.
 
-Nothing here mints a handle. It is handed a table and it reads from it, so a
-source without a handle stays unciteable no matter how the passage is
-rendered.
+Nothing here commits citation authority. `choose_offers` does allocate handles
+- it extends a table speculatively, which is how a candidate prompt can be
+rendered and priced at all - but every such table is thrown away unless its
+caller commits the relations that came back. A source whose marker never
+reached the model comes out of this module with nothing.
 """
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -108,8 +111,34 @@ def marker_surcharge(counter: Any, markers: Sequence[str]) -> int:
 
 
 @dataclass(frozen=True)
+class OfferRender:
+    """One candidate prompt, and what it actually shows the model.
+
+    `placed` is the load-bearing part and is why rendering cannot just return
+    text. A relation being eligible does not mean a marker for it reached the
+    prompt: the placement rules reject a span whose offsets do not describe
+    the text, one whose passage is not inside the run it covers, one filed
+    under another source. Those rejections happen inside the render, so only
+    the render can say which relations the model was really offered.
+
+    Reported as relations rather than read back out of `markers`, because a
+    marker names a source and the unit here is a passage: two passages of one
+    document share a marker, and one of them may have been placed while the
+    other was not.
+    """
+
+    messages: List[Dict[str, Any]]
+    markers: Tuple[str, ...] = ()
+    placed: Tuple[Tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class OfferChoice:
     """What one model call may offer, rendered and priced.
+
+    `granted` is what the caller may commit, and every entry in it earned a
+    marker in `messages`. `table` is the extension those grants imply, so a
+    caller that commits `granted` and renders again gets this same prompt.
 
     `fits` false is the terminal condition: not "these offers did not fit"
     but "this prompt does not fit even offering nothing new", which is a
@@ -125,11 +154,19 @@ class OfferChoice:
     fits: bool
 
 
+def _relation(entry: Binding) -> Tuple[str, str]:
+    return (
+        str(entry.get("source_id") or ""),
+        str(entry.get("evidence_id") or ""),
+    )
+
+
 def _already_offered(table: CitationTable, entry: Binding) -> bool:
-    source_id = str(entry.get("source_id") or "")
-    return table.handle_for(source_id) is not None and str(
-        entry.get("evidence_id") or ""
-    ) in table.evidence_for(source_id)
+    source_id, evidence_id = _relation(entry)
+    return (
+        table.handle_for(source_id) is not None
+        and evidence_id in table.evidence_for(source_id)
+    )
 
 
 def choose_offers(
@@ -137,7 +174,7 @@ def choose_offers(
     registry: SourceRegistry,
     committed: CitationTable,
     candidates: Sequence[Binding],
-    render: Callable[[CitationTable], Tuple[List[Dict[str, Any]], List[str]]],
+    render: Callable[[CitationTable], OfferRender],
     counter: Any,
     budget: int,
 ) -> OfferChoice:
@@ -148,6 +185,20 @@ def choose_offers(
     invocation's - which matters because a source that loses the budget
     decision must not come out of it holding a handle. The caller commits the
     survivors afterwards and renders once more from the table it actually got.
+
+    Only what the render placed is granted. Being eligible is not the same as
+    being shown: a span with impossible offsets, a passage the rendered run
+    does not contain, a relation the table files elsewhere - the placement
+    rules reject each of those inside the render, and the marker never
+    reaches the model. Committing such a relation would hand a source
+    citation authority for text nobody was ever offered, which is precisely
+    the conservation rule this layer exists to hold.
+
+    An unplaced candidate is dropped and the speculation starts again rather
+    than being filtered out at the end. Its handle had already taken a number,
+    so every source allocated after it was rendered and priced under a name
+    the committed table would not give it. Restarting costs one more pass and
+    keeps what was measured and what is committed the same prompt.
 
     The unit is the relation, not the occurrence. Committing one passage
     labels every span that names it on the next render, so choosing per
@@ -169,17 +220,27 @@ def choose_offers(
     while True:
         offered = required + fresh
         table = extend_citation_table(registry, committed, offered)
-        messages, markers = render(table)
-        tokens = counter.count_messages(messages) + marker_surcharge(
-            counter, markers
+        rendered = render(table)
+        placed = set(rendered.placed)
+        # Only the fresh ones force a restart. A required relation already
+        # holds its number in `committed`, so whether it is passed here again
+        # changes no allocation.
+        surviving = [entry for entry in fresh if _relation(entry) in placed]
+        if len(surviving) != len(fresh):
+            fresh = surviving
+            continue
+        tokens = counter.count_messages(rendered.messages) + marker_surcharge(
+            counter, rendered.markers
         )
         if tokens <= budget:
             return OfferChoice(
                 table=table,
-                messages=messages,
-                markers=tuple(markers),
+                messages=rendered.messages,
+                markers=tuple(rendered.markers),
                 tokens=tokens,
-                granted=tuple(offered),
+                granted=tuple(
+                    entry for entry in offered if _relation(entry) in placed
+                ),
                 fits=True,
             )
         if not fresh:
@@ -324,25 +385,29 @@ def _labelled_with_markers(
     spans: Sequence[GroundedSpan],
     table: CitationTable,
     registry: SourceRegistry,
-) -> Tuple[str, List[str]]:
-    """`label_passage`, and the markers it actually placed.
+) -> Tuple[str, List[str], List[Tuple[str, str]]]:
+    """`label_passage`, and what it actually placed.
 
-    The budget needs the second half. Which spans earned a marker is decided
-    inside the labelling and not by the caller - a span can be eligible and
-    still be dropped for its offsets - so counting what was offered would
-    price markers that are not in the text.
+    The budget needs the markers and the offer decision needs the relations,
+    and both for the same reason: which spans earned a marker is decided
+    inside the labelling, not by the caller. A span can name an eligible
+    relation and still be dropped for its offsets, so counting or committing
+    what was *offered* would price and grant markers that are not in the text.
     """
     labelled = label_passage(text, spans, table, registry)
-    markers = [
-        handle_marker(handle)
-        for handle in (
-            _eligible(table, span)
-            for span in spans
-            if _placeable(text, span) and _covers_its_evidence(registry, text, span)
-        )
-        if handle is not None
-    ]
-    return labelled, markers
+    markers: List[str] = []
+    placed: List[Tuple[str, str]] = []
+    for span in spans:
+        if not _placeable(text, span) or not _covers_its_evidence(
+            registry, text, span
+        ):
+            continue
+        handle = _eligible(table, span)
+        if handle is None:
+            continue
+        markers.append(handle_marker(handle))
+        placed.append((span.source_id, span.evidence_id))
+    return labelled, markers, placed
 
 
 def label_snippets(
@@ -350,8 +415,8 @@ def label_snippets(
     grounds: Sequence[Optional[Binding]],
     table: CitationTable,
     registry: SourceRegistry,
-) -> Tuple[List[str], List[str]]:
-    """Context snippets with their markers, and the markers placed.
+) -> Tuple[List[str], List[str], List[Tuple[str, str]]]:
+    """Context snippets with their markers, the markers, and what was placed.
 
     The automatic retrieval route has no spans, because it needs none: a
     snippet *is* a passage, so the run a marker follows is the whole string.
@@ -371,21 +436,26 @@ def label_snippets(
             f"{len(grounds)} entries for {len(snippets)} snippets"
         )
     labelled: List[str] = []
-    placed: List[str] = []
+    markers: List[str] = []
+    placed: List[Tuple[str, str]] = []
     for snippet, ground in zip(snippets, grounds):
         if not ground:
             labelled.append(snippet)
             continue
+        source_id, evidence_id = _relation(ground)
         span = GroundedSpan(
             start=0,
             end=len(snippet),
-            source_id=str(ground.get("source_id") or ""),
-            evidence_id=str(ground.get("evidence_id") or ""),
+            source_id=source_id,
+            evidence_id=evidence_id,
         )
-        text, markers = _labelled_with_markers(snippet, [span], table, registry)
+        text, placed_markers, placed_here = _labelled_with_markers(
+            snippet, [span], table, registry
+        )
         labelled.append(text)
-        placed.extend(markers)
-    return labelled, placed
+        markers.extend(placed_markers)
+        placed.extend(placed_here)
+    return labelled, markers, placed
 
 
 def instruct(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -400,7 +470,7 @@ def instruct(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     agent path produces - it always builds a system block - so it is the
     plain-list case, and the instruction has to land somewhere.
     """
-    prepared = [dict(message) for message in messages or []]
+    prepared = [deepcopy(dict(message)) for message in messages or []]
     for message in prepared:
         if message.get("role") == "system":
             body = str(message.get("content") or "")
@@ -417,7 +487,7 @@ def rebuild_agent_messages(
     transcript: TrustedTranscript,
     table: CitationTable,
     registry: SourceRegistry,
-) -> Tuple[List[Dict[str, Any]], List[str]]:
+) -> Tuple[List[Dict[str, Any]], List[str], List[Tuple[str, str]]]:
     """The conversation so far, from parent state only, with its offers in it.
 
     The worker assembles a message list of its own and sends it with every
@@ -440,28 +510,32 @@ def rebuild_agent_messages(
     Model turns go in as they are. They are the public reply the worker
     continued from, and they carry no namespace by construction.
     """
-    messages = [dict(message) for message in initial_messages or []]
+    messages = [deepcopy(dict(message)) for message in initial_messages or []]
     markers: List[str] = []
+    placed: List[Tuple[str, str]] = []
     for entry in transcript.entries:
         if isinstance(entry, ModelTurn):
             if entry.assistant_message is not None:
-                messages.append(dict(entry.assistant_message))
+                messages.append(deepcopy(dict(entry.assistant_message)))
             else:
                 messages.append(
                     {
                         "role": "assistant",
                         "content": entry.content,
-                        "tool_calls": [dict(call) for call in entry.tool_calls],
+                        "tool_calls": [
+                            deepcopy(dict(call)) for call in entry.tool_calls
+                        ],
                     }
                 )
             continue
         if not isinstance(entry, ToolRound) or not entry.offerable:
             continue
         for result in entry.results:
-            text, placed = _labelled_with_markers(
+            text, placed_markers, placed_here = _labelled_with_markers(
                 result.text, result.spans, table, registry
             )
-            markers.extend(placed)
+            markers.extend(placed_markers)
+            placed.extend(placed_here)
             messages.append(
                 {
                     "role": "tool",
@@ -470,4 +544,4 @@ def rebuild_agent_messages(
                     "content": text,
                 }
             )
-    return messages, markers
+    return messages, markers, placed

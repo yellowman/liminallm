@@ -16,6 +16,7 @@ import pytest
 from liminallm.service.citation_offers import (
     CITATION_INSTRUCTION,
     MARKER_SEPARATOR,
+    OfferRender,
     choose_offers,
     handle_marker,
     instruct,
@@ -528,8 +529,14 @@ def _snippet_render(registry, snippets, grounds):
     """The automatic route's shape: label the snippets, one message."""
 
     def render(table):
-        labelled, markers = label_snippets(snippets, grounds, table, registry)
-        return [{"role": "user", "content": "\n".join(labelled)}], markers
+        labelled, markers, placed = label_snippets(
+            snippets, grounds, table, registry
+        )
+        return OfferRender(
+            messages=[{"role": "user", "content": "\n".join(labelled)}],
+            markers=tuple(markers),
+            placed=tuple(placed),
+        )
 
     return render
 
@@ -689,12 +696,18 @@ class TestASnippetIsItsOwnPassage:
         grounds = [None, bindings[0], bindings[1]]
         table = build_citation_table(registry, bindings[:2], nonce=NONCE)
 
-        labelled, markers = label_snippets(snippets, grounds, table, registry)
+        labelled, markers, placed = label_snippets(
+            snippets, grounds, table, registry
+        )
 
         assert labelled[0] == "a digest of older turns"
         assert labelled[1] == f"{ALPHA_B} {handle_marker(table.handle_for('src_1'))}"
         assert labelled[2] == f"{BETA_B} {handle_marker(table.handle_for('src_2'))}"
         assert len(markers) == 2
+        assert placed == [
+            ("src_1", bindings[0]["evidence_id"]),
+            ("src_2", bindings[1]["evidence_id"]),
+        ]
 
     def test_a_snippet_that_is_not_its_passage_is_not_named(self):
         """The same placement rule as everywhere else: the run a marker
@@ -702,12 +715,13 @@ class TestASnippetIsItsOwnPassage:
         registry, bindings = _three()
         table = build_citation_table(registry, bindings, nonce=NONCE)
 
-        labelled, markers = label_snippets(
+        labelled, markers, placed = label_snippets(
             ["a paraphrase of the alpha passage"], [bindings[0]], table, registry
         )
 
         assert labelled == ["a paraphrase of the alpha passage"]
         assert markers == []
+        assert placed == []
 
     def test_a_vector_of_the_wrong_length_is_refused(self):
         """Zipping would attach every marker after the gap to the wrong
@@ -760,7 +774,7 @@ class TestTheAgentPromptIsRebuiltFromParentStateAlone:
             {"role": "user", "content": "how long"},
         ]
 
-        messages, markers = rebuild_agent_messages(
+        messages, markers, placed = rebuild_agent_messages(
             base, self._transcript(registry, bindings), table, registry
         )
 
@@ -772,6 +786,7 @@ class TestTheAgentPromptIsRebuiltFromParentStateAlone:
         marker = handle_marker(table.handle_for("src_1"))
         assert messages[3]["content"] == f"[a.md]\n{ALPHA_B} {marker}"
         assert markers == [marker]
+        assert placed == [("src_1", bindings[0]["evidence_id"])]
 
     def test_a_divergent_round_is_left_out_entirely(self):
         """Not included unlabelled. Its results may not even carry a
@@ -780,7 +795,7 @@ class TestTheAgentPromptIsRebuiltFromParentStateAlone:
         registry, bindings = _three()
         table = build_citation_table(registry, bindings[:1], nonce=NONCE)
 
-        messages, markers = rebuild_agent_messages(
+        messages, markers, placed = rebuild_agent_messages(
             [{"role": "user", "content": "how long"}],
             self._transcript(registry, bindings, offerable=False),
             table,
@@ -789,6 +804,7 @@ class TestTheAgentPromptIsRebuiltFromParentStateAlone:
 
         assert [m["role"] for m in messages] == ["user", "assistant"]
         assert markers == []
+        assert placed == []
 
     def test_nothing_the_worker_sent_is_in_it(self):
         """The property the whole reconstruction exists for, stated as a
@@ -824,3 +840,213 @@ class TestTheInstructionIsTheParentsOwn:
         assert original == [
             {"role": "system", "content": "answer from the sources"}
         ]
+
+
+class TestOnlyWhatReachedTheModelIsGranted:
+    """Being eligible is not being shown.
+
+    A relation can pass every identity check and still earn no marker: the
+    placement rules reject it inside the render, for offsets that do not
+    describe the text or a passage the run does not contain. Granting it
+    anyway would hand a source citation authority for text nobody was offered
+    - the conservation rule, failing at the last seam that could still catch
+    it.
+    """
+
+    @staticmethod
+    def _one():
+        registry = SourceRegistry()
+        source = registry.register_source(
+            kind="file", title="a.md", locator="/files/a.md"
+        )
+        evidence = registry.add_evidence(source.source_id, text=ALPHA_B)
+        return registry, binding(source.source_id, evidence.evidence_id)
+
+    def test_a_relation_the_render_could_not_place_is_not_granted(self):
+        registry, entry = self._one()
+
+        def render(table):
+            # A valid relation over text that does not contain its passage:
+            # the placement rules refuse it and no marker is written.
+            labelled, markers, placed = label_snippets(
+                ["a paraphrase that quotes nothing"], [entry], table, registry
+            )
+            return OfferRender(
+                messages=[{"role": "user", "content": labelled[0]}],
+                markers=tuple(markers),
+                placed=tuple(placed),
+            )
+
+        choice = choose_offers(
+            registry=registry,
+            committed=CitationTable(nonce=NONCE),
+            candidates=[entry],
+            render=render,
+            counter=TokenCounter(model="no-tokenizer"),
+            budget=10_000,
+        )
+
+        assert choice.fits
+        assert choice.granted == ()
+        assert choice.markers == ()
+        assert choice.table.handle_for("src_1") is None
+
+    def test_a_relation_with_no_occurrence_at_all_is_not_granted(self):
+        """The renderer simply has nowhere in this prompt to put it."""
+        registry, entry = self._one()
+
+        def render(_table):
+            return OfferRender(
+                messages=[{"role": "user", "content": "nothing was retrieved"}]
+            )
+
+        choice = choose_offers(
+            registry=registry,
+            committed=CitationTable(nonce=NONCE),
+            candidates=[entry],
+            render=render,
+            counter=TokenCounter(model="no-tokenizer"),
+            budget=10_000,
+        )
+
+        assert choice.fits
+        assert choice.granted == ()
+        assert choice.table.handle_for("src_1") is None
+
+    def test_an_unplaceable_candidate_does_not_take_a_number(self):
+        """The numbering red. If the invisible candidate keeps its slot in the
+        speculation, the visible one is rendered and priced as `-2` and then
+        committed as `-1`: the prompt the model saw and the table the answer
+        resolves against stop being the same."""
+        registry = SourceRegistry()
+        entries = []
+        for title, body in (("a.md", ALPHA_B), ("b.md", BETA_B)):
+            source = registry.register_source(
+                kind="file", title=title, locator=f"/files/{title}"
+            )
+            evidence = registry.add_evidence(source.source_id, text=body)
+            entries.append(binding(source.source_id, evidence.evidence_id))
+        # The first candidate is shown a snippet that is not its passage.
+        snippets = ["a paraphrase that quotes nothing", BETA_B]
+
+        def render(table):
+            labelled, markers, placed = label_snippets(
+                snippets, entries, table, registry
+            )
+            return OfferRender(
+                messages=[{"role": "user", "content": "\n".join(labelled)}],
+                markers=tuple(markers),
+                placed=tuple(placed),
+            )
+
+        choice = choose_offers(
+            registry=registry,
+            committed=CitationTable(nonce=NONCE),
+            candidates=entries,
+            render=render,
+            counter=TokenCounter(model="no-tokenizer"),
+            budget=10_000,
+        )
+
+        assert [g["source_id"] for g in choice.granted] == ["src_2"]
+        assert choice.table.handle_for("src_1") is None
+        assert choice.table.handle_for("src_2") == f"{NONCE}-1"
+        # And the prompt the model would see names it that way too.
+        assert f"{NONCE}-1" in choice.messages[0]["content"]
+        assert f"{NONCE}-2" not in choice.messages[0]["content"]
+
+    def test_a_committed_relation_this_prompt_does_not_show_is_not_reported(self):
+        """The restart loop covers fresh candidates. This covers the other
+        kind: a relation already committed by an earlier call, whose passage
+        does not appear in *this* prompt. Committing it again would change
+        nothing, and reporting it as granted would still be a false statement
+        about what the model was just offered."""
+        registry, entry = self._one()
+        committed = build_citation_table(registry, [entry], nonce=NONCE)
+
+        def render(_table):
+            return OfferRender(
+                messages=[{"role": "user", "content": "a later question"}]
+            )
+
+        choice = choose_offers(
+            registry=registry,
+            committed=committed,
+            candidates=[entry],
+            render=render,
+            counter=TokenCounter(model="no-tokenizer"),
+            budget=10_000,
+        )
+
+        assert choice.fits
+        assert choice.granted == ()
+        # The handle it already holds is untouched - it is not withdrawn.
+        assert choice.table.handle_for("src_1") == f"{NONCE}-1"
+
+
+class TestTheMaterializerSharesNothingWithTrustedState:
+    """`ModelTurn` deep-copies on the way in and out so that a later stage
+    cannot edit what an attempt is restored to. A reconstruction handing the
+    backend the same nested objects would undo that: a provider formatter or
+    SDK that edits a tool call in place would change the record, and the
+    second materialization of one assembly would differ from the first."""
+
+    def test_a_rebuilt_turn_shares_no_nested_object_with_the_transcript(self):
+        registry, bindings = _three()
+        table = build_citation_table(registry, bindings[:1], nonce=NONCE)
+        transcript = TrustedTranscript()
+        transcript.record(ModelTurn(
+            operation_seq=1,
+            assistant_message={
+                "role": "assistant",
+                "content": "looking",
+                "tool_calls": [
+                    {"function": {"name": "file_search", "arguments": "{}"},
+                     "extra": {"signature": "abc"}}
+                ],
+            },
+        ))
+        base = [{"role": "system", "content": "answer", "meta": {"kept": True}}]
+
+        messages, _markers, _placed = rebuild_agent_messages(
+            base, transcript, table, registry
+        )
+
+        messages[0]["meta"]["kept"] = "steered"
+        messages[1]["tool_calls"][0]["extra"]["signature"] = "steered"
+
+        assert base[0]["meta"]["kept"] is True
+        turn = transcript.entries[0]
+        assert turn.assistant_message["tool_calls"][0]["extra"]["signature"] == (
+            "abc"
+        )
+
+    def test_a_synthesized_turn_copies_its_tool_calls_too(self):
+        """The other branch. A model turn with no `assistant_message` is
+        rebuilt from `content` and `tool_calls`, and those calls are the
+        transcript's own frozen tuple - shallow-copying an entry leaves the
+        nested arguments shared."""
+        registry, bindings = _three()
+        table = build_citation_table(registry, bindings[:1], nonce=NONCE)
+        transcript = TrustedTranscript()
+        transcript.record(ModelTurn(
+            operation_seq=1,
+            content="looking",
+            tool_calls=({"name": "file_search",
+                         "function": {"arguments": "{}"}},),
+        ))
+
+        messages, _markers, _placed = rebuild_agent_messages(
+            [], transcript, table, registry
+        )
+        messages[0]["tool_calls"][0]["function"]["arguments"] = "steered"
+
+        assert transcript.entries[0].tool_calls[0]["function"]["arguments"] == "{}"
+
+    def test_instruct_shares_no_nested_object_either(self):
+        original = [{"role": "system", "content": "answer", "meta": {"kept": True}}]
+
+        prepared = instruct(original)
+        prepared[0]["meta"]["kept"] = "steered"
+
+        assert original[0]["meta"]["kept"] is True
