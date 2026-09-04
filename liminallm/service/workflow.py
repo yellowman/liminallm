@@ -2929,10 +2929,19 @@ class WorkflowEngine(WorkflowStreamingMixin):
         #   the canonical public text exactly - measured, not assumed - so a
         #   refactor routing streaming through this seam would attach
         #   citations to an answer that had not been written yet.
+        #
+        # `citations_intact` is the third part and is not like the other two:
+        # it refuses something reachable today. Once a round of this assembly
+        # diverged from the turn that asked for it, the parent can no longer
+        # say what conversation the final answer was written in - so an
+        # answer quoting a handle from an earlier, honest round is a handle
+        # the model wrote in a prompt the worker composed. Exact matching
+        # accepts it, because the model did write it; this is what does not.
         if (
             succeeded
             and worker_tool == "agent.files_v1"
             and not plan.get("stream_final")
+            and context.citations_intact
         ):
             citations = transfer_citations(
                 context.canonical_model_response,

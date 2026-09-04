@@ -572,6 +572,100 @@ class TestOneModelTurnAuthorizesOneRound:
         assert transcript.unanswered_turn() is None
 
 
+class TestDivergenceEndsCitationAuthorityForTheAssembly:
+    """`offerable` protects one round; this protects the answer.
+
+    Protecting only the divergent round leaves the case the check exists for.
+    An honest first round teaches the model a real handle. The worker then
+    drives a conversation of its own composing - which it is allowed to do,
+    that is what an untrusted half is - and the model, reading that prompt,
+    writes the handle it learned into the final answer. The exact-match
+    transfer accepts it, because the model really did write it. What was
+    forged was the prompt around the round, not the round.
+    """
+
+    def test_an_honest_assembly_keeps_its_authority(self, store, monkeypatch):
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, calls=[SEARCH])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
+
+        assert context.transcript.rounds()[0].offerable is True
+        assert context.citations_intact is True
+
+    def test_one_divergent_round_ends_it(self, store, monkeypatch):
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, calls=[SEARCH])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        # A different tool from the one the model asked for.
+        _ask(broker, invocation, "tools.round",
+             {"calls": [{"id": "c1", "name": "web_fetch",
+                         "arguments": {"url": "https://a.example"}}],
+              "fallback_query": "hours"}, 2)
+
+        assert context.transcript.rounds()[0].offerable is False
+        assert context.citations_intact is False
+
+    def test_a_later_honest_round_does_not_bring_it_back(
+        self, store, monkeypatch
+    ):
+        """The monotonic half. Everything after the divergence happened in a
+        conversation the parent can no longer describe, so a round that looks
+        correct inside it proves nothing about the assembly."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _model(engine, monkeypatch, calls=[SEARCH])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 1)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [{"id": "c1", "name": "web_fetch",
+                         "arguments": {"url": "https://a.example"}}],
+              "fallback_query": "hours"}, 2)
+        assert context.citations_intact is False
+
+        _model(engine, monkeypatch, calls=[SEARCH])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": []}, 3)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "again"}, 4)
+
+        assert [r.offerable for r in context.transcript.rounds()] == [False, True]
+        assert context.citations_intact is False
+
+    def test_the_round_still_runs(self, store, monkeypatch):
+        """Only the citations stop. What a worker may ask for is the
+        capability layer's question and is answered the way it always was."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        reply = _ask(broker, invocation, "tools.round",
+                     {"calls": [SUBMITTED], "fallback_query": "hours"}, 1)
+
+        assert context.citations_intact is False
+        assert reply["result"]["results"], reply
+
+    def test_a_replacement_attempt_inherits_the_loss(self, store, monkeypatch):
+        """Derived from the record the ledger restores, so an attempt that
+        replays a divergent round does not start with its authority back."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "hours"}, 1)
+        assert context.citations_intact is False
+
+        fresh = InvocationContext(user_id="u", source_registry=SourceRegistry())
+        replayed = CapabilityBroker(engine, fresh)
+        replayed._apply_parent_state(
+            {"transcript": [r.as_dict() for r in context.transcript.rounds()]}
+        )
+
+        assert fresh.citations_intact is False
+
+
 class TestAWorkerCannotRewindItsOwnPosition:
     """One worker walks its control flow forwards. A rewind is how a
     compromised one would overwrite parent-side state the parent believes it

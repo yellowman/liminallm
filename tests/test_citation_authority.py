@@ -384,6 +384,81 @@ class TestThroughTheRealAgentLoop:
         result = await self._run(engine, registry, invocation)
         assert invocation.citations.nonce not in str(result.get("content"))
 
+    @pytest.mark.asyncio
+    async def test_a_diverged_assembly_transfers_nothing_it_still_matches(
+        self, store, monkeypatch
+    ):
+        """The attack the round-level check alone does not stop.
+
+        The model writes a handle it genuinely learned, and the answer comes
+        back byte-for-byte, so every other gate here passes. What the parent
+        cannot say is which conversation the model wrote it in: once a round
+        diverged from the turn that asked for it, the surrounding prompt was
+        the worker's to compose.
+
+        Divergence is forced at the point it is decided, rather than by
+        pretending a worker misbehaved, because what is under test is what
+        happens after it is detected - the detection has its own witnesses.
+        The same run without the divergence is asserted beside it, so this
+        cannot pass by transferring nothing for some unrelated reason.
+        """
+        from liminallm.service import broker as broker_module
+
+        engine = get_runtime().workflow
+
+        def _asks_then_answers(handle):
+            """A model that runs one tool round and then answers, citing."""
+            state = {"turns": 0}
+
+            def _generate(*_a, **_k):
+                state["turns"] += 1
+                if state["turns"] == 1:
+                    return {
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "c1",
+                            "name": "file_search",
+                            "arguments": '{"query": "hours"}',
+                        }],
+                        "assistant_message": None,
+                        "usage": {},
+                    }
+                return {
+                    "content": f"{ANSWER} [cite:{handle}]",
+                    "tool_calls": [],
+                    "assistant_message": None,
+                    "usage": {},
+                }
+
+            return _generate
+
+        registry, invocation = self._seed(engine, monkeypatch)
+        monkeypatch.setattr(
+            engine.llm,
+            "generate_with_tools",
+            _asks_then_answers(invocation.citations.handle_for("src_1")),
+            raising=False,
+        )
+        honest = await self._run(engine, registry, invocation)
+        assert honest.get("validated_citations"), honest
+
+        registry, invocation = self._seed(engine, monkeypatch)
+        monkeypatch.setattr(
+            engine.llm,
+            "generate_with_tools",
+            _asks_then_answers(invocation.citations.handle_for("src_1")),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            broker_module, "calls_match", lambda offered, submitted: False
+        )
+        diverged = await self._run(engine, registry, invocation)
+
+        # The answer is still the model's own, unedited - the transfer's
+        # other gate passes and this one is what refuses.
+        assert diverged.get("content") == ANSWER, repr(diverged.get("content"))
+        assert not diverged.get("validated_citations"), diverged
+
 
 class TestTheGateIsTheResolvedWorkerBody:
     @pytest.mark.asyncio

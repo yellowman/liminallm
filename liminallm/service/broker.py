@@ -187,6 +187,26 @@ class InvocationContext:
     #: schemas are model input for the same reason and are kept for it.
     initial_messages: Tuple[Dict[str, Any], ...] = ()
     initial_tools: Tuple[Dict[str, Any], ...] = ()
+    #: Whether anything in this assembly may still carry a citation.
+    #:
+    #: False from the first round whose calls were not the calls the previous
+    #: model turn asked for, and never true again. `ToolRound.offerable` says
+    #: one round cannot be reconstructed faithfully; this says the assembly
+    #: cannot, which is a stronger and longer-lived claim.
+    #:
+    #: The reason it has to outlive the round. Protecting only the divergent
+    #: round leaves the attack that motivates the check: a first, honest round
+    #: teaches the model a real handle, the worker then drives a conversation
+    #: of its own making, and the model writes that handle into a final answer
+    #: the exact-match transfer accepts - because the model really did write
+    #: it. The individual tool result was never forged; the prompt around it
+    #: was. So the whole assembly stops offering and stops transferring.
+    #:
+    #: Only the citations. What a worker may ask for is the capability layer's
+    #: question and is answered the same way it always was: the round runs,
+    #: the turn continues, the user gets an answer. It just carries no
+    #: citations.
+    citations_intact: bool = True
 
     def remember_base_prompt(
         self, messages: Sequence[Any], tools: Sequence[Any]
@@ -690,6 +710,21 @@ class CapabilityBroker:
         # operation's entry and an operation has one outcome however many
         # attempts replay it.
         self._ctx.transcript.restore(parent_state.get("transcript") or [])
+        # Derived from the record that was just folded in, rather than sent
+        # beside it. The transcript is what a replay restores, so a fresh run
+        # and a replacement attempt reading the same ledger reach the same
+        # answer without the fact being carried twice and able to disagree.
+        #
+        # Assigned in one direction only, and measured equivalent today:
+        # nothing can currently remove a round from the record, so recomputing
+        # it as `all(...)` gives the same answer and a mutation swapping the
+        # two survives. Kept as the one-directional form because the property
+        # being asserted is "never true again", not "no round is currently
+        # divergent" - a later stage that rebuilt the transcript, or a partial
+        # restore, is where the two stop agreeing, and that is the direction a
+        # citation gate must not drift in.
+        if any(not entry.offerable for entry in self._ctx.transcript.rounds()):
+            self._ctx.citations_intact = False
 
     # -- retrieval, notes, history ----------------------------------------
 
