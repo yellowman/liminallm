@@ -250,27 +250,12 @@ class InvocationContext:
     #: question and is answered the same way it always was: the round runs,
     #: the turn continues, the user gets an answer. It just carries no
     #: citations.
+    #:
+    #: Per-attempt, unlike `Invocation.citation_budget_intact` beside it. This
+    #: one is about the conversation an attempt is driving, which a
+    #: replacement attempt restarts; that one is about the table, which it
+    #: inherits.
     citations_intact: bool = True
-    #: Whether this assembly can still materialize the citation state it has
-    #: already committed.
-    #:
-    #: False, and never true again, when the prompt does not fit even offering
-    #: nothing new - the committed handles are in text the model has read, so
-    #: they cannot be withdrawn to make room, and a prompt that cannot carry
-    #: them cannot carry citations at all. Also false when a committed table
-    #: does not reproduce the prompt that was priced from its speculative
-    #: twin, which is the same conclusion by a different route: what the model
-    #: would be sent is not what was measured.
-    #:
-    #: Separate from `citations_intact` so the two causes stay legible - one
-    #: is the worker diverging from the protocol, this one is the parent
-    #: running out of room. The outward behaviour is identical: no
-    #: instruction, no labels, no new handles, no final transfer.
-    #:
-    #: A new relation that does not fit is a different thing and leaves this
-    #: true. That one is under-offered, and the assembly carries on citing
-    #: what it already had.
-    citation_budget_intact: bool = True
 
     def remember_base_prompt(
         self,
@@ -928,25 +913,37 @@ class CapabilityBroker:
         and renders once more from the table it got. The worker's copy stays
         a protocol diagnostic.
 
-        The tools are the parent's too, for the reason 12a established: a
-        schema is model input, and a worker that could substitute one could
-        describe a capability in words of its own.
+        The schemas are the parent's for the reason 12a established - a schema
+        is model input, and a worker that could substitute one could describe
+        a capability in words of its own - but an empty list is not a
+        substitution. It is the worker giving a capability up, which it is
+        allowed to do and which the loop relies on: on its last round, and
+        when the deadline has passed, it offers no tools so the model has to
+        write a final answer. Re-offering the parent's schemas there would
+        hand back the capability the worker just surrendered, and the model
+        could spend the turn on another tool call. So: subtract yes, invent
+        no.
 
-        Once offers are on, a refusal falls back to the parent's own
-        unlabelled conversation and never to the worker's: losing the markers
-        is not a reason to start trusting the message list that came back.
+        Once offers are on, every refusal falls back to the parent's own
+        unlabelled conversation and never to the worker's. That is the
+        load-bearing half. A committed handle is text the model has already
+        read, so a later call made from a message list the worker composed is
+        one where the worker can ask for that handle by name - the model
+        writes it honestly, exact matching accepts it, and a real citation
+        transfers for a claim no source made.
         """
         worker_messages = list(payload.get("messages") or [])
         worker_tools = list(payload.get("tools") or [])
         registry = self._ctx.source_registry
-        if (
-            not self._engine.CITATION_OFFERS_ENABLED
-            or registry is None
-            or not self._ctx.citations_intact
-            or not self._ctx.citation_budget_intact
-        ):
+        if not self._engine.CITATION_OFFERS_ENABLED or registry is None:
             return worker_messages, worker_tools
-        tools = [deepcopy(dict(tool)) for tool in self._ctx.initial_tools]
+        tools = (
+            []
+            if not worker_tools
+            else [deepcopy(dict(tool)) for tool in self._ctx.initial_tools]
+        )
+        if not self._ctx.citations_intact or not invocation.citation_budget_intact:
+            return self._unlabelled_prompt(invocation), tools
 
         def rebuild(table: CitationTable):
             return rebuild_agent_messages(
@@ -977,7 +974,7 @@ class CapabilityBroker:
             # citations rather than the service.
             messages, markers, placed = rebuild(table)
             return OfferRender(
-                messages=prepared(instruct(messages)),
+                messages=prepared(instruct(messages) if markers else messages),
                 markers=tuple(markers),
                 placed=tuple(placed),
             )
@@ -991,17 +988,17 @@ class CapabilityBroker:
             budget=self._engine.prompt_budget(),
         )
         if not choice.fits:
-            self._ctx.citation_budget_intact = False
+            invocation.poison_citation_budget()
             return self._unlabelled_prompt(invocation), tools
         table = invocation.extend_citations(registry, list(choice.granted))
-        final, _markers, _placed = rebuild(table)
-        instructed = instruct(final)
+        final, markers, _placed = rebuild(table)
+        instructed = instruct(final) if markers else final
         if prepared(instructed) != choice.messages:
             # The table that was committed did not reproduce the prompt that
             # was priced from its speculative twin. What the model would be
             # sent is not what was measured, so nothing here is trustworthy
             # enough to send - and it will not become so on the next call.
-            self._ctx.citation_budget_intact = False
+            invocation.poison_citation_budget()
             return self._unlabelled_prompt(invocation), tools
         return instructed, tools
 

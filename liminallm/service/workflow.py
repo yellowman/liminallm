@@ -1991,19 +1991,30 @@ class WorkflowEngine(WorkflowStreamingMixin):
             not self.CITATION_OFFERS_ENABLED
             or invocation is None
             or registry is None
+            or not invocation.citation_budget_intact
         ):
             return list(snippets), None
+
+        def build(labelled: List[str], markers: Sequence[str]) -> List[dict]:
+            # The rule only when there is something to apply it to. Sent with
+            # no marker in the prompt it describes something that is not
+            # there, and it is not free: its own tokens can push an ordinary
+            # prompt over the budget after every offer has already been given
+            # up, which fails in the wrong direction.
+            messages, _adapters = self.llm._prepare_generation(
+                prompt, adapters, labelled, history,
+                instruction=CITATION_INSTRUCTION if markers else None,
+            )
+            return messages
 
         def render(table) -> OfferRender:
             labelled, markers, placed = label_snippets(
                 snippets, aligned, table, registry
             )
-            messages, _adapters = self.llm._prepare_generation(
-                prompt, adapters, labelled, history,
-                instruction=CITATION_INSTRUCTION,
-            )
             return OfferRender(
-                messages=messages, markers=tuple(markers), placed=tuple(placed)
+                messages=build(labelled, markers),
+                markers=tuple(markers),
+                placed=tuple(placed),
             )
 
         choice = choose_offers(
@@ -2021,21 +2032,25 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # this line adds is that the two refusals stay different facts -
             # a prompt with no room for markers, and a namespace that moved -
             # rather than one branch standing in for both.
+            invocation.poison_citation_budget()
             return list(snippets), None
         table = invocation.extend_citations(registry, list(choice.granted))
-        labelled, _markers, _placed = label_snippets(
+        labelled, markers, _placed = label_snippets(
             snippets, aligned, table, registry
         )
-        final, _adapters = self.llm._prepare_generation(
-            prompt, adapters, labelled, history, instruction=CITATION_INSTRUCTION,
-        )
-        if final != choice.messages:
+        if build(labelled, markers) != choice.messages:
             # The committed table did not reproduce the prompt priced from its
-            # speculative twin - a branch that took the numbers this one
-            # reserved, since the table belongs to the invocation and branches
-            # run concurrently. What would go is not what was measured.
+            # speculative twin, so what would go is not what was measured.
+            #
+            # The handles are committed by now - the second render is only
+            # possible against the table the invocation actually got - so
+            # dropping the markers here is not the whole answer. The
+            # invocation is poisoned as well, which is what stops the final
+            # transfer from resolving a handle out of an answer the model
+            # wrote without ever being shown it.
+            invocation.poison_citation_budget()
             return list(snippets), None
-        return labelled, CITATION_INSTRUCTION
+        return labelled, CITATION_INSTRUCTION if markers else None
 
     @staticmethod
     def _merge_bindings(
@@ -3032,6 +3047,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # round is a handle the model wrote in a prompt the worker composed.
         # Exact matching accepts it, because the model did write it; this is
         # what does not.
+        #
+        # `citation_budget_intact` refuses the same thing arrived at from the
+        # other side. The parent, not the worker, gave up materializing the
+        # table; but the handles committed before it gave up are still in the
+        # namespace, and the prompts after it are ones no offer was rendered
+        # into. An answer quoting such a handle is quoting one this turn can
+        # no longer say the model was shown, and the two flags have to be read
+        # together or the second is only a prompt-building preference.
         if (
             succeeded
             and (
@@ -3040,6 +3063,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
             and not plan.get("stream_final")
             and context.citations_intact
+            and invocation.citation_budget_intact
         ):
             citations = transfer_citations(
                 context.canonical_model_response,

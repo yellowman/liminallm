@@ -639,6 +639,22 @@ class Invocation:
         #: fails, its citation authority is discarded with it, and the next
         #: one opens a namespace of its own.
         self.citations = CitationTable(nonce=mint_nonce())
+        #: Whether the table above can still be safely materialized.
+        #:
+        #: Beside the table because it is a statement about the table, with
+        #: the same lifetime: it says whether the handles already in it can be
+        #: put back in front of the model, and those handles outlive any one
+        #: attempt. Kept on an attempt's context instead, a replacement
+        #: attempt would start it true while inheriting the very table it
+        #: describes - and the answer would be built from a prompt the parent
+        #: had already concluded it could not build.
+        #:
+        #: False, and never true again, when a prompt cannot carry what has
+        #: been committed, or when a committed table does not reproduce the
+        #: prompt priced from its speculative twin. Everything downstream then
+        #: refuses together: no instruction, no labels, no new handles, and no
+        #: final transfer. The turn still answers; it carries no citations.
+        self.citation_budget_intact = True
         #: The registry that opened this execution, so `close` can retire the
         #: entry without any module-level lookup.
         self.registry = registry
@@ -661,6 +677,17 @@ class Invocation:
         with self._lock:
             self.citations = extend_citation_table(registry, self.citations, bindings)
             return self.citations
+
+    def poison_citation_budget(self) -> None:
+        """Give up materializing this execution's citations, for good.
+
+        Monotonic on purpose. Whatever made the prompt unbuildable - no room
+        left for the committed floor, or a second render that did not
+        reproduce the priced one - is a property of what has already been
+        committed, so a later call inherits it rather than escaping it.
+        """
+        with self._lock:
+            self.citation_budget_intact = False
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"Invocation({self.invocation_id!r}, tool={self.tool!r})"
