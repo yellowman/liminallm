@@ -114,6 +114,7 @@ from liminallm.service.tool_namespace import (
     ToolResolutionScope,
     resolve_executable_handler,
 )
+from liminallm.service.transcript import TrustedTranscript
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
@@ -1955,7 +1956,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
         return aligned
 
     def _unlabelled_agent_prompt(
-        self, invocation: Invocation, context: InvocationContext
+        self,
+        invocation: Invocation,
+        context: InvocationContext,
+        transcript: TrustedTranscript,
     ) -> List[Dict[str, Any]]:
         """The trusted conversation with nothing offered in it.
 
@@ -1966,18 +1970,27 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         Still the parent's bytes rather than the worker's. Losing the offers
         is not a reason to start trusting the message list that came back.
+
+        The transcript is passed in rather than read off the context, so this
+        and the offered form are cut at the same point. A fallback that ended
+        one exchange later than the prompt it replaces would be a different
+        conversation, which is the whole thing this layer is for.
         """
         messages, _markers, _placed = rebuild_agent_messages(
             context.initial_messages,
             context.initial_grounded_messages,
-            context.transcript,
+            transcript,
             CitationTable(nonce=invocation.citations.nonce),
             context.source_registry,
         )
         return messages
 
     def agent_prompt(
-        self, invocation: Invocation, context: InvocationContext
+        self,
+        invocation: Invocation,
+        context: InvocationContext,
+        *,
+        replace_terminal_answer: bool = False,
     ) -> Optional[List[Dict[str, Any]]]:
         """One agent model call's conversation, as the parent builds it.
 
@@ -2000,23 +2013,36 @@ class WorkflowEngine(WorkflowStreamingMixin):
         reached, render once more from the table that was committed, and
         refuse if the two disagree.
 
-        Two callers, one rule. The blocking seam runs this per model call; the
-        streamed path runs it once for the final turn it serves itself. They
-        were one function from the start rather than two that agree today,
-        because what they build is the same conversation and the reasons it
-        must not come from the worker do not differ between them.
+        Two callers, one rule, and one difference between them.
+
+        The blocking seam runs this before each model call, continuing the
+        conversation. The streamed path runs it once to *replace* a turn: the
+        worker has already asked the model for a final answer and thrown the
+        reply away - its loop keeps that reply out of the conversation it
+        hands back, because the parent is about to produce the answer itself -
+        and `replace_terminal_answer` says to cut at the same point. Without
+        it the parent puts the discarded draft in the prompt the replacement
+        is written from, which is neither what the worker handed over nor
+        anything the model was ever shown.
+
+        The record keeps the draft either way. That the model produced one is
+        a fact about the turn; where a replacement starts from is a different
+        question, and the cut is a view rather than an edit.
         """
         registry = context.source_registry
         if not self.CITATION_OFFERS_ENABLED or registry is None:
             return None
+        transcript = context.transcript
+        if replace_terminal_answer:
+            transcript = transcript.without_trailing_answer()
         if not context.citations_intact or not invocation.citation_budget_intact:
-            return self._unlabelled_agent_prompt(invocation, context)
+            return self._unlabelled_agent_prompt(invocation, context, transcript)
 
         def rebuild(table: CitationTable):
             return rebuild_agent_messages(
                 context.initial_messages,
                 context.initial_grounded_messages,
-                context.transcript,
+                transcript,
                 table,
                 registry,
             )
@@ -2057,7 +2083,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         if not choice.fits:
             invocation.poison_citation_budget()
-            return self._unlabelled_agent_prompt(invocation, context)
+            return self._unlabelled_agent_prompt(invocation, context, transcript)
         table = invocation.extend_citations(registry, list(choice.granted))
         final, markers, _placed = rebuild(table)
         instructed = instruct(final) if markers else final
@@ -2067,7 +2093,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # sent is not what was measured, so nothing here is trustworthy
             # enough to send - and it will not become so on the next call.
             invocation.poison_citation_budget()
-            return self._unlabelled_agent_prompt(invocation, context)
+            return self._unlabelled_agent_prompt(invocation, context, transcript)
         return instructed
 
     def _offered_context(

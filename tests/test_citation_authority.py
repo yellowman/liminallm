@@ -2398,9 +2398,28 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
     off. These witnesses turn it on to inspect what reaches the backend.
     """
 
-    @staticmethod
-    def _streaming(engine, monkeypatch, store, *, offers, planted=None):
+    #: Distinct strings for every part of the exchange, so an assertion that
+    #: one of them reached the prompt cannot be satisfied by another. The
+    #: passage and the discarded draft used to be the same word, and a
+    #: witness for "the passage is there" passed just as well when the draft
+    #: was there instead.
+    PASSAGE = "SOURCE-SAYS-400-HOURS"
+    DRAFT = "DRAFT-DO-NOT-REPLAY"
+    ASKED = "how long"
+
+    @classmethod
+    def _streaming(cls, engine, monkeypatch, store, *, offers, planted=None,
+                   answers_immediately=False, rounds_exhausted=False):
         """A streamed agent turn over one retrieved passage.
+
+        By default the model calls a tool and then writes `DRAFT`, which the
+        worker discards: with `stream_final` its loop breaks without appending
+        that reply, because the parent is about to write the answer itself.
+
+        `answers_immediately` skips the tool round, so the draft is the whole
+        transcript. `rounds_exhausted` keeps calling tools until the worker
+        runs out of rounds, so the transcript ends in one and there is no
+        draft to cut.
 
         `planted` replaces the conversation the worker hands back, which is
         what a compromised worker gets to choose. Forced at the handover
@@ -2412,8 +2431,14 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
                 type(engine), "CITATION_OFFERS_ENABLED", offers, raising=False
             )
         _tools_on(monkeypatch, engine)
+        if rounds_exhausted:
+            # `stream_final` spends one fewer round than the limit, so two is
+            # the smallest limit with a tool round in it.
+            monkeypatch.setattr(
+                type(engine), "MAX_AGENT_ROUNDS", 2, raising=False
+            )
         chunk = KnowledgeChunk(
-            context_id="ctx", fs_path="/files/manual.md", content=ANSWER,
+            context_id="ctx", fs_path="/files/manual.md", content=cls.PASSAGE,
             embedding=[], chunk_index=0,
         )
         monkeypatch.setattr(
@@ -2427,12 +2452,16 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
 
         def _generate(*a, **k):
             rounds["n"] += 1
+            wants_tool = (
+                rounds_exhausted or (rounds["n"] == 1 and not answers_immediately)
+            )
             return {
-                "content": ANSWER, "assistant_message": None, "usage": {},
+                "content": "" if wants_tool else cls.DRAFT,
+                "assistant_message": None, "usage": {},
                 "tool_calls": ([{
-                    "id": "c1", "name": "web_search",
+                    "id": f"c{rounds['n']}", "name": "web_search",
                     "arguments": '{"query":"how long"}',
-                }] if rounds["n"] == 1 else []),
+                }] if wants_tool else []),
             }
 
         monkeypatch.setattr(
@@ -2452,9 +2481,10 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
 
         def _watch(self, invocation, worker_tool, plan, context, *a, **kw):
             result = real(self, invocation, worker_tool, plan, context, *a, **kw)
-            if planted is not None and plan.get("stream_final"):
-                result["messages"] = deepcopy(planted)
-            served.append((invocation, context))
+            if plan.get("stream_final"):
+                served.append((invocation, context, deepcopy(result)))
+                if planted is not None:
+                    result["messages"] = deepcopy(planted)
             return result
 
         monkeypatch.setattr(type(engine), "_serve_invocation", _watch)
@@ -2487,7 +2517,7 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
         await self._run(engine, user_id)
 
         assert seen["messages"] == self.PLANTED
-        invocation, _context = served[-1]
+        invocation, _context, _result = served[-1]
         assert not invocation.citations
 
     @pytest.mark.asyncio
@@ -2502,7 +2532,7 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
         await self._run(engine, user_id)
 
         assert seen["messages"] == self.PLANTED
-        invocation, _context = served[-1]
+        invocation, _context, _result = served[-1]
         assert not invocation.citations
 
     @pytest.mark.asyncio
@@ -2522,7 +2552,7 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
         # The parent's conversation: its system block, its user turn, and the
         # tool round it recorded while the worker drove.
         blob = json.dumps(seen["messages"])
-        assert ANSWER in blob
+        assert self.PASSAGE in blob
         assert "web_search" in blob, seen["messages"]
 
     @pytest.mark.asyncio
@@ -2539,11 +2569,11 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
 
         await self._run(engine, user_id)
 
-        invocation, _context = served[-1]
+        invocation, _context, _result = served[-1]
         handle = invocation.citations.handle_for("src_1")
         assert handle, dict(invocation.citations.by_source)
         system = seen["messages"][0]["content"]
-        assert f"{ANSWER} [cite:{handle}]" in system, system[-200:]
+        assert f"{self.PASSAGE} [cite:{handle}]" in system, system[-200:]
         assert CITATION_INSTRUCTION in system
 
     @pytest.mark.asyncio
@@ -2599,7 +2629,89 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
         assert "800 hours" not in json.dumps(seen["messages"])
         assert "[cite:" not in json.dumps(seen["messages"])
         assert CITATION_INSTRUCTION not in json.dumps(seen["messages"])
-        assert ANSWER in json.dumps(seen["messages"])
+        assert self.PASSAGE in json.dumps(seen["messages"])
+        # Cut at the same point as the prompt it stands in for. A fallback
+        # that ended one exchange later would be a different conversation.
+        assert self.DRAFT not in json.dumps(seen["messages"])
+
+
+    @pytest.mark.asyncio
+    async def test_the_discarded_draft_is_not_in_the_prompt_that_replaces_it(
+        self, store, monkeypatch
+    ):
+        """The worker asks for a final answer, throws the reply away, and
+        hands back the conversation without it - because the parent is about
+        to write that answer itself. The parent's reconstruction has to be cut
+        at the same point.
+
+        Put the draft back and the replacement is written from a prompt
+        containing a draft of itself: neither what the worker handed over, nor
+        anything the model was ever shown.
+        """
+        engine = get_runtime().workflow
+        user_id, seen, served = self._streaming(
+            engine, monkeypatch, store, offers=True
+        )
+
+        await self._run(engine, user_id)
+
+        _invocation, _context, result = served[-1]
+        handed_over = json.dumps(result.get("messages") or [])
+        assert self.DRAFT not in handed_over, "the worker kept its own draft"
+
+        streamed = json.dumps(seen["messages"])
+        assert self.DRAFT not in streamed, seen["messages"]
+        # And it is a cut, not a truncation: everything before the draft is
+        # still there, including the round the worker really ran.
+        assert self.PASSAGE in streamed
+        assert self.ASKED in streamed
+        roles = [message.get("role") for message in seen["messages"]]
+        assert "tool" in roles, seen["messages"]
+        assert any(
+            message.get("tool_calls") for message in seen["messages"]
+        ), seen["messages"]
+        # The record still says the draft happened.
+        entries = _context.transcript.entries
+        assert any(
+            getattr(entry, "content", "") == self.DRAFT for entry in entries
+        ), entries
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_never_called_a_tool_streams_the_base_prompt(
+        self, store, monkeypatch
+    ):
+        """The draft is the whole transcript. What is left after the cut is
+        the conversation as the planner built it."""
+        engine = get_runtime().workflow
+        user_id, seen, served = self._streaming(
+            engine, monkeypatch, store, offers=True, answers_immediately=True
+        )
+
+        await self._run(engine, user_id)
+
+        streamed = json.dumps(seen["messages"])
+        assert self.DRAFT not in streamed, seen["messages"]
+        assert self.PASSAGE in streamed
+        assert [m.get("role") for m in seen["messages"]] == ["system", "user"]
+
+    @pytest.mark.asyncio
+    async def test_a_transcript_ending_in_a_round_is_not_trimmed(
+        self, store, monkeypatch
+    ):
+        """The worker ran out of rounds with a tool exchange outstanding, so
+        there is no draft and nothing to cut. Trimming by position rather than
+        by shape would drop the last tool result the answer depends on."""
+        engine = get_runtime().workflow
+        user_id, seen, served = self._streaming(
+            engine, monkeypatch, store, offers=True, rounds_exhausted=True
+        )
+
+        await self._run(engine, user_id)
+
+        roles = [message.get("role") for message in seen["messages"]]
+        assert roles[-1] == "tool", seen["messages"]
+        assert self.DRAFT not in json.dumps(seen["messages"])
+        assert self.PASSAGE in json.dumps(seen["messages"])
 
 
 class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:

@@ -1172,7 +1172,9 @@ class WorkflowStreamingMixin:
             # the answer will be written from, so a `[cite:...]` the worker
             # put in that history is one the model would copy into an answer
             # the parent then treats as its own.
-            offered = self.agent_prompt(invocation, stream_context)
+            offered = self.agent_prompt(
+                invocation, stream_context, replace_terminal_answer=True
+            )
             messages = (
                 offered if offered is not None
                 else (result.get("messages") or messages)

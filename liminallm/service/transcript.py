@@ -253,6 +253,39 @@ class TrustedTranscript:
         last = self.entries[-1]
         return last if isinstance(last, ModelTurn) else None
 
+    def without_trailing_answer(self) -> "TrustedTranscript":
+        """This record, cut before a terminal answer the parent is replacing.
+
+        One caller: the streamed final turn. The worker stops after its tool
+        rounds and hands the conversation back for the parent to finish, and
+        its loop deliberately leaves the last no-tool response out of that
+        conversation - the parent is about to produce the answer, so repeating
+        the draft would put it in the prompt it is being written from.
+
+        The parent records that response anyway, because it happened. This is
+        the difference between the two facts: the record still says the model
+        produced a draft, and a reconstruction meant to replace it starts from
+        the state immediately before.
+
+        Structural, not textual. What is dropped is a trailing `ModelTurn`
+        with no tool calls - the shape the worker breaks on - rather than
+        anything matching the answer's words, which would be a guess about
+        text the model wrote.
+
+        Only trailing, and only that shape. A transcript ending in a
+        `ToolRound` is a conversation waiting for its first answer and is
+        returned whole; a model turn that asked for tools is an exchange the
+        rounds after it depend on.
+
+        A copy, so the caller cannot narrow the record by reading it.
+        """
+        entries = list(self.entries)
+        if entries:
+            last = entries[-1]
+            if isinstance(last, ModelTurn) and not last.tool_calls:
+                entries.pop()
+        return TrustedTranscript(entries=entries)
+
     def as_list(self) -> List[Dict[str, Any]]:
         return [entry.as_dict() for entry in self.entries]
 

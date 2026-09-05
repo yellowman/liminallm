@@ -1184,3 +1184,105 @@ class TestTheParentRecordsWhereTheSelectedContextLanded:
         ) == ()
         assert engine._initial_grounding(messages, [], []) == ()
         assert engine._initial_grounding([], [ground], [(0, 3)]) == ()
+
+
+class TestCuttingBeforeAnAnswerThatIsBeingReplaced:
+    """`without_trailing_answer` is the streamed final turn's cutoff.
+
+    The worker asks the model for a final answer, throws the reply away and
+    hands the conversation back without it, because the parent is about to
+    write that answer itself. The parent records the reply anyway - it
+    happened - so a reconstruction meant to replace it needs a different
+    cutoff from the record.
+
+    Structural, not textual: what is dropped is the shape the worker breaks
+    on, never anything matching the answer's words.
+    """
+
+    @staticmethod
+    def _answer(seq, content="drafted"):
+        return ModelTurn(operation_seq=seq, content=content)
+
+    @staticmethod
+    def _asked_for_tools(seq):
+        return ModelTurn(
+            operation_seq=seq,
+            content="",
+            tool_calls=({"id": "c1", "name": "web_search", "arguments": "{}"},),
+        )
+
+    @staticmethod
+    def _round(seq):
+        return ToolRound(
+            operation_seq=seq,
+            results=(TrustedToolResult(
+                operation_seq=seq, call_index=0, tool_name="web_search",
+                tool_message_id="c1", text="found",
+            ),),
+        )
+
+    def test_a_trailing_answer_is_dropped(self):
+        transcript = TrustedTranscript()
+        transcript.record(self._asked_for_tools(1))
+        transcript.record(self._round(2))
+        transcript.record(self._answer(3))
+
+        cut = transcript.without_trailing_answer()
+
+        assert [type(e).__name__ for e in cut.entries] == ["ModelTurn", "ToolRound"]
+
+    def test_a_trailing_round_is_kept(self):
+        """The worker ran out of rounds with an exchange outstanding. Cutting
+        by position rather than by shape would drop the tool result the
+        answer is supposed to be written from."""
+        transcript = TrustedTranscript()
+        transcript.record(self._asked_for_tools(1))
+        transcript.record(self._round(2))
+
+        cut = transcript.without_trailing_answer()
+
+        assert [type(e).__name__ for e in cut.entries] == ["ModelTurn", "ToolRound"]
+
+    def test_a_trailing_turn_that_asked_for_tools_is_kept(self):
+        """Not every trailing `ModelTurn` is a discarded answer. One carrying
+        tool calls is the assistant message a tool message answers, and
+        dropping it leaves that reply attached to nothing."""
+        transcript = TrustedTranscript()
+        transcript.record(self._round(1))
+        transcript.record(self._asked_for_tools(2))
+
+        cut = transcript.without_trailing_answer()
+
+        assert [type(e).__name__ for e in cut.entries] == ["ToolRound", "ModelTurn"]
+        assert cut.entries[-1].tool_calls
+
+    def test_an_empty_transcript_survives_the_cut(self):
+        assert TrustedTranscript().without_trailing_answer().entries == []
+
+    def test_only_the_last_answer_goes(self):
+        """Two answers in a row is not a shape the loop produces, and the
+        rule is still 'the last one': anything else would be searching the
+        record for drafts rather than cutting at a known point."""
+        transcript = TrustedTranscript()
+        transcript.record(self._answer(1, "first"))
+        transcript.record(self._answer(2, "second"))
+
+        cut = transcript.without_trailing_answer()
+
+        assert [e.content for e in cut.entries] == ["first"]
+
+    def test_the_record_itself_is_untouched(self):
+        """A view, not an edit. That the model produced a draft is a fact
+        about the turn, and a reader taking a different cutoff must not
+        narrow what everyone else sees."""
+        transcript = TrustedTranscript()
+        transcript.record(self._asked_for_tools(1))
+        transcript.record(self._answer(2))
+
+        cut = transcript.without_trailing_answer()
+        cut.record(self._answer(3, "added to the view"))
+
+        assert [type(e).__name__ for e in transcript.entries] == [
+            "ModelTurn", "ModelTurn"
+        ]
+        assert transcript.entries[-1].content == "drafted"
