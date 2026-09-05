@@ -48,9 +48,11 @@ from liminallm.service.citation_offers import (
     CITATION_INSTRUCTION,
     OfferRender,
     choose_offers,
+    instruct,
     label_snippets,
+    rebuild_agent_messages,
 )
-from liminallm.service.citations import transfer_citations
+from liminallm.service.citations import CitationTable, transfer_citations
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     cosine_similarity,
@@ -1951,6 +1953,122 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 f"{len(aligned)} entries for {len(snippets)} snippets"
             )
         return aligned
+
+    def _unlabelled_agent_prompt(
+        self, invocation: Invocation, context: InvocationContext
+    ) -> List[Dict[str, Any]]:
+        """The trusted conversation with nothing offered in it.
+
+        What every path that cannot carry citations sends. Rendered against a
+        table that cites nothing, so no marker is placed, and without the
+        instruction - a model told to copy markers and shown none is being
+        asked about something that is not there.
+
+        Still the parent's bytes rather than the worker's. Losing the offers
+        is not a reason to start trusting the message list that came back.
+        """
+        messages, _markers, _placed = rebuild_agent_messages(
+            context.initial_messages,
+            context.initial_grounded_messages,
+            context.transcript,
+            CitationTable(nonce=invocation.citations.nonce),
+            context.source_registry,
+        )
+        return messages
+
+    def agent_prompt(
+        self, invocation: Invocation, context: InvocationContext
+    ) -> Optional[List[Dict[str, Any]]]:
+        """One agent model call's conversation, as the parent builds it.
+
+        `None` means the feature is not operating - offers are off, or this
+        turn recorded no provenance - and the caller sends whatever it sent
+        before any of this existed. That is the only answer that returns the
+        worker into the picture, and it is what keeps production byte-identical.
+
+        Anything else is the parent's own conversation, rebuilt from the base
+        prompt it kept and the record it wrote. The worker's message list is
+        never model input once offers are on: a committed handle is text the
+        model has already read, so a call built from a list the worker
+        composed is one where the worker can ask for that handle by name - the
+        model writes it honestly, exact matching accepts it, and a citation
+        transfers for a claim no source made. Both integrity failures
+        therefore fall back to the unlabelled reconstruction rather than to
+        the worker.
+
+        Speculate, price the prepared form, commit only what a marker actually
+        reached, render once more from the table that was committed, and
+        refuse if the two disagree.
+
+        Two callers, one rule. The blocking seam runs this per model call; the
+        streamed path runs it once for the final turn it serves itself. They
+        were one function from the start rather than two that agree today,
+        because what they build is the same conversation and the reasons it
+        must not come from the worker do not differ between them.
+        """
+        registry = context.source_registry
+        if not self.CITATION_OFFERS_ENABLED or registry is None:
+            return None
+        if not context.citations_intact or not invocation.citation_budget_intact:
+            return self._unlabelled_agent_prompt(invocation, context)
+
+        def rebuild(table: CitationTable):
+            return rebuild_agent_messages(
+                context.initial_messages,
+                context.initial_grounded_messages,
+                context.transcript,
+                table,
+                registry,
+            )
+
+        def prepared(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            # What the backend will really be sent. `generate_with_tools` and
+            # `stream_messages` each run this themselves, so the priced tree
+            # and the sent tree are the same computation over the same input -
+            # and the raw messages are what gets passed on, or the adapter
+            # guidance lands twice.
+            ready, _adapters = self.llm._prepare_backend_messages(
+                messages, context.adapters
+            )
+            return ready
+
+        def render(table: CitationTable) -> OfferRender:
+            # Instructed first, then prepared. The two orders agree for every
+            # conversation the parent builds, because they all open with a
+            # system message and the guidance goes after it - measured, not
+            # assumed. They part when there is no leading system message:
+            # preparation then puts the guidance first and the instruction is
+            # appended to *it*, which reads as the adapter asking for
+            # citations rather than the service.
+            messages, markers, placed = rebuild(table)
+            return OfferRender(
+                messages=prepared(instruct(messages) if markers else messages),
+                markers=tuple(markers),
+                placed=tuple(placed),
+            )
+
+        choice = choose_offers(
+            registry=registry,
+            committed=invocation.citations,
+            candidates=context.provenance_bindings,
+            render=render,
+            counter=self.llm.token_counter(),
+            budget=self.prompt_budget(),
+        )
+        if not choice.fits:
+            invocation.poison_citation_budget()
+            return self._unlabelled_agent_prompt(invocation, context)
+        table = invocation.extend_citations(registry, list(choice.granted))
+        final, markers, _placed = rebuild(table)
+        instructed = instruct(final) if markers else final
+        if prepared(instructed) != choice.messages:
+            # The table that was committed did not reproduce the prompt that
+            # was priced from its speculative twin. What the model would be
+            # sent is not what was measured, so nothing here is trustworthy
+            # enough to send - and it will not become so on the next call.
+            invocation.poison_citation_budget()
+            return self._unlabelled_agent_prompt(invocation, context)
+        return instructed
 
     def _offered_context(
         self,

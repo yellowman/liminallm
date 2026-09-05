@@ -42,17 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
-from liminallm.service.citation_offers import (
-    OfferRender,
-    choose_offers,
-    instruct,
-    rebuild_agent_messages,
-)
-from liminallm.service.citations import (
-    CitationTable,
-    assert_scrubbed,
-    scrub_namespace,
-)
+from liminallm.service.citations import assert_scrubbed, scrub_namespace
 from liminallm.service.invocation import (
     Invocation,
     LeaseRevoked,
@@ -876,28 +866,6 @@ class CapabilityBroker:
 
     # -- the model --------------------------------------------------------
 
-    def _unlabelled_prompt(
-        self, invocation: Invocation
-    ) -> List[Dict[str, Any]]:
-        """The trusted conversation with nothing offered in it.
-
-        What every path that cannot carry citations sends. Rendered against a
-        table that cites nothing, so no marker is placed, and without the
-        instruction - a model told to copy markers and shown none is being
-        asked about something that is not there.
-
-        Still the parent's bytes rather than the worker's. Losing the offers
-        is not a reason to start trusting the message list that comes back.
-        """
-        messages, _markers, _placed = rebuild_agent_messages(
-            self._ctx.initial_messages,
-            self._ctx.initial_grounded_messages,
-            self._ctx.transcript,
-            CitationTable(nonce=invocation.citations.nonce),
-            self._ctx.source_registry,
-        )
-        return messages
-
     def _model_prompt(
         self, invocation: Invocation, payload: Dict[str, Any]
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -908,10 +876,10 @@ class CapabilityBroker:
 
         With offers on the worker's message list is not model input at all.
         The parent rebuilds the conversation from the base prompt it kept and
-        the record it wrote, labels it from a speculative table, prices the
-        prepared form of that, commits only what a marker actually reached,
-        and renders once more from the table it got. The worker's copy stays
-        a protocol diagnostic.
+        the record it wrote; `_agent_prompt` owns that, because the streamed
+        final turn needs the same conversation and a second copy of the rule
+        would be a second copy of its defects. What arrives here is only the
+        worker-payload half: which messages, and which schemas.
 
         The schemas are the parent's for the reason 12a established - a schema
         is model input, and a worker that could substitute one could describe
@@ -923,84 +891,18 @@ class CapabilityBroker:
         hand back the capability the worker just surrendered, and the model
         could spend the turn on another tool call. So: subtract yes, invent
         no.
-
-        Once offers are on, every refusal falls back to the parent's own
-        unlabelled conversation and never to the worker's. That is the
-        load-bearing half. A committed handle is text the model has already
-        read, so a later call made from a message list the worker composed is
-        one where the worker can ask for that handle by name - the model
-        writes it honestly, exact matching accepts it, and a real citation
-        transfers for a claim no source made.
         """
         worker_messages = list(payload.get("messages") or [])
         worker_tools = list(payload.get("tools") or [])
-        registry = self._ctx.source_registry
-        if not self._engine.CITATION_OFFERS_ENABLED or registry is None:
+        offered = self._engine.agent_prompt(invocation, self._ctx)
+        if offered is None:
             return worker_messages, worker_tools
         tools = (
             []
             if not worker_tools
             else [deepcopy(dict(tool)) for tool in self._ctx.initial_tools]
         )
-        if not self._ctx.citations_intact or not invocation.citation_budget_intact:
-            return self._unlabelled_prompt(invocation), tools
-
-        def rebuild(table: CitationTable):
-            return rebuild_agent_messages(
-                self._ctx.initial_messages,
-                self._ctx.initial_grounded_messages,
-                self._ctx.transcript,
-                table,
-                registry,
-            )
-
-        def prepared(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-            # What the backend will really be sent. `generate_with_tools`
-            # runs this itself, so the priced tree and the sent tree are the
-            # same computation over the same input - and the raw messages are
-            # what gets passed on, or the adapter guidance lands twice.
-            ready, _adapters = self._engine.llm._prepare_backend_messages(
-                messages, self._ctx.adapters
-            )
-            return ready
-
-        def render(table: CitationTable) -> OfferRender:
-            # Instructed first, then prepared. The two orders agree for every
-            # conversation the parent builds, because they all open with a
-            # system message and the guidance goes after it - measured, not
-            # assumed. They part when there is no leading system message:
-            # preparation then puts the guidance first and the instruction is
-            # appended to *it*, which reads as the adapter asking for
-            # citations rather than the service.
-            messages, markers, placed = rebuild(table)
-            return OfferRender(
-                messages=prepared(instruct(messages) if markers else messages),
-                markers=tuple(markers),
-                placed=tuple(placed),
-            )
-
-        choice = choose_offers(
-            registry=registry,
-            committed=invocation.citations,
-            candidates=self._ctx.provenance_bindings,
-            render=render,
-            counter=self._engine.llm.token_counter(),
-            budget=self._engine.prompt_budget(),
-        )
-        if not choice.fits:
-            invocation.poison_citation_budget()
-            return self._unlabelled_prompt(invocation), tools
-        table = invocation.extend_citations(registry, list(choice.granted))
-        final, markers, _placed = rebuild(table)
-        instructed = instruct(final) if markers else final
-        if prepared(instructed) != choice.messages:
-            # The table that was committed did not reproduce the prompt that
-            # was priced from its speculative twin. What the model would be
-            # sent is not what was measured, so nothing here is trustworthy
-            # enough to send - and it will not become so on the next call.
-            invocation.poison_citation_budget()
-            return self._unlabelled_prompt(invocation), tools
-        return instructed, tools
+        return offered, tools
 
     def _llm_generate_with_tools(
         self, invocation: Invocation, seq: int, payload: Dict[str, Any]

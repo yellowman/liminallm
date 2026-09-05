@@ -308,6 +308,7 @@ class LLMService:
         history: Optional[List[Message]] = None,
         *,
         user_id: Optional[str] = None,
+        instruction: Optional[str] = None,
     ) -> Iterator[dict]:
         """Stream tokens from the LLM per SPEC §13.7.
 
@@ -321,7 +322,7 @@ class LLMService:
         carries, so the pump could not interrupt a blocked read.
         """
         messages, normalized_adapters = self._prepare_generation(
-            prompt, adapters, context_snippets, history
+            prompt, adapters, context_snippets, history, instruction=instruction
         )
         return self.backend.generate_stream(
             messages, normalized_adapters, user_id=user_id

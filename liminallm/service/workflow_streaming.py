@@ -841,10 +841,19 @@ class WorkflowStreamingMixin:
         # After the budget, as on the blocking path: a chunk the pruner
         # dropped never reached the model. Held until the stream completes -
         # a node that fails mid-answer grounded nothing.
-        self._record_grounding(
+        aligned = self._record_grounding(
             source_registry, ctx_chunks, context_snippets,
             leading=leading, sink=bindings_sink,
         )
+        # The same offer the blocking `llm.generic` makes, on the same terms.
+        # This node is that one with a different transport, and a rule that
+        # held only for the blocking half would make whether an answer can
+        # cite depend on whether the client asked for tokens.
+        shown, instruction = self._offered_context(
+            invocation, source_registry, context_snippets, aligned,
+            prompt=message or "", adapters=adapters, history=history,
+        )
+        offer = {"instruction": instruction} if instruction else {}
 
         # `generate_stream` is a synchronous iterator, and iterating it here
         # ran the model on the event loop: every other request the worker was
@@ -860,9 +869,10 @@ class WorkflowStreamingMixin:
                 self.llm.generate_stream,
                 message or "",
                 adapters=adapters,
-                context_snippets=context_snippets,
+                context_snippets=shown,
                 history=history,
                 user_id=user_id,
+                **offer,
             ),
             label=str(node.get("id") or "llm"),
             cancel_event=cancel_event,
@@ -1029,12 +1039,21 @@ class WorkflowStreamingMixin:
         # The positions are kept too, married to their relations here for the
         # same reason as on the blocking path.
         initial_grounded = self._initial_grounding(messages, aligned, context_ranges)
-        # What the worker's own searches record, kept beside the assembly's
-        # rather than in the caller's sink. If this path abandons the
-        # assembly for the plain fallback, streams a partial answer, or fails,
-        # the list dies with it - the evidence stays in the turn's registry as
+        # What this assembly may cite: what the planner retrieved, and then
+        # whatever the worker's own searches add to it. Kept here rather than
+        # in the caller's sink, so that if this path abandons the assembly for
+        # the plain fallback, streams a partial answer, or fails, the list
+        # dies with it - the evidence stays in the turn's registry as
         # consulted, and neither half becomes authority.
-        capability_bindings: List[Binding] = []
+        #
+        # Seeded with the assembly's own grounding the way the blocking path
+        # seeds it. The final turn is streamed from the prompt the planner
+        # built, so the passage that prompt was built around is the first
+        # thing it can cite; an offer layer reading only the worker's searches
+        # would label everything except the context the turn actually started
+        # from. Merging into the turn's result below is unchanged - it dedupes
+        # by relation, and these were already merged there.
+        capability_bindings: List[Binding] = list(agent_bindings)
         if not tools or not self.llm.supports_tools:
             # The plain body answers, so it fills the sink from the prompt it
             # builds. `agent_bindings` above are discarded with the assembly
@@ -1139,7 +1158,25 @@ class WorkflowStreamingMixin:
             if cancel_event and cancel_event.is_set():
                 yield {"event": "cancel_ack", "data": {}}
                 return
-            messages = result.get("messages") or messages
+            # Whose conversation the final turn runs on.
+            #
+            # The worker built one while it drove the tool rounds, and with
+            # offers off that is what streams - the same bytes this path has
+            # always sent. Once offers are on it is not model input at all:
+            # the parent rebuilds the conversation from the base prompt it
+            # kept and the record it wrote, labels what it may, and streams
+            # that. The rule is the blocking seam's, not a second copy of it.
+            #
+            # This turn is the one that matters most for it. The worker
+            # chooses everything up to here and then hands back the history
+            # the answer will be written from, so a `[cite:...]` the worker
+            # put in that history is one the model would copy into an answer
+            # the parent then treats as its own.
+            offered = self.agent_prompt(invocation, stream_context)
+            messages = (
+                offered if offered is not None
+                else (result.get("messages") or messages)
+            )
             usage = self._merge_usage(usage, result.get("usage") or {})
             snippets.extend(result.get("context_snippets") or [])
             tool_trace.extend(result.get("tool_calls") or [])
