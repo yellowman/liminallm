@@ -402,8 +402,17 @@ class ScrubbedTokenStream:
         The provider's own `content` is checked against the tokens it sent
         rather than trusted in place of them. They are two claims about one
         answer, and a provider that contradicts itself has not given the
-        parent an answer it can read citations out of - so the reader is left
-        unfinished, `intact` stays false, and the held tail is never flushed.
+        parent an answer it can read citations out of.
+
+        A contradiction becomes an error rather than a quieter completion.
+        Refusing the citations is not enough on its own: `message_done` is
+        what the streamed node treats as the answer boundary, so a completion
+        carrying the released text - however correctly scrubbed - is a
+        truncated answer with a success stamp on it, ready to be persisted as
+        the turn's reply. There is no completion here to mistake for one. What
+        the client has already been shown stands, by the same partial-answer
+        handling a backend failure gets, and the reader is left unfinished so
+        nothing downstream reads authority out of it.
 
         Otherwise the tail goes first. A consumer that replaces its
         accumulated tokens with the final content has to be given a final
@@ -413,8 +422,13 @@ class ScrubbedTokenStream:
         reported = data.get("content")
         if reported is not None and str(reported) != self.reader.canonical:
             self.contradicted = True
-            data["content"] = self.reader.released
-            return [{**event, "data": data}]
+            return [{
+                "event": "error",
+                "data": {
+                    "code": "server_error",
+                    "message": "provider stream contradicted its own tokens",
+                },
+            }]
         tail, _origins = self.reader.finish()
         data["content"] = self.reader.released
         done = {**event, "data": data}

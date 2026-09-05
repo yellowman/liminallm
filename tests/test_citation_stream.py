@@ -8,7 +8,9 @@ early is never text the finished scrub would have taken out.
 
 from __future__ import annotations
 
+import asyncio
 import random
+import threading
 from json import dumps as json_dumps
 
 import pytest
@@ -20,6 +22,7 @@ from liminallm.service.citation_stream import (
     ScrubbedTokenStream,
 )
 from liminallm.service.citations import scrub_positions
+from liminallm.service.node_attempt import StreamPump
 from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
 
 NONCE = "K7Q2ABCD"
@@ -491,6 +494,26 @@ class TestWhatTheFilterLetsThrough:
         assert stream.contradicted
         assert not stream.reader.intact()
 
+    def test_a_contradiction_is_not_a_completion(self):
+        """Zero citations is not the whole of it.
+
+        `message_done` is what the streamed node treats as the answer
+        boundary, so a completion carrying correctly scrubbed but truncated
+        text is a partial answer wearing a success stamp - ready to be
+        returned as the turn's reply and persisted. There is no completion
+        here at all; the turn ends the way a backend failure ends, with
+        whatever the client was already shown.
+        """
+        raw = ["400 hours ", MARKER]
+        stream = ScrubbedTokenStream(
+            self._events(*raw, content="800 hours " + MARKER), NONCE
+        )
+        events = list(stream)
+        kinds = [event["event"] for event in events]
+        assert "message_done" not in kinds, events
+        assert kinds[-1] == "error", events
+        assert events[-1]["data"]["code"] == "server_error"
+
     def test_a_stream_with_no_reported_content_still_completes(self):
         raw = ["400 hours ", MARKER, " exactly"]
         stream = ScrubbedTokenStream(self._events(*raw), NONCE)
@@ -522,3 +545,74 @@ class TestTheCeilingStopsRatherThanTruncates:
 
     def test_the_default_is_the_length_the_system_calls_a_whole_reply(self):
         assert MAX_CANONICAL_CHARS == 4 * MAX_GENERATION_TOKENS
+
+
+class TestTheRealPumpCanStillStopABlockedProvider:
+    """The composition, not the delegation.
+
+    The tests above prove the wrapper forwards `abort`, `armed` and `close`.
+    This proves the thing that matters: a `StreamPump` owning the wrapper
+    owning a cancellable backend can still interrupt a read in flight, and
+    still knows that it can.
+
+    Without it a generator would pass every delegation test by not existing,
+    and a node timeout would quietly go back to waiting out the provider
+    client's own thirty-second one.
+    """
+
+    class _BlockingBackend:
+        """A backend stream that stops between events until aborted."""
+
+        def __init__(self):
+            self._released = threading.Event()
+            self._sent = False
+            self.aborted = False
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if not self._sent:
+                self._sent = True
+                return {"event": "token", "data": "400 hours"}
+            # The read a stop has to interrupt. Without `abort` reaching it,
+            # nothing here checks a flag and the thread stays put.
+            self._released.wait(timeout=10)
+            if self.aborted:
+                # What a cancellable backend really does: the shutdown socket
+                # raises out of the read rather than ending it tidily. Ending
+                # tidily would be recorded as a natural completion, which is
+                # the opposite of what a stop means.
+                raise ConnectionError("stream aborted")
+            raise StopIteration
+
+        @property
+        def armed(self):
+            return True
+
+        def abort(self):
+            self.aborted = True
+            self._released.set()
+
+        def close(self):
+            self.closed = True
+
+    @pytest.mark.asyncio
+    async def test_stopping_the_pump_reaches_the_backend_through_the_wrapper(self):
+        backend = self._BlockingBackend()
+        wrapper = ScrubbedTokenStream(backend, NONCE)
+        pump = StreamPump(lambda: wrapper, label="citation-stream").start()
+
+        events = pump.events()
+        first = await asyncio.wait_for(events.__anext__(), timeout=5)
+        assert first == {"event": "token", "data": "400 hours"}
+
+        # The pump can say the death will be prompt, which it reads off the
+        # iterator it owns - the wrapper, which answers for the backend.
+        assert pump.cancellation_proven()
+
+        assert await asyncio.wait_for(pump.wait_dead(2.0), timeout=5)
+        assert backend.aborted, "the stop never reached the backend"
+        assert backend.closed, "the producer thread did not close the backend"
+        assert pump.interrupted
