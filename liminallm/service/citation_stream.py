@@ -34,6 +34,15 @@ across the stream rather than paid at the end, so the incremental scrubber
 this would be replaced with buys milliseconds and owes a proof that it agrees
 with `scrub_positions` on every input. If answers get long enough for it to
 matter, the number to beat is here.
+
+Whoever wires this owes it a ceiling, because nothing else provides one today.
+`MAX_GENERATION_TOKENS` is only ever subtracted from the context window to
+leave room for a reply; no backend here sends a max-output parameter of any
+kind, so a reply's length is the provider's to choose. Extrapolating the
+numbers above, a 100,000-character answer is tens of seconds of regex. Two
+things make that safe and neither is this module's to do: run the scan off the
+event loop, and bound the canonical text - by an output cap on the request, or
+by refusing to keep scrubbing past a size the caller names.
 """
 
 from __future__ import annotations
@@ -69,15 +78,23 @@ def _partial_pattern(nonce: str) -> "re.Pattern[str]":
 #: these ends the search immediately, so the scan is the length of the run
 #: rather than of the answer.
 #:
-#: Both cases of every one of them. The keyword is matched case-insensitively
-#: and the nonce alphabet is uppercase, so a walk that knew only the lowercase
-#: `cite` stopped at the `I` of `[CITE:` and never offered that suffix to the
-#: check above - which then released `[CITE:` and had it removed under itself
-#: when the closing bracket arrived. A missing character here is not a slow
-#: search, it is a marker on the wire.
-def _partial_alphabet(nonce: str) -> frozenset:
-    letters = " \t[:-0123456789cite" + nonce
-    return frozenset(letters.lower() + letters.upper())
+#: A pattern rather than a set, compiled with the flag the matcher above uses,
+#: because "the same character ignoring case" is the regex engine's question
+#: and it does not answer it the way `str` does. `re.IGNORECASE` folds four
+#: characters into this alphabet that `.lower() + .upper()` leaves out - U+212A
+#: KELVIN SIGN for `K`, U+017F LATIN SMALL LETTER LONG S for `S`, and U+0131
+#: and U+0130 for `i` - and `K` and `S` are both in the nonce alphabet.
+#:
+#: What that cost was not a slow search. `K7Q2` `ABCD` split across two chunks
+#: is a nonce to the finished scrub and was four ordinary characters to this
+#: walk, so the first half went out and the second half deleted it. The one
+#: before it was the same mistake in ASCII - a walk that knew only lowercase
+#: `cite` stopped inside `[CITE:` - which is why this now asks rather than
+#: enumerates.
+def _partial_characters(nonce: str) -> "re.Pattern[str]":
+    letters = sorted(set(" \t[:-0123456789cite" + nonce))
+    joined = "|".join(re.escape(character) for character in letters)
+    return re.compile(rf"(?:{joined})", re.IGNORECASE)
 
 
 class CanonicalCitationStream:
@@ -102,7 +119,7 @@ class CanonicalCitationStream:
         self._canonical: List[str] = []
         self._released = ""
         self._partial = _partial_pattern(nonce)
-        self._alphabet = _partial_alphabet(nonce)
+        self._characters = _partial_characters(nonce)
         self._finished = False
 
     @property
@@ -146,16 +163,22 @@ class CanonicalCitationStream:
         return tail, origins
 
     def intact(self) -> bool:
-        """Whether what was released is what the finished text scrubs to.
+        """Whether this stream finished, and released what it should have.
 
         The contract as one comparison, checked rather than argued. Everything
         above is an argument that the released text is always a prefix of this
         one; a caller that gets `False` has an answer whose public form nobody
         can vouch for, and no citation may be read out of it.
 
-        Only meaningful once `finish` has run - before that the released text
-        is a proper prefix by design.
+        A stream that has not finished is not intact, whatever its text says.
+        Saying "only meaningful after `finish`" and then answering anyway put
+        the burden on every caller: an answer whose held tail happens to be
+        empty - which is most ordinary prose - would have told a cancelled or
+        failed turn that its public form was vouched for. This is about to sit
+        in an authority gate, so it answers the question the gate is asking.
         """
+        if not self._finished:
+            return False
         public, _origins = scrub_positions(self.canonical, self.nonce)
         return self._released == public
 
@@ -237,7 +260,7 @@ class CanonicalCitationStream:
         text rather than to the answer.
         """
         start = len(public)
-        while start > 0 and public[start - 1] in self._alphabet:
+        while start > 0 and self._characters.fullmatch(public[start - 1]):
             start -= 1
         for index in range(start, len(public)):
             if self._partial.fullmatch(public[index:]):

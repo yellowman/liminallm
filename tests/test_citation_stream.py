@@ -18,6 +18,19 @@ from liminallm.service.citations import scrub_positions
 NONCE = "K7Q2ABCD"
 MARKER = f"[cite:{NONCE}-1]"
 
+#: A nonce holding the other letter Python folds a non-ASCII character into.
+#: `K` and `S` are both in the real nonce alphabet, so neither of these is a
+#: contrived input.
+S_NONCE = "K7Q2SBCD"
+
+#: Characters `re.IGNORECASE` treats as the ASCII letter beside them and
+#: `.lower() + .upper()` does not. Named rather than pasted, because a reader
+#: comparing the two spellings by eye would see the same letter twice.
+KELVIN = "\u212a"       # KELVIN SIGN, folds to K
+LONG_S = "\u017f"       # LATIN SMALL LETTER LONG S, folds to S
+DOTLESS_I = "\u0131"    # LATIN SMALL LETTER DOTLESS I, folds to I
+DOTTED_I = "\u0130"     # LATIN CAPITAL LETTER I WITH DOT ABOVE, folds to I
+
 
 def _read(nonce, chunks):
     """Run a stream and return (released, origins)."""
@@ -79,6 +92,27 @@ class TestAMarkerNeverBecomesObservable:
                 assert NONCE.lower() not in seen.lower(), (chunks, seen)
                 assert f"[cite:{NONCE}".lower() not in seen.lower(), (chunks, seen)
 
+    def test_text_released_before_a_removal_cannot_be_spliced_into_a_nonce(self):
+        """The second defect this reader had, pinned by name.
+
+        `K7Q2` `K7Q2` `k7q2ab` has no complete occurrence in it, and the last
+        six characters are the only ones a marker could be growing from. So a
+        hold that asked only "is the tail a partial occurrence" released the
+        first eight - and then `cdABCD` arrived, the middle became a nonce and
+        vanished, and the two halves left behind spliced into another one.
+
+        It lived in the random corpus for exactly as long as the seed happened
+        to draw it. Named here because a defect that has been seen once should
+        not depend on a lottery.
+        """
+        text = "K7Q2K7Q2k7q2abcdABCD"
+        expected, _origins = scrub_positions(text, NONCE)
+        assert expected == "K7Q2", expected
+        for chunks in [["K7Q2K7Q2k7q2ab", "cdABCD"], list(text),
+                       ["K7Q2K7Q2k7q2", "abcd", "ABCD"]]:
+            _reader, public, _o = _read(NONCE, chunks)
+            assert public == expected, chunks
+
     def test_a_stream_cut_off_mid_marker_emits_none_of_it(self):
         """Cancellation. `finish` is what releases the hold, so an answer that
         stops halfway through a marker has emitted no part of it - and has no
@@ -100,6 +134,57 @@ class TestAMarkerNeverBecomesObservable:
         reader = CanonicalCitationStream(NONCE)
         released = "".join(reader.push(character) for character in prose)
         assert released == prose
+
+
+class TestTheHoldAsksTheSameEngineTheScrubAsks:
+    """Case-insensitivity is the regex engine's question, not `str`'s.
+
+    `re.IGNORECASE` folds characters into the namespace alphabet that
+    `.lower() + .upper()` does not, and two of them - KELVIN SIGN for `K`,
+    LONG S for `S` - fold into letters the real nonce alphabet contains. A
+    hold that decided which characters could be part of a marker by building
+    a set walked straight past them, released half a nonce, and had the other
+    half delete it.
+
+    These are the whole namespace to the finished scrub, so they must be the
+    whole namespace to the reader at every split.
+    """
+
+    @pytest.mark.parametrize("nonce,text", [
+        (NONCE, KELVIN + "7Q2ABCD"),
+        (NONCE, "before " + KELVIN + "7Q2ABCD after"),
+        (NONCE, f"[c{DOTTED_I}te:{NONCE}-1]"),
+        (NONCE, f"[c{DOTLESS_I}te:{NONCE}-1]"),
+        (NONCE, f"a [C{DOTLESS_I}TE:{NONCE}-2] b"),
+        (S_NONCE, "K7Q2" + LONG_S + "BCD"),
+        (S_NONCE, f"held [cite:K7Q2{LONG_S}BCD-1] here"),
+        (S_NONCE, "K" + KELVIN.upper() + "7Q2" + LONG_S + "BCD"),
+    ])
+    def test_every_split_still_agrees_with_the_finished_scrub(self, nonce, text):
+        expected, expected_origins = scrub_positions(text, nonce)
+        assert expected != text, "the fixture is not a namespace occurrence"
+        for chunks in _every_split(text):
+            _reader, public, origins = _read(nonce, chunks)
+            assert public == expected, (chunks, public, expected)
+            assert origins == expected_origins, chunks
+
+    @pytest.mark.parametrize("nonce,text", [
+        (NONCE, KELVIN + "7Q2ABCD"),
+        (NONCE, f"[c{DOTTED_I}te:{NONCE}-1]"),
+        (S_NONCE, "K7Q2" + LONG_S + "BCD"),
+    ])
+    def test_no_split_lets_a_folded_half_out(self, nonce, text):
+        """The failure was not that the marker survived. It was that half of
+        it was released and the rest of the answer then contradicted it."""
+        for chunks in _every_split(text):
+            reader = CanonicalCitationStream(nonce)
+            seen = ""
+            for chunk in chunks:
+                seen += reader.push(chunk)
+            tail, _origins = reader.finish()
+            seen += tail
+            assert seen == scrub_positions(text, nonce)[0], chunks
+            assert reader.intact()
 
 
 class TestWhatIsNotThisTurnsNamespaceIsLeftAlone:
@@ -160,6 +245,8 @@ class TestTheStreamAgreesWithTheFinishedScrubOnAnythingAtAll:
         "[cite:OTHER-1]", "see [1]", "a[b]c", "  ", "-999", "999",
         NONCE[:1], NONCE[:3], NONCE[:7], NONCE[3:], f"[CITE:{NONCE}-2]",
         f"[cite:{NONCE}]", f" {NONCE}-3", "attic bit tidier",
+        KELVIN, LONG_S, DOTLESS_I, DOTTED_I, KELVIN + "7Q2ABCD",
+        f"[c{DOTTED_I}te:", f"[C{DOTLESS_I}TE:{NONCE}-1]",
     ]
 
     def test_random_texts_and_random_chunkings(self):
@@ -221,6 +308,20 @@ class TestTheGuardsOnStateThatShouldNotHappen:
         reader._released = f"400 hours [cite:{NONCE}"
         with pytest.raises(ValueError):
             reader.push("-1] exactly")
+
+    def test_a_stream_that_has_not_finished_is_not_intact(self):
+        """The gate this is about to sit in asks one question - may citations
+        be read out of this answer - and an unfinished stream's answer is no.
+
+        Ordinary prose holds nothing back, so its released text equals the
+        scrub of what has arrived so far. Answering on the text alone would
+        have told a cancelled turn that its public form was vouched for."""
+        reader = CanonicalCitationStream(NONCE)
+        reader.push("The service interval is four hundred hours.")
+        assert reader.released == "The service interval is four hundred hours."
+        assert not reader.intact()
+        reader.finish()
+        assert reader.intact()
 
     def test_intact_is_equality_and_not_containment(self):
         """A public form that merely contains what was released is an answer
