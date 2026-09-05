@@ -9,11 +9,18 @@ early is never text the finished scrub would have taken out.
 from __future__ import annotations
 
 import random
+from json import dumps as json_dumps
 
 import pytest
 
-from liminallm.service.citation_stream import CanonicalCitationStream
+from liminallm.service.citation_stream import (
+    MAX_CANONICAL_CHARS,
+    CanonicalCitationStream,
+    CanonicalStreamTooLong,
+    ScrubbedTokenStream,
+)
 from liminallm.service.citations import scrub_positions
+from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
 
 NONCE = "K7Q2ABCD"
 MARKER = f"[cite:{NONCE}-1]"
@@ -332,3 +339,186 @@ class TestTheGuardsOnStateThatShouldNotHappen:
         reader._released = "hours"
         assert "hours" in scrub_positions(reader.canonical, NONCE)[0]
         assert not reader.intact()
+
+
+class TestTheFilterKeepsTheHandlesThePumpReachesFor:
+    """`StreamPump` owns its iterator and reaches into it.
+
+    On `stop` it looks for `abort`, because a cancellable backend can
+    interrupt a read already in flight and the stop flag is only read between
+    events; `cancellation_proven` reads `armed` to decide whether that death
+    can be presumed prompt; and the producer thread calls `close` on the way
+    out. A generator wrapping the provider would have none of the three, and
+    the loss would be silent - a `timeout_ms` quietly back to waiting out the
+    provider client's own timeout.
+    """
+
+    class _Provider:
+        """A backend stream with the handles the pump uses."""
+
+        def __init__(self, events, armed=True):
+            self._events = iter(events)
+            self._armed = armed
+            self.aborted = False
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self.aborted:
+                raise StopIteration
+            return next(self._events)
+
+        @property
+        def armed(self):
+            return self._armed
+
+        def abort(self):
+            self.aborted = True
+
+        def close(self):
+            self.closed = True
+
+    def test_abort_reaches_the_backend(self):
+        provider = self._Provider([{"event": "token", "data": "x"}])
+        stream = ScrubbedTokenStream(provider, NONCE)
+        stream.abort()
+        assert provider.aborted
+
+    def test_armed_is_the_backends_answer(self):
+        assert ScrubbedTokenStream(self._Provider([], armed=True), NONCE).armed
+        assert not ScrubbedTokenStream(self._Provider([], armed=False), NONCE).armed
+
+    def test_close_reaches_the_backend(self):
+        provider = self._Provider([])
+        ScrubbedTokenStream(provider, NONCE).close()
+        assert provider.closed
+
+    def test_a_backend_without_the_handles_is_still_iterable(self):
+        """Plain in-memory doubles carry none of them, and the pump already
+        treats an unarmed producer as one whose death it will not presume."""
+        stream = ScrubbedTokenStream(
+            iter([{"event": "token", "data": "plain"}]), NONCE
+        )
+        assert not stream.armed
+        stream.abort()
+        stream.close()
+        assert [event["data"] for event in stream] == ["plain"]
+
+
+class TestWhatTheFilterLetsThrough:
+    @staticmethod
+    def _events(*chunks, content=None):
+        out = [{"event": "token", "data": chunk} for chunk in chunks]
+        data = {"usage": {}}
+        if content is not None:
+            data["content"] = content
+        out.append({"event": "message_done", "data": data})
+        return out
+
+    def test_a_marker_split_across_tokens_never_leaves(self):
+        raw = ["400 hours ", "[ci", "te:" + NONCE, "-1]", " exactly"]
+        stream = ScrubbedTokenStream(self._events(*raw, content="".join(raw)), NONCE)
+        events = list(stream)
+        tokens = [e["data"] for e in events if e["event"] == "token"]
+        assert "".join(tokens) == "400 hours exactly"
+        assert NONCE not in "".join(tokens)
+        done = events[-1]
+        assert done["event"] == "message_done"
+        assert done["data"]["content"] == "400 hours exactly"
+        assert stream.reader.intact()
+
+    def test_no_empty_token_is_forwarded(self):
+        """A chunk wholly inside a marker produces nothing safe. Forwarding an
+        empty token would read to a consumer counting events as the model
+        having said something."""
+        raw = ["[cite:", NONCE, "-1]", "done"]
+        events = list(ScrubbedTokenStream(self._events(*raw, content="".join(raw)),
+                                          NONCE))
+        tokens = [e for e in events if e["event"] == "token"]
+        assert all(e["data"] for e in tokens), tokens
+        assert "".join(e["data"] for e in tokens) == "done"
+
+    def test_the_held_tail_goes_before_the_completion(self):
+        """A consumer that replaces its accumulated tokens with the final
+        content has to be handed a final content those tokens add up to.
+
+        Trailing spaces are the everyday case: `[ \t]*` in front of a marker
+        is part of the match, so a run of them at the end of an answer is held
+        until there is nothing left that could claim it."""
+        raw = ["answer", "   "]
+        events = list(ScrubbedTokenStream(self._events(*raw, content="".join(raw)),
+                                          NONCE))
+        assert [e["event"] for e in events] == ["token", "token", "message_done"]
+        assert events[0]["data"] == "answer"
+        assert events[1]["data"] == "   ", "the tail was not released"
+        tokens = "".join(e["data"] for e in events if e["event"] == "token")
+        assert tokens == events[-1]["data"]["content"] == "answer   "
+
+    def test_an_unclosed_marker_is_not_this_turns_namespace(self):
+        """`[cite:` with the handle taken out of it names nothing, and the
+        scrub deliberately leaves everything that is not this namespace. The
+        filter must not invent a stricter rule than the oracle it serves."""
+        raw = ["answer", " [cite:" + NONCE]
+        text = "".join(raw)
+        stream = ScrubbedTokenStream(self._events(*raw, content=text), NONCE)
+        events = list(stream)
+        tokens = "".join(e["data"] for e in events if e["event"] == "token")
+        assert tokens == scrub_positions(text, NONCE)[0] == "answer [cite:"
+        assert NONCE not in tokens
+        assert stream.reader.intact()
+
+    def test_events_that_are_not_tokens_pass_through(self):
+        error = {"event": "error", "data": {"code": "server_error"}}
+        events = list(ScrubbedTokenStream([error], NONCE))
+        assert events == [error]
+
+    def test_a_provider_that_contradicts_its_own_tokens_is_refused(self):
+        """Two claims about one answer. The tokens are what the client was
+        shown, so a final content that disagrees is not a correction the
+        parent may accept - and an answer nobody can vouch for carries no
+        citations."""
+        raw = ["400 hours ", MARKER]
+        stream = ScrubbedTokenStream(
+            self._events(*raw, content="800 hours " + MARKER), NONCE
+        )
+        events = list(stream)
+        tokens = "".join(e["data"] for e in events if e["event"] == "token")
+        assert tokens == "400 hours"
+        assert "800" not in json_dumps(events)
+        assert NONCE not in json_dumps(events)
+        assert stream.contradicted
+        assert not stream.reader.intact()
+
+    def test_a_stream_with_no_reported_content_still_completes(self):
+        raw = ["400 hours ", MARKER, " exactly"]
+        stream = ScrubbedTokenStream(self._events(*raw), NONCE)
+        events = list(stream)
+        assert events[-1]["data"]["content"] == "400 hours exactly"
+        assert stream.reader.intact()
+
+
+class TestTheCeilingStopsRatherThanTruncates:
+    def test_it_fires_and_takes_the_provider_with_it(self):
+        """Truncating would hand the client a shorter answer that looks
+        finished, when tokens from it have already been rendered."""
+        provider = TestTheFilterKeepsTheHandlesThePumpReachesFor._Provider(
+            [{"event": "token", "data": "x" * 40} for _ in range(10)]
+        )
+        stream = ScrubbedTokenStream(provider, NONCE, max_canonical_chars=100)
+        with pytest.raises(CanonicalStreamTooLong):
+            list(stream)
+        assert provider.aborted
+        assert not stream.reader.intact()
+        assert len(stream.reader.canonical) <= 100
+
+    def test_an_answer_inside_the_ceiling_is_untouched(self):
+        events = [{"event": "token", "data": "fits"},
+                  {"event": "message_done", "data": {"content": "fits"}}]
+        stream = ScrubbedTokenStream(events, NONCE, max_canonical_chars=100)
+        assert [e["data"] for e in stream if e["event"] == "token"] == ["fits"]
+        assert stream.reader.intact()
+
+    def test_the_default_is_the_length_the_system_calls_a_whole_reply(self):
+        assert MAX_CANONICAL_CHARS == 4 * MAX_GENERATION_TOKENS

@@ -48,7 +48,7 @@ by refusing to keep scrubbing past a size the caller names.
 from __future__ import annotations
 
 import re
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 from liminallm.service.citations import scrub_positions
 
@@ -266,3 +266,158 @@ class CanonicalCitationStream:
             if self._partial.fullmatch(public[index:]):
                 return len(public) - index
         return 0
+
+
+#: How much canonical text one streamed answer may accumulate.
+#:
+#: A ceiling is needed because nothing else supplies one. `MAX_GENERATION_TOKENS`
+#: is only ever subtracted from the context window to leave room for a reply,
+#: and no backend here sends a max-output parameter, so a provider decides how
+#: long an answer runs. The scan above is quadratic, so "as long as it likes"
+#: is a way to spend a minute of CPU on one turn.
+#:
+#: Four characters per token against that same 4,096, which is the length the
+#: rest of the system already treats as a whole reply. Cutting it finer would
+#: buy time by killing answers the deployment considers legitimate, which is
+#: the wrong trade to make silently.
+#:
+#: Measured at the limit rather than extrapolated: 16,384 characters in 4,097
+#: events costs 2.1s. That is producer-thread CPU spread across the stream -
+#: half a millisecond per token, invisible as latency - so what the ceiling
+#: bounds is how much of a worker one long answer can occupy, not how fast a
+#: short one feels. A deployment that wants less passes a smaller number.
+#:
+#: The constant factor is the thing worth attacking if this ever matters, and
+#: the shape of the fix is known: everything before the released mark is
+#: settled and contains no occurrences, so the rescan could start at the
+#: frontier instead of at zero. It is not done here because it is a second
+#: implementation of the transformation and would owe the differential proof
+#: over again - which is at least a proof this module already knows how to
+#: produce.
+MAX_CANONICAL_CHARS = 4 * 4096
+
+
+class CanonicalStreamTooLong(RuntimeError):
+    """A streamed answer went past what the parent will scrub."""
+
+
+class ScrubbedTokenStream:
+    """A provider's event iterator with this turn's namespace taken out.
+
+    Wraps the iterator rather than the consumer, so the scrubbing happens on
+    whichever thread pulls the provider - which is `StreamPump`'s own producer
+    thread, not the event loop. A quadratic scan on the loop would stall every
+    other request the worker is serving for the length of one long answer.
+
+    A wrapper, not a generator, and that distinction is the reason this class
+    exists at all. `StreamPump` reaches into its iterator for `abort` when it
+    stops - a cancellable backend can interrupt a read already in flight,
+    which the stop flag alone cannot - and for `armed` to decide whether that
+    death can be presumed prompt. A generator has neither, so wrapping the
+    provider in one would silently take a `timeout_ms` back to waiting out the
+    provider client's own 30-60 second timeout. Both are proxied, and so is
+    `close`, which the pump calls from the producer thread on the way out.
+
+    What reaches the consumer is only ever `reader.released` text. A token
+    event carrying nothing safe yet is not forwarded as an empty one: the
+    provider is pulled again, so a marker split across five chunks costs five
+    reads rather than five empty events.
+    """
+
+    def __init__(
+        self,
+        events: Any,
+        nonce: str,
+        *,
+        max_canonical_chars: int = MAX_CANONICAL_CHARS,
+    ) -> None:
+        self._events = iter(events)
+        self.reader = CanonicalCitationStream(nonce)
+        self._limit = max_canonical_chars
+        self._pending: List[Dict[str, Any]] = []
+        #: Set when the provider's own final content did not match the tokens
+        #: it sent. The completion is refused rather than believed, and the
+        #: reader is left unfinished, which is what `intact` reports.
+        self.contradicted = False
+
+    # -- what the pump reaches for ----------------------------------------
+
+    def __iter__(self) -> "ScrubbedTokenStream":
+        return self
+
+    @property
+    def armed(self) -> bool:
+        return bool(getattr(self._events, "armed", False))
+
+    def abort(self) -> None:
+        abort = getattr(self._events, "abort", None)
+        if callable(abort):
+            abort()
+
+    def close(self) -> None:
+        close = getattr(self._events, "close", None)
+        if callable(close):
+            close()
+
+    # -- the filter -------------------------------------------------------
+
+    def __next__(self) -> Dict[str, Any]:
+        while True:
+            if self._pending:
+                return self._pending.pop(0)
+            event = next(self._events)
+            if not isinstance(event, dict):
+                return event
+            kind = event.get("event")
+            if kind == "token":
+                public = self._take(str(event.get("data") or ""))
+                if not public:
+                    # Nothing has cleared the hold. Pull again rather than
+                    # forward an empty token, which a consumer counting
+                    # events would read as the model having said nothing.
+                    continue
+                return {"event": "token", "data": public}
+            if kind == "message_done":
+                self._pending.extend(self._complete(event))
+                continue
+            return event
+
+    def _take(self, chunk: str) -> str:
+        """One raw chunk in, whatever is safe to show out."""
+        if len(self.reader.canonical) + len(chunk) > self._limit:
+            # Past the ceiling. Not truncated: earlier public tokens have
+            # already reached the client, so quietly stopping here would hand
+            # them a shorter answer that looks finished. The provider is cut
+            # off, the reader never finishes, and the turn ends as the error
+            # it is.
+            self.abort()
+            raise CanonicalStreamTooLong(
+                f"streamed answer exceeded {self._limit} characters"
+            )
+        return self.reader.push(chunk)
+
+    def _complete(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """The end of the stream, in public terms.
+
+        The provider's own `content` is checked against the tokens it sent
+        rather than trusted in place of them. They are two claims about one
+        answer, and a provider that contradicts itself has not given the
+        parent an answer it can read citations out of - so the reader is left
+        unfinished, `intact` stays false, and the held tail is never flushed.
+
+        Otherwise the tail goes first. A consumer that replaces its
+        accumulated tokens with the final content has to be given a final
+        content those tokens add up to.
+        """
+        data = dict(event.get("data") or {})
+        reported = data.get("content")
+        if reported is not None and str(reported) != self.reader.canonical:
+            self.contradicted = True
+            data["content"] = self.reader.released
+            return [{**event, "data": data}]
+        tail, _origins = self.reader.finish()
+        data["content"] = self.reader.released
+        done = {**event, "data": data}
+        if tail:
+            return [{"event": "token", "data": tail}, done]
+        return [done]
