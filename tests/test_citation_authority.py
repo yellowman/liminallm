@@ -38,6 +38,7 @@ from liminallm.service.provenance import (
 from liminallm.service.rag import register_retrieved_chunks
 from liminallm.service.runtime import get_runtime
 from liminallm.service import workflow as workflow_module
+from liminallm.service import workflow_streaming as workflow_module_streaming
 from liminallm.storage.models import KnowledgeChunk
 from tests.mcpfixture import allow_local
 
@@ -2927,3 +2928,401 @@ class TestTheBackendSeesTheInstructionThePromptWasPricedWith:
         self._assert_offered(
             seen["messages"], cited[-1].citations.handle_for("src_1")
         )
+
+
+class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
+    """S6's boundary, end to end: the first byte of model output that becomes
+    observable outside the parent.
+
+    Two decisions meet here and they are not the same decision. Taking the
+    namespace out is unconditional once the model has been shown it - a marker
+    that reaches a client has already been rendered, and removing it afterwards
+    is a correction rather than a boundary. Granting a citation is conditional
+    on all of it: the stream finished, the provider agreed with itself, the
+    assembly did not diverge, and the parent did not give up materializing.
+    """
+
+    SHOWN = "SOURCE-SAYS-400-HOURS"
+
+    #: How each integrity flag dies, once a handle really exists. Both are
+    #: broken mid-stream rather than up front: broken earlier, no handle is
+    #: ever offered, and a `[cite:]` with nothing in it is not this namespace -
+    #: the witness would be proving that a non-marker survives.
+    BREAKERS = {
+        "citation_budget_intact":
+            lambda invocation, contexts: invocation.poison_citation_budget(),
+        "citations_intact":
+            lambda invocation, contexts: [
+                setattr(context, "citations_intact", False)
+                for context in contexts
+            ],
+        None: lambda invocation, contexts: None,
+    }
+
+    @classmethod
+    def _streamed(cls, engine, monkeypatch, store, *, chunks, reported=None,
+                  agent=False, cancel_after=None, break_at=None, breaks=None,
+                  passages=None, draft=None):
+        """A streamed turn whose provider emits exactly `chunks`.
+
+        The double replaces the *backend*, so the real `LLMService`, the real
+        `ScrubbedTokenStream` and the real `StreamPump` are all in the run.
+        Replacing the service would take the filter out of the picture, which
+        is the thing under test.
+
+        `{H}` and `{H2}` in a chunk become this turn's handles for the first
+        and second retrieved passage, read at stream time - by which point the
+        offer has been made and committed. `draft` is the worker's pre-stream
+        answer on the agent path and takes the same substitutions, so a
+        witness can have the draft and the stream cite different sources.
+        """
+        monkeypatch.setattr(
+            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
+        )
+        monkeypatch.setattr(
+            type(engine.llm.backend), "supports_tools",
+            property(lambda _s: agent),
+        )
+        if agent:
+            monkeypatch.setattr(engine, "tool_network_policy", allow_local())
+        retrieved = [
+            KnowledgeChunk(
+                context_id="ctx", fs_path=path, content=text,
+                embedding=[], chunk_index=0,
+            )
+            for path, text in (passages or [("/files/manual.md", cls.SHOWN)])
+        ]
+        monkeypatch.setattr(
+            engine, "rag",
+            SimpleNamespace(retrieve=lambda *a, **k: list(retrieved)),
+        )
+        monkeypatch.setattr(engine, "_validate_context_scope", lambda ids, **k: ["ctx"])
+        monkeypatch.setattr(engine, "_resolve_context_ids", lambda a, b: ["ctx"])
+        user_id = store.create_user(
+            email=f"s6_{uuid.uuid4().hex[:8]}@example.com"
+        ).id
+        opened: list = []
+        real_open = engine.invocations.open
+
+        def _open(*a, **k):
+            invocation = real_open(*a, **k)
+            opened.append(invocation)
+            return invocation
+
+        monkeypatch.setattr(engine.invocations, "open", _open)
+        # Every context this turn builds, so a witness can break the one the
+        # streamed turn is actually running under.
+        contexts: list = []
+        real_init = InvocationContext.__init__
+
+        def _init(self, *a, **k):
+            real_init(self, *a, **k)
+            contexts.append(self)
+
+        monkeypatch.setattr(InvocationContext, "__init__", _init)
+        breaker = cls.BREAKERS[breaks]
+
+        def _fill(text):
+            cited = [inv for inv in opened if inv.citations]
+            table = cited[-1].citations if cited else None
+
+            def handle(source_id):
+                return (table.handle_for(source_id) or "") if table else ""
+
+            return text.replace("{H2}", handle("src_2")).replace(
+                "{H}", handle("src_1")
+            )
+
+        def _backend_stream(messages, adapters, *, user_id=None):
+            cited = [inv for inv in opened if inv.citations]
+            for index, raw in enumerate(chunks):
+                if cancel_after is not None and index == cancel_after:
+                    return
+                if break_at is not None and index == break_at:
+                    breaker(cited[-1] if cited else opened[-1], contexts)
+                yield {"event": "token", "data": _fill(raw)}
+            content = _fill("".join(chunks))
+            yield {
+                "event": "message_done",
+                "data": {"content": reported if reported is not None else content},
+            }
+
+        monkeypatch.setattr(
+            engine.llm.backend, "generate_stream", _backend_stream, raising=False
+        )
+        if agent:
+            monkeypatch.setattr(
+                engine.llm, "generate_with_tools",
+                lambda *a, **k: {
+                    "content": _fill(draft or ""), "assistant_message": None,
+                    "usage": {}, "tool_calls": [],
+                },
+                raising=False,
+            )
+        return user_id, opened
+
+    @staticmethod
+    async def _run(engine, user_id):
+        return [
+            event async for event in engine.run_streaming(
+                None, None, "how long", "ctx", user_id
+            )
+        ]
+
+    @staticmethod
+    def _tokens(events):
+        return "".join(
+            str(e.get("data") or "") for e in events if e.get("event") == "token"
+        )
+
+    @staticmethod
+    def _cited(events):
+        for event in events:
+            data = event.get("data")
+            if isinstance(data, dict) and data.get("validated_citations"):
+                return data["validated_citations"]
+        return []
+
+    @pytest.mark.asyncio
+    async def test_a_marker_is_scrubbed_and_its_citation_points_into_what_was_shown(
+        self, store, monkeypatch
+    ):
+        """The positive coordinate witness S6's persistence layer consumes.
+
+        The client sees the answer with no marker in it, and the citation's
+        `public_offset` indexes that text - computed from the origin map this
+        stream produced, not from a second scrub performed afterwards.
+        """
+        engine = get_runtime().workflow
+        user_id, opened = self._streamed(
+            engine, monkeypatch, store,
+            chunks=["Alpha ", "[cite:", "{H}", "]", " beta gamma"],
+        )
+
+        events = await self._run(engine, user_id)
+
+        public = self._tokens(events)
+        assert public == "Alpha beta gamma", public
+        assert "[cite:" not in json.dumps(events)
+        invocation = [inv for inv in opened if inv.citations][-1]
+        assert invocation.citations.nonce not in json.dumps(events)
+        cited = self._cited(events)
+        assert len(cited) == 1, cited
+        assert cited[0]["source_id"] == "src_1"
+        # The marker sat directly after "Alpha", so that is where the citation
+        # points in the text the client actually has.
+        assert cited[0]["public_offset"] == len("Alpha")
+        assert public[: cited[0]["public_offset"]] == "Alpha"
+        # And the name it uses can still be resolved.
+        done = [e for e in events if e.get("event") == "message_done"][-1]
+        assert "src_1" in done["data"]["provenance_snapshot"]["sources"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "flag,agent",
+        [("citation_budget_intact", False), ("citations_intact", True)],
+    )
+    async def test_integrity_failure_still_scrubs_but_grants_nothing(
+        self, store, monkeypatch, flag, agent
+    ):
+        """Scrubbing is unconditional; granting is not.
+
+        The handle is real and the model was shown it, which is what makes
+        this the interesting case: whatever went wrong afterwards, the
+        namespace still comes out of the answer and the answer still carries
+        no citation. Each flag is broken on a path where it means something -
+        budget integrity anywhere, protocol divergence where there is a worker
+        to diverge.
+        """
+        engine = get_runtime().workflow
+        user_id, opened = self._streamed(
+            engine, monkeypatch, store, agent=agent,
+            chunks=["400 hours ", "[cite:", "{H}", "]"],
+            break_at=1, breaks=flag,
+        )
+
+        events = await self._run(engine, user_id)
+
+        cited = [inv for inv in opened if inv.citations]
+        assert cited, "no handle was committed, so nothing was broken"
+        assert cited[-1].citations.nonce not in json.dumps(events)
+        assert "[cite:" not in json.dumps(events)
+        assert self._cited(events) == []
+
+    @pytest.mark.asyncio
+    async def test_a_provider_that_contradicts_itself_completes_nothing(
+        self, store, monkeypatch
+    ):
+        """Not merely zero citations. `message_done` is the answer boundary, so
+        a completion carrying correctly scrubbed but truncated text would be a
+        partial answer with a success stamp on it."""
+        engine = get_runtime().workflow
+        user_id, opened = self._streamed(
+            engine, monkeypatch, store,
+            chunks=["400 hours ", "[cite:", "{H}", "]"],
+            reported="800 hours and something else entirely",
+        )
+
+        events = await self._run(engine, user_id)
+
+        assert "[cite:" not in json.dumps(events)
+        assert "800 hours" not in json.dumps(events)
+        assert self._cited(events) == []
+        cited = [inv for inv in opened if inv.citations]
+        assert cited[-1].citations.nonce not in json.dumps(events)
+
+    @pytest.mark.asyncio
+    async def test_a_stream_cancelled_mid_marker_shows_and_grants_nothing(
+        self, store, monkeypatch
+    ):
+        """The held fragment is never flushed by cleanup, and an unfinished
+        stream is authority for nothing.
+
+        The visible text ends on a full stop deliberately. This is the one
+        witness here that reads a stream mid-hold, and the hold reaches back
+        over any character a handle could start with - so a prefix ending in
+        `s` releases one character less whenever the turn's nonce happens to
+        begin with `S`, which is a real letter of the alphabet and about one
+        turn in thirty. Correct, and nondeterministic to assert against; a
+        full stop is in no marker of any nonce.
+        """
+        engine = get_runtime().workflow
+        user_id, opened = self._streamed(
+            engine, monkeypatch, store,
+            chunks=["400 hours. ", "[cite:", "{H}", "]"],
+            cancel_after=2,
+        )
+
+        events = await self._run(engine, user_id)
+
+        assert self._tokens(events) == "400 hours."
+        assert "[cite:" not in json.dumps(events)
+        assert self._cited(events) == []
+        cited = [inv for inv in opened if inv.citations]
+        assert cited[-1].citations.nonce not in json.dumps(events)
+
+    @pytest.mark.asyncio
+    async def test_the_streamed_agent_turn_earns_its_citation_too(
+        self, store, monkeypatch
+    ):
+        """The other call site, positively.
+
+        The integrity witness above runs this path but asserts nothing is
+        granted, so a seam that dropped every citation here would have looked
+        correct. This is the same answer arriving through the agent's final
+        streamed turn instead of the plain node.
+        """
+        engine = get_runtime().workflow
+        user_id, opened = self._streamed(
+            engine, monkeypatch, store, agent=True,
+            chunks=["Alpha ", "[cite:", "{H}", "]", " beta gamma"],
+        )
+
+        events = await self._run(engine, user_id)
+
+        public = self._tokens(events)
+        assert public == "Alpha beta gamma", public
+        assert "[cite:" not in json.dumps(events)
+        cited = self._cited(events)
+        assert len(cited) == 1, cited
+        assert cited[0]["source_id"] == "src_1"
+        assert cited[0]["public_offset"] == len("Alpha")
+
+    @pytest.mark.asyncio
+    async def test_the_discarded_draft_cites_one_source_and_the_answer_another(
+        self, store, monkeypatch
+    ):
+        """Two answers exist at the end of a streamed agent turn, and only one
+        of them was served.
+
+        The worker writes a draft and hands the conversation back; the parent
+        drops that draft from the prompt and streams an answer of its own.
+        Both are the model's own words and both name a handle this turn really
+        issued, so "citations come from what the model wrote" does not pick
+        between them. What picks is which one the client received.
+
+        So they are made to disagree: the draft cites the first passage, the
+        served answer cites the second. `canonical_model_response` still holds
+        the draft afterwards - correctly, it happened - which is what makes
+        reading citations out of it look reasonable and be wrong.
+        """
+        engine = get_runtime().workflow
+        user_id, opened = self._streamed(
+            engine, monkeypatch, store, agent=True,
+            passages=[
+                ("/files/manual.md", self.SHOWN),
+                ("/files/appendix.md", "APPENDIX-SAYS-SOMETHING-ELSE"),
+            ],
+            draft="Draft [cite:{H}]",
+            chunks=["Answer ", "[cite:", "{H2}", "]"],
+        )
+        # Every context this turn builds, so the draft the parent filed can be
+        # read back. Chained onto the fixture's own hook rather than replacing
+        # it - the fixture needs its copy to break integrity with.
+        seen_contexts: list = []
+        chained = InvocationContext.__init__
+
+        def _watch(self, *a, **k):
+            chained(self, *a, **k)
+            seen_contexts.append(self)
+
+        monkeypatch.setattr(InvocationContext, "__init__", _watch)
+
+        events = await self._run(engine, user_id)
+
+        table = [inv for inv in opened if inv.citations][-1].citations
+        assert table.handle_for("src_1"), "the draft's source was never offered"
+        assert table.handle_for("src_2"), "the answer's source was never offered"
+        # The wrong answer is genuinely available: the parent kept the draft,
+        # and the draft names a handle of this turn.
+        drafts = [
+            context.canonical_model_response for context in seen_contexts
+            if context.canonical_model_response
+        ]
+        assert drafts, "no draft was recorded, so nothing was resisted"
+        assert table.handle_for("src_1") in json.dumps(drafts[-1])
+
+        assert self._tokens(events) == "Answer"
+        assert "Draft" not in self._tokens(events)
+        cited = self._cited(events)
+        assert [entry["source_id"] for entry in cited] == ["src_2"], cited
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("agent", [False, True])
+    async def test_with_the_gate_off_the_provider_is_not_filtered_at_all(
+        self, store, monkeypatch, agent
+    ):
+        """Production, and the difference is not cosmetic.
+
+        With offers off no marker is ever shown, so a filter in the path would
+        remove nothing - but it would still hold text, still scan the whole
+        answer per chunk, and still stop an answer at its ceiling. The gate is
+        what keeps a streamed turn the shape it was before any of this
+        existed: the transformation does not run, rather than running and
+        finding nothing to do.
+
+        Both call sites, because both consult the gate separately and a turn
+        that reaches production through the agent is the same turn.
+        """
+        engine = get_runtime().workflow
+        user_id, _opened = self._streamed(
+            engine, monkeypatch, store, agent=agent, chunks=["plain ", "answer"],
+        )
+        monkeypatch.setattr(
+            type(engine), "CITATION_OFFERS_ENABLED", False, raising=False
+        )
+        built: list = []
+        real = workflow_module_streaming.ScrubbedTokenStream
+
+        def _counting(*args, **kwargs):
+            built.append(args)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(
+            workflow_module_streaming, "ScrubbedTokenStream", _counting
+        )
+
+        events = await self._run(engine, user_id)
+
+        assert self._tokens(events) == "plain answer"
+        assert built == [], "the filter was built with offers off"

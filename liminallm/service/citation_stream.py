@@ -339,6 +339,11 @@ class ScrubbedTokenStream:
         #: it sent. The completion is refused rather than believed, and the
         #: reader is left unfinished, which is what `intact` reports.
         self.contradicted = False
+        #: The origin map this stream's own completion produced, kept so a
+        #: caller reading citations out of it never scrubs the text a second
+        #: time. Two scrubs are two chances to disagree about where a marker
+        #: was, which is the whole ambiguity the reader exists to remove.
+        self.origins: List[int] = []
 
     # -- what the pump reaches for ----------------------------------------
 
@@ -429,7 +434,7 @@ class ScrubbedTokenStream:
                     "message": "provider stream contradicted its own tokens",
                 },
             }]
-        tail, _origins = self.reader.finish()
+        tail, self.origins = self.reader.finish()
         data["content"] = self.reader.released
         done = {**event, "data": data}
         if tail:

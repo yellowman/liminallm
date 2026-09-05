@@ -27,6 +27,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from liminallm.logging import log_routing_trace, log_workflow_trace
 from liminallm.service.broker import InvocationContext
+from liminallm.service.citation_stream import ScrubbedTokenStream
+from liminallm.service.citations import citation_payload, validate_citations
 from liminallm.service.invocation import Invocation, LeaseRevoked
 from liminallm.service.node_attempt import (
     BreakerObservation,
@@ -150,6 +152,12 @@ class WorkflowStreamingMixin:
         # What may support the answer: the registry is the turn's consulted
         # superset, these are the bindings of nodes that actually completed.
         provenance_bindings: List[Binding] = []
+        # Citations in *this content*, whose `public_offset` indexes it. Held
+        # beside the answer and replaced with it, the way the blocking driver
+        # holds them: a node that replaces the answer replaces these too,
+        # including with none, or the previous node's offsets end up pointing
+        # into a string that is no longer what anyone was shown.
+        validated_citations: List[Dict[str, Any]] = []
         workflow_trace: List[Dict[str, Any]] = []
         context_snippets: List[str] = []
         context_seen = set()
@@ -291,6 +299,9 @@ class WorkflowStreamingMixin:
                             if data.get("content"):
                                 content = data["content"]
                                 provenance_bindings = list(node_sink)
+                                validated_citations = list(
+                                    data.get("validated_citations") or []
+                                )
                             node_usage = data.get("usage", {})
                             usage = self._merge_usage(usage, node_usage)
                             for snippet in data.get("context_snippets") or []:
@@ -546,20 +557,26 @@ class WorkflowStreamingMixin:
             log_routing_trace(routing_trace, logger=self.logger)
 
         # Emit final message_done with complete response
-        yield {
-            "event": "message_done",
-            "data": {
-                "content": content,
-                "usage": usage,
-                "adapters": adapters,
-                "adapter_gates": adapter_gates,
-                "context_snippets": context_snippets,
-                "provenance_bindings": provenance_bindings,
-                "workflow_trace": workflow_trace,
-                "routing_trace": routing_trace,
-                "vars": vars_scope,
-            },
+        completed: Dict[str, Any] = {
+            "content": content,
+            "usage": usage,
+            "adapters": adapters,
+            "adapter_gates": adapter_gates,
+            "context_snippets": context_snippets,
+            "provenance_bindings": provenance_bindings,
+            "validated_citations": validated_citations,
+            "workflow_trace": workflow_trace,
+            "routing_trace": routing_trace,
+            "vars": vars_scope,
         }
+        if validated_citations:
+            # The same lookup table the blocking result carries, for the same
+            # reason: a citation says `src_3`, which means nothing once this
+            # registry goes out of scope with the turn. Keeping the two
+            # transports' completed objects the same shape is deliberate - a
+            # consumer should not have to ask which one it is reading.
+            completed["provenance_snapshot"] = source_registry.snapshot()
+        yield {"event": "message_done", "data": completed}
 
         await self.cache_conversation_state(conversation_id, history, user_id)
 
@@ -863,17 +880,36 @@ class WorkflowStreamingMixin:
         # execution, so one revoke reaches it - see `StreamPump`. The breaker
         # `started` mark lives inside the pump gate: the provider call is the
         # tool's work beginning, and everything above is planning.
-        async for event in self._pumped(
-            invocation,
-            partial(
-                self.llm.generate_stream,
+        # The provider is built and pulled on the pump's producer thread, and
+        # the filter is built there with it. Constructing either here would
+        # put the backend call - and the scrub's quadratic scan - back on the
+        # event loop, which is the arrangement `StreamPump` exists to avoid.
+        #
+        # The wrapper is kept rather than rebuilt. What a citation is read out
+        # of is the canonical text this exact stream accumulated; recovering
+        # it afterwards from the public events would mean scrubbing again and
+        # guessing at what was removed, which is the ambiguity the reader
+        # exists to remove.
+        streamed: Dict[str, ScrubbedTokenStream] = {}
+
+        def produce():
+            raw = self.llm.generate_stream(
                 message or "",
                 adapters=adapters,
                 context_snippets=shown,
                 history=history,
                 user_id=user_id,
                 **offer,
-            ),
+            )
+            if not self.CITATION_OFFERS_ENABLED:
+                return raw
+            filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
+            streamed["stream"] = filtered
+            return filtered
+
+        async for event in self._pumped(
+            invocation,
+            produce,
             label=str(node.get("id") or "llm"),
             cancel_event=cancel_event,
             observation=observation,
@@ -892,16 +928,58 @@ class WorkflowStreamingMixin:
                 # the keys blocking `llm.generic` returns. The handler names
                 # its result's fields; `StreamedNodeAttempt` consumes this
                 # and refuses to reconstruct one from the client event.
-                yield {
-                    "event": "tool_result",
-                    "data": {
-                        "content": data.get("content", ""),
-                        "usage": data.get("usage") or {},
-                        "context_snippets": list(data.get("context_snippets") or []),
-                    },
+                result = {
+                    "content": data.get("content", ""),
+                    "usage": data.get("usage") or {},
+                    "context_snippets": list(data.get("context_snippets") or []),
                 }
+                # Public text in the result, canonical text nowhere near it.
+                # This object becomes ordinary workflow state.
+                citations = self._streamed_citations(
+                    streamed.get("stream"), invocation
+                )
+                if citations:
+                    result["validated_citations"] = citations
+                    data["validated_citations"] = citations
+                yield {"event": "tool_result", "data": dict(result)}
                 event = {"event": "message_done", "data": data}
             yield event
+
+    @staticmethod
+    def _streamed_citations(
+        stream: Optional[ScrubbedTokenStream],
+        invocation: Invocation,
+        *,
+        citations_intact: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """What a finished stream earned, read out of the stream itself.
+
+        Three things are true at the end of a streamed answer and only one of
+        them is authority. The provider's own reported content was a
+        consistency witness and has already done its job. What the client saw
+        is `released`. What a citation is read out of is `canonical` - the raw
+        text this exact producer accumulated - and never
+        `canonical_model_response`, which on the agent path holds the
+        pre-stream draft the worker discarded.
+
+        Nothing here is conditional on the *scrub*, which happened
+        unconditionally on the way out. This is the other half: whether the
+        answer may carry citations. It may not when there was no stream, when
+        the stream did not finish - cancelled, cut off, or contradicted by its
+        own provider - when the assembly diverged from the protocol, or when
+        the parent gave up materializing the table it had committed.
+
+        The origin map is the one that completion produced. Scrubbing again to
+        recover it would be a second answer to "where did this marker go".
+        """
+        if stream is None or not stream.reader.intact():
+            return []
+        if not citations_intact or not invocation.citation_budget_intact:
+            return []
+        return citation_payload(
+            validate_citations(stream.reader.canonical, invocation.citations),
+            stream.origins,
+        )
 
     async def _pumped(
         self,
@@ -1192,11 +1270,21 @@ class WorkflowStreamingMixin:
             # *call* off the loop and then iterated the result on it, which is
             # where the tokens actually arrive.
             content_parts: List[str] = []
+            # Built and pulled on the producer thread, and kept afterwards, for
+            # the reasons the plain node states.
+            streamed: Dict[str, ScrubbedTokenStream] = {}
+
+            def produce():
+                raw = self.llm.stream_messages(messages, adapters, user_id=user_id)
+                if not self.CITATION_OFFERS_ENABLED:
+                    return raw
+                filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
+                streamed["stream"] = filtered
+                return filtered
+
             async for event in self._pumped(
                 invocation,
-                partial(
-                    self.llm.stream_messages, messages, adapters, user_id=user_id
-                ),
+                produce,
                 label="agent.files_v1",
                 cancel_event=cancel_event,
                 observation=observation,
@@ -1306,5 +1394,15 @@ class WorkflowStreamingMixin:
             "artifacts": session.get("artifacts", []),
             "injection_findings": session.get("injection_findings", []),
         }
+        # Read out of the stream the parent just served, never out of
+        # `canonical_model_response`. That field holds the worker's discarded
+        # pre-stream draft - correctly, it happened - and the answer this turn
+        # is delivering is the one that came out of the producer above.
+        citations = self._streamed_citations(
+            streamed.get("stream"), invocation,
+            citations_intact=stream_context.citations_intact,
+        )
+        if citations:
+            completed["validated_citations"] = citations
         yield {"event": "tool_result", "data": dict(completed)}
         yield {"event": "message_done", "data": completed}
