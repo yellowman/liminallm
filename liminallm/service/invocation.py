@@ -669,12 +669,28 @@ class Invocation:
     ) -> CitationTable:
         """Grow this execution's citation namespace, and return it.
 
-        Under the lock, because a workflow runs children concurrently and the
-        table is replaced rather than mutated: two threads reading the old one
-        and each writing a successor would lose one of the two extensions, and
-        with it the handles it allocated.
+        A poisoned execution grows no further. "Poisoned" means the parent
+        gave up putting this table in front of the model, so a handle
+        allocated afterwards is authority for text nothing will ever show -
+        and the callers that decide to poison are also the callers that would
+        allocate. Enforcing it at the mutator instead of at each of them makes
+        it a property of the object: today every caller checks first, so this
+        refuses nothing, and it is here for the next caller rather than for
+        the current ones.
+
+        Returned rather than raised. Not extending is the documented outcome
+        of having given up, not a fault, and the caller reads the table it got
+        back exactly as it would any other.
+
+        Under the lock, because the table is replaced rather than mutated:
+        two readers of the old one each writing a successor would lose one of
+        the two extensions and the handles it allocated. The same lock covers
+        the check above, so a poison landing mid-extension cannot be observed
+        half-applied.
         """
         with self._lock:
+            if not self.citation_budget_intact:
+                return self.citations
             self.citations = extend_citation_table(registry, self.citations, bindings)
             return self.citations
 

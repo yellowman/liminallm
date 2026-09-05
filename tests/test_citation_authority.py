@@ -2261,6 +2261,33 @@ class TestGivingUpOnMaterializationGivesUpTheCitations:
         assert poisoned.get("content") == ANSWER, repr(poisoned.get("content"))
         assert not poisoned.get("validated_citations"), poisoned
 
+    def test_a_poisoned_execution_allocates_no_further_handles(
+        self, store, monkeypatch
+    ):
+        """The invariant at the object rather than at each of its callers.
+
+        Every caller today checks the flag before reaching here, so nothing in
+        production depends on this - which is the point. The next caller,
+        streaming among them, gets the rule for free instead of having to
+        remember it, and a handle minted after the parent gave up would be
+        authority for text nothing will ever show.
+        """
+        engine = get_runtime().workflow
+        registry, bindings = _registry(count=2)
+        invocation = engine.invocations.open(
+            uuid.uuid4().hex, tool="agent.files_v1", user_id="u", tenant_id=None
+        )
+        invocation.extend_citations(registry, bindings[:1])
+        before = dict(invocation.citations.by_source)
+        assert before, "the precondition never held"
+        invocation.poison_citation_budget()
+
+        returned = invocation.extend_citations(registry, bindings[1:])
+
+        assert dict(returned.by_source) == before
+        assert dict(invocation.citations.by_source) == before
+        assert invocation.citations.handle_for("src_2") is None
+
     @pytest.mark.asyncio
     async def test_the_agent_route_reads_the_same_flag(
         self, store, monkeypatch
