@@ -2657,6 +2657,26 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   handle, model client, settings object, filesystem credential, or
   identity. Every effect is a capability request the parent answers, and
   liveness is checked before each one.
+- A worker may request only the capabilities its own body uses. The set is
+  per implementation, not per request: the parent resolves which body it
+  spawned - following a `tool.spec` handler alias - and refuses anything
+  outside that body's list before the handler, the withdrawal check and the
+  ledger. Refusing ahead of the ledger is what stops a committed result
+  replaying into a worker that may not ask for it. A tool with no body of
+  its own runs the host body and gets `tool.host` alone.
+- A round of tool calls runs only when the parent's own record of the
+  previous model turn asked for it: there is an unanswered model turn, it
+  asked for at least one call, and the submitted calls are those calls -
+  name, decoded arguments, order and count, ignoring the provider's call
+  ids. Anything else is refused, and nothing of it is recorded.
+- A call runs only for a tool that turn actually offered, and the offered
+  set is the names in the schemas sent to that model call intersected with
+  the parent's own base prompt. A worker may send fewer schemas - the last
+  round offers none so the model has to answer - and may not introduce a
+  name: with offers off its schemas still reach the model, and they still
+  confer no authority. A relayed round naming an unoffered tool is answered
+  rather than refused, since the worker did as it was told, and none of its
+  calls run.
 - The worker confines itself before any body runs: environment replaced
   wholesale, network structurally absent, filesystem view limited to a
   scratch the parent owns. Linux: user + mount + network namespace and a

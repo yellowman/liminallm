@@ -34,7 +34,7 @@ import os
 import shutil
 import signal
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional
 
 if TYPE_CHECKING:  # parent-side only; `from __future__ import annotations`
     from liminallm.service.invocation import Attempt, Invocation
@@ -503,6 +503,38 @@ _BODIES: Dict[str, Callable[[BrokerClient, str, Dict[str, Any]], Dict[str, Any]]
 #: `tool.spec` handler alias, so an aliased tool reaches its body rather than
 #: falling through to a host map the body was moved out of.
 BODY_NAMES = frozenset(_BODIES)
+
+#: Body → the capabilities it asks the broker for. Every `broker.call` in this
+#: file is one of these names inside one of these functions, which is what
+#: makes the list short enough to be a rule: a request outside it is not a
+#: capability the worker needs and could not use if it got one.
+#:
+#: Keyed by the body rather than by the tool name so the two tables cannot
+#: drift, and so an aliased spec is judged by what actually runs.
+#:
+#: This governs capability requests, which is a narrower thing than what a
+#: turn may do. The tools inside `tools.round` never arrive as capabilities;
+#: what a round may run is decided by the model turn the parent recorded.
+_BODY_CAPABILITIES: Dict[Callable[..., Any], FrozenSet[str]] = {
+    _body_agent_loop: frozenset({"llm.generate_with_tools", "tools.round"}),
+    _body_python: frozenset({"python.run"}),
+    _body_web_search: frozenset({"web.search"}),
+    _body_web_fetch: frozenset({"web.fetch"}),
+    _body_file_search: frozenset({"rag.retrieve"}),
+    _body_notes_search: frozenset({"notes.search"}),
+    _body_host_tool: frozenset({"tool.host"}),
+}
+
+#: Tool → the capabilities its worker may ask for.
+WORKER_CAPABILITIES: Dict[str, FrozenSet[str]] = {
+    name: _BODY_CAPABILITIES[body] for name, body in _BODIES.items()
+}
+
+#: What a tool with no body of its own gets, because `_worker_main` runs
+#: `_body_host_tool` for it. The same rule as the rows above rather than a
+#: second one, so a tool that is not named anywhere still reaches exactly the
+#: capability its body would use.
+DEFAULT_CAPABILITIES: FrozenSet[str] = _BODY_CAPABILITIES[_body_host_tool]
 
 
 # ---------------------------------------------------------------------------

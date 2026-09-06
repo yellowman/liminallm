@@ -3505,7 +3505,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
         serve thread waking late cannot run its plan under the retry's
         authority.
         """
-        broker = CapabilityBroker(self, context, on_capability=on_capability)
+        broker = CapabilityBroker(
+            self, context, worker_tool=worker_tool, on_capability=on_capability
+        )
 
         def mark_started() -> None:
             # One attribute write, no-throw by construction: the spawn calls

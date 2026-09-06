@@ -307,7 +307,9 @@ class TestAnAttachmentIsNamedByTheNameTheChatGaveIt:
             source_registry=registry,
             provenance_bindings=[],
         )
-        broker = CapabilityBroker(runtime.workflow, context)
+        broker = CapabilityBroker(
+            runtime.workflow, context, worker_tool="file.search_v1"
+        )
         reply = broker._answer(
             InvocationRegistry().open(
                 uuid.uuid4().hex, tool="file.search_v1", user_id=user_id,

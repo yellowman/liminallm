@@ -32,6 +32,7 @@ from liminallm.service.provenance import (
     binding,
 )
 from liminallm.service.runtime import get_runtime
+from liminallm.service.tool_worker import WORKER_CAPABILITIES
 from liminallm.service.web import UNTRUSTED_OPEN, neutralize_markers
 
 RESULTS = [
@@ -41,6 +42,15 @@ RESULTS = [
     # Registered as consulted and still not citable: nothing was quoted.
     {"title": "NoSnippet", "url": "https://c.example", "snippet": ""},
     {"title": "Beta", "url": "https://b.example", "snippet": "nine hundred hours"},
+]
+#: The schemas a turn offers here, in the shape a model gets them. A round
+#: runs only for a tool the parent offered on the turn that asked.
+TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": name, "description": name, "parameters": {}},
+    }
+    for name in ("web_search", "web_fetch")
 ]
 PAGE = {
     "url": "https://p.example",
@@ -76,8 +86,23 @@ def _turn():
     return registry, invocation, context
 
 
+def _worker_for(capability):
+    """The worker whose body asks for this capability.
+
+    Read out of the real table rather than written down here, so a witness
+    that names a capability is served by the worker production would have
+    serving it - and so this stops compiling if that stops being true.
+    """
+    for tool, allowed in WORKER_CAPABILITIES.items():
+        if capability in allowed:
+            return tool
+    raise AssertionError(f"no worker body asks for {capability}")
+
+
 def _ask(engine, context, invocation, capability, payload, seq=1):
-    broker = CapabilityBroker(engine, context)
+    broker = CapabilityBroker(
+        engine, context, worker_tool=_worker_for(capability)
+    )
     reply = broker._answer(
         invocation,
         {"capability": capability, "operation_seq": seq, "payload": payload},
@@ -271,26 +296,54 @@ class TestARoundKeepsOneRecordPerCall:
     """An offset means nothing without the string it indexes, and a round
     returns one string per call."""
 
-    @staticmethod
-    def _round(engine, context, invocation):
-        return _ask(
-            engine, context, invocation, "tools.round",
-            {
-                "calls": [
-                    {"id": "c1", "name": "web_search",
-                     "arguments": {"query": "hours"}},
-                    {"id": "c2", "name": "web_fetch",
-                     "arguments": {"url": "https://p.example"}},
-                ],
+    CALLS = [
+        {"id": "c1", "name": "web_search", "arguments": {"query": "hours"}},
+        {"id": "c2", "name": "web_fetch",
+         "arguments": {"url": "https://p.example"}},
+    ]
+
+    @classmethod
+    def _round(cls, engine, context, invocation, monkeypatch):
+        """The round, and the model turn that asked for it.
+
+        A round runs only when the parent's own record asked for it, so the
+        turn comes first - through the capability that records one, rather
+        than written into the transcript here.
+        """
+        context.remember_base_prompt([], TOOLS)
+        monkeypatch.setattr(
+            engine.llm,
+            "generate_with_tools",
+            lambda *a, **k: {
+                "content": "",
+                "tool_calls": [dict(c) for c in cls.CALLS],
+                "assistant_message": None,
+                "usage": {},
+            },
+            raising=False,
+        )
+        broker = CapabilityBroker(
+            engine, context, worker_tool=_worker_for("tools.round")
+        )
+        assert broker._answer(invocation, {
+            "capability": "llm.generate_with_tools", "operation_seq": 1,
+            "payload": {"messages": [], "tools": TOOLS},
+        })["ok"]
+        reply = broker._answer(invocation, {
+            "capability": "tools.round", "operation_seq": 2,
+            "payload": {
+                "calls": [dict(c) for c in cls.CALLS],
                 "fallback_query": "hours",
             },
-        )
+        })
+        assert reply["ok"], reply
+        return reply
 
     def test_each_passage_is_one_call_s_own_result(self, store, monkeypatch):
         engine = get_runtime().workflow
         _web(engine, monkeypatch)
         registry, invocation, context = _turn()
-        reply = self._round(engine, context, invocation)
+        reply = self._round(engine, context, invocation, monkeypatch)
         results = reply["result"]["results"]
 
         assert len(context.grounded_passages) == 2
@@ -308,7 +361,7 @@ class TestARoundKeepsOneRecordPerCall:
         engine = get_runtime().workflow
         _web(engine, monkeypatch)
         registry, invocation, context = _turn()
-        self._round(engine, context, invocation)
+        self._round(engine, context, invocation, monkeypatch)
         fetched = [
             passage
             for passage in context.grounded_passages
@@ -554,7 +607,9 @@ class TestAReplayInheritsWhatTheFirstAttemptRendered:
 
         monkeypatch.setattr(web, "search_web", _tripwire)
         second = InvocationContext(user_id="u", source_registry=registry)
-        replay = CapabilityBroker(engine, second)._answer(
+        replay = CapabilityBroker(
+            engine, second, worker_tool=_worker_for("web.search")
+        )._answer(
             invocation,
             {"capability": "web.search", "operation_seq": 1, "payload": payload},
         )

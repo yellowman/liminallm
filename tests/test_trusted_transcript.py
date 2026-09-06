@@ -21,7 +21,7 @@ import pytest
 
 from liminallm.service import taint
 from liminallm.service.broker import CapabilityBroker, InvocationContext
-from liminallm.service.invocation import InvocationRegistry
+from liminallm.service.invocation import InvocationRegistry, payload_hash
 from liminallm.service.provenance import SourceRegistry, binding
 from liminallm.service.runtime import get_runtime
 from liminallm.service.transcript import (
@@ -60,6 +60,20 @@ def _web(engine, monkeypatch):
     monkeypatch.setattr(engine, "tool_network_policy", None)
 
 
+#: The schemas this file's turns are given, in the shape a model gets them.
+#: A round runs only for a tool the parent offered on the turn that asked, so
+#: a witness about what a round records has to start from a turn that offered
+#: something.
+TOOLS = [
+    {
+        "type": "function",
+        "function": {"name": name, "description": name, "parameters": {}},
+    }
+    for name in ("web_search", "web_fetch", "run_python", "file_search",
+                 "note_search", "t")
+]
+
+
 def _turn(engine, monkeypatch):
     _web(engine, monkeypatch)
     registry = SourceRegistry()
@@ -67,7 +81,13 @@ def _turn(engine, monkeypatch):
         uuid.uuid4().hex, tool="agent.files_v1", user_id="u", tenant_id=None
     )
     context = InvocationContext(user_id="u", source_registry=registry)
-    return registry, invocation, context, CapabilityBroker(engine, context)
+    context.remember_base_prompt([], TOOLS)
+    return (
+        registry,
+        invocation,
+        context,
+        CapabilityBroker(engine, context, worker_tool="agent.files_v1"),
+    )
 
 
 def _model(engine, monkeypatch, content="", calls=()):
@@ -109,12 +129,12 @@ class TestTheRecordSpansTheWholeTurn:
 
         _model(engine, monkeypatch, content="looking", calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round",
              {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
         _model(engine, monkeypatch, content="400 hours")
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 3)
+             {"messages": [], "tools": TOOLS}, 3)
 
         assert [
             (type(entry).__name__, entry.operation_seq)
@@ -138,7 +158,7 @@ class TestTheRecordSpansTheWholeTurn:
         ]
         _model(engine, monkeypatch, calls=calls)
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round", {
             "calls": [
                 SUBMITTED,
@@ -163,7 +183,7 @@ class TestTheRecordSpansTheWholeTurn:
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         reply = _ask(broker, invocation, "tools.round",
                      {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
 
@@ -185,7 +205,7 @@ class TestTheCallIsNamedByWhatTheParentDispatched:
         same = {"id": "same", "name": "web_search", "arguments": '{"query": "hours"}'}
         _model(engine, monkeypatch, calls=[same, same])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round", {
             "calls": [
                 {"id": "same", "name": "web_search", "arguments": {"query": "hours"}},
@@ -209,7 +229,7 @@ class TestTheCallIsNamedByWhatTheParentDispatched:
         anonymous = {"name": "web_search", "arguments": '{"query": "hours"}'}
         _model(engine, monkeypatch, calls=[anonymous])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round", {
             "calls": [{"name": "web_search", "arguments": {"query": "hours"}}],
             "fallback_query": "hours",
@@ -221,47 +241,49 @@ class TestTheCallIsNamedByWhatTheParentDispatched:
 
 
 class TestARoundThatIsNotTheOneAskedForCarriesNoAuthority:
-    """It still runs: what a worker may request is the capability layer's
-    question, and that layer answers it unchanged. But the parent can no
-    longer reconstruct the exchange, so nothing in the round may be cited."""
+    """It does not run. The parent watched the model turn happen, so a round
+    whose calls are not the ones it recorded is the worker's own composition,
+    and running it would put effects behind a request no model made.
 
-    def test_a_different_tool_makes_the_round_unofferable(
-        self, store, monkeypatch
-    ):
+    Refused rather than answered, because the worker is the party at fault:
+    an honest one submits what it was handed."""
+
+    def _refused(self, broker, invocation, calls, seq=2):
+        reply = broker._answer(invocation, {
+            "capability": "tools.round", "operation_seq": seq,
+            "payload": {"calls": calls, "fallback_query": "x"},
+        })
+        assert reply["ok"] is False, reply
+        assert reply["code"] == "round_not_asked", reply
+        return reply
+
+    def test_a_different_tool_is_refused(self, store, monkeypatch):
         engine = get_runtime().workflow
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[
             {"id": "c1", "name": "file_search", "arguments": '{"query": "manual"}'}
         ])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
-        reply = _ask(broker, invocation, "tools.round", {
-            "calls": [
-                {"id": "c1", "name": "web_search", "arguments": {"query": "else"}}
-            ],
-            "fallback_query": "x",
-        }, 2)
+             {"messages": [], "tools": TOOLS}, 1)
 
-        # Executed, as before.
-        assert reply["result"]["results"]
-        # And not eligible to carry a citation.
-        assert context.transcript.rounds()[0].offerable is False
+        self._refused(broker, invocation, [
+            {"id": "c1", "name": "web_search", "arguments": {"query": "else"}}
+        ])
 
-    def test_different_arguments_make_the_round_unofferable(
-        self, store, monkeypatch
-    ):
+        assert context.transcript.rounds() == [], "a refused round was recorded"
+
+    def test_different_arguments_are_refused(self, store, monkeypatch):
         engine = get_runtime().workflow
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
-        _ask(broker, invocation, "tools.round", {
-            "calls": [
-                {"id": "c1", "name": "web_search", "arguments": {"query": "other"}}
-            ],
-            "fallback_query": "x",
-        }, 2)
-        assert context.transcript.rounds()[0].offerable is False
+             {"messages": [], "tools": TOOLS}, 1)
+
+        self._refused(broker, invocation, [
+            {"id": "c1", "name": "web_search", "arguments": {"query": "other"}}
+        ])
+
+        assert context.transcript.rounds() == []
 
     def test_the_round_the_model_asked_for_stays_offerable(
         self, store, monkeypatch
@@ -270,7 +292,7 @@ class TestARoundThatIsNotTheOneAskedForCarriesNoAuthority:
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round",
              {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
         assert context.transcript.rounds()[0].offerable is True
@@ -281,15 +303,14 @@ class TestARoundThatIsNotTheOneAskedForCarriesNoAuthority:
         """Only the name differs, so a check that compared arguments alone
         would call this the round the model asked for."""
         engine = get_runtime().workflow
-        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[
             {"id": "c1", "name": "note_search", "arguments": '{"query": "hours"}'}
         ])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
-        _ask(broker, invocation, "tools.round",
-             {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
-        assert context.transcript.rounds()[0].offerable is False
+             {"messages": [], "tools": TOOLS}, 1)
+
+        self._refused(broker, invocation, [SUBMITTED])
 
     def test_an_extra_call_the_model_did_not_ask_for_is_divergence(
         self, store, monkeypatch
@@ -297,18 +318,15 @@ class TestARoundThatIsNotTheOneAskedForCarriesNoAuthority:
         """Every call the model asked for is present and one more besides.
         Comparing pairwise without comparing the count would miss it."""
         engine = get_runtime().workflow
-        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
-        _ask(broker, invocation, "tools.round", {
-            "calls": [
-                SUBMITTED,
-                {"id": "c2", "name": "web_search", "arguments": {"query": "extra"}},
-            ],
-            "fallback_query": "hours",
-        }, 2)
-        assert context.transcript.rounds()[0].offerable is False
+             {"messages": [], "tools": TOOLS}, 1)
+
+        self._refused(broker, invocation, [
+            SUBMITTED,
+            {"id": "c2", "name": "web_search", "arguments": {"query": "extra"}},
+        ])
 
     def test_a_round_the_model_never_asked_for_at_all_is_divergence(
         self, store, monkeypatch
@@ -316,9 +334,10 @@ class TestARoundThatIsNotTheOneAskedForCarriesNoAuthority:
         """No preceding model turn, so nothing offered these calls."""
         engine = get_runtime().workflow
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
-        _ask(broker, invocation, "tools.round",
-             {"calls": [SUBMITTED], "fallback_query": "hours"}, 1)
-        assert context.transcript.rounds()[0].offerable is False
+
+        self._refused(broker, invocation, [SUBMITTED], seq=1)
+
+        assert context.transcript.rounds() == []
 
     def test_the_ids_are_not_what_is_compared(self):
         """They are the provider's, they arrive through the worker, and a
@@ -345,15 +364,15 @@ class TestOneOperationLeavesOneEntry:
         registry, invocation, first, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         payload = {"calls": [SUBMITTED], "fallback_query": "hours"}
         _ask(broker, invocation, "tools.round", payload, 2)
 
         second = InvocationContext(user_id="u", source_registry=registry)
-        replay_broker = CapabilityBroker(engine, second)
+        replay_broker = CapabilityBroker(engine, second, worker_tool="agent.files_v1")
         # The replacement attempt replays both operations in order.
         _ask(replay_broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         reply = replay_broker._answer(
             invocation,
             {"capability": "tools.round", "operation_seq": 2, "payload": payload},
@@ -437,7 +456,7 @@ class TestTheRecordIsTheContinuationNotTheAuthority:
         handle = invocation.citations.handle_for(source.source_id)
         self._cited(engine, monkeypatch, invocation, handle)
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
 
         turn = context.transcript.entries[0]
         assert invocation.citations.nonce not in json.dumps(turn.as_dict())
@@ -461,7 +480,7 @@ class TestTheRecordIsTheContinuationNotTheAuthority:
         handle = invocation.citations.handle_for(source.source_id)
         self._cited(engine, monkeypatch, invocation, handle)
         reply = _ask(broker, invocation, "llm.generate_with_tools",
-                     {"messages": [], "tools": []}, 1)
+                     {"messages": [], "tools": TOOLS}, 1)
 
         # What the worker was actually handed, parsed as the worker parses it.
         handed = json.loads(reply["result"]["tool_calls"][0]["arguments"])
@@ -485,7 +504,7 @@ class TestTheIdsComeFromTheTurnThatAsked:
             {"id": "real", "name": "web_search", "arguments": '{"query": "hours"}'}
         ])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round", {
             "calls": [
                 {"id": "evil", "name": "web_search", "arguments": {"query": "hours"}}
@@ -505,22 +524,23 @@ class TestOneModelTurnAuthorizesOneRound:
     would otherwise get a second set of grounded passages - different
     documents, possibly - carrying the authority of one request."""
 
-    def test_a_second_identical_round_is_not_offerable(
-        self, store, monkeypatch
-    ):
+    def test_a_second_identical_round_is_refused(self, store, monkeypatch):
         engine = get_runtime().workflow
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round",
              {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
         # Same calls again, with no model turn in between. A different payload
         # so the ledger does not simply replay the first.
-        _ask(broker, invocation, "tools.round",
-             {"calls": [SUBMITTED], "fallback_query": "again"}, 3)
+        again = broker._answer(invocation, {
+            "capability": "tools.round", "operation_seq": 3,
+            "payload": {"calls": [SUBMITTED], "fallback_query": "again"},
+        })
 
-        assert [r.offerable for r in context.transcript.rounds()] == [True, False]
+        assert again["ok"] is False, again
+        assert len(context.transcript.rounds()) == 1, "a second round ran"
 
     def test_a_fresh_model_turn_authorizes_the_next_round(
         self, store, monkeypatch
@@ -529,40 +549,44 @@ class TestOneModelTurnAuthorizesOneRound:
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round",
              {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 3)
+             {"messages": [], "tools": TOOLS}, 3)
         _ask(broker, invocation, "tools.round",
              {"calls": [SUBMITTED], "fallback_query": "again"}, 4)
 
         assert [r.offerable for r in context.transcript.rounds()] == [True, True]
 
-    def test_an_unrequested_round_gets_no_message_ids_either(
+    def test_an_unrequested_round_produces_no_record_at_all(
         self, store, monkeypatch
     ):
         """There is no request to tie its results to, so there is no message
-        to rebuild. Falling back to the tool name would invent one."""
+        to rebuild - and now no round either."""
         engine = get_runtime().workflow
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
-        _ask(broker, invocation, "tools.round",
-             {"calls": [SUBMITTED], "fallback_query": "hours"}, 1)
-        round_entry = context.transcript.rounds()[0]
-        assert round_entry.offerable is False
-        assert round_entry.results[0].tool_message_id == ""
+        reply = broker._answer(invocation, {
+            "capability": "tools.round", "operation_seq": 1,
+            "payload": {"calls": [SUBMITTED], "fallback_query": "hours"},
+        })
+        assert reply["ok"] is False, reply
+        assert context.transcript.rounds() == []
 
-    def test_an_empty_round_answering_nothing_is_not_offerable(
+    def test_an_empty_round_answering_nothing_is_refused(
         self, store, monkeypatch
     ):
         """Two empty call lists compare equal, so a check that only compared
         them would call a round with no request behind it authorized."""
         engine = get_runtime().workflow
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
-        _ask(broker, invocation, "tools.round",
-             {"calls": [], "fallback_query": "hours"}, 1)
-        assert context.transcript.rounds()[0].offerable is False
+        reply = broker._answer(invocation, {
+            "capability": "tools.round", "operation_seq": 1,
+            "payload": {"calls": [], "fallback_query": "hours"},
+        })
+        assert reply["ok"] is False, reply
+        assert context.transcript.rounds() == []
 
     def test_an_answered_turn_is_no_longer_the_unanswered_one(self):
         transcript = TrustedTranscript()
@@ -589,24 +613,24 @@ class TestDivergenceEndsCitationAuthorityForTheAssembly:
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round",
              {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
 
         assert context.transcript.rounds()[0].offerable is True
         assert context.citations_intact is True
 
-    def test_one_divergent_round_ends_it(self, store, monkeypatch):
+    def test_a_restored_divergent_round_ends_it(self, store, monkeypatch):
+        """Restored rather than executed, because the broker no longer runs a
+        divergent round at all. What survives is the ledger: a round committed
+        as unofferable by an earlier attempt comes back to a later one, and
+        the gate has to read it there."""
         engine = get_runtime().workflow
-        _registry, invocation, context, broker = _turn(engine, monkeypatch)
-        _model(engine, monkeypatch, calls=[SEARCH])
-        _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
-        # A different tool from the one the model asked for.
-        _ask(broker, invocation, "tools.round",
-             {"calls": [{"id": "c1", "name": "web_fetch",
-                         "arguments": {"url": "https://a.example"}}],
-              "fallback_query": "hours"}, 2)
+        _registry, _invocation, context, broker = _turn(engine, monkeypatch)
+
+        broker._apply_parent_state(
+            {"transcript": [ToolRound(operation_seq=1, offerable=False).as_dict()]}
+        )
 
         assert context.transcript.rounds()[0].offerable is False
         assert context.citations_intact is False
@@ -616,49 +640,72 @@ class TestDivergenceEndsCitationAuthorityForTheAssembly:
     ):
         """The monotonic half. Everything after the divergence happened in a
         conversation the parent can no longer describe, so a round that looks
-        correct inside it proves nothing about the assembly."""
+        correct inside it proves nothing about the assembly.
+
+        The divergent round arrives the way a replacement attempt gets it -
+        replayed out of the ledger - which is what puts this worker's position
+        past it and lets the honest round follow.
+        """
         engine = get_runtime().workflow
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
-        _model(engine, monkeypatch, calls=[SEARCH])
-        _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
-        _ask(broker, invocation, "tools.round",
-             {"calls": [{"id": "c1", "name": "web_fetch",
-                         "arguments": {"url": "https://a.example"}}],
-              "fallback_query": "hours"}, 2)
+        payload = {"calls": [SUBMITTED], "fallback_query": "hours"}
+        invocation.ledger.begin(1, "tools.round", payload_hash(payload))
+        invocation.ledger.commit(
+            1,
+            {"results": ["from the abandoned attempt"], "snippets": []},
+            parent_state={
+                "transcript": [
+                    ToolRound(operation_seq=1, offerable=False).as_dict()
+                ]
+            },
+        )
+        assert _ask(broker, invocation, "tools.round", payload, 1)["replayed"]
         assert context.citations_intact is False
 
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 3)
+             {"messages": [], "tools": TOOLS}, 2)
         _ask(broker, invocation, "tools.round",
-             {"calls": [SUBMITTED], "fallback_query": "again"}, 4)
+             {"calls": [SUBMITTED], "fallback_query": "again"}, 3)
 
         assert [r.offerable for r in context.transcript.rounds()] == [False, True]
         assert context.citations_intact is False
 
-    def test_the_round_still_runs(self, store, monkeypatch):
-        """Only the citations stop. What a worker may ask for is the
-        capability layer's question and is answered the way it always was."""
+    def test_a_divergent_round_leaves_the_authority_alone(
+        self, store, monkeypatch
+    ):
+        """Refused before anything is recorded, so there is no unofferable
+        round for the gate to read. The citations of the rounds that did
+        happen are not forfeited by a request that never ran."""
         engine = get_runtime().workflow
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
-        reply = _ask(broker, invocation, "tools.round",
-                     {"calls": [SUBMITTED], "fallback_query": "hours"}, 1)
+        _model(engine, monkeypatch, calls=[SEARCH])
+        _ask(broker, invocation, "llm.generate_with_tools",
+             {"messages": [], "tools": TOOLS}, 1)
+        _ask(broker, invocation, "tools.round",
+             {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
 
-        assert context.citations_intact is False
-        assert reply["result"]["results"], reply
+        refused = broker._answer(invocation, {
+            "capability": "tools.round", "operation_seq": 3,
+            "payload": {"calls": [SUBMITTED], "fallback_query": "hours"},
+        })
+
+        assert refused["ok"] is False, refused
+        assert len(context.transcript.rounds()) == 1
+        assert context.citations_intact is True
 
     def test_a_replacement_attempt_inherits_the_loss(self, store, monkeypatch):
         """Derived from the record the ledger restores, so an attempt that
         replays a divergent round does not start with its authority back."""
         engine = get_runtime().workflow
-        _registry, invocation, context, broker = _turn(engine, monkeypatch)
-        _ask(broker, invocation, "tools.round",
-             {"calls": [SUBMITTED], "fallback_query": "hours"}, 1)
+        _registry, _invocation, context, broker = _turn(engine, monkeypatch)
+        broker._apply_parent_state(
+            {"transcript": [ToolRound(operation_seq=1, offerable=False).as_dict()]}
+        )
         assert context.citations_intact is False
 
         fresh = InvocationContext(user_id="u", source_registry=SourceRegistry())
-        replayed = CapabilityBroker(engine, fresh)
+        replayed = CapabilityBroker(engine, fresh, worker_tool="agent.files_v1")
         replayed._apply_parent_state(
             {"transcript": [r.as_dict() for r in context.transcript.rounds()]}
         )
@@ -676,7 +723,7 @@ class TestAWorkerCannotRewindItsOwnPosition:
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, content="one")
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         again = broker._answer(invocation, {
             "capability": "tools.round", "operation_seq": 1,
             "payload": {"calls": [SUBMITTED], "fallback_query": "hours"},
@@ -690,10 +737,10 @@ class TestAWorkerCannotRewindItsOwnPosition:
         _registry, invocation, _context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, content="one")
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         skipped = broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 3,
-            "payload": {"messages": [], "tools": []},
+            "payload": {"messages": [], "tools": TOOLS},
         })
         assert skipped["result"]["error"] == "broker_sequence"
 
@@ -702,22 +749,25 @@ class TestAWorkerCannotRewindItsOwnPosition:
     ):
         """The client counted the request before sending it. A position not
         spent here is a position an honest worker's next request is refused
-        for."""
+        for.
+
+        Two fetches by a fetch worker, because withdrawal and the position
+        rule both belong to one worker's own forward walk - and no worker's
+        body asks for both a model turn and a page.
+        """
         engine = get_runtime().workflow
-        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
-        _model(engine, monkeypatch, content="one")
-        _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+        _registry, invocation, context, _agent = _turn(engine, monkeypatch)
+        broker = CapabilityBroker(engine, context, worker_tool="web.fetch_v1")
 
         taint.record_findings(
             invocation.session, [{"type": "override-instructions"}]
         )
         withdrawn = _ask(broker, invocation, "web.fetch",
-                         {"url": "https://x.example"}, 2)
+                         {"url": "https://x.example"}, 1)
         assert "REFUSED" in str(withdrawn["result"]), withdrawn
 
-        following = _ask(broker, invocation, "llm.generate_with_tools",
-                         {"messages": [], "tools": []}, 3)
+        following = _ask(broker, invocation, "web.fetch",
+                         {"url": "https://y.example"}, 2)
         assert following["result"].get("error") != "broker_sequence"
 
     def test_a_live_request_cannot_reoccupy_a_withdrawn_position(
@@ -726,16 +776,16 @@ class TestAWorkerCannotRewindItsOwnPosition:
         """The other half of the same rule. A position left unspent is a
         position a second, live request can take."""
         engine = get_runtime().workflow
-        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
+        _registry, invocation, context, _agent = _turn(engine, monkeypatch)
+        broker = CapabilityBroker(engine, context, worker_tool="web.fetch_v1")
         taint.record_findings(
             invocation.session, [{"type": "override-instructions"}]
         )
         _ask(broker, invocation, "web.fetch", {"url": "https://x.example"}, 1)
-        _model(engine, monkeypatch, content="one")
         again = broker._answer(invocation, {
-            "capability": "llm.generate_with_tools",
+            "capability": "web.fetch",
             "operation_seq": 1,
-            "payload": {"messages": [], "tools": []},
+            "payload": {"url": "https://y.example"},
         })
         assert again["result"]["error"] == "broker_sequence"
 
@@ -751,7 +801,7 @@ class TestAWorkerCannotRewindItsOwnPosition:
         })
         _model(engine, monkeypatch, content="one")
         following = _ask(broker, invocation, "llm.generate_with_tools",
-                         {"messages": [], "tools": []}, 2)
+                         {"messages": [], "tools": TOOLS}, 2)
         assert following["result"].get("error") != "broker_sequence"
 
     def test_a_replacement_worker_counts_from_one_again(
@@ -761,16 +811,16 @@ class TestAWorkerCannotRewindItsOwnPosition:
         it diverges, and the rule must not stand in the way of that."""
         engine = get_runtime().workflow
         registry, invocation, _first, broker = _turn(engine, monkeypatch)
-        _model(engine, monkeypatch, content="one")
+        _model(engine, monkeypatch, content="one", calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round",
              {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
 
         second = InvocationContext(user_id="u", source_registry=registry)
-        replacement = CapabilityBroker(engine, second)
+        replacement = CapabilityBroker(engine, second, worker_tool="agent.files_v1")
         one = _ask(replacement, invocation, "llm.generate_with_tools",
-                   {"messages": [], "tools": []}, 1)
+                   {"messages": [], "tools": TOOLS}, 1)
         two = _ask(replacement, invocation, "tools.round",
                    {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
         assert one.get("replayed") and two.get("replayed")
@@ -944,6 +994,10 @@ class TestTheParentKeepsTheConversationItStarted:
         user_id = store.create_user(
             email=f"base_{uuid.uuid4().hex[:8]}@example.com"
         ).id
+        # Before the plan: the round below runs only because the parent's
+        # own prompt offered `web_search`, and it offers it only when web
+        # tools are on at the moment the prompt is assembled.
+        _web(engine, monkeypatch)
         _tool, _plan, context, _pre = await self._plan(
             engine, monkeypatch, user_id=user_id
         )
@@ -951,16 +1005,15 @@ class TestTheParentKeepsTheConversationItStarted:
             uuid.uuid4().hex, tool="agent.files_v1", user_id=user_id,
             tenant_id=None,
         )
-        _web(engine, monkeypatch)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
         _model(engine, monkeypatch, content="looking", calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         _ask(broker, invocation, "tools.round",
              {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
         _model(engine, monkeypatch, content="400 hours")
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 3)
+             {"messages": [], "tools": TOOLS}, 3)
 
         assert context.initial_messages and context.initial_tools
         assert [
@@ -1053,7 +1106,7 @@ class TestNoneOfItCrossesThePipe:
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _model(engine, monkeypatch, calls=[SEARCH])
         _ask(broker, invocation, "llm.generate_with_tools",
-             {"messages": [], "tools": []}, 1)
+             {"messages": [], "tools": TOOLS}, 1)
         reply = _ask(broker, invocation, "tools.round",
                      {"calls": [SUBMITTED], "fallback_query": "hours"}, 2)
         assert context.transcript.rounds(), "the fixture recorded nothing"

@@ -130,7 +130,9 @@ class TestTheBrokerDoesNotUnpickleItsWorker:
 
         invocation = Invocation("hostile-worker", tool="agent.files_v1")
         invocation.begin_attempt()
-        broker = CapabilityBroker(None, InvocationContext(user_id="u1"))
+        broker = CapabilityBroker(
+            None, InvocationContext(user_id="u1"), worker_tool="agent.files_v1"
+        )
         try:
             result = broker.serve(
                 parent_conn, invocation, is_alive=lambda: False
@@ -157,7 +159,9 @@ class TestTheBrokerDoesNotUnpickleItsWorker:
 
         invocation = Invocation("good-worker", tool="agent.files_v1")
         invocation.begin_attempt()
-        broker = CapabilityBroker(None, InvocationContext(user_id="u1"))
+        broker = CapabilityBroker(
+            None, InvocationContext(user_id="u1"), worker_tool="agent.files_v1"
+        )
         try:
             result = broker.serve(parent_conn, invocation, is_alive=lambda: True)
         finally:
@@ -241,7 +245,9 @@ class TestFramesAreBounded:
 
         invocation = Invocation("greedy-worker", tool="agent.files_v1")
         invocation.begin_attempt()
-        broker = CapabilityBroker(None, InvocationContext(user_id="u1"))
+        broker = CapabilityBroker(
+            None, InvocationContext(user_id="u1"), worker_tool="agent.files_v1"
+        )
         try:
             result = broker.serve(
                 parent_conn, invocation, is_alive=lambda: True, budget=budget

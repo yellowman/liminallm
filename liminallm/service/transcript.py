@@ -114,12 +114,16 @@ class ToolRound:
     """One `tools.round` operation, as the parent executed it.
 
     `offerable` is false when the calls the worker submitted are not the calls
-    the previous model turn asked for. Such a round still runs - what a worker
-    may request is the capability layer's question, and it answers that one
-    the same way it always did - but the parent can no longer reconstruct the
-    exchange faithfully, so nothing in it may carry a citation. Divergence is
-    a property of the round rather than of a call, because the mismatch is in
-    the correspondence between two lists.
+    the previous model turn asked for, so nothing in the round may carry a
+    citation: the parent cannot reconstruct the exchange faithfully.
+    Divergence is a property of the round rather than of a call, because the
+    mismatch is in the correspondence between two lists.
+
+    No such round is written today - the broker refuses a divergent one rather
+    than running it, so a round that reaches this record corresponds. The
+    field stays because a restore reads it back, and because "cannot be
+    reconstructed" is the property a citation gate depends on, which is not
+    the same statement as "the broker currently refuses it".
     """
 
     operation_seq: int
@@ -173,6 +177,7 @@ class ModelTurn:
     content: str = ""
     tool_calls: Tuple[Dict[str, Any], ...] = ()
     assistant_message: Optional[Dict[str, Any]] = None
+    offered_tools: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -180,6 +185,9 @@ class ModelTurn:
         )
         object.__setattr__(
             self, "assistant_message", deepcopy(self.assistant_message)
+        )
+        object.__setattr__(
+            self, "offered_tools", tuple(str(n) for n in self.offered_tools)
         )
 
     def as_dict(self) -> Dict[str, Any]:
@@ -189,6 +197,7 @@ class ModelTurn:
             "content": self.content,
             "tool_calls": [deepcopy(dict(call)) for call in self.tool_calls],
             "assistant_message": deepcopy(self.assistant_message),
+            "offered_tools": list(self.offered_tools),
         }
 
     @classmethod
@@ -198,6 +207,7 @@ class ModelTurn:
             content=str(raw.get("content") or ""),
             tool_calls=tuple(dict(call) for call in raw.get("tool_calls") or []),
             assistant_message=raw.get("assistant_message"),
+            offered_tools=tuple(raw.get("offered_tools") or ()),
         )
 
 
