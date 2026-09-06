@@ -250,6 +250,13 @@ trail.
   all otherwise; a `locator` is published only for kinds whose locator is a
   reference a reader can follow. `meta.title` is the presentation label - a
   client must not derive a name from an identifier or a path.
+- a publicly shared conversation is a second audience, and the stored form is
+  the owner's. Its messages carry `content` and citation segments reduced to
+  the anchor, the kind, the title and a followable locator - no source
+  identity, no evidence fingerprint - and no other segment type at all. A
+  reader with the link holds none of the objects a citation names, so an
+  identity they cannot open, or a hash of a passage they cannot read, is a
+  claim to test a guess against rather than provenance.
 - summary messages are `sender='system', role='system',
   meta.summary=true`.
 

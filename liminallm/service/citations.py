@@ -696,10 +696,6 @@ def public_source_id(kind: str, origin_id: str) -> str:
     return ""
 
 
-#: Segment types a shared conversation shows. Everything else is dropped
-#: rather than projected: a `tool_call` segment carries a call's arguments and
-#: result, and an anonymous reader is being shown an answer, not a trace.
-SHARED_SEGMENT_TYPES = frozenset({"text", "code", "citation"})
 
 
 def shared_citation(segment: Mapping[str, Any]) -> Dict[str, Any]:
@@ -739,26 +735,33 @@ def shared_citation(segment: Mapping[str, Any]) -> Dict[str, Any]:
 def shared_content_struct(struct: Any) -> Optional[Dict[str, Any]]:
     """A stored `content_struct` as a shared conversation may show it.
 
-    An allowlist of segment types with the citations projected, because this
-    crosses to a reader who authenticated as nobody. A struct that keeps
-    nothing is `None` rather than an empty one: the message's own `content`
-    is what a share renders when there is no structure to add to it.
+    Projected citations, and nothing else at all. Not an allowlist of segment
+    types with the others copied through: the share already carries the
+    message's own `content`, so a second structured copy of its text buys the
+    page nothing and can differ from it. A `content_struct` on a *user*
+    message is whatever that client sent - the normalizer checks its shape and
+    its coordinates, not that a text segment says what the message says - so a
+    text segment's `text`, `tags` and `meta` are fields nobody promised an
+    anonymous reader, carrying values the share page does not render.
+
+    The same reasoning refuses a `tool_call` segment, which carries a call's
+    arguments and result: a stranger is being shown an answer, not a trace.
+
+    Structured text or code on a share is a feature someone can add later,
+    with its own projection and its own statement of how it relates to the
+    public `content`. `None` when nothing is kept, because the message's own
+    text is what a share renders when there is no structure to add to it.
     """
     if not isinstance(struct, Mapping):
         return None
     segments = struct.get("segments")
     if not isinstance(segments, Sequence) or isinstance(segments, (str, bytes)):
         return None
-    kept: List[Dict[str, Any]] = []
-    for segment in segments:
-        if not isinstance(segment, Mapping):
-            continue
-        if segment.get("type") not in SHARED_SEGMENT_TYPES:
-            continue
-        if segment.get("type") == "citation":
-            kept.append(shared_citation(segment))
-        else:
-            kept.append(dict(segment))
+    kept = [
+        shared_citation(segment)
+        for segment in segments
+        if isinstance(segment, Mapping) and segment.get("type") == "citation"
+    ]
     return {"segments": kept} if kept else None
 
 

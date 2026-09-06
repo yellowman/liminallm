@@ -111,8 +111,10 @@ const escapeAttr = (str) => escapeHtml(str).replace(/"/g, '&quot;');
 //: the two pages: the signed-in chat opens a panel on click, so its chips
 //: carry the citation and announce themselves as buttons, and the share page
 //: has no panel - a `role="button"` there would be a promise to a screen
-//: reader that nothing keeps. That page also shows every chip, since the
-//: "and N more" control is wired on the chat's own message list.
+//: reader that nothing keeps. With no panel to open, a share chip for a
+//: source that has an address becomes that link instead. That page also shows
+//: every chip, since the "and N more" control is wired on the chat's own
+//: message list.
 const citationsRowHtml = (message, { interactive = true } = {}) => {
   const citations = citationViews(message);
   if (!citations.length) return '';
@@ -135,17 +137,27 @@ const citationsRowHtml = (message, { interactive = true } = {}) => {
     const extra = i >= visible ? ' is-extra' : '';
     const hide = i >= visible ? ' hidden' : '';
     const kind = citationKind(c.kind);
+    // On the share there is no panel to open, so a citation with an address
+    // is the link itself rather than a chip that does nothing. Through
+    // `safeLinkHref`, which is markdown.js's http(s)-only validator - a
+    // global by the time any of this renders, since both pages load that
+    // script before their own.
+    const href = interactive || typeof safeLinkHref !== 'function'
+      ? null
+      : safeLinkHref(c.href || '');
+    const tag = href ? 'a' : 'span';
     // `escapeAttr`: the lead is the model's own answer, quoted back into an
     // attribute, and a quote in it would close this one and open others on
     // the element.
-    return `<span class="citation-link${extra}"${hide} data-kind="${kind}" ` +
+    return `<${tag} class="citation-link${extra}"${hide} data-kind="${kind}" ` +
       `title="${escapeAttr(hover)}"` +
       (interactive ? ` data-citation="${data}" tabindex="0" role="button"` : '') +
+      (href ? ` href="${escapeAttr(href)}" target="_blank" rel="noopener noreferrer"` : '') +
       `>` +
       `<svg class="citation-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" ` +
       `stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ` +
       `stroke-linejoin="round">${CITATION_ICONS[kind]}</svg>` +
-      `<span class="citation-title">${escapeHtml(citationLabel(label))}</span></span>`;
+      `<span class="citation-title">${escapeHtml(citationLabel(label))}</span></${tag}>`;
   }).join('');
   const more = citations.length > visible
     ? `<button type="button" class="citation-more">and ${citations.length - visible} more</button>`

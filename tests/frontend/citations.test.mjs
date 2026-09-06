@@ -149,6 +149,48 @@ test('a share chip announces nothing it cannot do', () => {
   assert.match(html, /manual\.md/);
 });
 
+test('a shared web citation is a link the reader can follow', () => {
+  const html = citationsRowHtml(
+    cited({
+      locator: 'https://example.test/handbook',
+      meta: { kind: 'web', title: 'Turbine handbook' },
+    }),
+    { interactive: false },
+  );
+  assert.match(html, /<a class="citation-link"/);
+  assert.match(html, /href="https:\/\/example\.test\/handbook"/);
+  assert.match(html, /rel="noopener noreferrer"/);
+});
+
+test('a shared citation with no address is not a link', () => {
+  const html = citationsRowHtml(
+    cited({ locator: '', meta: { kind: 'file', title: 'manual.md' } }),
+    { interactive: false },
+  );
+  assert.doesNotMatch(html, /<a /);
+  assert.match(html, /<span class="citation-link"/);
+});
+
+test('a locator that is not an http address never becomes an href', () => {
+  for (const locator of ['javascript:alert(1)', 'data:text/html,x', 'ftp://x/y']) {
+    const html = citationsRowHtml(
+      cited({ locator, meta: { kind: 'web', title: 'hostile' } }),
+      { interactive: false },
+    );
+    assert.doesNotMatch(html, /href=/);
+    assert.doesNotMatch(html, /<a /);
+  }
+});
+
+test('the signed-in chip stays a button, since it opens the panel', () => {
+  const html = citationsRowHtml(cited({
+    locator: 'https://example.test/handbook',
+    meta: { kind: 'web', title: 'Turbine handbook' },
+  }));
+  assert.doesNotMatch(html, /<a /);
+  assert.match(html, /role="button"/);
+});
+
 test('a message with no citations renders no row', () => {
   assert.equal(citationsRowHtml({ content: 'plain', content_struct: null }), '');
   assert.equal(citationsRowHtml({}), '');

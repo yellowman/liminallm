@@ -1048,6 +1048,52 @@ class TestAShareViewerIsADifferentAudience:
         assert set(shown[0]["meta"]) == {"kind", "title"}
 
     @pytest.mark.asyncio
+    async def test_structured_text_a_share_never_renders_does_not_cross(
+        self, store, client
+    ):
+        """A user's `content_struct` is whatever that client sent.
+
+        The normalizer checks its shape and its coordinates, not that a text
+        segment says what the message says, so its `text`, `tags` and `meta`
+        are fields nobody promised a stranger - and the share page renders
+        none of them: it draws `content` and the citation chips. Sending a
+        second structured copy of the body is how an anonymous API caller
+        ends up with more than the page shows.
+        """
+        turn = _turn(store)
+        store.append_message(
+            turn.conversation_id,
+            sender="user", role="user", content="VISIBLE",
+            content_struct={"segments": [{
+                "type": "text", "text": "HIDDEN-SECRET",
+                "meta": {"secret": "PRIVATE-META"},
+            }]},
+        )
+        await chat_turn.finish(get_runtime(), turn, {
+            "content": ANSWER,
+            "validated_citations": CITED,
+            "provenance_snapshot": SNAPSHOT,
+        })
+        store.set_conversation_public(
+            turn.conversation_id, user_id=turn.user_id, public=True
+        )
+
+        resp = client.get(f"/v1/public/conversations/{turn.conversation_id}")
+
+        assert resp.status_code == 200, resp.text
+        assert "VISIBLE" in resp.text
+        assert "HIDDEN-SECRET" not in resp.text
+        assert "PRIVATE-META" not in resp.text
+        # And the assistant's own citation still crosses, projected.
+        shown = [
+            segment
+            for message in resp.json()["data"]["messages"]
+            for segment in (message.get("content_struct") or {}).get("segments") or []
+        ]
+        assert [segment["type"] for segment in shown] == ["citation"]
+        assert shown[0]["meta"]["title"] == "manual.md"
+
+    @pytest.mark.asyncio
     async def test_a_trace_segment_is_not_part_of_a_share(self, store, client):
         """An anonymous reader is being shown an answer, not a trace. Nothing
         writes a `tool_call` segment onto an assistant row today, which is
