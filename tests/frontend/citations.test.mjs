@@ -18,12 +18,20 @@ import assert from 'node:assert/strict';
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const source = readFileSync(join(root, 'frontend/common.js'), 'utf8');
 
+// The same stub markdown.test.mjs uses, and for the same reason: `escapeHtml`
+// escapes by writing textContent into a detached div and reading innerHTML
+// back, so a stub that returned the text unchanged would make every escaping
+// assertion in this file pass without escaping anything. A browser text node
+// escapes `&`, `<` and `>` and leaves quotes alone - which is exactly why
+// `escapeAttr` exists on top of it.
 const documentStub = {
   createElement: () => {
     let text = '';
     return {
       set textContent(v) { text = String(v); },
-      get innerHTML() { return text; },
+      get innerHTML() {
+        return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      },
     };
   },
 };
@@ -67,6 +75,14 @@ test('a zero, negative or missing anchor is the start', () => {
   }
 });
 
+test('an anchor that is not a position fails toward the start', () => {
+  // Infinity is the case that separates the guard from the loop: `seen <
+  // Infinity` holds for the whole string, so without the finiteness check
+  // this returns the length instead of refusing.
+  assert.equal(utf16Index(ANSWER, Infinity), 0);
+  assert.equal(utf16Index(ANSWER, -Infinity), 0);
+});
+
 test('every anchor in a mixed string round-trips through code points', () => {
   const text = 'a\u{1F600}b\u{1F1EC}\u{1F1E7}céd';
   const points = Array.from(text);
@@ -82,4 +98,78 @@ test('a tail never begins half way through a pair', () => {
   assert.equal(text.slice(-3).charCodeAt(0), 0xde00);
   assert.equal(lastCodePoints(text, 99), text);
   assert.equal(lastCodePoints(null, 3), '');
+});
+
+//: The chip row, from the two audiences that render it.
+const rowCtx = createContext({ URL, console, document: documentStub });
+runInContext(
+  ['frontend/common.js', 'frontend/markdown.js']
+    .map((f) => readFileSync(join(root, f), 'utf8')).join('\n;\n'),
+  rowCtx,
+);
+const { citationsRowHtml } = runInContext('({ citationsRowHtml })', rowCtx);
+
+const cited = (segment) => ({
+  content: 'Four hundred hours',
+  content_struct: { segments: [{ type: 'citation', start: 18, end: 18, ...segment }] },
+});
+
+test('the chip is labelled with the title, never an identifier', () => {
+  const html = citationsRowHtml(cited({
+    locator: '', meta: { kind: 'file', title: 'manual.md' },
+  }));
+  assert.match(html, /manual\.md/);
+  assert.match(html, /data-kind="file"/);
+});
+
+test('a web citation is drawn as one', () => {
+  const html = citationsRowHtml(cited({
+    locator: 'https://example.test/handbook',
+    meta: { kind: 'web', title: 'Turbine handbook' },
+  }));
+  assert.match(html, /data-kind="web"/);
+  assert.match(html, /Turbine handbook/);
+});
+
+test('the hover carries the words the citation follows', () => {
+  const html = citationsRowHtml(cited({
+    locator: '', meta: { kind: 'file', title: 'manual.md' },
+  }));
+  assert.match(html, /Four hundred hours/);
+});
+
+test('a share chip announces nothing it cannot do', () => {
+  const html = citationsRowHtml(
+    cited({ locator: '', meta: { kind: 'file', title: 'manual.md' } }),
+    { interactive: false },
+  );
+  assert.doesNotMatch(html, /role="button"/);
+  assert.doesNotMatch(html, /tabindex/);
+  assert.doesNotMatch(html, /data-citation/);
+  assert.match(html, /manual\.md/);
+});
+
+test('a message with no citations renders no row', () => {
+  assert.equal(citationsRowHtml({ content: 'plain', content_struct: null }), '');
+  assert.equal(citationsRowHtml({}), '');
+});
+
+test('a hostile title cannot close the attribute it sits in', () => {
+  // A source's title is not the reader's text: a page title, a filename, a
+  // note heading - all of them arrive from somewhere else.
+  const html = citationsRowHtml(cited({
+    locator: '', meta: { kind: 'file', title: '" onmouseover="alert(1)' },
+  }));
+  // Every quote in the title is an entity, so neither attribute it appears
+  // in can be closed early.
+  assert.match(html, /title="&quot; onmouseover=&quot;alert\(1\)/);
+  assert.doesNotMatch(html, /title="" onmouseover/);
+});
+
+test('a hostile title cannot open a tag of its own', () => {
+  const html = citationsRowHtml(cited({
+    locator: '', meta: { kind: 'file', title: '<img src=x onerror=alert(1)>' },
+  }));
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
 });

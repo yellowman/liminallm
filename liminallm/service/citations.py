@@ -612,13 +612,33 @@ def replaced_answer(
 #: locator is safe to publish, which is the direction a leak should fail in.
 PUBLIC_LOCATOR_KINDS = frozenset({"web"})
 
-#: Source kinds whose `origin_id` may be published as it stands.
+#: Identities the owner of a conversation may be shown, by kind and by form.
 #:
 #: `origin_id` is the producer's internal identity for an object, and being
-#: the right internal identity does not make it the right public one. These
-#: three name something the reader already has: their own note, their own
-#: conversation, or a file identified by the digest of its own bytes.
-PUBLIC_IDENTITY_KINDS = frozenset({"note", "conversation", "file", "web"})
+#: the right internal identity does not make it the right public one. What is
+#: listed here names something the owner already holds: their own note, their
+#: own conversation, or an attachment identified by the digest of its own
+#: bytes.
+#:
+#: Keyed by form and not by kind alone, because one kind already carries two
+#: identity schemes with different semantics: a `file` is either an attachment
+#: generation - `attachment-generation:<sha256>:<ext>`, immutable by
+#: construction - or a plain context file, which has no identity at all. A
+#: future producer that starts issuing file identities of some third shape
+#: publishes nothing until someone reviews that shape, rather than inheriting
+#: this approval from the kind.
+#:
+#: The prefix is written here rather than imported from `attachments`, which
+#: would make this module depend on that one; `tests/test_citation_projection`
+#: pins it against the real `generation_key()` so the two cannot drift.
+#:
+#: `web` is absent because a web source has no `origin_id`: its identity is
+#: the URL, which travels as the locator.
+PUBLIC_IDENTITY_FORMS: Dict[str, Tuple[str, ...]] = {
+    "note": ("note:",),
+    "conversation": ("conversation:",),
+    "file": ("attachment-generation:",),
+}
 
 #: Source kinds whose `origin_id` is published as a stable opaque token.
 #:
@@ -651,7 +671,9 @@ def public_source_id(kind: str, origin_id: str) -> str:
     a public one whether or not today's client renders it. Three outcomes,
     and a kind nobody has classified gets the third:
 
-    * published as it stands, for an identity the reader already holds;
+    * published as it stands, for an identity in a form the owner holds -
+      by form, not by kind, so one producer's new identity scheme does not
+      inherit another's approval;
     * published as a stable digest, for one that names the deployment rather
       than the reader - the same source still gets the same token in every
       turn, so a client can group by it;
@@ -663,12 +685,81 @@ def public_source_id(kind: str, origin_id: str) -> str:
     """
     if not origin_id:
         return ""
-    if kind in PUBLIC_IDENTITY_KINDS:
+    if any(
+        origin_id.startswith(prefix)
+        for prefix in PUBLIC_IDENTITY_FORMS.get(kind, ())
+    ):
         return origin_id
     if kind in OPAQUE_IDENTITY_KINDS:
         digest = hashlib.sha256(origin_id.encode("utf-8")).hexdigest()
         return f"opaque:{digest[:32]}"
     return ""
+
+
+#: Segment types a shared conversation shows. Everything else is dropped
+#: rather than projected: a `tool_call` segment carries a call's arguments and
+#: result, and an anonymous reader is being shown an answer, not a trace.
+SHARED_SEGMENT_TYPES = frozenset({"text", "code", "citation"})
+
+
+def shared_citation(segment: Mapping[str, Any]) -> Dict[str, Any]:
+    """One stored citation as an anonymous reader of a share may see it.
+
+    Two audiences, and the stored form is the first one's. "Public to the
+    owner of the conversation" and "public to whoever has the link" are
+    different boundaries: the owner holds the note, the attachment and the
+    passage a citation names, and a share viewer holds none of them. So the
+    identity goes, and so do the fingerprints - a content hash of a private
+    passage is a checkable claim about bytes the reader cannot read, which is
+    the sort of thing an oracle is made of.
+
+    What is left is what a share is for: where the citation sits in the
+    answer, what kind of source it was, what it is called, and a link where
+    the source has an address anyone can follow.
+
+    The locator is re-checked against the kind rather than trusted from the
+    row. Storage already applies that rule, so this is a second statement of
+    it at the boundary where being wrong is worse.
+    """
+    meta = segment.get("meta")
+    meta = meta if isinstance(meta, Mapping) else {}
+    kind = str(meta.get("kind") or "")
+    return {
+        "type": "citation",
+        "start": segment.get("start"),
+        "end": segment.get("end"),
+        "locator": (
+            str(segment.get("locator") or "")
+            if kind in PUBLIC_LOCATOR_KINDS else ""
+        ),
+        "meta": {"kind": kind, "title": str(meta.get("title") or "")},
+    }
+
+
+def shared_content_struct(struct: Any) -> Optional[Dict[str, Any]]:
+    """A stored `content_struct` as a shared conversation may show it.
+
+    An allowlist of segment types with the citations projected, because this
+    crosses to a reader who authenticated as nobody. A struct that keeps
+    nothing is `None` rather than an empty one: the message's own `content`
+    is what a share renders when there is no structure to add to it.
+    """
+    if not isinstance(struct, Mapping):
+        return None
+    segments = struct.get("segments")
+    if not isinstance(segments, Sequence) or isinstance(segments, (str, bytes)):
+        return None
+    kept: List[Dict[str, Any]] = []
+    for segment in segments:
+        if not isinstance(segment, Mapping):
+            continue
+        if segment.get("type") not in SHARED_SEGMENT_TYPES:
+            continue
+        if segment.get("type") == "citation":
+            kept.append(shared_citation(segment))
+        else:
+            kept.append(dict(segment))
+    return {"segments": kept} if kept else None
 
 
 def _resolve_evidence(

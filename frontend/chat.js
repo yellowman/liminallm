@@ -137,7 +137,6 @@ const $ = (id) => document.getElementById(id);
 
 // escapeHtml leaves quotes alone (fine for text nodes); attribute values need
 // them encoded too.
-const escapeAttr = (str) => escapeHtml(str).replace(/"/g, '&quot;');
 
 // Citation modal for displaying source content
 const showCitationModal = (element) => {
@@ -1132,106 +1131,9 @@ const renderMessage = (m) => {
   if (m.token_count) metaBits.push(`${m.token_count} tokens`);
   if (m.model) metaBits.push(escapeHtml(m.model));
 
-//: A citation names a source, so the chip leads with what kind of source it
-//: is and what it is called. Drawn rather than fetched: a real favicon means
-//: a request to every cited domain from the reader's browser, which hands
-//: those sites the reader's address and the fact that they were cited. These
-//: are also mostly the reader's own files, which have no favicon at all.
-const CITATION_ICONS = {
-  web: '<circle cx="10" cy="10" r="6.5"/><path d="M3.5 10h13M10 3.5c2.8 3.6 2.8 9.4 0 13' +
-       'c-2.8-3.6-2.8-9.4 0-13Z"/>',
-  file: '<path d="M4.5 3.25h7L15.5 7v9.75a.75.75 0 0 1-.75.75H4.5a.75.75 0 0 1-.75-.75' +
-        'V4a.75.75 0 0 1 .75-.75Z"/><path d="M11.25 3.5V7h3.75"/>',
-};
-
-//: Two icons, because two are all the set holds. The citation now carries the
-//: source's kind, so this reads it instead of guessing from a string: an
-//: earlier version read `.md`, `.markdown` and `.txt` as the notes vault, and
-//: those are ordinary upload types here, so an attached `manual.md` was
-//: presented to the reader as a note they had written.
-const citationKind = (kind) => (kind === 'web' ? 'web' : 'file');
-
-//: Long enough to recognise, short enough that eight fit on a line.
-const CITATION_LABEL_MAX = 32;
-//: How much of the answer before the anchor the hover shows, in code points.
-const CITATION_LEAD_MAX = 120;
-//: After this many the row stops being a list and starts being a wall.
-const CITATION_VISIBLE = 8;
-
-//: The title is the label. It is the source's own name - a filename, a page
-//: title, a note's heading - and the citation carries it precisely so a
-//: reader is never shown an identifier or a path instead.
-const citationLabel = (title) => {
-  const tail = /^https?:\/\//i.test(title)
-    ? title.replace(/^https?:\/\//i, '').replace(/\/$/, '')
-    : title;
-  return tail.length > CITATION_LABEL_MAX
-    ? `${tail.slice(0, CITATION_LABEL_MAX - 1)}\u2026`
-    : tail;
-};
-
-  // Render citations as clickable links per SPEC §17
-  // Note: Uses event delegation via messagesEl click handler (see initEventListeners)
-  //
-  // One shape, the stored one (SPEC §2.2). A citation segment is an anchor
-  // into this message's own `content`, so the chip is built from the answer
-  // beside it: the title names the source, the locator is a link only where
-  // the kind says a locator is one, and the anchor says which words the
-  // citation follows. `start` counts code points, so the slice converts.
-  let citationsHtml = '';
-  const citations = (m.content_struct?.segments || [])
-    .filter(seg => seg.type === 'citation')
-    .map(seg => ({
-      title: seg.meta?.title || '',
-      kind: seg.meta?.kind || '',
-      href: seg.locator || '',
-      // The passage itself is not stored - deleting a document has to reach
-      // what a citation shows - so what a reader gets before opening one is
-      // the run-up to it in the answer they are already reading.
-      lead: lastCodePoints(
-        String(m.content || '').slice(0, utf16Index(m.content, seg.start)).trim(),
-        CITATION_LEAD_MAX,
-      ),
-      evidence: seg.meta?.evidence || [],
-    }));
-  if (citations.length) {
-    citationsHtml = `
-      <div class="citations-row">
-        ${citations.map((c, i) => {
-          const label = c.title || `Citation ${i + 1}`;
-          // JSON.stringify escapes internal quotes; only need & and " for double-quoted attr
-          // `escapeAttr`, not a second hand-written encoder beside it.
-          const snippetData = escapeAttr(JSON.stringify({
-            title: c.title || '',
-            kind: c.kind || '',
-            href: c.href || '',
-            lead: c.lead || '',
-            evidence: c.evidence || [],
-          }));
-          // The hover text is the source and the words it follows, which is
-          // what a reader wants before deciding to open it.
-          const lead = c.lead.replace(/\s+/g, ' ').trim();
-          const hover = lead ? `${label}\n\n\u2026${lead}` : label;
-          const extra = i >= CITATION_VISIBLE ? ' is-extra' : '';
-          const hide = i >= CITATION_VISIBLE ? ' hidden' : '';
-          const kind = citationKind(c.kind);
-          // `escapeAttr`: the lead is the model's own answer, quoted back
-          // into an attribute, and a quote in it would close this one and
-          // open others on the element.
-          return `<span class="citation-link${extra}"${hide} data-kind="${kind}" ` +
-            `title="${escapeAttr(hover)}" data-citation="${snippetData}" ` +
-            `tabindex="0" role="button">` +
-            `<svg class="citation-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" ` +
-            `stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ` +
-            `stroke-linejoin="round">${CITATION_ICONS[kind]}</svg>` +
-            `<span class="citation-title">${escapeHtml(citationLabel(label))}</span></span>`;
-        }).join('')}
-        ${citations.length > CITATION_VISIBLE
-          ? `<button type="button" class="citation-more">and ${citations.length - CITATION_VISIBLE} more</button>`
-          : ''}
-      </div>
-    `;
-  }
+  // One implementation, in common.js, because the share page renders the
+  // same chips from the projection of the same segments.
+  const citationsHtml = citationsRowHtml(m, { interactive: true });
 
   // The turn description (written by a quick model pass) rides on the user
   // message's meta and feeds the turn navigator.

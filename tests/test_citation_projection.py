@@ -26,6 +26,16 @@ from liminallm.service.citations import durable_citations, public_source_id
 from liminallm.service.runtime import get_runtime
 
 
+@pytest.fixture
+def client():
+    """An unauthenticated client, for the surface that has no principal."""
+    from fastapi.testclient import TestClient
+
+    from liminallm import app as app_module
+
+    return TestClient(app_module.app)
+
+
 def _digest(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -844,8 +854,24 @@ class TestAnInternalIdentityIsNotAutomaticallyAPublicOne:
         )["source_id"] == "conversation:c-1"
 
     def test_an_attachment_keeps_its_digest_identity(self):
-        generation = "gen:" + ("d" * 64) + ":.md"
+        """Built from the real key rather than a plausible one.
+
+        The allowlist writes the prefix out rather than importing it, so this
+        is what stops the two from drifting - and a hand-written `gen:...`
+        would have proved only that the fixture matched the fixture.
+        """
+        from liminallm.service.attachments import generation_key
+
+        generation = generation_key("d" * 64, "report.pdf")
+        assert generation and generation.startswith("attachment-generation:")
+
         assert self._stored("file", generation)["source_id"] == generation
+
+    def test_a_file_identity_of_some_other_shape_is_not_published(self):
+        """The kind is not the attestation. `file` covers both an attachment
+        generation and a plain context file, and a third scheme added later
+        publishes nothing until someone reviews its shape."""
+        assert public_source_id("file", "file_row:42") == ""
 
     def test_a_kind_nobody_classified_publishes_nothing(self):
         """Fail-closed, like the locator: a kind added later carries no
@@ -897,3 +923,242 @@ class TestAnEvidenceLocatorSaysWhereNotWhich:
     def test_an_empty_locator_stays_empty(self):
         assert self._locator({}) == {}
         assert self._locator({"chunk_index": None}) == {}
+
+
+class TestAShareViewerIsADifferentAudience:
+    """"Public to the owner" and "public to whoever has the link" are two
+    boundaries, and the stored citation is the first one's.
+
+    The owner holds the note, the attachment and the passage a citation names.
+    A share viewer authenticated as nobody holds none of them, so an identity
+    they cannot open - or a hash of a passage they cannot read - is a
+    checkable claim rather than provenance.
+    """
+
+    #: Everything a stored citation can carry that the owner may see and a
+    #: stranger may not. Each is what one production producer really emits.
+    PRIVATE = {
+        "note": "note:6f1b8c2e-77aa-4f0d-9d2e-2b6f0f6b1234",
+        "conversation": "conversation:1d6a5f70-2c3b-4c1a-9c62-3e5c9d70abcd",
+        "attachment": "attachment-generation:" + ("e" * 64) + ":.pdf",
+        "mcp": 'mcp:["9c1e77aa-4f0d-4d2e-8b6f-0f6b12345678","lookup_stock"]',
+        "chunk": "knowledge_chunk:42",
+    }
+
+    @staticmethod
+    def _snapshot(kind, origin_id, passage):
+        return {
+            "sources": {
+                "src_1": {
+                    "source_id": "src_1", "kind": kind, "title": "private notes",
+                    "origin_id": origin_id, "locator": None, "metadata": {},
+                },
+            },
+            "evidence": [{
+                "evidence_id": "ev_1", "source_id": "src_1", "text": passage,
+                "locator": {"chunk_index": 7}, "content_hash": _digest(passage),
+            }],
+        }
+
+    @pytest.mark.asyncio
+    async def test_no_private_identity_or_fingerprint_crosses_the_share(
+        self, store, client
+    ):
+        """The whole boundary, driven through the anonymous route.
+
+        A note is cited, the conversation is shared, and the share is fetched
+        with no credentials at all - a fresh client, so not even a cookie
+        from another test's login could be carrying the request.
+        """
+        passage = "the private passage the answer rested on"
+        turn = _turn(store)
+        message = await chat_turn.finish(get_runtime(), turn, {
+            "content": ANSWER,
+            "validated_citations": CITED,
+            "provenance_snapshot": self._snapshot(
+                "note", self.PRIVATE["note"], passage
+            ),
+        })
+        stored = store.get_message(message.id)
+        # The owner's own copy carries all of it, which is what makes the
+        # share's version a projection rather than a coincidence.
+        owner = json.dumps(stored.content_struct)
+        assert self.PRIVATE["note"] in owner
+        assert _digest(passage) in owner
+
+        store.set_conversation_public(
+            turn.conversation_id, user_id=turn.user_id, public=True
+        )
+        resp = client.get(f"/v1/public/conversations/{turn.conversation_id}")
+
+        assert resp.status_code == 200, resp.text
+        body = resp.text
+        assert ANSWER in body, "the share showed no answer"
+        for name, identity in self.PRIVATE.items():
+            assert identity not in body, name
+        assert _digest(passage) not in body
+        assert passage not in body
+        assert "content_hash" not in body
+        assert "evidence" not in body
+
+    @pytest.mark.asyncio
+    async def test_the_share_still_shows_what_a_citation_is_for(
+        self, store, client
+    ):
+        """Stripping is not deleting: the reader still sees that the answer
+        cited something, where, and what it was called."""
+        passage = "a page of the handbook"
+        turn = _turn(store)
+        await chat_turn.finish(get_runtime(), turn, {
+            "content": ANSWER,
+            "validated_citations": CITED,
+            "provenance_snapshot": {
+                "sources": {
+                    "src_1": {
+                        "source_id": "src_1", "kind": "web",
+                        "title": "Turbine handbook", "origin_id": None,
+                        "locator": "https://example.test/handbook",
+                        "metadata": {},
+                    },
+                },
+                "evidence": [{
+                    "evidence_id": "ev_1", "source_id": "src_1",
+                    "text": passage, "locator": {"chunk_index": 7},
+                    "content_hash": _digest(passage),
+                }],
+            },
+        })
+        store.set_conversation_public(
+            turn.conversation_id, user_id=turn.user_id, public=True
+        )
+
+        resp = client.get(f"/v1/public/conversations/{turn.conversation_id}")
+
+        shown = [
+            segment
+            for message in resp.json()["data"]["messages"]
+            for segment in (message.get("content_struct") or {}).get("segments") or []
+            if segment.get("type") == "citation"
+        ]
+        assert len(shown) == 1, resp.text
+        assert shown[0]["meta"]["title"] == "Turbine handbook"
+        assert shown[0]["locator"] == "https://example.test/handbook"
+        assert shown[0]["start"] == 4
+        assert set(shown[0]) == {"type", "start", "end", "locator", "meta"}
+        assert set(shown[0]["meta"]) == {"kind", "title"}
+
+    @pytest.mark.asyncio
+    async def test_a_trace_segment_is_not_part_of_a_share(self, store, client):
+        """An anonymous reader is being shown an answer, not a trace. Nothing
+        writes a `tool_call` segment onto an assistant row today, which is
+        why the allowlist is written rather than left to that."""
+        turn = _turn(store)
+        await chat_turn.finish(get_runtime(), turn, {
+            "content": ANSWER,
+            "validated_citations": [],
+            "content_struct": {"segments": [
+                {"type": "text", "text": ANSWER},
+                {"type": "tool_call", "name": "lookup",
+                 "arguments": {"token": "SECRET-ARGUMENT"}},
+            ]},
+        })
+        store.set_conversation_public(
+            turn.conversation_id, user_id=turn.user_id, public=True
+        )
+
+        resp = client.get(f"/v1/public/conversations/{turn.conversation_id}")
+
+        assert "SECRET-ARGUMENT" not in resp.text
+        assert "tool_call" not in resp.text
+        assert ANSWER in resp.text
+
+
+class TestTheResponsesSurfaceCarriesWhatTheTurnCited:
+    """The OpenAI-compatible surface answers from the same kernel, so a turn
+    that cited something must not arrive there having cited nothing.
+
+    Not in `annotations`: that field is the provider's own file-citation
+    shape, and filling it would claim a file identity this surface does not
+    have. The extension is the honest slot, and what goes in it is the record
+    the turn stored rather than the transient coordinates beside it.
+    """
+
+    @staticmethod
+    def _cited_backend(monkeypatch):
+        """Offers on, one retrievable passage, and an answer that cites it."""
+        from types import SimpleNamespace
+
+        from liminallm.storage.models import KnowledgeChunk
+
+        engine = get_runtime().workflow
+        monkeypatch.setattr(
+            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
+        )
+        opened: list = []
+        real_open = engine.invocations.open
+
+        def _open(*a, **k):
+            invocation = real_open(*a, **k)
+            opened.append(invocation)
+            return invocation
+
+        monkeypatch.setattr(engine.invocations, "open", _open)
+        chunk = KnowledgeChunk(
+            context_id="ctx", fs_path="/files/manual.md",
+            content="SOURCE SAYS 400 HOURS", embedding=[], chunk_index=0,
+        )
+        monkeypatch.setattr(
+            engine, "rag", SimpleNamespace(retrieve=lambda *a, **k: [chunk])
+        )
+        monkeypatch.setattr(engine, "_validate_context_scope", lambda ids, **k: ["ctx"])
+        monkeypatch.setattr(engine, "_resolve_context_ids", lambda a, b: ["ctx"])
+
+        def _generate(*a, **k):
+            cited = [inv for inv in opened if inv.citations]
+            handle = next(iter(cited[-1].citations.by_handle), "") if cited else ""
+            return {"content": f"Four hundred hours [cite:{handle}]", "usage": {}}
+
+        monkeypatch.setattr(engine.llm, "generate", _generate, raising=False)
+        return opened
+
+    def test_a_cited_answer_arrives_with_its_citation(
+        self, client, auth_headers, monkeypatch
+    ):
+        opened = self._cited_backend(monkeypatch)
+
+        resp = client.post(
+            "/v1/responses", headers=auth_headers,
+            json={"input": "how long between inspections"},
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        cited = body["liminallm"]["citations"]
+        assert len(cited) == 1, body["liminallm"]
+        assert cited[0]["meta"]["title"] == "manual.md"
+        # The anchor indexes the text this response carries.
+        text = "".join(
+            part.get("text", "")
+            for item in body["output"] if item.get("type") == "message"
+            for part in item.get("content") or []
+        )
+        assert text == "Four hundred hours"
+        assert cited[0]["start"] == len(text)
+        # The dialect's own field stays empty, and nothing of the namespace
+        # reached the wire.
+        for item in body["output"]:
+            for part in item.get("content") or []:
+                assert part.get("annotations") == []
+        nonce = [inv for inv in opened if inv.citations][-1].citations.nonce
+        assert nonce not in resp.text and "[cite:" not in resp.text
+
+    def test_an_uncited_answer_carries_an_empty_list(
+        self, client, auth_headers
+    ):
+        """The key is always present, so a client reads one shape."""
+        resp = client.post(
+            "/v1/responses", headers=auth_headers, json={"input": "hello"},
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["liminallm"]["citations"] == []

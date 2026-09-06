@@ -155,6 +155,7 @@ from liminallm.service.attachments import (
     store_generation,
 )
 from liminallm.service.auth import AuthContext
+from liminallm.service.citations import shared_content_struct
 from liminallm.service.errors import BadRequestError, NotFoundError, ServiceError
 from liminallm.service.fs import (
     PathAuthorityError,
@@ -1832,19 +1833,33 @@ def _responses_enrich_tool_items(items: list, tool_trace: list) -> None:
             item["action"] = _web_search_action(query)
 
 
-def _responses_extension(orchestration: dict) -> dict:
+def _responses_extension(orchestration: dict, assistant_message=None) -> dict:
     """The enrichment the dialect has no slot for, under one namespaced key.
 
     Extra top-level keys survive the OpenAI SDKs (their models allow unknown
     fields) and stay invisible to strict typed readers. Citations are NOT
-    faked into annotations: an annotation needs a character anchor and a file
-    identity this surface cannot honestly provide, so provenance rides here
-    as plain snippets instead.
+    faked into `annotations`: that field is a file-citation shape belonging to
+    the provider's own file search, and filling it would claim a file identity
+    this surface does not have. They ride here instead, in the form the turn
+    stored - the anchor into `output_text`, the kind, the title, and what the
+    reader may be shown of the source.
+
+    Read from the persisted message rather than from the orchestration, for
+    the reason the whole projection exists: the orchestration's citations are
+    transient coordinates beside a turn-scoped registry, and what a client
+    should be handed is the record that outlives the turn.
     """
+    struct = getattr(assistant_message, "content_struct", None) or {}
+    segments = struct.get("segments") if isinstance(struct, dict) else None
     return {
         "context_snippets": list(orchestration.get("context_snippets") or []),
         "tool_trace": list(orchestration.get("tool_calls") or []),
         "adapters": _stringify_adapters(orchestration.get("adapters", [])),
+        "citations": [
+            dict(segment)
+            for segment in segments or []
+            if isinstance(segment, dict) and segment.get("type") == "citation"
+        ],
     }
 
 
@@ -2132,7 +2147,7 @@ async def _responses_stream(
                     "completed",
                     closed_items + [item],
                     usage=_responses_usage(usage),
-                    extension=_responses_extension(turn.orchestration),
+                    extension=_responses_extension(turn.orchestration, assistant_msg),
                 )
             },
         )
@@ -2319,7 +2334,7 @@ async def create_response(
                 previous_response_id=previous_response_id,
                 metadata=metadata,
                 usage=_responses_usage(usage),
-                extension=_responses_extension(turn.orchestration),
+                extension=_responses_extension(turn.orchestration, assistant_msg),
             ),
         )
     except _ResponsesReject as reject:
@@ -5222,8 +5237,15 @@ async def get_public_conversation(
 ):
     """Read a publicly shared conversation (unauthenticated).
 
-    Only role, content, and timestamps are exposed - message metadata,
-    adapter traces, and owner identity stay private.
+    Role, content, timestamps, and the part of `content_struct` a stranger
+    may see. Message metadata, adapter traces, and owner identity stay
+    private.
+
+    `shared_content_struct` is what makes the structure safe to include: the
+    stored citations are the owner's, and they name a note, an attachment
+    generation or a passage fingerprint - identities of things this reader
+    cannot open and should not be able to test a guess against. What crosses
+    is the anchor, the kind, the title and a followable link.
     """
     runtime = get_runtime()
     await enforce(
@@ -5249,7 +5271,12 @@ async def get_public_conversation(
             "title": conversation.title or "Shared conversation",
             "updated_at": conversation.updated_at,
             "messages": [
-                {"role": m.role, "content": m.content, "created_at": m.created_at}
+                {
+                    "role": m.role,
+                    "content": m.content,
+                    "content_struct": shared_content_struct(m.content_struct),
+                    "created_at": m.created_at,
+                }
                 for m in ordered
             ],
         },
