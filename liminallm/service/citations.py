@@ -33,6 +33,7 @@ produced, and only when the answer coming back is that response unchanged.
 from __future__ import annotations
 
 import bisect
+import hashlib
 import json
 import re
 import secrets
@@ -612,10 +613,13 @@ def replaced_answer(
 PUBLIC_LOCATOR_KINDS = frozenset({"web"})
 
 
-def _evidence_descriptors(
-    snapshot: Optional[Mapping[str, Any]], wanted: Sequence[Any]
-) -> List[Dict[str, Any]]:
-    """The fingerprints of the passages a citation rested on.
+def _resolve_evidence(
+    snapshot: Optional[Mapping[str, Any]],
+    *,
+    source_id: str,
+    evidence_ids: Optional[Sequence[Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """The fingerprints of the passages a citation rested on, or nothing.
 
     The hash and the position, never the text. Copying the passage would put
     corpus prose in a message row, where deleting the document does not reach
@@ -625,22 +629,55 @@ def _evidence_descriptors(
     may be gone, or the path may hold different bytes now - the stored hash
     matches neither, so the citation reads as being about something that is
     no longer there rather than silently pointing at whatever replaced it.
+
+    All or nothing, and `None` says so. A citation with no fingerprint is not
+    a weaker citation, it is a citation that has stopped identifying anything
+    durable - for a plain file it would be a title and two empty strings - so
+    a caller that cannot resolve one drops the citation instead of storing it
+    unpinned. Zero evidence cannot happen upstream either: a handle is only
+    issued once a valid binding exists, so an empty list here is already two
+    representations of one turn disagreeing.
+
+    Four things every record must satisfy, and each of them is a way the two
+    sides could disagree:
+
+    * it exists, so no wanted fingerprint is silently missing;
+    * it belongs to the source being cited. `build_citation_table` refuses a
+      binding whose evidence names a different source, and the registry is a
+      consulted superset, so an id from a source the answer never cited is
+      one that legitimately exists - it just is not this citation's;
+    * it carries its passage, since a record with no text cannot be checked;
+    * its hash is the hash of that passage. The snapshot carries both and the
+      durable row will carry only one, so this is the last place the claim can
+      be checked at all. Deliberately redundant - the registry computes the
+      same digest - which is what a check at an authority boundary should be.
     """
+    wanted = [str(item) for item in evidence_ids or []]
     if not wanted:
-        return []
-    keep = {str(item) for item in wanted}
+        return None
     records = (snapshot or {}).get("evidence") or []
     if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
-        return []
-    found: List[Dict[str, Any]] = []
+        return None
+    by_id: Dict[str, Mapping[str, Any]] = {}
     for record in records:
-        if not isinstance(record, Mapping):
-            continue
-        if str(record.get("evidence_id") or "") not in keep:
-            continue
+        if isinstance(record, Mapping):
+            by_id[str(record.get("evidence_id") or "")] = record
+    found: List[Dict[str, Any]] = []
+    for evidence_id in wanted:
+        record = by_id.get(evidence_id)
+        if record is None:
+            return None
+        if str(record.get("source_id") or "") != source_id:
+            return None
+        text = record.get("text")
+        if not isinstance(text, str):
+            return None
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest != str(record.get("content_hash") or ""):
+            return None
         locator = record.get("locator")
         found.append({
-            "content_hash": str(record.get("content_hash") or ""),
+            "content_hash": digest,
             "locator": dict(locator) if isinstance(locator, Mapping) else {},
         })
     return found
@@ -674,9 +711,12 @@ def durable_citations(
     * it names a source the snapshot cannot resolve, so nothing durable
       could say what was cited;
     * its offset is not a position in `content`, so the coordinate was
-      measured against a different string;
-    * `content` is not the string the offsets were computed for at all,
-      which the bounds check is what detects.
+      measured against a different string - which is also how `content` not
+      being the string the offsets were computed for is detected at all;
+    * its evidence does not resolve, exactly and to this source. See
+      `_resolve_evidence`: the fingerprints are what identify the reading,
+      so a citation that loses them is not a weaker citation but one that
+      has stopped identifying anything.
 
     Dropping the citation and keeping the message is deliberate. An answer
     that cites nothing is an ordinary answer; an answer stored with a
@@ -720,6 +760,13 @@ def durable_citations(
             continue
         if offset < 0 or offset > len(content or ""):
             continue
+        evidence = _resolve_evidence(
+            snapshot,
+            source_id=str(entry.get("source_id") or ""),
+            evidence_ids=entry.get("evidence_ids"),
+        )
+        if evidence is None:
+            continue
         kind = str(source.get("kind") or "")
         segments.append({
             "type": "citation",
@@ -733,9 +780,7 @@ def durable_citations(
             "meta": {
                 "kind": kind,
                 "title": str(source.get("title") or ""),
-                "evidence": _evidence_descriptors(
-                    snapshot, entry.get("evidence_ids") or ()
-                ),
+                "evidence": evidence,
             },
         })
     return segments

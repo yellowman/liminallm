@@ -234,6 +234,9 @@ trail.
   by default: Python indexes code points and JavaScript indexes UTF-16 code
   units, so an anchor after an emoji is 1 in the stored record and 2 in a
   naive `String.prototype.slice`. A renderer converts; the record does not.
+  Storage enforces this: a segment whose coordinates are not positions in
+  the content is dropped, since a span is what several segment types are
+  for and one that indexes nothing is a record of nothing.
 - a citation segment is an anchor rather than a span: the model's marker is
   removed from `content` before it is stored, so what survives is the
   position it was written at and `start == end`. A citation on an assistant

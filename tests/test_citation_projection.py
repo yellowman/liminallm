@@ -14,6 +14,7 @@ consulted and the answer rests only on what it cited.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 
@@ -23,6 +24,20 @@ from liminallm.api import chat_turn
 from liminallm.service.auth import AuthContext
 from liminallm.service.citations import durable_citations
 from liminallm.service.runtime import get_runtime
+
+
+def _digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+#: The passages the fixture's evidence records describe, hashed the way the
+#: registry hashes them - the projection recomputes the digest, so a
+#: hand-written one would only ever prove that the check rejects fixtures.
+PASSAGES = {
+    "ev_1": "SOURCE SAYS 400 HOURS",
+    "ev_2": "the handbook says otherwise",
+}
+
 
 #: A turn's registry as `SourceRegistry.snapshot()` exports it.
 #:
@@ -63,16 +78,16 @@ SNAPSHOT = {
         {
             "evidence_id": "ev_1",
             "source_id": "src_1",
-            "text": "SOURCE SAYS 400 HOURS",
+            "text": PASSAGES["ev_1"],
             "locator": {"chunk_index": 3},
-            "content_hash": "a" * 64,
+            "content_hash": _digest(PASSAGES["ev_1"]),
         },
         {
             "evidence_id": "ev_2",
             "source_id": "src_2",
-            "text": "the handbook says otherwise",
+            "text": PASSAGES["ev_2"],
             "locator": {},
-            "content_hash": "b" * 64,
+            "content_hash": _digest(PASSAGES["ev_2"]),
         },
     ],
 }
@@ -159,7 +174,8 @@ class TestACitationOutlivesItsTurnAsAnAnchor:
         # What pins the reading: the fingerprint of the passage the answer
         # rested on, and no passage text.
         assert cited[0]["meta"]["evidence"] == [
-            {"content_hash": "a" * 64, "locator": {"chunk_index": 3}}
+            {"content_hash": _digest(PASSAGES["ev_1"]),
+             "locator": {"chunk_index": 3}}
         ]
         assert "SOURCE SAYS" not in json.dumps(message.content_struct)
         # The answer the anchors point into is in the struct too, and it is
@@ -449,13 +465,76 @@ class TestALocatorIsPublishedOnlyWhereItIsAReference:
         assert "8f14e45f" not in row
         assert "/users/" not in row
 
-    def test_an_evidence_id_the_snapshot_does_not_hold_resolves_to_nothing(self):
-        """The lookup is a lookup: a fingerprint that cannot be found is
-        absent, not invented from a neighbouring record."""
-        segments = durable_citations(
+    def test_evidence_belonging_to_another_source_drops_the_citation(self):
+        """The relation the authority gate already enforces, enforced again
+        where it becomes durable.
+
+        `build_citation_table` refuses a binding whose evidence names a
+        different source. The registry is a consulted superset, so `ev_2`
+        legitimately exists - it just belongs to the handbook, not the manual,
+        and storing its fingerprint under the manual's citation would say the
+        answer rested on a passage it never read.
+        """
+        assert durable_citations(
+            [{**CITED[0], "evidence_ids": ["ev_2"]}], SNAPSHOT, ANSWER
+        ) == []
+
+    def test_a_fingerprint_that_does_not_fingerprint_its_passage_drops_it(self):
+        """The snapshot carries the passage and the hash; the row will carry
+        only the hash. This is the last place the claim can be checked at all,
+        so it is - redundantly, since the registry computed that digest."""
+        broken = {
+            **SNAPSHOT,
+            "evidence": [
+                {**SNAPSHOT["evidence"][0], "content_hash": "c" * 64},
+                SNAPSHOT["evidence"][1],
+            ],
+        }
+        assert durable_citations(CITED, broken, ANSWER) == []
+
+    def test_a_record_that_does_not_carry_its_passage_drops_the_citation(self):
+        """The hash is checked against the passage, so a record with no
+        passage cannot be checked at all - and an unchecked fingerprint is
+        what this boundary exists to refuse, not to pass through."""
+        broken = {
+            **SNAPSHOT,
+            "evidence": [
+                {**SNAPSHOT["evidence"][0], "text": None},
+                SNAPSHOT["evidence"][1],
+            ],
+        }
+        assert durable_citations(CITED, broken, ANSWER) == []
+
+    def test_a_citation_naming_no_evidence_at_all_is_dropped(self):
+        """Upstream a handle is issued only once a binding exists, so an
+        empty list is already a disagreement rather than a citation that
+        happens to rest on nothing."""
+        assert durable_citations(
+            [{**CITED[0], "evidence_ids": []}], SNAPSHOT, ANSWER
+        ) == []
+        entry = {key: value for key, value in CITED[0].items()
+                 if key != "evidence_ids"}
+        assert durable_citations([entry], SNAPSHOT, ANSWER) == []
+
+    def test_resolving_some_of_the_evidence_is_not_resolving_it(self):
+        """No silent subset: a citation that rested on two passages and can
+        only account for one is not a citation about one of them."""
+        assert durable_citations(
+            [{**CITED[0], "evidence_ids": ["ev_1", "ev_missing"]}],
+            SNAPSHOT, ANSWER,
+        ) == []
+
+    def test_an_evidence_id_the_snapshot_does_not_hold_drops_the_citation(self):
+        """Not a citation with an empty fingerprint list.
+
+        Upstream, a handle exists only once a valid binding does, so a
+        validated citation naming evidence the snapshot cannot resolve is two
+        representations of one turn disagreeing. What would be stored is a
+        title and two empty strings, which identifies nothing.
+        """
+        assert durable_citations(
             [{**CITED[0], "evidence_ids": ["ev_missing"]}], SNAPSHOT, ANSWER
-        )
-        assert segments[0]["meta"]["evidence"] == []
+        ) == []
 
 
 class TestOnlyTheValidatedListMakesACitationSegment:
