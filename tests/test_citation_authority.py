@@ -2990,7 +2990,9 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
                 context_id="ctx", fs_path=path, content=text,
                 embedding=[], chunk_index=0,
             )
-            for path, text in (passages or [("/files/manual.md", cls.SHOWN)])
+            for path, text in (
+                [("/files/manual.md", cls.SHOWN)] if passages is None else passages
+            )
         ]
         monkeypatch.setattr(
             engine, "rag",
@@ -3025,12 +3027,18 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         def _fill(text):
             cited = [inv for inv in opened if inv.citations]
             table = cited[-1].citations if cited else None
+            # `{N}` is the namespace itself, which exists even for a turn that
+            # committed no handle - that is the case it is here to write.
+            live = cited or opened
+            nonce = live[-1].citations.nonce if live else ""
 
             def handle(source_id):
                 return (table.handle_for(source_id) or "") if table else ""
 
-            return text.replace("{H2}", handle("src_2")).replace(
-                "{H}", handle("src_1")
+            return (
+                text.replace("{N}", nonce)
+                .replace("{H2}", handle("src_2"))
+                .replace("{H}", handle("src_1"))
             )
 
         def _backend_stream(messages, adapters, *, user_id=None):
@@ -3326,3 +3334,296 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
 
         assert self._tokens(events) == "plain answer"
         assert built == [], "the filter was built with offers off"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("agent", [False, True])
+    async def test_a_turn_that_committed_no_handle_is_not_filtered_either(
+        self, store, monkeypatch, agent
+    ):
+        """The feature being on is not the same fact as this turn offering
+        something.
+
+        A conversation with nothing citable retrieves nothing, places no
+        marker and commits no handle, so the model is never shown this turn's
+        namespace. Filtering it anyway would edit prose on the strength of a
+        coincidence - the answer here contains the freshly minted nonce, which
+        the model cannot have been copying - and would make every ordinary
+        answer pay the scrub and the length ceiling once this is enabled.
+
+        Both call sites, because each decides this for itself.
+        """
+        engine = get_runtime().workflow
+        user_id, opened = self._streamed(
+            engine, monkeypatch, store, agent=agent,
+            passages=[],
+            chunks=["the token is ", "{N}", " as it happens"],
+        )
+        built: list = []
+        real = workflow_module_streaming.ScrubbedTokenStream
+
+        def _counting(*args, **kwargs):
+            built.append(args)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(
+            workflow_module_streaming, "ScrubbedTokenStream", _counting
+        )
+
+        events = await self._run(engine, user_id)
+
+        assert not any(inv.citations for inv in opened), (
+            "the fixture committed a handle, so nothing was being tested"
+        )
+        assert built == [], "a turn with no handle still built the filter"
+        # The namespace reaches the client untouched. Matched against the
+        # turn's own nonces rather than one invocation's, because a turn opens
+        # several and the answer names the one that streamed.
+        public = self._tokens(events)
+        prefix, suffix = "the token is ", " as it happens"
+        assert public.startswith(prefix) and public.endswith(suffix), public
+        assert public[len(prefix): -len(suffix)] in {
+            inv.citations.nonce for inv in opened
+        }, public
+
+
+class TestOneAnswerCarriesOneSetOfCitations:
+    """A turn's answer and its citation coordinates are one replacement unit.
+
+    Content is replacement state: the last node that produced an answer owns
+    the turn's answer. The two records beside it describe *that string* -
+    provenance says what may support it, and a citation's `public_offset` is
+    an index into it - so a node that replaces one and not the others leaves
+    the turn advertising a coordinate measured in text nobody was shown. It
+    does not even dangle visibly: the registry is the turn's consulted
+    superset, so the stale `src_1` still resolves in the final snapshot.
+
+    The streamed runner had this right for the node that streams and wrong for
+    every other way an answer can be replaced.
+    """
+
+    @classmethod
+    def _turn(cls, engine, monkeypatch, store, nodes, *, replacement="Beta."):
+        """A streamed node that earns a citation, then a node that replaces it.
+
+        The first retrieval grounds one passage and the second grounds a
+        different one, so the two nodes cite different sources and a survivor
+        can be told apart from a leftover. Every node after the first runs the
+        blocking `rag.answer_with_context_v1` body - a real MODEL_ANSWER_HOST
+        that is not in `STREAMABLE_HANDLER_NAMES`, which is what puts a
+        streamed turn on the blocking-bodied branch.
+
+        `{H}` in `replacement` becomes the handle that node's own offer
+        committed, so the replacing answer can carry a real citation of its
+        own or none at all.
+        """
+        monkeypatch.setattr(
+            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
+        )
+        opened: list = []
+        real_open = engine.invocations.open
+
+        def _open(*a, **k):
+            invocation = real_open(*a, **k)
+            opened.append(invocation)
+            return invocation
+
+        monkeypatch.setattr(engine.invocations, "open", _open)
+        retrievals = {"n": 0}
+
+        def _retrieve(*a, **k):
+            retrievals["n"] += 1
+            tag = "A" if retrievals["n"] == 1 else "B"
+            return [KnowledgeChunk(
+                context_id="ctx", fs_path=f"/files/{tag}.md",
+                content=f"PASSAGE-{tag}", embedding=[], chunk_index=0,
+            )]
+
+        monkeypatch.setattr(engine, "rag", SimpleNamespace(retrieve=_retrieve))
+        monkeypatch.setattr(engine, "_validate_context_scope", lambda ids, **k: ["ctx"])
+        monkeypatch.setattr(engine, "_resolve_context_ids", lambda a, b: ["ctx"])
+
+        def _own_handle():
+            """The one handle the node now running committed, if any."""
+            cited = [inv for inv in opened if inv.citations]
+            if not cited:
+                return ""
+            return next(iter(cited[-1].citations.by_handle), "")
+
+        def _backend_stream(messages, adapters, *, user_id=None):
+            marker = f"[cite:{_own_handle()}]"
+            for piece in ("Alpha ", marker):
+                yield {"event": "token", "data": piece}
+            yield {"event": "message_done", "data": {"content": f"Alpha {marker}"}}
+
+        monkeypatch.setattr(
+            engine.llm.backend, "generate_stream", _backend_stream, raising=False
+        )
+        monkeypatch.setattr(
+            engine.llm, "generate",
+            lambda *a, **k: {
+                "content": replacement.replace("{H}", _own_handle()), "usage": {},
+            },
+            raising=False,
+        )
+        user = store.create_user(email=f"rep_{uuid.uuid4().hex[:8]}@example.com")
+        artifact = store.create_artifact(
+            "workflow", f"rep-{uuid.uuid4().hex[:6]}",
+            {"kind": "workflow.chat", "entrypoint": nodes[0]["id"], "nodes": nodes},
+            owner_user_id=user.id, visibility="private",
+        )
+        return user, artifact, opened
+
+    @staticmethod
+    async def _run(engine, artifact, user):
+        return [
+            event async for event in engine.run_streaming(
+                artifact.id, None, "how long", "ctx",
+                user_id=user.id, tenant_id=None,
+            )
+        ]
+
+    @staticmethod
+    def _watch_grants(engine, monkeypatch):
+        """What each streamed node's authority seam granted.
+
+        Read at the seam rather than from the events: a streamed node's
+        canonical result is consumed by `StreamedNodeAttempt` and never
+        reaches the client stream, so a witness that a citation existed
+        before the replacement has nowhere else to look.
+        """
+        granted: list = []
+        real = type(engine)._streamed_citations
+
+        def _spy(*args, **kwargs):
+            out = real(*args, **kwargs)
+            granted.append(out)
+            return out
+
+        monkeypatch.setattr(
+            type(engine), "_streamed_citations", staticmethod(_spy)
+        )
+        return granted
+
+    #: A streamed node, then a blocking-bodied one that answers instead.
+    REPLACED = [
+        {"id": "a", "type": "tool_call", "tool": "llm.generic", "next": "b"},
+        {"id": "b", "type": "tool_call",
+         "tool": "rag.answer_with_context_v1", "next": "fin"},
+        {"id": "fin", "type": "end"},
+    ]
+
+    #: The same first node, then a parallel block whose child answers.
+    FANNED = [
+        {"id": "a", "type": "tool_call", "tool": "llm.generic", "next": "fan"},
+        {"id": "fan", "type": "parallel", "next": ["b"], "after": "fin"},
+        {"id": "b", "type": "tool_call", "tool": "rag.answer_with_context_v1"},
+        {"id": "fin", "type": "end"},
+    ]
+
+    @pytest.mark.asyncio
+    async def test_a_blocking_bodied_replacement_takes_the_citations_with_it(
+        self, store, monkeypatch
+    ):
+        """The reported failure, end to end.
+
+        The streamed node cites `PASSAGE-A` at offset 5 of `Alpha`; the node
+        after it answers `Beta.` and cites nothing. The turn used to report
+        `Beta.` with a citation into a string it no longer contains, and the
+        snapshot still resolved the name.
+        """
+        engine = get_runtime().workflow
+        user, artifact, _opened = self._turn(
+            engine, monkeypatch, store, self.REPLACED
+        )
+        granted = self._watch_grants(engine, monkeypatch)
+
+        events = await self._run(engine, artifact, user)
+
+        assert any(granted), (
+            "the streamed node earned no citation, so nothing could leak"
+        )
+        done = [e for e in events if e.get("event") == "message_done"][-1]["data"]
+        assert done["content"] == "Beta.", done["content"]
+        assert done.get("validated_citations") == [], done.get("validated_citations")
+        assert "provenance_snapshot" not in done
+
+    @pytest.mark.asyncio
+    async def test_the_replacing_node_brings_its_own_citation(
+        self, store, monkeypatch
+    ):
+        """Copy, not clear.
+
+        The blocking body earns a citation of its own, into its own answer, so
+        a fix that only cleared would lose a real one. Only the replacement's
+        survives, and it names the source that node read.
+        """
+        engine = get_runtime().workflow
+        user, artifact, opened = self._turn(
+            engine, monkeypatch, store, self.REPLACED,
+            replacement="Beta [cite:{H}]",
+        )
+
+        events = await self._run(engine, artifact, user)
+
+        done = [e for e in events if e.get("event") == "message_done"][-1]["data"]
+        assert done["content"] == "Beta", done["content"]
+        cited = done.get("validated_citations") or []
+        assert [item["source_id"] for item in cited] == ["src_2"], cited
+        # Into this answer, not the one before it.
+        assert cited[0]["public_offset"] == len("Beta")
+        assert done["provenance_snapshot"]["sources"].keys() >= {"src_2"}
+
+    @pytest.mark.asyncio
+    async def test_a_parallel_block_clears_what_it_cannot_merge(
+        self, store, monkeypatch
+    ):
+        """A block's answer is its children's answers concatenated, so a
+        child's offsets index a string that is not it. The block carries no
+        citations, and it must not carry the previous node's either."""
+        engine = get_runtime().workflow
+        user, artifact, _opened = self._turn(
+            engine, monkeypatch, store, self.FANNED,
+            replacement="Beta [cite:{H}]",
+        )
+        granted = self._watch_grants(engine, monkeypatch)
+
+        events = await self._run(engine, artifact, user)
+
+        assert any(granted), (
+            "the streamed node earned no citation, so nothing could leak"
+        )
+        done = [e for e in events if e.get("event") == "message_done"][-1]["data"]
+        assert "Beta" in done["content"] and "Alpha" not in done["content"]
+        assert done.get("validated_citations") == [], done.get("validated_citations")
+        assert "provenance_snapshot" not in done
+
+    @pytest.mark.asyncio
+    async def test_the_blocking_parallel_block_clears_them_too(
+        self, store, monkeypatch
+    ):
+        """The same graph on the transport that had the rule first.
+
+        The blocking runner cleared here from the start and nothing pinned it,
+        so the two runners could have drifted back apart in the other
+        direction. Its node before the block earns a citation through the
+        blocking seam rather than a stream, which is the only difference.
+        """
+        engine = get_runtime().workflow
+        user, artifact, _opened = self._turn(
+            engine, monkeypatch, store, self.FANNED,
+            replacement="Beta [cite:{H}]",
+        )
+
+        result = await engine.run(
+            artifact.id, None, "how long", "ctx",
+            user_id=user.id, tenant_id=None,
+        )
+
+        assert any(
+            entry.get("validated_citations")
+            for entry in result.get("workflow_trace") or []
+        ), "no node earned a citation, so nothing could leak"
+        assert "Beta" in result["content"], result["content"]
+        assert result.get("validated_citations") == [], (
+            result.get("validated_citations")
+        )

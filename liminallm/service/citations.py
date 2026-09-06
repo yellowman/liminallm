@@ -38,7 +38,7 @@ import re
 import secrets
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from liminallm.service.provenance import Binding, ProvenanceError, SourceRegistry
 
@@ -542,6 +542,44 @@ def citation_payload(
         }
         for item in occurrences
     ]
+
+
+class Answer(NamedTuple):
+    """A turn's answer, and the two records that describe *that string*."""
+
+    content: str
+    bindings: List[Binding]
+    citations: List[Dict[str, Any]]
+
+
+def replaced_answer(
+    content: Any,
+    bindings: Optional[Sequence[Binding]],
+    citations: Optional[Sequence[Dict[str, Any]]],
+) -> Optional[Answer]:
+    """One node's answer as a replacement, or nothing when it produced none.
+
+    A workflow's answer is replacement state: a later node that produces one
+    replaces the earlier answer rather than adding to it. These three move
+    together because the other two are measurements of the content and of
+    nothing else. Provenance says what may support this string; a citation's
+    `public_offset` is an index into it. Take the new content and keep the old
+    citations and the turn publishes an offset measured in a string nobody was
+    shown, naming a source the new answer may never have read - and the
+    turn-wide registry is a consulted superset, so that stale name still
+    resolves instead of dangling visibly.
+
+    Returned whole rather than assigned in place because partial replacement
+    is the failure this exists to stop. Both runners have shipped a site that
+    replaced two of the three; a caller here unpacks all three or takes none.
+
+    `None` when there is no answer to take. A node that produced no content
+    changes nothing, which is what keeps the server-authored fallback
+    sentence from inheriting the model's grounding and citations.
+    """
+    if not content:
+        return None
+    return Answer(content, list(bindings or []), list(citations or []))
 
 
 def _namespace_pattern(nonce: str) -> "re.Pattern[str]":

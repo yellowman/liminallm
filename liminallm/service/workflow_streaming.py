@@ -28,7 +28,11 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from liminallm.logging import log_routing_trace, log_workflow_trace
 from liminallm.service.broker import InvocationContext
 from liminallm.service.citation_stream import ScrubbedTokenStream
-from liminallm.service.citations import citation_payload, validate_citations
+from liminallm.service.citations import (
+    citation_payload,
+    replaced_answer,
+    validate_citations,
+)
 from liminallm.service.invocation import Invocation, LeaseRevoked
 from liminallm.service.node_attempt import (
     BreakerObservation,
@@ -296,12 +300,12 @@ class WorkflowStreamingMixin:
                             # the blocking driver does and what keeps the
                             # server-authored "No response generated." below
                             # from inheriting the model's grounding.
-                            if data.get("content"):
-                                content = data["content"]
-                                provenance_bindings = list(node_sink)
-                                validated_citations = list(
-                                    data.get("validated_citations") or []
-                                )
+                            answer = replaced_answer(
+                                data.get("content"), node_sink,
+                                data.get("validated_citations"),
+                            )
+                            if answer is not None:
+                                content, provenance_bindings, validated_citations = answer
                             node_usage = data.get("usage", {})
                             usage = self._merge_usage(usage, node_usage)
                             for snippet in data.get("context_snippets") or []:
@@ -380,14 +384,18 @@ class WorkflowStreamingMixin:
                             break
                         context_seen.add(snippet)
                         context_snippets.append(snippet)
-                    if result.get("content"):
-                        content = result["content"]
-                        # A blocking-bodied attempt carries its bindings in
-                        # its result rather than through the sink, and this
-                        # branch used to copy everything but them.
-                        provenance_bindings = list(
-                            result.get("provenance_bindings") or []
-                        )
+                    # A blocking-bodied attempt carries its bindings and its
+                    # citations in its result rather than through the sink,
+                    # and this branch used to copy neither - it then copied
+                    # the bindings only, which left a streamed node's
+                    # citations pointing into an answer this one replaced.
+                    answer = replaced_answer(
+                        result.get("content"),
+                        result.get("provenance_bindings"),
+                        result.get("validated_citations"),
+                    )
+                    if answer is not None:
+                        content, provenance_bindings, validated_citations = answer
                     usage = self._merge_usage(usage, result.get("usage") or {})
                     pending.extend(node_outcome.next_nodes)
                     continue
@@ -471,15 +479,19 @@ class WorkflowStreamingMixin:
 
                         # Merge parallel results
                         vars_scope.update(parallel_result.merged_outputs)
-                        if parallel_result.merged_content:
-                            content = parallel_result.merged_content
-                            # The block's answer is its successful children's
-                            # answers concatenated, so its grounding is
-                            # theirs - the same ownership rule the blocking
-                            # driver applies.
-                            provenance_bindings = list(
-                                parallel_result.merged_bindings
-                            )
+                        # The block's answer is its successful children's
+                        # answers concatenated, so its grounding is theirs -
+                        # the same ownership rule the blocking driver
+                        # applies. Citations are not merged and cannot be:
+                        # a child's offsets index that child's answer, not
+                        # the concatenation, so the block carries none.
+                        answer = replaced_answer(
+                            parallel_result.merged_content,
+                            parallel_result.merged_bindings,
+                            [],
+                        )
+                        if answer is not None:
+                            content, provenance_bindings, validated_citations = answer
                         usage = self._merge_usage(usage, parallel_result.merged_usage)
                         for snippet in parallel_result.merged_snippets:
                             if snippet not in context_seen and len(context_snippets) < MAX_CONTEXT_SNIPPETS:
@@ -513,8 +525,20 @@ class WorkflowStreamingMixin:
                             break
                         context_seen.add(snippet)
                         context_snippets.append(snippet)
-                if result.get("content"):
-                    content = result["content"]
+                # The same unit, on the branch that reaches it. Only switch
+                # and end nodes arrive here - the artifact schema admits four
+                # node types and the other two are handled above - and
+                # neither produces content, so this is a documented
+                # equivalent: written for the rule rather than for a case
+                # that occurs. A node type added later answers through this
+                # branch, and the failure it would cause is silent.
+                answer = replaced_answer(
+                    result.get("content"),
+                    result.get("provenance_bindings"),
+                    result.get("validated_citations"),
+                )
+                if answer is not None:
+                    content, provenance_bindings, validated_citations = answer
                 node_usage = result.get("usage")
                 usage = self._merge_usage(usage, node_usage or {})
 
@@ -890,6 +914,14 @@ class WorkflowStreamingMixin:
         # it afterwards from the public events would mean scrubbing again and
         # guessing at what was removed, which is the ambiguity the reader
         # exists to remove.
+        #
+        # Built only for a turn that committed a handle, which is not the same
+        # question as whether the feature is on. A turn with nothing citable
+        # offers the model no namespace, so there is nothing of it in the
+        # answer to remove - and removing anything would be editing prose on
+        # the strength of a coincidence, the same rule the two capability
+        # bodies follow. It also keeps the quadratic scan and the length
+        # ceiling off every ordinary conversation once this is enabled.
         streamed: Dict[str, ScrubbedTokenStream] = {}
 
         def produce():
@@ -901,7 +933,7 @@ class WorkflowStreamingMixin:
                 user_id=user_id,
                 **offer,
             )
-            if not self.CITATION_OFFERS_ENABLED:
+            if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
                 return raw
             filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
             streamed["stream"] = filtered
@@ -1270,13 +1302,14 @@ class WorkflowStreamingMixin:
             # *call* off the loop and then iterated the result on it, which is
             # where the tokens actually arrive.
             content_parts: List[str] = []
-            # Built and pulled on the producer thread, and kept afterwards, for
+            # Built and pulled on the producer thread, kept afterwards, and
+            # built only for a turn that committed a handle - all three for
             # the reasons the plain node states.
             streamed: Dict[str, ScrubbedTokenStream] = {}
 
             def produce():
                 raw = self.llm.stream_messages(messages, adapters, user_id=user_id)
-                if not self.CITATION_OFFERS_ENABLED:
+                if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
                     return raw
                 filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
                 streamed["stream"] = filtered

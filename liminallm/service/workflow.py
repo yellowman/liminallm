@@ -52,7 +52,11 @@ from liminallm.service.citation_offers import (
     label_snippets,
     rebuild_agent_messages,
 )
-from liminallm.service.citations import CitationTable, transfer_citations
+from liminallm.service.citations import (
+    CitationTable,
+    replaced_answer,
+    transfer_citations,
+)
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     cosine_similarity,
@@ -908,17 +912,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     vars_scope.update(parallel_result.merged_outputs)
 
                     # Update content if parallel nodes produced any
-                    if parallel_result.merged_content:
-                        content = parallel_result.merged_content
-                        # The block's answer is every successful child's
-                        # answer concatenated, so its grounding is theirs.
-                        provenance_bindings = list(parallel_result.merged_bindings)
-                        # Citations are not merged, and cannot be: their
-                        # offsets index one child's answer, which is not the
-                        # concatenation. Cleared rather than carried, because
-                        # carrying would leave the previous node's offsets
-                        # pointing into a string that is no longer the answer.
-                        validated_citations = []
+                    # The block's answer is every successful child's answer
+                    # concatenated, so its grounding is theirs. Citations are
+                    # not merged, and cannot be: their offsets index one
+                    # child's answer, which is not the concatenation.
+                    answer = replaced_answer(
+                        parallel_result.merged_content,
+                        parallel_result.merged_bindings,
+                        [],
+                    )
+                    if answer is not None:
+                        content, provenance_bindings, validated_citations = answer
 
                     # Merge usage
                     usage = self._merge_usage(usage, parallel_result.merged_usage)
@@ -963,13 +967,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # merely because that node also succeeded, and a union would let a
             # citation validator accept a reference to one. A node that
             # produces no content changes neither.
-            if result.get("content"):
-                content = result["content"]
-                provenance_bindings = list(result.get("provenance_bindings") or [])
-                # Same rule, same reason: these are citations *in this
-                # content*, and their `public_offset` indexes it. A node that
-                # replaces the answer replaces them, including with none.
-                validated_citations = list(result.get("validated_citations") or [])
+            answer = replaced_answer(
+                result.get("content"),
+                result.get("provenance_bindings"),
+                result.get("validated_citations"),
+            )
+            if answer is not None:
+                content, provenance_bindings, validated_citations = answer
             node_usage = result.get("usage")
             usage = self._merge_usage(usage, node_usage or {})
 
