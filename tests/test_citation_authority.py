@@ -1824,19 +1824,18 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
         assert table.handle_for("src_1") == f"{table.nonce}-1"
         assert "src_2" not in json.dumps(seen["messages"])
 
-    def test_the_engine_as_it_ships_offers_nothing(self, store, monkeypatch):
+    def test_the_engine_as_it_ships_offers(self, store, monkeypatch):
         """The shipped default, read off the engine rather than off a patch.
 
-        A table with entries in it is not the gate either: this invocation is
-        already carrying a handle from an earlier round, and the flag still
-        decides."""
+        Every other witness here sets the flag, which proves what the feature
+        does and not that it is on. This one takes the engine as a deployment
+        gets it; `test_with_the_gate_off_the_worker_s_messages_are_what_runs`
+        is the same seam with the rollback applied.
+        """
         engine = get_runtime().workflow
-        registry, invocation, context = self._grounded_context(
+        _registry, invocation, context = self._grounded_context(
             engine, monkeypatch, offers=None
         )
-        invocation.extend_citations(registry, list(context.provenance_bindings))
-        assert invocation.citations, "the precondition never held"
-        before = dict(invocation.citations.by_source)
         seen = self._capturing(engine, monkeypatch)
         broker = CapabilityBroker(engine, context)
 
@@ -1845,9 +1844,13 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
             "payload": {"messages": self.STEERED, "tools": [{"a": 1}]},
         })
 
-        assert seen["messages"] == self.STEERED
-        assert seen["tools"] == [{"a": 1}]
-        assert dict(invocation.citations.by_source) == before
+        system = seen["messages"][0]["content"]
+        handle = invocation.citations.handle_for("src_1")
+        assert handle, "the passage that was shown earned no handle"
+        assert f"{ANSWER} [cite:{handle}]" in system
+        assert CITATION_INSTRUCTION in system
+        assert "800 hours" not in json.dumps(seen["messages"])
+        assert seen["tools"] == list(context.initial_tools)
 
     def test_a_diverged_assembly_offers_nothing_either(self, store, monkeypatch):
         engine = get_runtime().workflow
@@ -1952,8 +1955,9 @@ class TestTheAutomaticRouteOffersItsOwnSnippets:
         assert seen["instruction"] is None
         assert not invocation.citations
 
-    def test_the_engine_as_it_ships_offers_nothing(self, store, monkeypatch):
-        """The shipped default, read off the engine rather than off a patch."""
+    def test_the_engine_as_it_ships_offers(self, store, monkeypatch):
+        """The shipped default, read off the engine rather than off a patch.
+        The rollback is the gate-off witness above."""
         engine = get_runtime().workflow
         self._retrieval(engine, monkeypatch, offers=None, contents=[ANSWER])
         seen = self._capturing(engine, monkeypatch)
@@ -1962,9 +1966,10 @@ class TestTheAutomaticRouteOffersItsOwnSnippets:
 
         self._run(engine, registry=registry, invocation=invocation)
 
-        assert seen["snippets"] == [ANSWER]
-        assert seen["instruction"] is None
-        assert not invocation.citations
+        handle = invocation.citations.handle_for("src_1")
+        assert handle, dict(invocation.citations.by_source)
+        assert seen["snippets"] == [f"{ANSWER} [cite:{handle}]"]
+        assert seen["instruction"] == CITATION_INSTRUCTION
 
     def test_a_retrieved_snippet_is_shown_with_its_marker(
         self, store, monkeypatch
@@ -2526,9 +2531,12 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
         assert not invocation.citations
 
     @pytest.mark.asyncio
-    async def test_the_engine_as_it_ships_streams_the_workers_conversation(
+    async def test_the_engine_as_it_ships_streams_the_parents_conversation(
         self, store, monkeypatch
     ):
+        """The shipped default, with a worker planting a conversation of its
+        own. The rollback is the gate-off witness above, where the planted
+        one is what streams."""
         engine = get_runtime().workflow
         user_id, seen, served = self._streaming(
             engine, monkeypatch, store, offers=None, planted=self.PLANTED
@@ -2536,9 +2544,10 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
 
         await self._run(engine, user_id)
 
-        assert seen["messages"] == self.PLANTED
+        assert seen["messages"] != self.PLANTED
+        assert "800 hours" not in json.dumps(seen["messages"])
         invocation, _context, _result = served[-1]
-        assert not invocation.citations
+        assert invocation.citations, "the streamed turn offered nothing"
 
     @pytest.mark.asyncio
     async def test_the_planted_conversation_is_not_what_the_model_answers_from(
@@ -2797,7 +2806,8 @@ class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:
         assert not any(inv.citations for inv in opened)
 
     @pytest.mark.asyncio
-    async def test_the_engine_as_it_ships_offers_nothing(self, store, monkeypatch):
+    async def test_the_engine_as_it_ships_offers(self, store, monkeypatch):
+        """The shipped default; the rollback is the gate-off witness above."""
         engine = get_runtime().workflow
         user_id, seen, opened = self._streaming(
             engine, monkeypatch, store, offers=None
@@ -2805,9 +2815,11 @@ class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:
 
         await self._run(engine, user_id)
 
-        assert seen["snippets"] == [ANSWER]
-        assert seen["instruction"] is None
-        assert not any(inv.citations for inv in opened)
+        cited = [inv for inv in opened if inv.citations]
+        assert cited, [inv.tool for inv in opened]
+        handle = cited[-1].citations.handle_for("src_1")
+        assert seen["snippets"] == [f"{ANSWER} [cite:{handle}]"]
+        assert seen["instruction"] == CITATION_INSTRUCTION
 
     @pytest.mark.asyncio
     async def test_a_streamed_snippet_is_shown_with_its_marker(

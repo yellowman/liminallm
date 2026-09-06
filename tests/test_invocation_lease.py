@@ -147,7 +147,7 @@ class TestNoRetryBeforeThePriorTreeIsDead:
                     if a.pid and a.pid not in pids_seen
                 )
 
-        def slow_host(tool, inputs, *, context):
+        def slow_host(tool, inputs, *, context, invocation=None):
             # The worker is alive and blocked on this reply when the node's
             # clock runs out. Longer than the node timeout, shorter than the
             # test's.
@@ -443,7 +443,7 @@ class TestEverythingBrokerOwnedIsKilledAndReaped:
         monkeypatch.setattr(
             engine,
             "_run_host_tool",
-            lambda tool, inputs, *, context: {
+            lambda tool, inputs, *, context, invocation=None: {
                 "status": "error",
                 "content": "no",
                 "error": "boom",
@@ -1453,7 +1453,7 @@ class TestTheWholePathStillWorks:
         monkeypatch.setattr(
             engine,
             "_run_host_tool",
-            lambda tool, inputs, *, context: time.sleep(5)
+            lambda tool, inputs, *, context, invocation=None: time.sleep(5)
             or {"status": "ok", "content": "late"},
         )
         try:

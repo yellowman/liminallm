@@ -3690,18 +3690,23 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
     #: Whether the model is shown citation markers at all.
     #:
+    #: On. A turn that grounds on something offers the model a handle for it,
+    #: takes the namespace back out of everything that crosses to the worker
+    #: or the client, and keeps what the model wrote as the only thing a
+    #: citation is read from.
+    #:
     #: Off, and the whole citation transformation is skipped rather than
     #: performed and undone: no speculative table, no instruction, no labels,
     #: no reconstruction standing in for the worker's messages, no handles
-    #: committed. What the production model is sent is byte-for-byte what it
-    #: was sent before any of this existed, which is a claim worth being able
-    #: to make plainly.
+    #: committed. What the model is sent is byte-for-byte what it was sent
+    #: before any of this existed, which is the rollback - a deploy-time one,
+    #: since this is a class attribute rather than a managed setting.
     #:
     #: A populated `CitationTable` is not this gate. Every turn mints a
     #: namespace whether or not anything is offered, so reading one as
     #: "offers are on" would turn the feature on for every turn that grounded
     #: anything.
-    CITATION_OFFERS_ENABLED = False
+    CITATION_OFFERS_ENABLED = True
 
     MAX_AGENT_ROUNDS = 3
     # Leave headroom under the node timeout for the final model turn.

@@ -1208,3 +1208,175 @@ class TestTheResponsesSurfaceCarriesWhatTheTurnCited:
 
         assert resp.status_code == 200, resp.text
         assert resp.json()["liminallm"]["citations"] == []
+
+
+class TestTheShippedDefaultCitesEndToEnd:
+    """The gate as a deployment gets it, with nothing patching it.
+
+    Every other end-to-end witness sets `CITATION_OFFERS_ENABLED` itself,
+    which was right while the feature was dormant and proves nothing about
+    the default now that it is on. These take the engine as it ships and
+    drive the surfaces a client actually uses.
+
+    Only the provider is doubled - the model is what has to write a marker,
+    and no real one is available here. Retrieval, the offer, the scrub, the
+    transfer, the projection and the persistence are the shipped code.
+    """
+
+    #: Long and repetitive enough to retrieve on, the way the provenance
+    #: fixtures do it.
+    CORPUS = "Turbine blade inspection interval detail. " * 60
+    QUESTION = "turbine blade inspection"
+
+    @staticmethod
+    def _context(client, auth_headers, text):
+        created = client.post(
+            "/v1/contexts", headers=auth_headers,
+            json={
+                "name": f"ship-{uuid.uuid4().hex[:6]}",
+                "description": "the shipped default",
+                "scope": "user",
+                "text": text,
+            },
+        )
+        assert created.status_code in (200, 201), created.text
+        return created.json()["data"]["id"]
+
+    @staticmethod
+    def _citing_provider(monkeypatch):
+        """A model that writes one marker, and the handles it was offered."""
+        engine = get_runtime().workflow
+        assert engine.CITATION_OFFERS_ENABLED is True, (
+            "this witness is about the shipped default"
+        )
+        opened: list = []
+        real_open = engine.invocations.open
+
+        def _open(*a, **k):
+            invocation = real_open(*a, **k)
+            opened.append(invocation)
+            return invocation
+
+        monkeypatch.setattr(engine.invocations, "open", _open)
+
+        def _handle():
+            cited = [inv for inv in opened if inv.citations]
+            return next(iter(cited[-1].citations.by_handle), "") if cited else ""
+
+        # The answer once, and afterwards whatever the caller asked about.
+        # The post-turn label pass calls `generate` too, and a double that
+        # answered every call with a marker would be inventing a leak: what
+        # it is handed is the scrubbed answer, and `answered` is how the
+        # witness below can read that back.
+        answered: list = []
+
+        def _generate(prompt="", *a, **k):
+            if not answered:
+                answered.append(prompt)
+                return {
+                    "content": f"Four hundred hours [cite:{_handle()}]",
+                    "usage": {},
+                }
+            answered.append(prompt)
+            return {"content": str(prompt), "usage": {}}
+
+        def _stream(*a, **k):
+            marker = f"[cite:{_handle()}]"
+            return iter([
+                {"event": "token", "data": "Four hundred hours "},
+                {"event": "token", "data": marker},
+                {"event": "message_done",
+                 "data": {"content": f"Four hundred hours {marker}"}},
+            ])
+
+        monkeypatch.setattr(engine.llm, "generate", _generate, raising=False)
+        monkeypatch.setattr(
+            engine.llm.backend, "generate_stream",
+            lambda messages, adapters, *, user_id=None: _stream(),
+            raising=False,
+        )
+        return opened, answered
+
+    def test_a_chat_turn_cites_and_the_owner_reads_it_back(
+        self, client, auth_headers, monkeypatch
+    ):
+        """Retrieval, offer, marker, scrub, projection, persistence - and the
+        owner's own API showing the citation on the stored message."""
+        opened, answered = self._citing_provider(monkeypatch)
+        context_id = self._context(client, auth_headers, self.CORPUS)
+
+        resp = client.post(
+            "/v1/chat", headers=auth_headers,
+            json={"context_id": context_id,
+                  "message": {"content": self.QUESTION}},
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        # What the client was shown carries no marker and no namespace.
+        assert data["content"] == "Four hundred hours", data["content"]
+        nonce = [inv for inv in opened if inv.citations][-1].citations.nonce
+        assert nonce not in resp.text and "[cite:" not in resp.text
+
+        listed = client.get(
+            f"/v1/conversations/{data['conversation_id']}/messages",
+            headers=auth_headers,
+        )
+        assert listed.status_code == 200, listed.text
+        cited = [
+            segment
+            for message in listed.json()["data"]["messages"]
+            for segment in (message.get("content_struct") or {}).get("segments") or []
+            if segment.get("type") == "citation"
+        ]
+        assert len(cited) == 1, listed.text
+        # The anchor indexes the answer as stored, and the source is named by
+        # what it is rather than where it lived.
+        assert cited[0]["start"] == len("Four hundred hours")
+        assert cited[0]["meta"]["title"]
+        assert cited[0]["meta"]["evidence"], "the reading was not pinned"
+        # Nothing anywhere in the owner's own listing, which includes the
+        # post-turn label written onto the user message. That pass is a second
+        # model call outside the invocation, so what it is handed decides
+        # whether a marker can be written down again - and it is handed the
+        # scrubbed answer.
+        assert nonce not in listed.text and "[cite:" not in listed.text
+        assert any("Four hundred hours" in prompt for prompt in answered[1:]), (
+            f"the label pass never saw the answer: {answered[1:]}"
+        )
+        assert not any(nonce in prompt for prompt in answered[1:])
+
+    def test_a_streamed_responses_turn_cites_on_the_default_too(
+        self, client, auth_headers, monkeypatch
+    ):
+        """The streamed path, which crosses the most of this stack: the offer,
+        the provider's raw stream, the producer-thread scrub, the public
+        tokens, the canonical authority behind them, and the projection that
+        rides on `response.completed`."""
+        opened, _answered = self._citing_provider(monkeypatch)
+        context_id = self._context(client, auth_headers, self.CORPUS)
+
+        with client.stream(
+            "POST", "/v1/responses", headers=auth_headers,
+            json={"input": self.QUESTION, "stream": True,
+                  "context_id": context_id},
+        ) as stream:
+            assert stream.status_code == 200, stream.read()
+            body = "".join(stream.iter_text())
+
+        events = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ") and line[6:].strip() not in ("", "[DONE]")
+        ]
+        completed = [
+            event for event in events
+            if event.get("type") == "response.completed"
+        ]
+        assert completed, body[:2000]
+        cited = completed[-1]["response"]["liminallm"]["citations"]
+        assert len(cited) == 1, completed[-1]["response"]["liminallm"]
+        assert cited[0]["meta"]["evidence"], "the reading was not pinned"
+        # Nothing of the namespace reached any event, delta or final.
+        nonce = [inv for inv in opened if inv.citations][-1].citations.nonce
+        assert nonce not in body and "[cite:" not in body
