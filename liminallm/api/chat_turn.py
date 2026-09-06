@@ -26,6 +26,7 @@ from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service import turn_effects
 from liminallm.service.auth import AuthContext
+from liminallm.service.citations import durable_citations
 
 logger = get_logger(__name__)
 
@@ -138,6 +139,35 @@ def _unguarded(_capability: str, _payload: Any):
     yield SimpleNamespace(replayable=False, result=None)
 
 
+def _with_citations(
+    struct: Any, content: str, citations: list[dict[str, Any]]
+) -> Any:
+    """The turn's structured content, with its citation anchors in it.
+
+    Appended rather than woven in: a citation segment carries its own
+    position, so where it sits in the list says nothing. The text segment is
+    added when there is none, because a struct of anchors with no text would
+    lose the answer the anchors point into - the same fallback
+    `normalize_content_struct` applies, applied here so the two cannot
+    disagree.
+
+    A turn that cited nothing returns exactly what it was given, `None`
+    included, so an ordinary answer is stored exactly as it was before any of
+    this existed. Anything that is not a struct is treated as none, which is
+    what `normalize_content_struct` does with it a line later; being stricter
+    here would turn a malformed field into a failed turn.
+    """
+    if not citations:
+        return struct
+    base = struct if isinstance(struct, dict) else {}
+    segments = list(base.get("segments") or [])
+    if not segments and content:
+        segments.append({"type": "text", "text": content})
+    merged = dict(base)
+    merged["segments"] = segments + citations
+    return merged
+
+
 async def finish(
     runtime,
     turn: Turn,
@@ -160,11 +190,42 @@ async def finish(
     instead would record that a turn was attempted - which is what the
     idempotency slot already records, and is not the same claim as "the message
     is in the table".
+
+    The turn's citations become durable here too, in the same append, because
+    an anchor stored without the answer it indexes is a coordinate into
+    nothing.
     """
     turn.orchestration = orchestration if isinstance(orchestration, dict) else {}
     assistant_content = turn.orchestration.get(
         "content", content or "No response generated."
     )
+    # The turn's citations, made durable against the exact string being
+    # stored. Both are transient above this line: `validated_citations` is
+    # measured in the answer, and `provenance_snapshot` is the turn's registry
+    # travelling beside it so a name can still be resolved once the turn ends.
+    # Neither goes into the row as it stands - what is written is the anchor
+    # and the source, with the nonce, the handle and the turn-local `src_#`
+    # left behind.
+    #
+    # Here rather than in the workflow because this is where the answer stops
+    # being a value and becomes a record: the string the offsets index is the
+    # one `append_message` is about to store, and it is checked against that
+    # string rather than the one the workflow had.
+    offered = turn.orchestration.get("validated_citations") or []
+    citations = durable_citations(
+        offered, turn.orchestration.get("provenance_snapshot"), assistant_content
+    )
+    if len(citations) != len(offered):
+        # Not a failure of the turn - the answer is stored either way - but it
+        # means a validated citation and the answer it was measured in
+        # disagreed, which is a defect somewhere upstream rather than a thing
+        # users do.
+        logger.warning(
+            "citation_projection_dropped",
+            conversation_id=turn.conversation_id,
+            offered=len(offered),
+            durable=len(citations),
+        )
     guard = commit or _unguarded
     with guard(
         "message.assistant",
@@ -176,7 +237,12 @@ async def finish(
             role="assistant",
             content=assistant_content,
             content_struct=normalize_content_struct(
-                turn.orchestration.get("content_struct"), assistant_content
+                _with_citations(
+                    turn.orchestration.get("content_struct"),
+                    assistant_content,
+                    citations,
+                ),
+                assistant_content,
             ),
             meta={
                 "adapters": turn.orchestration.get("adapters", []),

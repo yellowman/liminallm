@@ -582,6 +582,80 @@ def replaced_answer(
     return Answer(content, list(bindings or []), list(citations or []))
 
 
+def durable_citations(
+    citations: Optional[Sequence[Mapping[str, Any]]],
+    snapshot: Optional[Mapping[str, Any]],
+    content: str,
+) -> List[Dict[str, Any]]:
+    """The citations that may outlive the turn, as `content_struct` segments.
+
+    Everything upstream of here is turn-scoped. The nonce is minted per turn,
+    the handle is only how the model named a source, and `src_3` restarts at
+    `src_1` on the next one - so none of the three may be written down. What
+    survives is where the citation is in the answer the caller kept, and what
+    the source was.
+
+    Two inputs, and only one of them is authority. `citations` are the
+    occurrences already validated against the handles this turn committed:
+    that list, and nothing else, decides what is cited. `snapshot` is the
+    turn's registry, which is everything *consulted* - so it is read as a
+    lookup table and never as a source of eligibility. A source sitting in
+    the snapshot that no validated citation names does not become a citation,
+    which is the difference between "the turn read this" and "the answer
+    rests on this".
+
+    Three ways an entry is dropped rather than written, all of them meaning
+    the two sides disagree about a fact one of them measured:
+
+    * it names a source the snapshot cannot resolve, so nothing durable
+      could say what was cited;
+    * its offset is not a position in `content`, so the coordinate was
+      measured against a different string;
+    * `content` is not the string the offsets were computed for at all,
+      which the bounds check is what detects.
+
+    Dropping the citation and keeping the message is deliberate. An answer
+    that cites nothing is an ordinary answer; an answer stored with a
+    coordinate into text nobody has is a claim about a source, and the
+    conservative direction is not to make it.
+
+    A marker occupies no space in the public text - it was removed - so the
+    segment is a zero-width anchor: `start` and `end` are both the insertion
+    point. `source_id` is the durable name of the source, which is the
+    producer's own identity where it has one and the locator otherwise;
+    `title` and `kind` ride in `meta`, where the segment schema keeps what it
+    does not name. The passage itself is not copied here: the citation says
+    which source supported the span, and the evidence stays in the corpus,
+    where deleting a document still reaches it.
+    """
+    sources = (snapshot or {}).get("sources") or {}
+    if not isinstance(sources, Mapping):
+        return []
+    segments: List[Dict[str, Any]] = []
+    for entry in citations or []:
+        source = sources.get(entry.get("source_id"))
+        if not isinstance(source, Mapping):
+            continue
+        offset = entry.get("public_offset")
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            continue
+        if offset < 0 or offset > len(content or ""):
+            continue
+        locator = str(source.get("locator") or "")
+        segments.append({
+            "type": "citation",
+            "start": offset,
+            "end": offset,
+            "locator": locator,
+            "source_id": str(source.get("origin_id") or "") or locator,
+            "meta": {
+                "kind": str(source.get("kind") or ""),
+                "title": str(source.get("title") or ""),
+            },
+        })
+    return segments
+
+
 def _namespace_pattern(nonce: str) -> "re.Pattern[str]":
     """Every plain form one turn's namespace can be written in.
 
