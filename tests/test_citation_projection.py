@@ -22,7 +22,7 @@ import pytest
 
 from liminallm.api import chat_turn
 from liminallm.service.auth import AuthContext
-from liminallm.service.citations import durable_citations
+from liminallm.service.citations import durable_citations, public_source_id
 from liminallm.service.runtime import get_runtime
 
 
@@ -777,3 +777,123 @@ class TestACitationNamesTheReadingItRestedOn:
         assert "revised schedule" not in json.dumps({
             "content_struct": stored.content_struct, "meta": stored.meta,
         })
+
+
+class TestAnInternalIdentityIsNotAutomaticallyAPublicOne:
+    """`content_struct` is an API field, so a stored `source_id` is a public
+    one whether or not today's client renders it.
+
+    Being the right internal identity does not make an identity the right
+    public one. The registry deliberately identifies an MCP source by the
+    admin-owned artifact row of its server, because two admins can both
+    configure a server called `inventory`; that is a fact about the
+    deployment's configuration, seen from a user's chat.
+    """
+
+    @staticmethod
+    def _snapshot(kind, origin_id, *, passage="a passage"):
+        return {
+            "sources": {
+                "src_1": {
+                    "source_id": "src_1", "kind": kind, "title": "the source",
+                    "origin_id": origin_id, "locator": None, "metadata": {},
+                },
+            },
+            "evidence": [{
+                "evidence_id": "ev_1", "source_id": "src_1", "text": passage,
+                "locator": {"chunk_index": 0}, "content_hash": _digest(passage),
+            }],
+        }
+
+    def _stored(self, kind, origin_id):
+        segments = durable_citations(CITED, self._snapshot(kind, origin_id), ANSWER)
+        assert len(segments) == 1, segments
+        return segments[0]
+
+    def test_an_mcp_server_artifact_id_is_not_published(self):
+        artifact = "3f2a1e10-0b7c-4d5e-9a11-77c0de5b1234"
+        origin = f'mcp:["{artifact}","lookup_stock"]'
+
+        stored = self._stored("mcp", origin)
+
+        assert artifact not in json.dumps(stored)
+        assert stored["source_id"].startswith("opaque:")
+        # Still an identity: the same tool cited in another turn groups with
+        # this one.
+        assert stored["source_id"] == public_source_id("mcp", origin)
+        assert public_source_id("mcp", origin) != public_source_id(
+            "mcp", f'mcp:["{artifact}","other_tool"]'
+        )
+
+    def test_an_inline_chunk_row_id_is_not_published_even_hashed(self):
+        """A digest of an enumerable identity is not opaque: anyone who wants
+        to know whether a citation is row 42 can hash 42. Inline text names no
+        object a reader could open, so it publishes no identity at all."""
+        stored = self._stored("unknown", "knowledge_chunk:42")
+
+        assert stored["source_id"] == ""
+        assert "42" not in json.dumps(stored["source_id"])
+        assert public_source_id("unknown", "knowledge_chunk:42") == ""
+
+    def test_the_reader_s_own_objects_keep_their_names(self):
+        """A note and a conversation are the reader's, and the id is how a
+        client would navigate to one."""
+        assert self._stored("note", "note:7")["source_id"] == "note:7"
+        assert self._stored(
+            "conversation", "conversation:c-1"
+        )["source_id"] == "conversation:c-1"
+
+    def test_an_attachment_keeps_its_digest_identity(self):
+        generation = "gen:" + ("d" * 64) + ":.md"
+        assert self._stored("file", generation)["source_id"] == generation
+
+    def test_a_kind_nobody_classified_publishes_nothing(self):
+        """Fail-closed, like the locator: a kind added later carries no
+        identity until someone decides its identity is safe to publish."""
+        assert public_source_id("newly-invented", "internal:1") == ""
+
+    def test_the_title_is_what_a_reader_is_shown(self):
+        """Every kind has one, and it is the presentation label - the client
+        must not derive a name from an identity or a path."""
+        assert self._stored("mcp", 'mcp:["x","y"]')["meta"]["title"] == "the source"
+
+
+class TestAnEvidenceLocatorSaysWhereNotWhich:
+    """The locator answers "where in this source", and a citation needs that
+    answer. `chunk_id` and `block_id` answer "which row", which is a different
+    claim and gets the same treatment as `origin_id`."""
+
+    @staticmethod
+    def _snapshot(locator, *, passage="a passage"):
+        return {
+            "sources": {
+                "src_1": {
+                    "source_id": "src_1", "kind": "file", "title": "manual.md",
+                    "origin_id": None, "locator": None, "metadata": {},
+                },
+            },
+            "evidence": [{
+                "evidence_id": "ev_1", "source_id": "src_1", "text": passage,
+                "locator": locator, "content_hash": _digest(passage),
+            }],
+        }
+
+    def _locator(self, locator):
+        segments = durable_citations(CITED, self._snapshot(locator), ANSWER)
+        assert len(segments) == 1, segments
+        return segments[0]["meta"]["evidence"][0]["locator"]
+
+    def test_a_position_in_the_source_is_kept(self):
+        assert self._locator({"chunk_index": 3, "page": 2, "section": "Intro"}) == {
+            "chunk_index": 3, "page": 2, "section": "Intro",
+        }
+
+    def test_a_row_id_is_not(self):
+        kept = self._locator({
+            "chunk_index": 3, "chunk_id": "9182", "block_id": "msg-uuid",
+        })
+        assert kept == {"chunk_index": 3}
+
+    def test_an_empty_locator_stays_empty(self):
+        assert self._locator({}) == {}
+        assert self._locator({"chunk_index": None}) == {}

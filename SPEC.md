@@ -243,6 +243,13 @@ trail.
   message is produced only by validating the model's own markers against the
   handles that turn issued (§17); a citation segment arriving from anywhere
   else is dropped rather than stored.
+- a citation's `source_id`, `locator` and `meta` are public: `content_struct`
+  is an API field, so what is stored is what a client may read. A source's
+  internal identity is published only where it names something the reader
+  holds, as an opaque stable token where it names the deployment, and not at
+  all otherwise; a `locator` is published only for kinds whose locator is a
+  reference a reader can follow. `meta.title` is the presentation label - a
+  client must not derive a name from an identifier or a path.
 - summary messages are `sender='system', role='system',
   meta.summary=true`.
 

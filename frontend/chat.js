@@ -153,25 +153,40 @@ const showCitationModal = (element) => {
       return showCitationModal(element);
     }
 
-    // Set modal content
-    const sourcePath = data.source_path || data.chunk_id || 'Unknown Source';
-    title.textContent = sourcePath.split('/').pop() || sourcePath;
+    // The title is the source's name; nothing here derives one from an
+    // identifier or a path, and no identifier is shown as if it were a name.
+    title.textContent = data.title || 'Source';
 
     // Build content display
     let html = '';
-    if (data.source_path) {
-      html += `<div class="citation-meta"><strong>Source:</strong> ${escapeHtml(data.source_path)}</div>`;
+    // A link only where the citation carried one, which is where the source
+    // has an address a reader can follow. `safeLinkHref` refuses anything
+    // that is not http(s), so a stored locator cannot become `javascript:`.
+    const href = safeLinkHref(data.href || '');
+    if (href) {
+      html += `<div class="citation-meta"><strong>Source:</strong> ` +
+        `<a href="${escapeAttr(href)}" target="_blank" rel="noopener noreferrer">` +
+        `${escapeHtml(data.href)}</a></div>`;
     }
-    if (data.context_id) {
-      html += `<div class="citation-meta"><strong>Context:</strong> ${escapeHtml(data.context_id)}</div>`;
+    const where = (data.evidence || [])
+      .map((item) => item?.locator || {})
+      .map((loc) => [
+        loc.page !== undefined ? `page ${loc.page}` : '',
+        loc.section ? `section ${loc.section}` : '',
+        loc.chunk_index !== undefined ? `chunk #${loc.chunk_index}` : '',
+      ].filter(Boolean).join(', '))
+      .filter(Boolean);
+    if (where.length) {
+      html += `<div class="citation-meta"><strong>Where:</strong> ` +
+        `${escapeHtml(where.join(' · '))}</div>`;
     }
-    if (data.chunk_index !== undefined) {
-      html += `<div class="citation-meta"><strong>Chunk:</strong> #${data.chunk_index}</div>`;
-    }
-    if (data.content) {
-      html += `<div class="citation-content"><pre>${escapeHtml(data.content)}</pre></div>`;
+    // The passage is deliberately not stored - deleting a document has to
+    // reach what a citation shows - so what is offered is the run-up to the
+    // citation in the answer itself.
+    if (data.lead) {
+      html += `<div class="citation-content"><pre>\u2026${escapeHtml(data.lead)}</pre></div>`;
     } else {
-      html += `<div class="citation-content"><em>No content preview available</em></div>`;
+      html += `<div class="citation-content"><em>No preview available</em></div>`;
     }
 
     content.innerHTML = html;
@@ -1129,23 +1144,27 @@ const CITATION_ICONS = {
         'V4a.75.75 0 0 1 .75-.75Z"/><path d="M11.25 3.5V7h3.75"/>',
 };
 
-//: Two kinds, because two are all the payload supports. An earlier version
-//: read `.md`, `.markdown` and `.txt` as the notes vault, but those are
-//: ordinary upload types in this application, so an attached `manual.md` was
-//: presented to the reader as a note they had written. There is no
-//: `source_type` on a citation to ask, so the chip does not claim one: a
-//: scheme is a fact about the source, an extension is a guess about it.
-const citationKind = (path) => (/^https?:\/\//i.test(path) ? 'web' : 'file');
+//: Two icons, because two are all the set holds. The citation now carries the
+//: source's kind, so this reads it instead of guessing from a string: an
+//: earlier version read `.md`, `.markdown` and `.txt` as the notes vault, and
+//: those are ordinary upload types here, so an attached `manual.md` was
+//: presented to the reader as a note they had written.
+const citationKind = (kind) => (kind === 'web' ? 'web' : 'file');
 
 //: Long enough to recognise, short enough that eight fit on a line.
 const CITATION_LABEL_MAX = 32;
+//: How much of the answer before the anchor the hover shows, in code points.
+const CITATION_LEAD_MAX = 120;
 //: After this many the row stops being a list and starts being a wall.
 const CITATION_VISIBLE = 8;
 
-const citationLabel = (path) => {
-  const tail = /^https?:\/\//i.test(path)
-    ? path.replace(/^https?:\/\//i, '').replace(/\/$/, '')
-    : path.split('/').pop() || path;
+//: The title is the label. It is the source's own name - a filename, a page
+//: title, a note's heading - and the citation carries it precisely so a
+//: reader is never shown an identifier or a path instead.
+const citationLabel = (title) => {
+  const tail = /^https?:\/\//i.test(title)
+    ? title.replace(/^https?:\/\//i, '').replace(/\/$/, '')
+    : title;
   return tail.length > CITATION_LABEL_MAX
     ? `${tail.slice(0, CITATION_LABEL_MAX - 1)}\u2026`
     : tail;
@@ -1153,58 +1172,59 @@ const citationLabel = (path) => {
 
   // Render citations as clickable links per SPEC §17
   // Note: Uses event delegation via messagesEl click handler (see initEventListeners)
-  // Citations can be at content_struct.citations OR extracted from content_struct.segments
+  //
+  // One shape, the stored one (SPEC §2.2). A citation segment is an anchor
+  // into this message's own `content`, so the chip is built from the answer
+  // beside it: the title names the source, the locator is a link only where
+  // the kind says a locator is one, and the anchor says which words the
+  // citation follows. `start` counts code points, so the slice converts.
   let citationsHtml = '';
-  let citations = m.content_struct?.citations || [];
-  // Fallback: extract citations from segments if not at top level
-  if (!citations.length && m.content_struct?.segments) {
-    citations = m.content_struct.segments
-      .filter(seg => seg.type === 'citation')
-      .map(seg => ({
-        source_path: seg.source_id || seg.locator || '',
-        chunk_id: seg.chunk_id || '',
-        content: seg.text || '',
-        context_id: seg.context_id || '',
-        chunk_index: seg.chunk_index,
-        score: seg.score,
-      }));
-  }
+  const citations = (m.content_struct?.segments || [])
+    .filter(seg => seg.type === 'citation')
+    .map(seg => ({
+      title: seg.meta?.title || '',
+      kind: seg.meta?.kind || '',
+      href: seg.locator || '',
+      // The passage itself is not stored - deleting a document has to reach
+      // what a citation shows - so what a reader gets before opening one is
+      // the run-up to it in the answer they are already reading.
+      lead: lastCodePoints(
+        String(m.content || '').slice(0, utf16Index(m.content, seg.start)).trim(),
+        CITATION_LEAD_MAX,
+      ),
+      evidence: seg.meta?.evidence || [],
+    }));
   if (citations.length) {
     citationsHtml = `
       <div class="citations-row">
         ${citations.map((c, i) => {
-          // Bug fix: Don't escape path here - only escape at output to prevent double-escaping
-          const path = c.source_path || c.chunk_id || `Citation ${i + 1}`;
-          const label = path.split('/').pop() || path;
+          const label = c.title || `Citation ${i + 1}`;
           // JSON.stringify escapes internal quotes; only need & and " for double-quoted attr
           // `escapeAttr`, not a second hand-written encoder beside it.
           const snippetData = escapeAttr(JSON.stringify({
-            source_path: c.source_path || '',
-            chunk_id: c.chunk_id || '',
-            content: c.content || c.snippet || '',
-            context_id: c.context_id || '',
-            chunk_index: c.chunk_index,
+            title: c.title || '',
+            kind: c.kind || '',
+            href: c.href || '',
+            lead: c.lead || '',
+            evidence: c.evidence || [],
           }));
-          // The hover text is the source and a taste of it, which is what a
-          // reader wants before deciding to open the whole chunk.
-          const excerpt = (c.content || c.snippet || '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .slice(0, 160);
-          const hover = excerpt ? `${path}\n\n${excerpt}\u2026` : path;
+          // The hover text is the source and the words it follows, which is
+          // what a reader wants before deciding to open it.
+          const lead = c.lead.replace(/\s+/g, ' ').trim();
+          const hover = lead ? `${label}\n\n\u2026${lead}` : label;
           const extra = i >= CITATION_VISIBLE ? ' is-extra' : '';
           const hide = i >= CITATION_VISIBLE ? ' hidden' : '';
-          const kind = citationKind(path);
-          // `escapeAttr`: the excerpt is a source's own text, and a fetched
-          // page can carry a quote that closes this attribute and opens
-          // others on the element.
+          const kind = citationKind(c.kind);
+          // `escapeAttr`: the lead is the model's own answer, quoted back
+          // into an attribute, and a quote in it would close this one and
+          // open others on the element.
           return `<span class="citation-link${extra}"${hide} data-kind="${kind}" ` +
             `title="${escapeAttr(hover)}" data-citation="${snippetData}" ` +
             `tabindex="0" role="button">` +
             `<svg class="citation-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" ` +
             `stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ` +
             `stroke-linejoin="round">${CITATION_ICONS[kind]}</svg>` +
-            `<span class="citation-title">${escapeHtml(citationLabel(path))}</span></span>`;
+            `<span class="citation-title">${escapeHtml(citationLabel(label))}</span></span>`;
         }).join('')}
         ${citations.length > CITATION_VISIBLE
           ? `<button type="button" class="citation-more">and ${citations.length - CITATION_VISIBLE} more</button>`

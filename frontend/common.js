@@ -18,6 +18,41 @@ const escapeHtml = (str) => {
   return div.innerHTML;
 }
 
+// A stored offset counts Unicode code points; a JavaScript string index counts
+// UTF-16 code units. The two agree until the text contains anything outside the
+// Basic Multilingual Plane - an emoji, and a great many scripts - and then an
+// anchor stored as 1 is index 2 here. SPEC §2.2 makes the stored unit
+// normative, so the conversion belongs on this side.
+//
+// Returns the index in `text` of the given code-point offset, clamped to the
+// end. Walking the string is what makes it correct: no arithmetic on the
+// offset can know how many of the characters before it were pairs.
+const utf16Index = (text, codePoints) => {
+  const source = String(text ?? '');
+  const wanted = Number(codePoints);
+  // `Number.isFinite` is a measured equivalent today and is kept as the
+  // statement of the rule: every comparison against NaN is false, so
+  // `seen < wanted` below already refuses a missing or unparseable anchor on
+  // the first pass. What it says that the loop does not is that an anchor
+  // which is not a number is not a position - which the loop only happens to
+  // agree with.
+  if (!Number.isFinite(wanted) || wanted <= 0) return 0;
+  let index = 0;
+  let seen = 0;
+  while (index < source.length && seen < wanted) {
+    index += source.codePointAt(index) > 0xffff ? 2 : 1;
+    seen += 1;
+  }
+  return index;
+}
+
+// The last `limit` code points of `text`, so a tail never begins half way
+// through a surrogate pair the way `slice(-limit)` can.
+const lastCodePoints = (text, limit) => {
+  const points = Array.from(String(text ?? ''));
+  return points.length > limit ? points.slice(-limit).join('') : points.join('');
+}
+
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
   // Fallback using crypto.getRandomValues() - cryptographically secure, broader browser support

@@ -612,6 +612,64 @@ def replaced_answer(
 #: locator is safe to publish, which is the direction a leak should fail in.
 PUBLIC_LOCATOR_KINDS = frozenset({"web"})
 
+#: Source kinds whose `origin_id` may be published as it stands.
+#:
+#: `origin_id` is the producer's internal identity for an object, and being
+#: the right internal identity does not make it the right public one. These
+#: three name something the reader already has: their own note, their own
+#: conversation, or a file identified by the digest of its own bytes.
+PUBLIC_IDENTITY_KINDS = frozenset({"note", "conversation", "file", "web"})
+
+#: Source kinds whose `origin_id` is published as a stable opaque token.
+#:
+#: An MCP source is identified by the admin-owned artifact row of the server
+#: plus the remote tool name, which is exactly right internally - two admins
+#: may both configure a server called `inventory` - and is a deployment's
+#: configuration seen from a user's chat. Hashed, a citation still groups
+#: with every other citation of that tool and names nothing.
+#:
+#: Only high-entropy identities belong here. A digest of an enumerable id is
+#: not opaque: anyone who wants to know whether a citation is row 42 can hash
+#: 42 and compare. That is why the inline `unknown` kind, whose identity is a
+#: `knowledge_chunk:<row id>`, is in neither set and publishes nothing.
+OPAQUE_IDENTITY_KINDS = frozenset({"mcp"})
+
+#: Evidence locator fields that say *where in a source* a passage sits.
+#:
+#: The rest of `EvidenceLocator` says *which row*: `chunk_id` is a knowledge
+#: chunk's own id and `block_id` is a message's. A citation needs the first
+#: question answered and does not need the second, so the second is not
+#: exported - the same decision as `origin_id`, made field by field because
+#: the locator is one object carrying both kinds of answer.
+PUBLIC_LOCATOR_FIELDS = ("chunk_index", "page", "section", "start", "end")
+
+
+def public_source_id(kind: str, origin_id: str) -> str:
+    """The producer's identity for a source, in a form that may be published.
+
+    `content_struct` is an API field, so a durable citation's `source_id` is
+    a public one whether or not today's client renders it. Three outcomes,
+    and a kind nobody has classified gets the third:
+
+    * published as it stands, for an identity the reader already holds;
+    * published as a stable digest, for one that names the deployment rather
+      than the reader - the same source still gets the same token in every
+      turn, so a client can group by it;
+    * not published, which is also what an empty `origin_id` produces.
+
+    The digest covers the identity alone, which is safe because every
+    producer's identity is already self-prefixed - `note:`, `conversation:`,
+    `mcp:`, `gen:` - so two kinds cannot collide on one string.
+    """
+    if not origin_id:
+        return ""
+    if kind in PUBLIC_IDENTITY_KINDS:
+        return origin_id
+    if kind in OPAQUE_IDENTITY_KINDS:
+        digest = hashlib.sha256(origin_id.encode("utf-8")).hexdigest()
+        return f"opaque:{digest[:32]}"
+    return ""
+
 
 def _resolve_evidence(
     snapshot: Optional[Mapping[str, Any]],
@@ -678,7 +736,11 @@ def _resolve_evidence(
         locator = record.get("locator")
         found.append({
             "content_hash": digest,
-            "locator": dict(locator) if isinstance(locator, Mapping) else {},
+            "locator": {
+                field: locator[field]
+                for field in PUBLIC_LOCATOR_FIELDS
+                if isinstance(locator, Mapping) and locator.get(field) is not None
+            },
         })
     return found
 
@@ -728,10 +790,11 @@ def durable_citations(
     point.
 
     What the record says the source *is*, and what it deliberately does not
-    say. `source_id` is the producer's own identity for the object and
-    nothing else - `note:7`, a conversation id, an attachment's
-    `gen:<sha256>:<ext>` - and is empty when the producer has none. It is
-    never the locator. A path is where a file was during this turn, not what
+    say. `source_id` is the producer's own identity for the object, in the
+    form `public_source_id` allows to be published - `note:7`, a conversation
+    id, an attachment's `gen:<sha256>:<ext>`, an opaque token for a tool, or
+    nothing. It is never the locator. A path is where a file was during this
+    turn, not what
     it is: plain retrieval says so itself, since chunks under a path claim to
     be the contents of that path *now*. Replace the file tomorrow and a
     citation identified by the path would follow the name to bytes that never
@@ -776,7 +839,9 @@ def durable_citations(
                 str(source.get("locator") or "")
                 if kind in PUBLIC_LOCATOR_KINDS else ""
             ),
-            "source_id": str(source.get("origin_id") or ""),
+            "source_id": public_source_id(
+                kind, str(source.get("origin_id") or "")
+            ),
             "meta": {
                 "kind": kind,
                 "title": str(source.get("title") or ""),
