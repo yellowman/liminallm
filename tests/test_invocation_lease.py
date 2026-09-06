@@ -597,6 +597,169 @@ class TestTheOperationLedger:
         ledger.fail(1, "provider down")
         assert ledger.replay(1, "web.search", digest) is None
 
+    def test_a_committed_step_cannot_be_failed_afterwards(self):
+        """Failure is a transition out of `pending`, not an assignment.
+
+        A committed result that stops being committed is one the next attempt
+        runs again, and the position is reachable by anyone who can send a
+        request at it - including a request refused before it began anything.
+        """
+        ledger = OperationLedger()
+        digest = payload_hash({"query": "q"})
+        ledger.begin(1, "web.search", digest)
+        ledger.commit(1, "the answer")
+
+        ledger.fail(1, "a later request was refused")
+
+        assert ledger.get(1).state == COMMITTED
+        assert ledger.get(1).result == "the answer"
+        replayed = ledger.replay(1, "web.search", digest)
+        assert replayed is not None and replayed.result == "the answer"
+
+    def test_an_unknown_step_cannot_be_failed_into_a_repeat(self):
+        """The sharper half. `unknown` means the effect may have landed, so a
+        durable retry refuses; `failed` means it did not, so the retry runs.
+        Overwriting the first with the second is how a durable operation
+        happens twice."""
+        ledger = OperationLedger()
+        digest = payload_hash({"created": ["a.csv"]})
+        ledger.begin(1, "publish.artifacts", digest)
+        ledger.orphan_pending()
+
+        ledger.fail(1, "a later request was refused")
+
+        assert ledger.get(1).state == UNKNOWN
+        with pytest.raises(RetryDivergence):
+            ledger.replay(1, "publish.artifacts", digest, durable=True)
+
+
+class TestARefusedRequestRecordsNoOutcome:
+    """A request refused before it began an operation must leave the ledger
+    exactly as it found it.
+
+    Otherwise the refusal is itself an effect: the position it was denied
+    stops being committed, and the next attempt - an authorized one - finds
+    nothing to inherit and runs the operation a second time. The refusals
+    reach one `except` each and they all share this property, so it is stated
+    once, where the record lives, rather than remembered at each of them.
+    """
+
+    def _committed(self, tool="file.search_v1"):
+        invocation = Invocation(uuid.uuid4().hex, tool=tool)
+        invocation.begin_attempt()
+        payload = {"query": "q"}
+        invocation.ledger.begin(1, "rag.retrieve", payload_hash(payload))
+        invocation.ledger.commit(1, {"text": "the first attempt's reading"})
+        return invocation, payload
+
+    def test_a_revoked_lease_does_not_erase_what_already_committed(
+        self, runtime, caller
+    ):
+        """Reachable without a compromised worker at all: a cancel arriving
+        while a replacement worker walks back up to where it diverged."""
+        engine = runtime.workflow
+        invocation, payload = self._committed()
+        broker = CapabilityBroker(
+            engine, InvocationContext(user_id=caller.id),
+            worker_tool="file.search_v1",
+        )
+        invocation.revoke("cancelled")
+        try:
+            reply = broker._answer(invocation, {
+                "capability": "rag.retrieve", "operation_seq": 1,
+                "payload": payload,
+            })
+
+            assert reply["ok"] is False and reply["code"] == "revoked", reply
+            entry = invocation.ledger.get(1)
+            assert entry.state == COMMITTED, entry.state
+            assert entry.result == {"text": "the first attempt's reading"}
+        finally:
+            invocation.close()
+
+    def test_a_refusal_does_not_hide_an_in_flight_step_from_orphaning(
+        self, runtime, caller
+    ):
+        """The case the committed one does not cover.
+
+        `pending` is what teardown converts to `unknown`, and `unknown` is
+        what makes a durable retry refuse rather than repeat. A refusal that
+        marked the position failed would take it out of that reach: it is a
+        legal transition out of `pending`, so no record-level guard stops it,
+        teardown then skips the step, and the next attempt reads `failed` and
+        runs a durable operation that may already have landed.
+
+        So a request records a failure only for an operation it began itself.
+        """
+        engine = runtime.workflow
+        invocation = Invocation(uuid.uuid4().hex, tool="agent.files_v1")
+        invocation.begin_attempt()
+        payload = {"query": "q"}
+        # In flight from an earlier attempt: begun and never finished.
+        invocation.ledger.begin(1, "rag.retrieve", payload_hash(payload))
+        broker = CapabilityBroker(
+            engine, InvocationContext(user_id=caller.id),
+            worker_tool="agent.files_v1",
+        )
+        try:
+            denied = broker._answer(invocation, {
+                "capability": "rag.retrieve", "operation_seq": 1,
+                "payload": payload,
+            })
+            assert denied["code"] == "capability_not_allowed", denied
+
+            assert invocation.ledger.orphan_pending() == 1, (
+                "the in-flight step was no longer pending"
+            )
+            assert invocation.ledger.get(1).state == UNKNOWN
+        finally:
+            invocation.close()
+
+    def test_a_request_that_fails_before_it_begins_records_nothing(
+        self, runtime, caller, monkeypatch
+    ):
+        """The general form, on the handler that catches everything.
+
+        Several steps run before `begin` - hashing the payload, building the
+        handler map, reading the withdrawal set - and each of them lands in
+        the same `except` as a failure inside the handler. Only the second
+        kind has an operation to report on. Without that distinction a request
+        that died on its way in marks another attempt's in-flight step failed,
+        which is the same erasure by a duller instrument.
+
+        The revoked lease reaches this rule too and cannot witness it: `revoke`
+        orphans the pending steps itself, so nothing is left in flight for a
+        later refusal to find.
+        """
+        from liminallm.service import broker as broker_module
+
+        engine = runtime.workflow
+        invocation = Invocation(uuid.uuid4().hex, tool="file.search_v1")
+        invocation.begin_attempt()
+        payload = {"query": "q"}
+        invocation.ledger.begin(1, "rag.retrieve", payload_hash(payload))
+        monkeypatch.setattr(
+            broker_module, "payload_hash",
+            lambda *_a, **_k: (_ for _ in ()).throw(ValueError("unhashable")),
+        )
+        broker = CapabilityBroker(
+            engine, InvocationContext(user_id=caller.id),
+            worker_tool="file.search_v1",
+        )
+        try:
+            reply = broker._answer(invocation, {
+                "capability": "rag.retrieve", "operation_seq": 1,
+                "payload": payload,
+            })
+            assert reply["ok"] is False and reply["code"] == "failed", reply
+
+            assert invocation.ledger.orphan_pending() == 1, (
+                "the in-flight step was no longer pending"
+            )
+            assert invocation.ledger.get(1).state == UNKNOWN
+        finally:
+            invocation.close()
+
 
 class TestWithdrawalIsEnforcedAtTheCapability:
     """§21.1 says the refusal happens at the capability, and it has to.

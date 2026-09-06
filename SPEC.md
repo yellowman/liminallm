@@ -2527,6 +2527,14 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   step replays its stored result; a durable retry whose payload diverges
   is refused; a read runs again; a step `pending` when its attempt died
   is `unknown`, and a durable `unknown` is refused rather than repeated.
+- Failure is a transition out of `pending`, and only a request that began
+  an operation may record one for it. Both halves are load-bearing, and
+  neither implies the other: a `committed` or `unknown` record overwritten
+  by a later failure is one the next attempt runs again, and a `pending`
+  record failed by a request that did not begin it is hidden from the
+  orphaning that would have made it `unknown`. A request refused before it
+  begins anything - for its asker, its lease, or an error on the way in -
+  leaves the ledger as it found it. Its position is still spent.
 - A durable operation is identified by what it did, not what it was
   called: payload hashes cover file *bytes*, not names.
 - Two ids because they answer different questions: the lease is per

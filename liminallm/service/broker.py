@@ -463,6 +463,12 @@ class CapabilityBroker:
         capability = str(message.get("capability") or "")
         payload = message.get("payload") or {}
         operation_seq = int(message.get("operation_seq") or 0)
+        #: Whether this request put an operation in flight at that position.
+        #: Only then is a failure below this request's to record: the entry
+        #: may be an earlier attempt's, and `pending` is a state a refusal is
+        #: allowed to leave - it is what teardown turns into `unknown`, which
+        #: is what makes a durable retry refuse instead of repeating.
+        began = False
         try:
             # Liveness first, before anything is looked up or dispatched. The
             # ordering is the control: after the handler runs, "revoked" is a
@@ -561,6 +567,7 @@ class CapabilityBroker:
                 self._apply_parent_state(replayed.parent_state)
                 return {"ok": True, "result": replayed.result, "replayed": True}
             invocation.ledger.begin(operation_seq, capability, digest)
+            began = True
             self._notify(capability)
             started = time.monotonic()
             # SPEC §18.3/§21.1: tool egress is allowlisted. The guard is
@@ -597,10 +604,12 @@ class CapabilityBroker:
             )
             return {"ok": True, "result": result}
         except LeaseRevoked as exc:
-            invocation.ledger.fail(operation_seq, str(exc))
+            if began:
+                invocation.ledger.fail(operation_seq, str(exc))
             return {"ok": False, "code": "revoked", "error": str(exc)}
         except RetryDivergence as exc:
-            invocation.ledger.fail(operation_seq, str(exc))
+            if began:
+                invocation.ledger.fail(operation_seq, str(exc))
             logger.warning(
                 "capability_retry_divergence",
                 invocation_id=invocation.invocation_id,
@@ -609,7 +618,8 @@ class CapabilityBroker:
             )
             return {"ok": False, "code": "retry_divergence", "error": str(exc)}
         except RoundNotAsked as exc:
-            invocation.ledger.fail(operation_seq, "round_not_asked")
+            if began:
+                invocation.ledger.fail(operation_seq, "round_not_asked")
             logger.warning(
                 "round_not_asked",
                 invocation_id=invocation.invocation_id,
@@ -617,7 +627,10 @@ class CapabilityBroker:
             )
             return {"ok": False, "code": "round_not_asked", "error": str(exc)}
         except CapabilityNotAllowed:
-            invocation.ledger.fail(operation_seq, "capability_not_allowed")
+            # No ledger entry. This request never began an operation - it was
+            # refused for the asker, ahead of `begin` - so there is no outcome
+            # here to record. Its sequence is spent all the same, above, which
+            # is what the next honest request counts from.
             logger.warning(
                 "capability_not_allowed",
                 invocation_id=invocation.invocation_id,
@@ -631,10 +644,12 @@ class CapabilityBroker:
                 "error": capability,
             }
         except UnknownCapability:
-            invocation.ledger.fail(operation_seq, "unknown_capability")
+            if began:
+                invocation.ledger.fail(operation_seq, "unknown_capability")
             return {"ok": False, "code": "unknown_capability", "error": capability}
         except Exception as exc:  # noqa: BLE001 - the worker gets the error, not a crash
-            invocation.ledger.fail(operation_seq, str(exc))
+            if began:
+                invocation.ledger.fail(operation_seq, str(exc))
             logger.warning(
                 "capability_failed",
                 invocation_id=invocation.invocation_id,
@@ -1148,9 +1163,16 @@ class CapabilityBroker:
             )
         # Faithfully relayed, but of a tool this turn did not put in front of
         # the model. That is the other half of the authority and a different
-        # failure: the worker did as it was told, so it is answered rather
-        # than refused, and the model reads why and writes an answer without
-        # the tool.
+        # failure: the worker did as it was told, so the round is answered
+        # rather than refused.
+        #
+        # Answered means a tool result the loop can carry on from, not a
+        # promise that it will. A round with another model turn after it can
+        # recover - the refusal is in the messages the next turn reads. The
+        # loop's terminal round has no turn after it, so nothing executes and
+        # the loop ends on the content the model already produced. Both are
+        # the intended outcome: the tool was withheld on purpose, and running
+        # it because the model asked anyway is the behaviour this replaces.
         #
         # All of them or none. A round is one committed operation with one
         # ledger entry and one transcript entry, and "which half ran" is not a

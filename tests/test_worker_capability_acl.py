@@ -473,6 +473,56 @@ class TestAWorkerAsksOnlyForWhatItsBodyNeeds:
         assert reply.get("code") == "capability_not_allowed", reply
         assert "committed earlier" not in str(reply)
 
+    def test_a_denied_request_does_not_destroy_the_record_it_was_denied(
+        self, engine, monkeypatch
+    ):
+        """Reading the committed result is not the only way to reach it.
+
+        A refusal that marks the position failed lets a worker wreck what it
+        may not read: the entry it was denied stops being committed, and the
+        next attempt - an authorized one - finds nothing to inherit and runs
+        the operation again. For a read that is a second, later reading of a
+        corpus that may have moved; for a durable step it is the repeat the
+        ledger exists to prevent.
+
+        The refusal never began this operation. It is not its outcome to
+        record.
+        """
+        from liminallm.service.invocation import COMMITTED, payload_hash
+
+        context = _context(engine)
+        invocation = _invocation("agent.files_v1")
+        payload = {"query": "secrets"}
+        digest = payload_hash(payload)
+        committed = {"text": "committed earlier", "snippets": []}
+        invocation.ledger.begin(1, "rag.retrieve", digest)
+        invocation.ledger.commit(1, committed)
+
+        denied = _ask(
+            _broker(engine, context, worker_tool="agent.files_v1"),
+            invocation, "rag.retrieve", payload, 1,
+        )
+        assert denied.get("code") == "capability_not_allowed", denied
+
+        entry = invocation.ledger.get(1)
+        assert entry.state == COMMITTED, entry.state
+        assert entry.result == committed, entry.result
+
+        # And the worker whose body does ask for it still inherits the work.
+        ran: list = []
+        monkeypatch.setattr(
+            CapabilityBroker, "_rag_retrieve",
+            lambda self, *a, **k: ran.append(a) or {"text": "ran again"},
+        )
+        replayed = _ask(
+            _broker(engine, _context(engine), worker_tool="file.search_v1"),
+            invocation, "rag.retrieve", payload, 1,
+        )
+
+        assert replayed.get("replayed") is True, replayed
+        assert replayed["result"] == committed, replayed
+        assert ran == [], "the committed operation ran a second time"
+
 
 class TestTheOfferedNamesSurviveARestore:
     """A replay restores the parent's record rather than running the operation
