@@ -592,13 +592,14 @@ _TEMPERATURE_POLICIES: List[Tuple[str, TemperaturePolicy]] = [
     ("gpt-5.4", TemperaturePolicy.CONDITIONAL),
     ("gpt-5.4-mini", TemperaturePolicy.OMIT),
     ("gpt-5.4-nano", TemperaturePolicy.OMIT),
-    # GPT-6 documents temperature, top_p and top_logprobs as unsupported
-    # and asks callers to drop them rather than rely on the API ignoring
-    # them. Written at the generation, not at `gpt-6-astra`: the allowance
-    # the 5.x line had was per version, this removal is not, and omitting
-    # a parameter a sibling would have taken costs nothing while sending
-    # one it rejects fails the request.
-    ("gpt-6", TemperaturePolicy.OMIT),
+    # GPT-6 Astra documents temperature, top_p and top_logprobs as
+    # unsupported and asks callers to drop them rather than rely on the API
+    # ignoring them. At the model, not the generation: the documentation
+    # establishes this for Astra and not for every future id beginning
+    # `gpt-6`, and this table's default is TUNABLE precisely because an
+    # unrecognized name is usually a conventional model on someone's own
+    # server. Dated Astra snapshots still match by prefix.
+    ("gpt-6-astra", TemperaturePolicy.OMIT),
     ("o1", TemperaturePolicy.OMIT),
     ("o3", TemperaturePolicy.OMIT),
     ("o4", TemperaturePolicy.OMIT),
@@ -900,6 +901,23 @@ RERANK_SMALL_VARIANTS: frozenset[str] = frozenset(
 # decides. Without it the size floor found no size and the small-variant
 # guard found no "mini", so auto turned reranking on for a 1.5B.
 _NAME_PARTS = re.compile(r"[-_./:]+")
+
+
+#: Models that serve tool calling only on /responses. Plain completions are
+#: supported on them, so this restricts one kind of request rather than the
+#: model: a round carrying tools has no chat/completions form to fall back to,
+#: and sending one anyway produces a request the provider rejects.
+#:
+#: An allowlist of documented restrictions, like the rerank set beside it. An
+#: unrecognized model reads as "no such restriction" and keeps the fallback,
+#: because that is the behaviour every other model has.
+RESPONSES_ONLY_TOOL_PREFIXES: Tuple[str, ...] = ("gpt-6-astra",)
+
+
+def requires_responses_for_tools(model_id: str) -> bool:
+    """Whether a tool round on this model may only go to /responses."""
+    tail = (model_id or "").strip().lower().rsplit("/", 1)[-1]
+    return any(tail.startswith(prefix) for prefix in RESPONSES_ONLY_TOOL_PREFIXES)
 
 
 def model_can_rerank(model_id: str) -> bool:
@@ -1444,6 +1462,22 @@ class ApiAdapterBackend:
                     "assistant_message": responses_compat.assistant_message(content, calls),
                     "usage": responses_compat.usage_dict(response),
                 }
+
+        # Falling back is right about the endpoint and wrong about this
+        # request. The choice of endpoint is per client - a provider without
+        # /responses is chat-only for everything - but on these models a round
+        # carrying tools has no chat form at all, so the fallback would send a
+        # request the provider refuses and report it as the model's answer.
+        # Refused here instead, where the reason can still be stated.
+        #
+        # Only when tools are on the request: ordinary completions are
+        # supported, and the loop's final round is one.
+        if tools and requires_responses_for_tools(processed["model"]):
+            raise RuntimeError(
+                f"{processed['model']} serves tool calling only on the "
+                "responses endpoint, which this provider did not answer; "
+                "chat/completions cannot carry this round"
+            )
 
         extra_body = self._with_reasoning_effort(processed["extra_body"])
         # The loop's final round offers no tools; OpenAI rejects an empty

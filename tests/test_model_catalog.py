@@ -269,6 +269,23 @@ class TestTemperaturePolicy:
         server, and nothing is sent unless someone asked for it anyway."""
         assert temperature_policy("acme-llm-9") is TemperaturePolicy.TUNABLE
 
+    def test_a_documented_removal_does_not_spread_to_its_whole_generation(self):
+        """The removal is written where the evidence is.
+
+        OpenAI documents the unsupported sampling parameters for GPT-6 Astra,
+        not for every id that starts `gpt-6`, and this table's default exists
+        because an unrecognized name is usually somebody's own server. A row
+        at the generation would drop an operator's configured temperature for
+        a model whose contract nobody checked - so Astra and its dated
+        snapshots are covered, and a sibling keeps the default until it is
+        looked up.
+        """
+        assert temperature_policy("gpt-6-astra") is TemperaturePolicy.OMIT
+        assert (
+            temperature_policy("gpt-6-astra-2026-09-03") is TemperaturePolicy.OMIT
+        )
+        assert temperature_policy("gpt-6-custom") is TemperaturePolicy.TUNABLE
+
     def test_the_backend_sends_no_temperature_by_default(self):
         from liminallm.service.model_backend import ApiAdapterBackend
 
