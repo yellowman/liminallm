@@ -23,10 +23,16 @@ import time
 import uuid
 from contextlib import aclosing
 from functools import partial
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from liminallm.logging import log_routing_trace, log_workflow_trace
 from liminallm.service.broker import InvocationContext
+from liminallm.service.citation_stream import ScrubbedTokenStream
+from liminallm.service.citations import (
+    citation_payload,
+    replaced_answer,
+    validate_citations,
+)
 from liminallm.service.invocation import Invocation, LeaseRevoked
 from liminallm.service.node_attempt import (
     BreakerObservation,
@@ -150,6 +156,12 @@ class WorkflowStreamingMixin:
         # What may support the answer: the registry is the turn's consulted
         # superset, these are the bindings of nodes that actually completed.
         provenance_bindings: List[Binding] = []
+        # Citations in *this content*, whose `public_offset` indexes it. Held
+        # beside the answer and replaced with it, the way the blocking driver
+        # holds them: a node that replaces the answer replaces these too,
+        # including with none, or the previous node's offsets end up pointing
+        # into a string that is no longer what anyone was shown.
+        validated_citations: List[Dict[str, Any]] = []
         workflow_trace: List[Dict[str, Any]] = []
         context_snippets: List[str] = []
         context_seen = set()
@@ -288,9 +300,12 @@ class WorkflowStreamingMixin:
                             # the blocking driver does and what keeps the
                             # server-authored "No response generated." below
                             # from inheriting the model's grounding.
-                            if data.get("content"):
-                                content = data["content"]
-                                provenance_bindings = list(node_sink)
+                            answer = replaced_answer(
+                                data.get("content"), node_sink,
+                                data.get("validated_citations"),
+                            )
+                            if answer is not None:
+                                content, provenance_bindings, validated_citations = answer
                             node_usage = data.get("usage", {})
                             usage = self._merge_usage(usage, node_usage)
                             for snippet in data.get("context_snippets") or []:
@@ -369,14 +384,18 @@ class WorkflowStreamingMixin:
                             break
                         context_seen.add(snippet)
                         context_snippets.append(snippet)
-                    if result.get("content"):
-                        content = result["content"]
-                        # A blocking-bodied attempt carries its bindings in
-                        # its result rather than through the sink, and this
-                        # branch used to copy everything but them.
-                        provenance_bindings = list(
-                            result.get("provenance_bindings") or []
-                        )
+                    # A blocking-bodied attempt carries its bindings and its
+                    # citations in its result rather than through the sink,
+                    # and this branch used to copy neither - it then copied
+                    # the bindings only, which left a streamed node's
+                    # citations pointing into an answer this one replaced.
+                    answer = replaced_answer(
+                        result.get("content"),
+                        result.get("provenance_bindings"),
+                        result.get("validated_citations"),
+                    )
+                    if answer is not None:
+                        content, provenance_bindings, validated_citations = answer
                     usage = self._merge_usage(usage, result.get("usage") or {})
                     pending.extend(node_outcome.next_nodes)
                     continue
@@ -460,15 +479,19 @@ class WorkflowStreamingMixin:
 
                         # Merge parallel results
                         vars_scope.update(parallel_result.merged_outputs)
-                        if parallel_result.merged_content:
-                            content = parallel_result.merged_content
-                            # The block's answer is its successful children's
-                            # answers concatenated, so its grounding is
-                            # theirs - the same ownership rule the blocking
-                            # driver applies.
-                            provenance_bindings = list(
-                                parallel_result.merged_bindings
-                            )
+                        # The block's answer is its successful children's
+                        # answers concatenated, so its grounding is theirs -
+                        # the same ownership rule the blocking driver
+                        # applies. Citations are not merged and cannot be:
+                        # a child's offsets index that child's answer, not
+                        # the concatenation, so the block carries none.
+                        answer = replaced_answer(
+                            parallel_result.merged_content,
+                            parallel_result.merged_bindings,
+                            [],
+                        )
+                        if answer is not None:
+                            content, provenance_bindings, validated_citations = answer
                         usage = self._merge_usage(usage, parallel_result.merged_usage)
                         for snippet in parallel_result.merged_snippets:
                             if snippet not in context_seen and len(context_snippets) < MAX_CONTEXT_SNIPPETS:
@@ -502,8 +525,20 @@ class WorkflowStreamingMixin:
                             break
                         context_seen.add(snippet)
                         context_snippets.append(snippet)
-                if result.get("content"):
-                    content = result["content"]
+                # The same unit, on the branch that reaches it. Only switch
+                # and end nodes arrive here - the artifact schema admits four
+                # node types and the other two are handled above - and
+                # neither produces content, so this is a documented
+                # equivalent: written for the rule rather than for a case
+                # that occurs. A node type added later answers through this
+                # branch, and the failure it would cause is silent.
+                answer = replaced_answer(
+                    result.get("content"),
+                    result.get("provenance_bindings"),
+                    result.get("validated_citations"),
+                )
+                if answer is not None:
+                    content, provenance_bindings, validated_citations = answer
                 node_usage = result.get("usage")
                 usage = self._merge_usage(usage, node_usage or {})
 
@@ -546,20 +581,26 @@ class WorkflowStreamingMixin:
             log_routing_trace(routing_trace, logger=self.logger)
 
         # Emit final message_done with complete response
-        yield {
-            "event": "message_done",
-            "data": {
-                "content": content,
-                "usage": usage,
-                "adapters": adapters,
-                "adapter_gates": adapter_gates,
-                "context_snippets": context_snippets,
-                "provenance_bindings": provenance_bindings,
-                "workflow_trace": workflow_trace,
-                "routing_trace": routing_trace,
-                "vars": vars_scope,
-            },
+        completed: Dict[str, Any] = {
+            "content": content,
+            "usage": usage,
+            "adapters": adapters,
+            "adapter_gates": adapter_gates,
+            "context_snippets": context_snippets,
+            "provenance_bindings": provenance_bindings,
+            "validated_citations": validated_citations,
+            "workflow_trace": workflow_trace,
+            "routing_trace": routing_trace,
+            "vars": vars_scope,
         }
+        if validated_citations:
+            # The same lookup table the blocking result carries, for the same
+            # reason: a citation says `src_3`, which means nothing once this
+            # registry goes out of scope with the turn. Keeping the two
+            # transports' completed objects the same shape is deliberate - a
+            # consumer should not have to ask which one it is reading.
+            completed["provenance_snapshot"] = source_registry.snapshot()
+        yield {"event": "message_done", "data": completed}
 
         await self.cache_conversation_state(conversation_id, history, user_id)
 
@@ -841,10 +882,19 @@ class WorkflowStreamingMixin:
         # After the budget, as on the blocking path: a chunk the pruner
         # dropped never reached the model. Held until the stream completes -
         # a node that fails mid-answer grounded nothing.
-        self._record_grounding(
+        aligned = self._record_grounding(
             source_registry, ctx_chunks, context_snippets,
             leading=leading, sink=bindings_sink,
         )
+        # The same offer the blocking `llm.generic` makes, on the same terms.
+        # This node is that one with a different transport, and a rule that
+        # held only for the blocking half would make whether an answer can
+        # cite depend on whether the client asked for tokens.
+        shown, instruction = self._offered_context(
+            invocation, source_registry, context_snippets, aligned,
+            prompt=message or "", adapters=adapters, history=history,
+        )
+        offer = {"instruction": instruction} if instruction else {}
 
         # `generate_stream` is a synchronous iterator, and iterating it here
         # ran the model on the event loop: every other request the worker was
@@ -854,16 +904,44 @@ class WorkflowStreamingMixin:
         # execution, so one revoke reaches it - see `StreamPump`. The breaker
         # `started` mark lives inside the pump gate: the provider call is the
         # tool's work beginning, and everything above is planning.
-        async for event in self._pumped(
-            invocation,
-            partial(
-                self.llm.generate_stream,
+        # The provider is built and pulled on the pump's producer thread, and
+        # the filter is built there with it. Constructing either here would
+        # put the backend call - and the scrub's quadratic scan - back on the
+        # event loop, which is the arrangement `StreamPump` exists to avoid.
+        #
+        # The wrapper is kept rather than rebuilt. What a citation is read out
+        # of is the canonical text this exact stream accumulated; recovering
+        # it afterwards from the public events would mean scrubbing again and
+        # guessing at what was removed, which is the ambiguity the reader
+        # exists to remove.
+        #
+        # Built only for a turn that committed a handle, which is not the same
+        # question as whether the feature is on. A turn with nothing citable
+        # offers the model no namespace, so there is nothing of it in the
+        # answer to remove - and removing anything would be editing prose on
+        # the strength of a coincidence, the same rule the two capability
+        # bodies follow. It also keeps the quadratic scan and the length
+        # ceiling off every ordinary conversation once this is enabled.
+        streamed: Dict[str, ScrubbedTokenStream] = {}
+
+        def produce():
+            raw = self.llm.generate_stream(
                 message or "",
                 adapters=adapters,
-                context_snippets=context_snippets,
+                context_snippets=shown,
                 history=history,
                 user_id=user_id,
-            ),
+                **offer,
+            )
+            if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
+                return raw
+            filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
+            streamed["stream"] = filtered
+            return filtered
+
+        async for event in self._pumped(
+            invocation,
+            produce,
             label=str(node.get("id") or "llm"),
             cancel_event=cancel_event,
             observation=observation,
@@ -882,16 +960,58 @@ class WorkflowStreamingMixin:
                 # the keys blocking `llm.generic` returns. The handler names
                 # its result's fields; `StreamedNodeAttempt` consumes this
                 # and refuses to reconstruct one from the client event.
-                yield {
-                    "event": "tool_result",
-                    "data": {
-                        "content": data.get("content", ""),
-                        "usage": data.get("usage") or {},
-                        "context_snippets": list(data.get("context_snippets") or []),
-                    },
+                result = {
+                    "content": data.get("content", ""),
+                    "usage": data.get("usage") or {},
+                    "context_snippets": list(data.get("context_snippets") or []),
                 }
+                # Public text in the result, canonical text nowhere near it.
+                # This object becomes ordinary workflow state.
+                citations = self._streamed_citations(
+                    streamed.get("stream"), invocation
+                )
+                if citations:
+                    result["validated_citations"] = citations
+                    data["validated_citations"] = citations
+                yield {"event": "tool_result", "data": dict(result)}
                 event = {"event": "message_done", "data": data}
             yield event
+
+    @staticmethod
+    def _streamed_citations(
+        stream: Optional[ScrubbedTokenStream],
+        invocation: Invocation,
+        *,
+        citations_intact: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """What a finished stream earned, read out of the stream itself.
+
+        Three things are true at the end of a streamed answer and only one of
+        them is authority. The provider's own reported content was a
+        consistency witness and has already done its job. What the client saw
+        is `released`. What a citation is read out of is `canonical` - the raw
+        text this exact producer accumulated - and never
+        `canonical_model_response`, which on the agent path holds the
+        pre-stream draft the worker discarded.
+
+        Nothing here is conditional on the *scrub*, which happened
+        unconditionally on the way out. This is the other half: whether the
+        answer may carry citations. It may not when there was no stream, when
+        the stream did not finish - cancelled, cut off, or contradicted by its
+        own provider - when the assembly diverged from the protocol, or when
+        the parent gave up materializing the table it had committed.
+
+        The origin map is the one that completion produced. Scrubbing again to
+        recover it would be a second answer to "where did this marker go".
+        """
+        if stream is None or not stream.reader.intact():
+            return []
+        if not citations_intact or not invocation.citation_budget_intact:
+            return []
+        return citation_payload(
+            validate_citations(stream.reader.canonical, invocation.citations),
+            stream.origins,
+        )
 
     async def _pumped(
         self,
@@ -1006,11 +1126,13 @@ class WorkflowStreamingMixin:
         # this line. It stays because a synchronous network call in an
         # `async def` is a stall waiting for a caller to change, not because a
         # measurement demands it.
+        context_ranges: List[Tuple[int, int]] = []
         messages, tools, _, mcp_tools, grounded = await asyncio.to_thread(
             partial(
                 self._build_agent_context,
                 explicit_context_ids=explicit_ids,
                 grounding=grounding,
+                context_ranges=context_ranges,
             ),
             message, attachments, history, user_id, conversation_id,
         )
@@ -1018,15 +1140,30 @@ class WorkflowStreamingMixin:
         # held locally until this assembly is known to be the answer path.
         # Committed to the sink below, and never sent in the plan: the worker
         # must not be able to name what supported the answer.
-        agent_bindings = self._record_grounding(
+        aligned = self._record_grounding(
             source_registry, ctx_chunks, grounded, leading=0
         )
-        # What the worker's own searches record, kept beside the assembly's
-        # rather than in the caller's sink. If this path abandons the
-        # assembly for the plain fallback, streams a partial answer, or fails,
-        # the list dies with it - the evidence stays in the turn's registry as
+        # Flat: the sink holds relations, and the aligned vector's positions
+        # belong to a snippet list this does not carry.
+        agent_bindings = [found for found in aligned if found]
+        # The positions are kept too, married to their relations here for the
+        # same reason as on the blocking path.
+        initial_grounded = self._initial_grounding(messages, aligned, context_ranges)
+        # What this assembly may cite: what the planner retrieved, and then
+        # whatever the worker's own searches add to it. Kept here rather than
+        # in the caller's sink, so that if this path abandons the assembly for
+        # the plain fallback, streams a partial answer, or fails, the list
+        # dies with it - the evidence stays in the turn's registry as
         # consulted, and neither half becomes authority.
-        capability_bindings: List[Binding] = []
+        #
+        # Seeded with the assembly's own grounding the way the blocking path
+        # seeds it. The final turn is streamed from the prompt the planner
+        # built, so the passage that prompt was built around is the first
+        # thing it can cite; an offer layer reading only the worker's searches
+        # would label everything except the context the turn actually started
+        # from. Merging into the turn's result below is unchanged - it dedupes
+        # by relation, and these were already merged there.
+        capability_bindings: List[Binding] = list(agent_bindings)
         if not tools or not self.llm.supports_tools:
             # The plain body answers, so it fills the sink from the prompt it
             # builds. `agent_bindings` above are discarded with the assembly
@@ -1071,6 +1208,32 @@ class WorkflowStreamingMixin:
             # final turn offers no tools, so there is no model-chosen control
             # flow left in it to contain, and this side streams it.
             traces: List[dict] = []
+            stream_context = InvocationContext(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                conversation_id=conversation_id,
+                context_id=context_id,
+                adapters=list(adapters or []),
+                history=list(history or []),
+                user_message=user_message,
+                # The turn's registry by reference, so the streamed path
+                # records into the same one as the rest of it. No bindings
+                # sent: the worker is never told what supported the answer.
+                # This is the collector the broker writes into when it serves
+                # a search.
+                source_registry=source_registry,
+                provenance_bindings=capability_bindings,
+                # On the context, never in the plan below: the plan is what
+                # the worker reads, and an entry there carries the server's
+                # URL and its taint class.
+                mcp_tools=mcp_tools,
+            )
+            # The parent's own copy of the prompt it is about to hand over,
+            # kept before the plan crosses. The streamed path finishes the
+            # turn itself, so it needs this at least as much as the batch one.
+            stream_context.remember_base_prompt(
+                messages, tools, grounded_messages=initial_grounded
+            )
             result = await asyncio.wait_for(
                 asyncio.to_thread(
                     self._serve_invocation,
@@ -1090,26 +1253,7 @@ class WorkflowStreamingMixin:
                         # it used, not only what a tool fetched.
                         "context_snippets": list(grounded),
                     },
-                    InvocationContext(
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        conversation_id=conversation_id,
-                        context_id=context_id,
-                        adapters=list(adapters or []),
-                        history=list(history or []),
-                        user_message=user_message,
-                        # The turn's registry by reference, so the streamed
-                        # path records into the same one as the rest of it.
-                        # No bindings sent: the worker is never told what
-                        # supported the answer. This is the collector the
-                        # broker writes into when it serves a search.
-                        source_registry=source_registry,
-                        provenance_bindings=capability_bindings,
-                        # On the context, never in the plan above: the plan is
-                        # what the worker reads, and an entry there carries the
-                        # server's URL and its taint class.
-                        mcp_tools=mcp_tools,
-                    ),
+                    stream_context,
                     self._worker_limits(self.tool_registry.get("agent.files_v1")),
                     on_capability=traces.append,
                     expected_attempt=(
@@ -1124,7 +1268,27 @@ class WorkflowStreamingMixin:
             if cancel_event and cancel_event.is_set():
                 yield {"event": "cancel_ack", "data": {}}
                 return
-            messages = result.get("messages") or messages
+            # Whose conversation the final turn runs on.
+            #
+            # The worker built one while it drove the tool rounds, and with
+            # offers off that is what streams - the same bytes this path has
+            # always sent. Once offers are on it is not model input at all:
+            # the parent rebuilds the conversation from the base prompt it
+            # kept and the record it wrote, labels what it may, and streams
+            # that. The rule is the blocking seam's, not a second copy of it.
+            #
+            # This turn is the one that matters most for it. The worker
+            # chooses everything up to here and then hands back the history
+            # the answer will be written from, so a `[cite:...]` the worker
+            # put in that history is one the model would copy into an answer
+            # the parent then treats as its own.
+            offered = self.agent_prompt(
+                invocation, stream_context, replace_terminal_answer=True
+            )
+            messages = (
+                offered if offered is not None
+                else (result.get("messages") or messages)
+            )
             usage = self._merge_usage(usage, result.get("usage") or {})
             snippets.extend(result.get("context_snippets") or [])
             tool_trace.extend(result.get("tool_calls") or [])
@@ -1138,11 +1302,22 @@ class WorkflowStreamingMixin:
             # *call* off the loop and then iterated the result on it, which is
             # where the tokens actually arrive.
             content_parts: List[str] = []
+            # Built and pulled on the producer thread, kept afterwards, and
+            # built only for a turn that committed a handle - all three for
+            # the reasons the plain node states.
+            streamed: Dict[str, ScrubbedTokenStream] = {}
+
+            def produce():
+                raw = self.llm.stream_messages(messages, adapters, user_id=user_id)
+                if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
+                    return raw
+                filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
+                streamed["stream"] = filtered
+                return filtered
+
             async for event in self._pumped(
                 invocation,
-                partial(
-                    self.llm.stream_messages, messages, adapters, user_id=user_id
-                ),
+                produce,
                 label="agent.files_v1",
                 cancel_event=cancel_event,
                 observation=observation,
@@ -1252,5 +1427,15 @@ class WorkflowStreamingMixin:
             "artifacts": session.get("artifacts", []),
             "injection_findings": session.get("injection_findings", []),
         }
+        # Read out of the stream the parent just served, never out of
+        # `canonical_model_response`. That field holds the worker's discarded
+        # pre-stream draft - correctly, it happened - and the answer this turn
+        # is delivering is the one that came out of the producer above.
+        citations = self._streamed_citations(
+            streamed.get("stream"), invocation,
+            citations_intact=stream_context.citations_intact,
+        )
+        if citations:
+            completed["validated_citations"] = citations
         yield {"event": "tool_result", "data": dict(completed)}
         yield {"event": "message_done", "data": completed}

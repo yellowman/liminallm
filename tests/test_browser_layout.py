@@ -1449,36 +1449,87 @@ class TestTheNoticesUnderAnAnswer:
             message,
         )
 
-    def _message(self, citations):
+    #: The answer the anchors below are measured in. One word per citation, so
+    #: an offset is a real position in it.
+    ANSWER = " ".join(f"w{i}" for i in range(20))
+
+    def _message(self, sources):
+        """A stored assistant message, with its citations produced by the
+        projection that really writes them.
+
+        `sources` are `(kind, title, locator)`. Everything below - the
+        segment type, where the anchor sits, which fields reach `meta` - is
+        `durable_citations`' answer rather than this file's memory of it.
+        That distinction is not academic: these witnesses described the
+        shape from memory, the projection moved underneath them, and they
+        went on asserting things about a row the renderer never receives.
+        """
+        import hashlib
+
+        from liminallm.service.citations import durable_citations
+
+        snapshot = {"sources": {}, "evidence": []}
+        cited = []
+        for index, (kind, title, locator) in enumerate(sources, start=1):
+            source_id = f"src_{index}"
+            evidence_id = f"ev_{index}"
+            passage = f"the passage behind {title}"
+            snapshot["sources"][source_id] = {
+                "source_id": source_id,
+                "kind": kind,
+                "title": title,
+                "origin_id": None,
+                "locator": locator,
+                "metadata": {},
+            }
+            snapshot["evidence"].append({
+                "evidence_id": evidence_id,
+                "source_id": source_id,
+                "text": passage,
+                "locator": {},
+                "content_hash": hashlib.sha256(
+                    passage.encode("utf-8")
+                ).hexdigest(),
+            })
+            cited.append({
+                "source_id": source_id,
+                "canonical_start": 0,
+                "canonical_end": 1,
+                "public_offset": min(index, len(self.ANSWER)),
+                "evidence_ids": [evidence_id],
+            })
+        segments = durable_citations(cited, snapshot, self.ANSWER)
+        assert len(segments) == len(sources), (
+            f"the projection dropped a citation: {segments}"
+        )
         return {
             "id": "m1",
             "role": "assistant",
-            "content": "an answer",
-            "content_struct": {"citations": citations},
+            "content": self.ANSWER,
+            "content_struct": {"segments": segments},
         }
 
     def test_a_source_cannot_write_attributes_into_the_page(
         self, browser, server
     ):
+        """The title is the source's own name, and a fetched page chooses it."""
         context, page = _signed_in_page(browser, server, DESKTOP)
         try:
             out = self._render(
                 page,
-                self._message([
-                    {"source_path": "notes/a.txt", "content": self.HOSTILE}
-                ]),
+                self._message([("web", self.HOSTILE, "https://example.test/p")]),
             )
             assert out["found"], "no citation chip was rendered"
             assert out["probe"] is None, (
-                "a citation's own text created an attribute on the chip: the "
-                "excerpt reaches `title` through `escapeHtml`, which by this "
-                "file's own comment leaves quotes alone"
+                "a source's own title created an attribute on the chip: the "
+                "title reaches the `title` attribute through `escapeHtml`, "
+                "which by this file's own comment leaves quotes alone"
             )
             assert self.HOSTILE in (out["title"] or ""), (
                 f"the quotes were not kept as text: {out['title']!r}"
             )
             decoded = page.evaluate(
-                "(s) => JSON.parse(s).content", out["citation"]
+                "(s) => JSON.parse(s).title", out["citation"]
             )
             assert decoded == self.HOSTILE, (
                 f"the citation payload no longer round-trips: {decoded!r}"
@@ -1489,28 +1540,31 @@ class TestTheNoticesUnderAnAnswer:
     def test_an_uploaded_file_is_not_dressed_up_as_a_note(
         self, browser, server
     ):
-        """`.md` and `.txt` are ordinary upload types here, so an extension
-        cannot say a source came from the notes vault, and nothing else in
-        the payload says so either."""
+        """The chip's kind is the kind the record carries.
+
+        `.md` and `.txt` are ordinary upload types here, so an extension must
+        not say a source came from the notes vault - and the renderer no
+        longer has the chance to decide, because the parent writes the kind
+        and this reads it. The filename is deliberately the one that used to
+        be misread.
+        """
         context, page = _signed_in_page(browser, server, DESKTOP)
         try:
-            out = self._render(
-                page,
-                self._message([
-                    {"source_path": "uploads/manual.md", "content": "x"}
-                ]),
-            )
+            out = self._render(page, self._message([("file", "manual.md", None)]))
             assert out["kind"] == "file", (
                 f"an uploaded manual.md rendered as {out['kind']!r}"
             )
             web = self._render(
-                page,
-                self._message([
-                    {"source_path": "https://example.com/p", "content": "x"}
-                ]),
+                page, self._message([("web", "A page", "https://example.test/p")])
             )
             assert web["kind"] == "web", (
                 f"an http source rendered as {web['kind']!r}"
+            )
+            # A kind nobody defined an icon for still renders as something,
+            # rather than reaching the attribute as the record's own string.
+            odd = self._render(page, self._message([("mcp", "A tool", None)]))
+            assert odd["kind"] == "file", (
+                f"an unknown kind reached the page as {odd['kind']!r}"
             )
         finally:
             context.close()
@@ -1523,8 +1577,7 @@ class TestTheNoticesUnderAnAnswer:
             out = self._render(
                 page,
                 self._message([
-                    {"source_path": f"f{i}.pdf", "content": "x"}
-                    for i in range(20)
+                    ("file", f"f{i}.pdf", None) for i in range(20)
                 ]),
             )
             assert out["chips"] == 20, "every citation should still be present"

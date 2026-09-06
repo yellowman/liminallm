@@ -134,7 +134,8 @@ def _tool_note_search(runtime, principal: AuthContext, arguments: Dict[str, Any]
         query,
         limit=_bounded_limit(arguments, 6),
     )
-    return notes_service.format_note_results(results)
+    text, _spans = notes_service.format_note_results(results)
+    return text
 
 
 def _tool_knowledge_search(

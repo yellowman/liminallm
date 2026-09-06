@@ -2031,7 +2031,15 @@ class TestTheCanonicalOutputCoversEveryStreamableHandler:
             lambda *a, **k: (
                 [{"role": "user", "content": "q"}],
                 [{"type": "function", "function": {"name": "file_search"}}],
-                None, [], ["s1"],
+                # The surviving grounding is a prefix of the retrieved chunks,
+                # and this turn selects no context, so it retrieves none. It
+                # used to say `["s1"]`, which describes a snippet no chunk
+                # produced - a state the real builder cannot reach, and one
+                # that reads as an unattributable passage to anything pairing
+                # the two. The transport parity under test does not depend on
+                # it: the schema is checked against the served result, which
+                # carries its own `context_snippets`.
+                None, [], [],
             ),
         )
         engine.llm.stream_messages = lambda *a, **k: iter([

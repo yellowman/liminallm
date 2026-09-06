@@ -45,7 +45,7 @@ import json
 import threading
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
-from typing import Any, Dict, Literal, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Literal, Mapping, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 #: Where a piece of evidence came from. Deliberately short: a kind exists
@@ -102,6 +102,221 @@ def binding(
         "source_id": _require_text(source_id, what="source_id"),
         "evidence_id": _require_text(evidence_id, what="evidence_id"),
     }
+
+
+@dataclass(frozen=True)
+class GroundedSpan:
+    """Which run of model-visible text came from which piece of evidence.
+
+    A binding says the answer may rest on some evidence. This says *where* in
+    what the model was shown that evidence appears, which is what a later
+    stage needs to attach a citation handle to the right passage rather than
+    to the whole tool result.
+
+    `start` and `end` index the finished string a producer returns - after
+    neutralization and after the untrusted-data envelope, because that is the
+    string that reaches the model. Built while the text is being assembled,
+    never recovered afterwards by matching evidence text back against it: two
+    results can share a snippet, one can be truncated, and a search that
+    dropped a result without a URL breaks the positional correspondence
+    between what was rendered and what was recorded.
+    """
+
+    start: int
+    end: int
+    source_id: str
+    evidence_id: str
+
+
+@dataclass(frozen=True)
+class GroundedMessage:
+    """Where evidence sits inside one message of the prompt the parent built.
+
+    A sibling of `GroundedPassage`, not a variant of it. A passage is one
+    producer's output and is identified by the call that made it; this is a
+    position in an assembled conversation, identified by which message it is.
+    Folding them together would give each the other's ambiguity - a passage
+    needs no message index, and a message has no call to name.
+
+    Why the selected context needs one at all: it is folded into the system
+    block as the prompt is written, so by the time anything wants to label it
+    the snippets are inside a larger string with no record of where. Finding
+    them again by searching is the failure this whole layer avoids - two
+    identical snippets, one snippet inside another, a snippet containing the
+    separator, or the digest quoting the same text all make a search land in
+    the wrong place. So the offsets are measured while the string is being
+    assembled and kept.
+
+    `text` is carried beside the index for the same reason `GroundedPassage`
+    carries it: offsets mean nothing without the exact string they were
+    measured in. It is also the gate. A reader that finds the message no
+    longer equal to this text must not adjust the offsets or search for a new
+    position - it under-offers instead.
+    """
+
+    message_index: int
+    text: str
+    spans: Tuple[GroundedSpan, ...] = ()
+
+
+@dataclass(frozen=True)
+class GroundedPassage:
+    """One producer's finished text, and where its evidence sits inside it.
+
+    The text is kept beside the spans, not just the spans, because the spans
+    only mean anything against the exact string they were measured in. Two
+    searches in one turn each produce offsets starting near zero, and a later
+    stage looking at an assembled prompt has to know which string a span of
+    `12..48` belongs to.
+
+    It is also what lets that stage refuse. The worker returns tool text and
+    can return anything; a passage recorded here is what the parent actually
+    produced, so labelling is done by matching the parent's own string rather
+    than by trusting the copy that came back.
+
+    Which is why the text alone is not enough to name it. Two calls in one
+    round can return the same string from different sources - two searches
+    that both answer "400 hours" - and the worker chooses the order it sends
+    those results back in. Matching by text cannot tell them apart, and
+    matching by position trusts an order the untrusted side controls, so a
+    round's passages carry the parent's own record of which call produced
+    them: `operation_seq` names the round, `call_index` the position the
+    parent dispatched, and `tool_call_id` the model's own name for it when
+    the provider supplied one. A passage from a capability that returns one
+    result carries none of these, because there is nothing to disambiguate.
+    """
+
+    text: str
+    spans: Tuple[GroundedSpan, ...] = ()
+    #: The committed operation this came from - the round, not the call.
+    operation_seq: Optional[int] = None
+    #: The call's position as the parent dispatched it, which is the identity
+    #: a replay reproduces: the round's payload is hashed whole, so the same
+    #: position in a matching round is the same call.
+    call_index: Optional[int] = None
+    #: The model's own id for the call, kept because a reconstructed tool
+    #: message needs it. Not an identity on its own: a provider may repeat one
+    #: or send none, and it arrives through the worker.
+    tool_call_id: Optional[str] = None
+
+    def as_dict(self) -> Dict[str, Any]:
+        """JSON-safe, for the ledger sidecar a replay reads back."""
+        return {
+            "text": self.text,
+            "spans": [asdict(span) for span in self.spans],
+            "operation_seq": self.operation_seq,
+            "call_index": self.call_index,
+            "tool_call_id": self.tool_call_id,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "GroundedPassage":
+        return cls(
+            text=str(raw.get("text") or ""),
+            spans=tuple(
+                GroundedSpan(
+                    start=int(span["start"]),
+                    end=int(span["end"]),
+                    source_id=str(span["source_id"]),
+                    evidence_id=str(span["evidence_id"]),
+                )
+                for span in raw.get("spans") or []
+            ),
+            operation_seq=(
+                int(raw["operation_seq"])
+                if raw.get("operation_seq") is not None
+                else None
+            ),
+            call_index=(
+                int(raw["call_index"]) if raw.get("call_index") is not None else None
+            ),
+            tool_call_id=(
+                str(raw["tool_call_id"])
+                if raw.get("tool_call_id") is not None
+                else None
+            ),
+        )
+
+
+class GroundedText:
+    """Model-visible text assembled together with what grounds each part.
+
+    Producers build a result out of pieces - one per search result, chunk,
+    note or remote item - and only some of those pieces are evidence. Adding
+    them here rather than joining strings keeps the association exact, since
+    the offsets are measured as the string is built.
+
+    This measures positions and does not decide content. `transform` is the
+    caller's own sanitization, applied per piece so that a piece's offsets are
+    its offsets in the finished text, and it defaults to none: a producer whose
+    contract does not rewrite its text must not start rewriting it because
+    provenance passed through here. Only the untrusted-data producers - the
+    web and remote tools - pass one, and each of those registers its evidence
+    from the transformed text, so the string a span covers is the string the
+    turn recorded.
+
+    With a transform, `render` also checks that the assembled whole is
+    unchanged by another pass. That check is what makes per-piece
+    transformation safe: the tool-call pattern tolerates whitespace, so `<`
+    ending one piece and `tool_call>` beginning the next would form a tag that
+    no single piece contained. When the check fails the whole text is
+    transformed as one and the spans are dropped - a render nothing can cite
+    rather than one whose offsets point at the wrong words.
+    """
+
+    def __init__(self, transform: Optional[Callable[[str], str]] = None) -> None:
+        self._transform = transform
+        self._pieces: list[str] = []
+        self._spans: list[GroundedSpan] = []
+        self._length = 0
+
+    def add(self, text: str, ground: Optional[Binding] = None) -> None:
+        """One piece of the result, and the evidence it came from if any."""
+        safe = self._transform(text) if self._transform is not None else text
+        if ground is not None:
+            source_id = ground.get("source_id")
+            evidence_id = ground.get("evidence_id")
+            if source_id and evidence_id:
+                self._spans.append(
+                    GroundedSpan(
+                        start=self._length,
+                        end=self._length + len(safe),
+                        source_id=source_id,
+                        evidence_id=evidence_id,
+                    )
+                )
+        self._pieces.append(safe)
+        self._length += len(safe)
+
+    def render(
+        self, prefix: str = "", suffix: str = ""
+    ) -> Tuple[str, Tuple[GroundedSpan, ...]]:
+        """The finished text and the spans into it.
+
+        The envelope goes on here, as two halves rather than a function that
+        wraps. The spans move by `len(prefix)`, which is known, instead of by
+        wherever the body turns out to be in the finished string: a page whose
+        body is its own URL appears in the header too, and the first match is
+        this system's words about the page rather than the page.
+        """
+        body = "".join(self._pieces)
+        spans = tuple(self._spans)
+        if self._transform is not None and self._transform(body) != body:
+            # A control token formed across a seam. Transform the whole and
+            # keep nothing: the offsets described the text before this pass.
+            body = self._transform(body)
+            spans = ()
+        if not prefix:
+            return f"{body}{suffix}", spans
+        return f"{prefix}{body}{suffix}", tuple(
+            GroundedSpan(
+                start=span.start + len(prefix),
+                end=span.end + len(prefix),
+                source_id=span.source_id,
+                evidence_id=span.evidence_id,
+            )
+            for span in spans
+        )
 
 
 @dataclass(frozen=True)

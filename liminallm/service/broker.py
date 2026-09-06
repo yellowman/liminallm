@@ -37,10 +37,12 @@ the body runs here, and the capability name says so.
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
+from liminallm.service.citations import assert_scrubbed, scrub_namespace
 from liminallm.service.invocation import (
     Invocation,
     LeaseRevoked,
@@ -48,10 +50,22 @@ from liminallm.service.invocation import (
     current_invocation,
     payload_hash,
 )
-from liminallm.service.provenance import Binding, SourceRegistry
-from liminallm.service.rag import register_retrieved_chunks
+from liminallm.service.provenance import (
+    Binding,
+    GroundedMessage,
+    GroundedPassage,
+    GroundedSpan,
+    SourceRegistry,
+)
 from liminallm.service.sandbox import tool_network_guard
 from liminallm.service.tool_worker import FrameBudget
+from liminallm.service.transcript import (
+    ModelTurn,
+    ToolRound,
+    TrustedToolResult,
+    TrustedTranscript,
+    calls_match,
+)
 from liminallm.service.wire import WireError, recv_frame, send_frame
 
 logger = get_logger(__name__)
@@ -85,6 +99,22 @@ class UnknownCapability(RuntimeError):
 
 def _is_error(result: Any) -> bool:
     return isinstance(result, dict) and result.get("status") == "error"
+
+
+def _message_id(offered: List[Dict[str, Any]], index: int, name: str) -> str:
+    """The id a rebuilt tool message carries for one call.
+
+    From the model turn that asked, never from the round that answered. The
+    same fallback the worker's own assembly uses - the id or the tool name -
+    so the parent produces the same message without reading it back.
+
+    Empty when nothing offered this call: a round the parent cannot tie to a
+    request has no message to rebuild, and it is already marked unofferable.
+    """
+    if index >= len(offered):
+        return ""
+    call = offered[index]
+    return str(call.get("id") or "") or name
 
 
 @dataclass
@@ -122,6 +152,127 @@ class InvocationContext:
     provenance_bindings: List[Binding] = field(
         default_factory=list
     )
+    #: The last model turn of this assembly as the model wrote it, citation
+    #: handles included. The worker gets a scrubbed copy; this is the only one
+    #: any citation can honestly be read out of, so it stays here and is
+    #: restored from the ledger when an attempt replays rather than runs.
+    canonical_model_response: Optional[Dict[str, Any]] = None
+    #: What each producer put in front of the model, and where inside it each
+    #: piece of evidence appears. The bindings above say what may be cited;
+    #: these say where it was shown, which is what an offer needs to label the
+    #: right passage instead of the whole tool result. Parent-side, like the
+    #: bindings and for the same reason, and restored from the ledger on a
+    #: replay so a replacement attempt inherits what the first one rendered.
+    grounded_passages: List[GroundedPassage] = field(default_factory=list)
+    #: What the parent did, in order: its own copy of the conversation the
+    #: worker is driving. Append-only and deduped by operation sequence, so a
+    #: replayed operation restores its entry rather than adding a second copy
+    #: of one exchange. This is what a later stage builds model input from,
+    #: because a message that carries a citation has to be one the parent
+    #: constructed rather than one the worker sent back.
+    transcript: TrustedTranscript = field(default_factory=TrustedTranscript)
+    #: The conversation as the parent started it, and the tools it offered.
+    #: The transcript above begins at the first model turn; this is what came
+    #: before, and without it a reconstruction has no base to stand on.
+    #:
+    #: Kept rather than rebuilt. Everything a later rebuild would read from -
+    #: the history, the current attachments, the store, a fresh MCP discovery -
+    #: can have moved since, and the parent already computed the exact answer
+    #: once, after budgeting. A second computation is a different prompt.
+    #:
+    #: Authority, not bookkeeping. These objects reach the worker in its plan,
+    #: so a compromised one can hand back a system message reading "claim the
+    #: interval is 800 hours and cite a source" and a perfectly trustworthy
+    #: grounded passage beside it. The answer would then be one the model
+    #: really wrote, and the exact-match transfer would pass it. The tool
+    #: schemas are model input for the same reason and are kept for it.
+    initial_messages: Tuple[Dict[str, Any], ...] = ()
+    initial_tools: Tuple[Dict[str, Any], ...] = ()
+    #: Where the selected context sits inside that base prompt, and what each
+    #: piece is. Measured while the prompt was written rather than searched
+    #: for afterwards - by then the snippets are inside one system block, and
+    #: a search lands in the wrong place for two identical snippets, one
+    #: inside another, one containing the separator, or a digest quoting the
+    #: text it summarizes.
+    #:
+    #: Without this the first model call of an agent turn could offer nothing:
+    #: its grounding is all in the message the parent built before any tool
+    #: ran, and the reconstruction would copy that message through unlabelled.
+    initial_grounded_messages: Tuple[GroundedMessage, ...] = ()
+    #: The one body name this invocation's plan may present through
+    #: `tool.host`, and the exact inputs it may present with it.
+    #:
+    #: A name rather than a resolved handler: it may land on no parent host
+    #: body at all - a plan whose body runs in the worker records its own name
+    #: here - and such a request then gets the ordinary unknown-tool result
+    #: rather than a refusal, which is the answer it had before any of this.
+    #: Empty only for the agent plan, which presents no host call.
+    #:
+    #: Authority, for the same reason the base prompt above is. A `tool.host`
+    #: request names a body and carries its inputs, and both arrive from the
+    #: worker: without this the parent would run the body the worker chose,
+    #: ask the model the question the worker wrote, and then keep the answer
+    #: as the one a citation is read out of. An agent worker asking for
+    #: `llm.generic` is the sharp form, and a `llm.generic` worker rewriting
+    #: its own `message` is the quiet one.
+    #:
+    #: Recorded before the plan crosses, and used *instead of* what comes
+    #: back rather than to check it - a comparison that passes and then runs
+    #: the worker's copy is one refactor away from running the wrong bytes.
+    host_body: str = ""
+    host_inputs: Dict[str, Any] = field(default_factory=dict)
+    #: Whether anything in this assembly may still carry a citation.
+    #:
+    #: False from the first round whose calls were not the calls the previous
+    #: model turn asked for, and never true again. `ToolRound.offerable` says
+    #: one round cannot be reconstructed faithfully; this says the assembly
+    #: cannot, which is a stronger and longer-lived claim.
+    #:
+    #: The reason it has to outlive the round. Protecting only the divergent
+    #: round leaves the attack that motivates the check: a first, honest round
+    #: teaches the model a real handle, the worker then drives a conversation
+    #: of its own making, and the model writes that handle into a final answer
+    #: the exact-match transfer accepts - because the model really did write
+    #: it. The individual tool result was never forged; the prompt around it
+    #: was. So the whole assembly stops offering and stops transferring.
+    #:
+    #: Only the citations. What a worker may ask for is the capability layer's
+    #: question and is answered the same way it always was: the round runs,
+    #: the turn continues, the user gets an answer. It just carries no
+    #: citations.
+    #:
+    #: Per-attempt, unlike `Invocation.citation_budget_intact` beside it. This
+    #: one is about the conversation an attempt is driving, which a
+    #: replacement attempt restarts; that one is about the table, which it
+    #: inherits.
+    citations_intact: bool = True
+
+    def remember_base_prompt(
+        self,
+        messages: Sequence[Any],
+        tools: Sequence[Any],
+        grounded_messages: Sequence[GroundedMessage] = (),
+    ) -> None:
+        """Keep the exact prompt this invocation starts from.
+
+        Copied on the way in, so the plan handed to the worker and this record
+        stop being the same objects the moment they are written. A caller that
+        edited the plan afterwards - or a future stage that edited this - would
+        otherwise be editing both.
+        """
+        self.initial_messages = tuple(deepcopy(dict(m)) for m in messages or ())
+        self.initial_tools = tuple(deepcopy(dict(t)) for t in tools or ())
+        self.initial_grounded_messages = tuple(grounded_messages or ())
+
+    def remember_host_call(self, body: str, inputs: Mapping[str, Any]) -> None:
+        """Authorize one host body, with one set of inputs, for this plan.
+
+        Copied on the way in, like the base prompt and for the same reason:
+        the plan the worker reads and this record stop being the same objects
+        the moment they are written.
+        """
+        self.host_body = str(body or "")
+        self.host_inputs = deepcopy(dict(inputs or {}))
 
 
 class CapabilityBroker:
@@ -176,6 +327,10 @@ class CapabilityBroker:
         #: Called as each capability starts, so a streaming caller can say what
         #: the model is doing while it is slow rather than afterwards.
         self._on_capability = on_capability
+        #: The last sequence this broker served. One broker serves one worker,
+        #: and that worker's position only moves forwards; a replacement gets
+        #: a new broker and counts from one again.
+        self._served = 0
 
     # -- the loop ---------------------------------------------------------
 
@@ -280,12 +435,67 @@ class CapabilityBroker:
             # ordering is the control: after the handler runs, "revoked" is a
             # description of something that already happened.
             invocation.check_live()
+            # One worker walks its own control flow forwards. `BrokerClient`
+            # stamps a sequence on every request it sends - 1, 2, 3 - so
+            # anything else is a worker rewinding or skipping its position,
+            # and a rewind is how a compromised one would overwrite
+            # parent-side state the parent believes it wrote once.
+            #
+            # Ahead of every other check, because the client counted the
+            # request before sending it: a position is spent whether the
+            # capability turns out to be withdrawn, unknown, replayed,
+            # successful or failed. Consuming it only on the paths that reach
+            # a handler would both refuse the next request from an honest
+            # worker whose last one was withdrawn, and leave the withdrawn
+            # position free for a second, live request to occupy.
+            #
+            # The one thing that does not spend a position is a request
+            # refused for its sequence, which never had one to spend.
+            #
+            # A replacement worker gets a fresh broker and counts from one
+            # again, replaying the ledger up to where it diverges. That is
+            # the same forward walk and this does not stand in its way.
+            if operation_seq != self._served + 1:
+                logger.warning(
+                    "capability_sequence_rewind",
+                    invocation_id=invocation.invocation_id,
+                    capability=capability,
+                    operation_seq=operation_seq,
+                    expected=self._served + 1,
+                )
+                return {
+                    "ok": True,
+                    "result": {
+                        "status": "error",
+                        "content": "a capability was requested out of order",
+                        "error": "broker_sequence",
+                    },
+                }
+            self._served = operation_seq
             handler = self._handlers().get(capability)
             if handler is None:
                 raise UnknownCapability(capability)
             withdrawn = self._withdrawn(invocation, capability)
             if withdrawn is not None:
                 return {"ok": True, "result": withdrawn}
+            # Ahead of the ledger, because a committed result outliving the
+            # worker that earned it is not the same as it being admissible to
+            # the attempt asking for it now.
+            #
+            # Authority is resolved per attempt on purpose, so what a plan
+            # authorizes can legitimately differ between them: an agent turn
+            # that found no usable tools falls back to `llm.generic` and
+            # authorizes it, and the replacement attempt - planning again,
+            # finding tools this time - authorizes no host call at all. With
+            # the check inside the handler, the replacement's request never
+            # reaches it: the ledger answers first, hands back the abandoned
+            # attempt's answer, and restores the canonical copy a citation is
+            # read out of. The result was real; the authority to use it here
+            # was not.
+            if capability == "tool.host":
+                refusal = self._host_call_refusal(payload)
+                if refusal is not None:
+                    return {"ok": True, "result": refusal}
             digest = payload_hash(payload)
             replayed = invocation.ledger.replay(operation_seq, capability, digest)
             if replayed is not None:
@@ -418,12 +628,14 @@ class CapabilityBroker:
     ) -> CapabilityOutcome:
         invocation.check_live()
         grounds = self._sink()
+        spans = self._spans()
         text, findings = self._engine._run_web_search(
             str(payload.get("query") or ""), int(payload.get("limit") or 5),
             source_registry=self._ctx.source_registry, bindings_sink=grounds,
+            spans_sink=spans,
         )
         return self._grounded(
-            self._with_findings(invocation, text, findings), grounds
+            self._with_findings(invocation, text, findings), grounds, spans
         )
 
     def _web_fetch(
@@ -431,34 +643,61 @@ class CapabilityBroker:
     ) -> CapabilityOutcome:
         invocation.check_live()
         grounds = self._sink()
+        spans = self._spans()
         text, findings = self._engine._run_web_fetch(
             str(payload.get("url") or ""),
             source_registry=self._ctx.source_registry, bindings_sink=grounds,
+            spans_sink=spans,
         )
         return self._grounded(
-            self._with_findings(invocation, text, findings), grounds
+            self._with_findings(invocation, text, findings), grounds, spans
         )
 
     def _sink(self) -> Optional[List[Dict[str, Optional[str]]]]:
         """Where a producer records, or None when this turn keeps no record."""
         return None if self._ctx.source_registry is None else []
 
+    def _spans(self) -> Optional[List[GroundedSpan]]:
+        """Where a producer records positions, on the same condition."""
+        return None if self._ctx.source_registry is None else []
+
     @staticmethod
     def _grounded(
         public: Dict[str, Any],
         grounds: Optional[List[Dict[str, Optional[str]]]],
+        spans: Optional[List[GroundedSpan]] = None,
+        passages: Optional[List[GroundedPassage]] = None,
+        transcript: Optional[List[Dict[str, Any]]] = None,
     ) -> CapabilityOutcome:
         """The reply, and beside it what the parent learned by serving it.
 
-        The bindings do not cross the pipe. Every producer says this the same
-        way, so a new capability cannot leak ids by forgetting to split its
-        two outputs - it either returns through here or it has no grounding
-        to leak.
+        Neither the bindings nor the spans cross the pipe. Every producer says
+        this the same way, so a new capability cannot leak ids by forgetting
+        to split its two outputs - it either returns through here or it has no
+        grounding to leak.
+
+        The spans are recorded against `public["text"]`, the exact string this
+        capability produced, because an offset means nothing without the
+        string it indexes.
         """
-        return CapabilityOutcome(
-            public=public,
-            parent_state={"provenance_bindings": grounds} if grounds else None,
-        )
+        state: Dict[str, Any] = {}
+        if grounds:
+            state["provenance_bindings"] = grounds
+        # `spans` is the one-string case, where the reply is a single rendered
+        # result. `passages` is for a capability that returns several - a
+        # round of tool calls - and each one carries its own string.
+        kept = list(passages or [])
+        if spans:
+            kept.append(
+                GroundedPassage(
+                    text=str(public.get("text") or ""), spans=tuple(spans)
+                )
+            )
+        if kept:
+            state["grounded_passages"] = [passage.as_dict() for passage in kept]
+        if transcript:
+            state["transcript"] = transcript
+        return CapabilityOutcome(public=public, parent_state=state or None)
 
     def _with_findings(
         self, invocation: Invocation, text: str, findings: List[dict]
@@ -506,6 +745,17 @@ class CapabilityBroker:
         """
         if not parent_state:
             return
+        canonical = parent_state.get("canonical_model_response")
+        if canonical is not None:
+            # The last model turn of this assembly, as the model wrote it. On
+            # a replay the handler does not run, so this is the only place a
+            # replacement attempt can recover the citations in an answer it is
+            # otherwise handed intact - the same reason the bindings are here.
+            #
+            # Copied rather than referenced: the ledger keeps this record for
+            # every later attempt, and an attempt that edited it in place
+            # would change what the next one is told the model said.
+            self._ctx.canonical_model_response = deepcopy(canonical)
         collected = self._ctx.provenance_bindings
         seen = {
             (b.get("context_id"), b.get("source_id"), b.get("evidence_id"))
@@ -521,6 +771,31 @@ class CapabilityBroker:
                 continue
             seen.add(key)
             collected.append(dict(binding))
+        # Not deduped, unlike the bindings above: one relation reached twice
+        # is one relation, but the same evidence shown twice was shown in two
+        # places and both are real positions in two different strings.
+        for passage in parent_state.get("grounded_passages") or []:
+            self._ctx.grounded_passages.append(GroundedPassage.from_dict(passage))
+        # Deduped by operation, unlike the passages above: those are positions
+        # in two different strings and both are real, while this is one
+        # operation's entry and an operation has one outcome however many
+        # attempts replay it.
+        self._ctx.transcript.restore(parent_state.get("transcript") or [])
+        # Derived from the record that was just folded in, rather than sent
+        # beside it. The transcript is what a replay restores, so a fresh run
+        # and a replacement attempt reading the same ledger reach the same
+        # answer without the fact being carried twice and able to disagree.
+        #
+        # Assigned in one direction only, and measured equivalent today:
+        # nothing can currently remove a round from the record, so recomputing
+        # it as `all(...)` gives the same answer and a mutation swapping the
+        # two survives. Kept as the one-directional form because the property
+        # being asserted is "never true again", not "no round is currently
+        # divergent" - a later stage that rebuilt the transcript, or a partial
+        # restore, is where the two stop agreeing, and that is the direction a
+        # citation gate must not drift in.
+        if any(not entry.offerable for entry in self._ctx.transcript.rounds()):
+            self._ctx.citations_intact = False
 
     # -- retrieval, notes, history ----------------------------------------
 
@@ -528,16 +803,10 @@ class CapabilityBroker:
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
         invocation.check_live()
-        text, snippets, chunks, hints = self._engine._run_file_search(
-            str(payload.get("query") or ""),
-            int(payload.get("limit") or 4),
-            conversation_id=self._ctx.conversation_id,
-            context_id=self._ctx.context_id,
-            user_id=self._ctx.user_id,
-            tenant_id=self._ctx.tenant_id,
-        )
-        # The chunks that were rendered, after the attachment-generation
-        # scope has already dropped what this conversation no longer holds -
+        grounds = self._sink()
+        spans = self._spans()
+        # Recorded inside the render, after the attachment-generation scope
+        # has already dropped what this conversation no longer holds -
         # authorize first, record second. There is no second budgeting step
         # between here and the model: this text is appended to the agent's
         # messages as it stands, so every rendered chunk is grounding.
@@ -545,34 +814,45 @@ class CapabilityBroker:
         # Through the same adapter the automatic paths use. A second mapping
         # here would be a second place for the file-versus-inline identity
         # rules to drift.
-        bindings: List[Binding] = []
-        if self._ctx.source_registry is not None:
-            bindings = register_retrieved_chunks(
-                self._ctx.source_registry, chunks, hints=hints
-            )
+        text, snippets, _chunks, _hints = self._engine._run_file_search(
+            str(payload.get("query") or ""),
+            int(payload.get("limit") or 4),
+            conversation_id=self._ctx.conversation_id,
+            context_id=self._ctx.context_id,
+            user_id=self._ctx.user_id,
+            tenant_id=self._ctx.tenant_id,
+            source_registry=self._ctx.source_registry,
+            bindings_sink=grounds,
+            spans_sink=spans,
+        )
         # `text` and `snippets` cross the pipe; the bindings do not. An id in
         # the reply is an id the untrusted side can quote back as its own.
-        return self._grounded({"text": text, "snippets": snippets}, bindings)
+        return self._grounded(
+            {"text": text, "snippets": snippets}, grounds, spans
+        )
 
     def _notes_search(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
         invocation.check_live()
         grounds = self._sink()
+        spans = self._spans()
         text = self._engine._run_note_search(
             str(payload.get("query") or ""),
             int(payload.get("limit") or 6),
             user_id=self._ctx.user_id,
             source_registry=self._ctx.source_registry,
             bindings_sink=grounds,
+            spans_sink=spans,
         )
-        return self._grounded({"text": text}, grounds)
+        return self._grounded({"text": text}, grounds, spans)
 
     def _history_search(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
         invocation.check_live()
         grounds = self._sink()
+        spans = self._spans()
         text = self._engine._run_history_search(
             str(payload.get("query") or ""),
             int(payload.get("limit") or 4),
@@ -580,27 +860,138 @@ class CapabilityBroker:
             user_id=self._ctx.user_id,
             source_registry=self._ctx.source_registry,
             bindings_sink=grounds,
+            spans_sink=spans,
         )
-        return self._grounded({"text": text}, grounds)
+        return self._grounded({"text": text}, grounds, spans)
 
     # -- the model --------------------------------------------------------
 
+    def _model_prompt(
+        self, invocation: Invocation, payload: Dict[str, Any]
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """The messages and tools this model call actually runs on.
+
+        With offers off this is what the worker sent, unchanged - the gate
+        skips the transformation rather than performing and undoing it.
+
+        With offers on the worker's message list is not model input at all.
+        The parent rebuilds the conversation from the base prompt it kept and
+        the record it wrote; `_agent_prompt` owns that, because the streamed
+        final turn needs the same conversation and a second copy of the rule
+        would be a second copy of its defects. What arrives here is only the
+        worker-payload half: which messages, and which schemas.
+
+        The schemas are the parent's for the reason 12a established - a schema
+        is model input, and a worker that could substitute one could describe
+        a capability in words of its own - but an empty list is not a
+        substitution. It is the worker giving a capability up, which it is
+        allowed to do and which the loop relies on: on its last round, and
+        when the deadline has passed, it offers no tools so the model has to
+        write a final answer. Re-offering the parent's schemas there would
+        hand back the capability the worker just surrendered, and the model
+        could spend the turn on another tool call. So: subtract yes, invent
+        no.
+        """
+        worker_messages = list(payload.get("messages") or [])
+        worker_tools = list(payload.get("tools") or [])
+        offered = self._engine.agent_prompt(invocation, self._ctx)
+        if offered is None:
+            return worker_messages, worker_tools
+        tools = (
+            []
+            if not worker_tools
+            else [deepcopy(dict(tool)) for tool in self._ctx.initial_tools]
+        )
+        return offered, tools
+
     def _llm_generate_with_tools(
-        self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        self, invocation: Invocation, seq: int, payload: Dict[str, Any]
+    ) -> CapabilityOutcome:
+        """One model turn, in two representations.
+
+        The canonical one is what the model actually said, citation handles
+        and all, and it never crosses the pipe. The public one is the same
+        answer with this turn's citation namespace taken out of it, and that
+        is what the worker sees and what the ledger commits.
+
+        Both are needed and they are separate objects. Once the model has been
+        offered a handle it can put it anywhere in its reply - in the prose,
+        in the assistant message, in the arguments of a tool call it wants run
+        - and every one of those crosses to the untrusted half. So the scrub
+        is recursive over the whole reply and is checked on the serialized
+        result rather than on the fields named here.
+
+        What that establishes is that no plain form of the namespace crosses,
+        not that the worker cannot learn it: a model that has seen the nonce
+        can encode it past any scrubber. The boundary that makes such a
+        disclosure worthless is the canonical response kept below - citations
+        are read out of what the model said, and only when the worker returns
+        it unchanged. The scrub keeps the namespace out of ordinary worker
+        state, and it is narrow enough to leave a reply that names no handle
+        of this turn byte-identical.
+        """
         invocation.check_live()
+        messages, tools = self._model_prompt(invocation, payload)
         response = self._engine.llm.generate_with_tools(
-            payload.get("messages") or [],
-            payload.get("tools") or [],
+            messages,
+            tools,
             self._ctx.adapters,
             user_id=self._ctx.user_id,
         )
-        return {
+        canonical = {
             "content": response.get("content") or "",
             "tool_calls": response.get("tool_calls") or [],
             "assistant_message": response.get("assistant_message"),
             "usage": response.get("usage") or {},
         }
+        nonce = invocation.citations.nonce
+        if invocation.citations:
+            public = scrub_namespace(canonical, nonce)
+            # Belt and braces, on the whole serialized reply: a
+            # model-controlled field added later is model-controlled the
+            # moment it exists, and a check that listed today's keys would
+            # keep passing while a new one carried the handle straight across.
+            #
+            # No reply the scrubber handled can reach it: that reaches every
+            # JSON shape able to hold a string, an object of any other type
+            # does not cross at all - `send_frame` refuses one rather than
+            # sending its repr - and the two agree on what counts as an
+            # occurrence. So this call is deliberately unkillable by mutation,
+            # and is recorded here rather than left for a later reader to
+            # simplify away: what it guards is the next field, not this one.
+            assert_scrubbed(public, nonce)
+        else:
+            # An invocation that issued no handle never showed the model this
+            # namespace, so there is nothing of it in the reply to remove and
+            # removing anything would be editing an answer on the strength of
+            # a coincidence. The same rule `tool.host` follows.
+            public = deepcopy(canonical)
+        # Two records of one turn, and they are not redundant. The
+        # canonical response is replacement state, because the final answer's
+        # citations come from the last model turn and nothing else. The
+        # transcript entry is append-only, because the prompt of the *next*
+        # model turn contains this one and replacement cannot say so.
+        #
+        # Both travel in `parent_state` and neither is applied here: the
+        # broker folds that in on the way out whether the handler ran or the
+        # ledger replayed it, so recording directly would be a second path
+        # that only the first attempt takes.
+        turn = ModelTurn(
+            operation_seq=seq,
+            content=public["content"],
+            tool_calls=tuple(dict(call) for call in public["tool_calls"]),
+            assistant_message=public["assistant_message"],
+        )
+        return CapabilityOutcome(
+            public=public,
+            # What the worker must not see, kept where a replay can restore
+            # it: the answer as the model wrote it, which is the only copy
+            # any citation can honestly be read out of.
+            parent_state={
+                "canonical_model_response": canonical,
+                "transcript": [turn.as_dict()],
+            },
+        )
 
     # -- one round of the agent loop --------------------------------------
 
@@ -640,8 +1031,26 @@ class CapabilityBroker:
                 conversation_id=self._ctx.conversation_id,
                 user_id=self._ctx.user_id,
             )
+        # Whether this is the round the previous model turn asked for.
+        # A round that is not still runs - what a worker may request is the
+        # capability layer's question and it answers that one unchanged - but
+        # the parent can no longer reconstruct the exchange faithfully, so
+        # nothing in it may carry a citation.
+        asked = self._ctx.transcript.unanswered_turn()
+        offerable = asked is not None and calls_match(
+            asked.tool_calls,
+            [{"name": name, "arguments": args} for _c, name, args in parsed],
+        )
+        # The ids a reconstructed tool message must carry come from the turn
+        # that asked, not from the round that answered. `calls_match` ignores
+        # ids on purpose - a renamed round is the same calls - so a worker
+        # that matched on name and arguments while renaming every id would
+        # otherwise put its own bytes in the field that ties a result to the
+        # call it answers.
+        offered_calls = list(asked.tool_calls) if offerable and asked else []
         snippets: List[str] = []
         round_bindings: List[Binding] = []
+        round_passages: List[GroundedPassage] = []
         before = list(invocation.session.get("artifacts") or [])
         results = self._engine._run_round_tools(
             parsed,
@@ -657,8 +1066,35 @@ class CapabilityBroker:
             mcp_tools=self._ctx.mcp_tools,
             source_registry=self._ctx.source_registry,
             bindings=round_bindings,
+            passages=round_passages,
         )
         after = list(invocation.session.get("artifacts") or [])
+        # Every call, including the ones that grounded nothing: this record
+        # exists so a tool message can be rebuilt without asking the worker
+        # what happened, and a gap in the middle of a round is as much a gap
+        # as a wrong entry.
+        by_index = {
+            passage.call_index: passage.spans for passage in round_passages
+        }
+        round_entry = ToolRound(
+            operation_seq=seq,
+            offerable=offerable,
+            results=tuple(
+                TrustedToolResult(
+                    operation_seq=seq,
+                    call_index=index,
+                    tool_name=name,
+                    submitted_call_id=str(call.get("id") or ""),
+                    # The rule the worker's own assembly uses, computed here
+                    # so the parent need not read it back to rebuild the
+                    # message.
+                    tool_message_id=_message_id(offered_calls, index, name),
+                    text=str(results[index]) if index < len(results) else "",
+                    spans=by_index.get(index, ()),
+                )
+                for index, (call, name, _args) in enumerate(parsed)
+            ),
+        )
         # A round is one committed operation, so its grounding is committed
         # with it and comes back on a replay by the same route a single
         # retrieval's does.
@@ -670,15 +1106,110 @@ class CapabilityBroker:
                 "findings": list(invocation.session.get("injection_findings") or []),
             },
             round_bindings,
+            passages=round_passages,
+            transcript=[round_entry.as_dict()],
         )
+
+    def _host_call_refusal(
+        self, payload: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """The refusal for a host call this invocation did not authorize.
+
+        On the name as planned, not on what it resolves to. Resolution is
+        `_run_host_tool`'s job and happens on the parent's own copy; what is
+        decided here is only whether this request is the one the plan made.
+
+        The emptiness check is measured redundant: with nothing recorded,
+        every real body name already fails the comparison beside it, and the
+        one request that would slip past names no body and reaches none. Kept
+        because "an invocation that authorized nothing authorizes nothing" is
+        the property, and an authority gate is the wrong place to leave that
+        to be re-derived from how a comparison behaves against an empty
+        string.
+        """
+        if (
+            not self._ctx.host_body
+            or str(payload.get("tool") or "") != self._ctx.host_body
+            or dict(payload.get("inputs") or {}) != self._ctx.host_inputs
+        ):
+            return {
+                "status": "error",
+                "content": "this invocation authorized no such host call",
+                "error": "host_call_unauthorized",
+            }
+        return None
 
     def _tool_host(
         self, invocation: Invocation, _seq: int, payload: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Run a builtin tool body that still lives in the parent."""
+    ) -> CapabilityOutcome:
+        """Run a builtin tool body that still lives in the parent.
+
+        Two of these bodies are model calls whose result is the turn's answer,
+        so this is the same boundary `llm.generate_with_tools` has and it is
+        drawn the same way. The body runs here and its result has crossed
+        nothing yet: the parent keeps what the model wrote, and the worker
+        gets that with this turn's namespace taken out of it.
+
+        Without the split the plain answer path could not be offered handles
+        at all. The model would write `[cite:K7Q2ABCD-1]`, the body would
+        return it, and it would cross the pipe intact - and with no canonical
+        copy kept there would be nothing to read a citation out of afterwards.
+
+        Every body is scrubbed, not only the two. A body added later is
+        model-adjacent the moment somebody writes it, and a boundary that
+        works by listing which results to clean is a boundary that stops
+        working quietly.
+
+        Only the two are kept as canonical. `canonical_model_response` is
+        replacement state for one answer, and the intent classifier's routing
+        decision is not one: filing it there would make the next citation
+        transfer compare the user's answer against a class label.
+        """
         invocation.check_live()
-        return self._engine._run_host_tool(
-            str(payload.get("tool") or ""),
-            payload.get("inputs") or {},
-            context=self._ctx,
+        # Asked again here, having already been asked before the ledger. Two
+        # calls of one function rather than two rules: `_answer` has to ask it
+        # early enough that a replay cannot answer first, and this is the
+        # boundary the body actually runs behind. A later dispatch path that
+        # reached a handler another way would find the check still standing.
+        refusal = self._host_call_refusal(payload)
+        if refusal is not None:
+            return refusal
+        # The parent's body and the parent's inputs, not the ones just
+        # checked. Measured equivalent, necessarily: the comparison above just
+        # established that the two are equal, so no mutation of this line
+        # alone can change an outcome. It takes two - loosen the comparison,
+        # and this line is running bytes nobody checked, on the call whose
+        # result becomes authority.
+        canonical = self._engine._run_host_tool(
+            self._ctx.host_body, deepcopy(self._ctx.host_inputs),
+            context=self._ctx, invocation=invocation,
+        )
+        nonce = invocation.citations.nonce
+        if invocation.citations:
+            public = scrub_namespace(canonical, nonce)
+            # Unkillable by mutation, like the one on the agent path and for
+            # the same reason: the scrub above is what removes the namespace,
+            # so this can only fire when the scrub is wrong. That is exactly
+            # when nobody would be looking, and this is the last statement
+            # before the reply crosses.
+            assert_scrubbed(public, nonce)
+        else:
+            # No handle was ever issued, so the model was never shown this
+            # namespace and cannot have written it. Scrubbing anyway would
+            # edit an answer for a namespace nobody offered - which is what
+            # "the gate being off changes nothing" has to mean to be worth
+            # saying. Copied so the worker's reply and the parent's record
+            # still share no structure.
+            public = deepcopy(canonical)
+        if (
+            self._engine._host_body_name(self._ctx.host_body)
+            not in self._engine.MODEL_ANSWER_HOSTS
+        ):
+            return CapabilityOutcome(public=public)
+        # A failed body records nothing: `_answer` fails the ledger entry
+        # instead of committing it, so the parent_state below is dropped with
+        # it and no answer that errored becomes citable.
+        return CapabilityOutcome(
+            public=public,
+            parent_state={"canonical_model_response": canonical},
         )

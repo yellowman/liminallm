@@ -1,7 +1,7 @@
 /**
  * Read-only viewer for publicly shared conversations, plus the share
- * directory at /share. Relies on common.js (escapeHtml) and markdown.js
- * (renderMarkdown, MSG_COPY_BUTTON_HTML), loaded first.
+ * directory at /share. Relies on common.js (escapeHtml, citationsRowHtml)
+ * and markdown.js (renderMarkdown, MSG_COPY_BUTTON_HTML), loaded first.
  */
 (() => {
   const publicApi = '/v1/public/conversations';
@@ -27,6 +27,17 @@
     actions.innerHTML = MSG_COPY_BUTTON_HTML;
     const contentWrap = document.createElement('div');
     contentWrap.appendChild(bubble);
+    // The same chips the chat shows, from the same helper, over the reduced
+    // citation the public route sends: a stranger sees that the answer cited
+    // something, what it was called and where it sits, and no identity or
+    // fingerprint of a source they cannot open. Not interactive - this page
+    // has no citation panel to open.
+    const row = citationsRowHtml(m, { interactive: false });
+    if (row) {
+      const citations = document.createElement('div');
+      citations.innerHTML = row;
+      contentWrap.appendChild(citations.firstElementChild);
+    }
     contentWrap.appendChild(actions);
     wrapper.appendChild(roleEl);
     wrapper.appendChild(contentWrap);

@@ -18,6 +18,171 @@ const escapeHtml = (str) => {
   return div.innerHTML;
 }
 
+// A stored offset counts Unicode code points; a JavaScript string index counts
+// UTF-16 code units. The two agree until the text contains anything outside the
+// Basic Multilingual Plane - an emoji, and a great many scripts - and then an
+// anchor stored as 1 is index 2 here. SPEC §2.2 makes the stored unit
+// normative, so the conversion belongs on this side.
+//
+// Returns the index in `text` of the given code-point offset, clamped to the
+// end. Walking the string is what makes it correct: no arithmetic on the
+// offset can know how many of the characters before it were pairs.
+const utf16Index = (text, codePoints) => {
+  const source = String(text ?? '');
+  const wanted = Number(codePoints);
+  // `Number.isFinite` is load-bearing, not decorative. NaN takes the same
+  // path either way, because every comparison against it is false and the
+  // loop below stops at once - but `Infinity` does not: without this it
+  // satisfies `seen < wanted` for the whole string and returns its length.
+  // An anchor that is not a position fails toward the start, where the worst
+  // outcome is an empty lead rather than the entire answer.
+  if (!Number.isFinite(wanted) || wanted <= 0) return 0;
+  let index = 0;
+  let seen = 0;
+  while (index < source.length && seen < wanted) {
+    index += source.codePointAt(index) > 0xffff ? 2 : 1;
+    seen += 1;
+  }
+  return index;
+}
+
+// The last `limit` code points of `text`, so a tail never begins half way
+// through a surrogate pair the way `slice(-limit)` can.
+const lastCodePoints = (text, limit) => {
+  const points = Array.from(String(text ?? ''));
+  return points.length > limit ? points.slice(-limit).join('') : points.join('');
+}
+
+// --------------------------------------------------------------------------
+// Citations
+// --------------------------------------------------------------------------
+
+//: A message's citation anchors, as a renderer wants them. Shared because two
+//: pages show the same thing from two audiences: the signed-in chat reads the
+//: stored citation, and the share page reads the projection of it that crosses
+//: to a stranger. Both are anchors into `content`, so both convert the same
+//: way, and one implementation is how they stay agreed.
+//:
+//: `lead` is the run-up to the citation in the answer itself. The passage a
+//: citation rested on is deliberately not stored - deleting a document has to
+//: reach what a citation shows - so what a reader gets before opening one is
+//: the words it follows.
+const CITATION_LEAD_MAX = 120;
+
+//: A citation names a source, so the chip leads with what kind of source it
+//: is and what it is called. Drawn rather than fetched: a real favicon means
+//: a request to every cited domain from the reader's browser, which hands
+//: those sites the reader's address and the fact that they were cited. These
+//: are also mostly the reader's own files, which have no favicon at all.
+const CITATION_ICONS = {
+  web: '<circle cx="10" cy="10" r="6.5"/><path d="M3.5 10h13M10 3.5c2.8 3.6 2.8 9.4 0 13' +
+       'c-2.8-3.6-2.8-9.4 0-13Z"/>',
+  file: '<path d="M4.5 3.25h7L15.5 7v9.75a.75.75 0 0 1-.75.75H4.5a.75.75 0 0 1-.75-.75' +
+        'V4a.75.75 0 0 1 .75-.75Z"/><path d="M11.25 3.5V7h3.75"/>',
+};
+
+//: Two icons, because two are all the set holds. The citation now carries the
+//: source's kind, so this reads it instead of guessing from a string: an
+//: earlier version read `.md`, `.markdown` and `.txt` as the notes vault, and
+//: those are ordinary upload types here, so an attached `manual.md` was
+//: presented to the reader as a note they had written.
+const citationKind = (kind) => (kind === 'web' ? 'web' : 'file');
+
+//: Long enough to recognise, short enough that eight fit on a line.
+const CITATION_LABEL_MAX = 32;
+//: After this many the row stops being a list and starts being a wall.
+const CITATION_VISIBLE = 8;
+
+//: The title is the label. It is the source's own name - a filename, a page
+//: title, a note's heading - and the citation carries it precisely so a
+//: reader is never shown an identifier or a path instead.
+const citationLabel = (title) => {
+  const tail = /^https?:\/\//i.test(title)
+    ? title.replace(/^https?:\/\//i, '').replace(/\/$/, '')
+    : title;
+  return tail.length > CITATION_LABEL_MAX
+    ? `${tail.slice(0, CITATION_LABEL_MAX - 1)}\u2026`
+    : tail;
+};
+
+const escapeAttr = (str) => escapeHtml(str).replace(/"/g, '&quot;');
+
+//: A message's citation chips, or nothing. `interactive` is what separates
+//: the two pages: the signed-in chat opens a panel on click, so its chips
+//: carry the citation and announce themselves as buttons, and the share page
+//: has no panel - a `role="button"` there would be a promise to a screen
+//: reader that nothing keeps. With no panel to open, a share chip for a
+//: source that has an address becomes that link instead. That page also shows
+//: every chip, since the "and N more" control is wired on the chat's own
+//: message list.
+const citationsRowHtml = (message, { interactive = true } = {}) => {
+  const citations = citationViews(message);
+  if (!citations.length) return '';
+  const visible = interactive ? CITATION_VISIBLE : citations.length;
+  const chips = citations.map((c, i) => {
+    const label = c.title || `Citation ${i + 1}`;
+    // JSON.stringify escapes internal quotes; only need & and " for
+    // double-quoted attr - `escapeAttr`, not a second hand-written encoder.
+    const data = escapeAttr(JSON.stringify({
+      title: c.title || '',
+      kind: c.kind || '',
+      href: c.href || '',
+      lead: c.lead || '',
+      evidence: c.evidence || [],
+    }));
+    // The hover text is the source and the words it follows, which is what a
+    // reader wants before deciding to open it.
+    const lead = String(c.lead || '').replace(/\s+/g, ' ').trim();
+    const hover = lead ? `${label}\n\n\u2026${lead}` : label;
+    const extra = i >= visible ? ' is-extra' : '';
+    const hide = i >= visible ? ' hidden' : '';
+    const kind = citationKind(c.kind);
+    // On the share there is no panel to open, so a citation with an address
+    // is the link itself rather than a chip that does nothing. Through
+    // `safeLinkHref`, which is markdown.js's http(s)-only validator - a
+    // global by the time any of this renders, since both pages load that
+    // script before their own.
+    const href = interactive || typeof safeLinkHref !== 'function'
+      ? null
+      : safeLinkHref(c.href || '');
+    const tag = href ? 'a' : 'span';
+    // `escapeAttr`: the lead is the model's own answer, quoted back into an
+    // attribute, and a quote in it would close this one and open others on
+    // the element.
+    return `<${tag} class="citation-link${extra}"${hide} data-kind="${kind}" ` +
+      `title="${escapeAttr(hover)}"` +
+      (interactive ? ` data-citation="${data}" tabindex="0" role="button"` : '') +
+      (href ? ` href="${escapeAttr(href)}" target="_blank" rel="noopener noreferrer"` : '') +
+      `>` +
+      `<svg class="citation-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" ` +
+      `stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ` +
+      `stroke-linejoin="round">${CITATION_ICONS[kind]}</svg>` +
+      `<span class="citation-title">${escapeHtml(citationLabel(label))}</span></${tag}>`;
+  }).join('');
+  const more = citations.length > visible
+    ? `<button type="button" class="citation-more">and ${citations.length - visible} more</button>`
+    : '';
+  return `<div class="citations-row">${chips}${more}</div>`;
+}
+
+const citationViews = (message) => {
+  const content = String(message?.content || '');
+  return (message?.content_struct?.segments || [])
+    .filter((seg) => seg && seg.type === 'citation')
+    .map((seg) => ({
+      title: seg.meta?.title || '',
+      kind: seg.meta?.kind || '',
+      href: seg.locator || '',
+      lead: lastCodePoints(
+        content.slice(0, utf16Index(content, seg.start)).trim(),
+        CITATION_LEAD_MAX,
+      ),
+      // Absent on a share, where fingerprints of passages the reader cannot
+      // read do not cross.
+      evidence: seg.meta?.evidence || [],
+    }));
+}
+
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
   // Fallback using crypto.getRandomValues() - cryptographically secure, broader browser support

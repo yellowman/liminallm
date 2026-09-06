@@ -96,11 +96,46 @@ _SEGMENT_KEYS: Dict[SegmentType, List[str]] = {
 }
 
 
-def _coerce_segment(segment: Any) -> Optional[ContentSegment]:
+def _coordinates_fit(segment: dict, content: Optional[str]) -> bool:
+    """Whether this segment's ``start``/``end`` are positions in ``content``.
+
+    SPEC §2.2 makes one coordinate system for the whole structure: offsets
+    into the same message's ``content``, counted in Unicode code points, with
+    ``0 <= start <= end <= len(content)``. A segment that does not satisfy it
+    is dropped rather than stored with the offending keys removed, because a
+    span is what several of these segment types are *for* - a citation with
+    no anchor and a redaction with no range are records of nothing.
+
+    ``bool`` is excluded explicitly: it is an ``int`` in Python, so ``True``
+    would otherwise pass as the position 1.
+
+    The upper bound is checked only when the content is known. The caller
+    normally has it, and a normalizer given none can still say that a
+    negative offset or an inverted range is not a range.
+    """
+    present = [key for key in ("start", "end") if key in segment]
+    if not present:
+        return True
+    for key in present:
+        value = segment[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return False
+        if content is not None and value > len(content):
+            return False
+    if len(present) == 2 and segment["start"] > segment["end"]:
+        return False
+    return True
+
+
+def _coerce_segment(
+    segment: Any, content: Optional[str] = None
+) -> Optional[ContentSegment]:
     if not isinstance(segment, dict):
         return None
     seg_type = segment.get("type")
     if seg_type not in _SEGMENT_KEYS:
+        return None
+    if not _coordinates_fit(segment, content):
         return None
     allowed_keys = _SEGMENT_KEYS[seg_type]
     normalized: ContentSegment = {"type": seg_type}
@@ -118,6 +153,10 @@ def normalize_content_struct(
     - Accepts dictionaries with a ``segments`` list and filters segments down to
       a stable set of keys per type.
     - Drops invalid structures to keep storage lean and JSON-serializable.
+    - Drops a segment whose ``start``/``end`` are not positions in ``content``
+      (SPEC §2.2). The stored coordinate system is the one renderers index by,
+      so a stored offset that is negative, inverted, past the end or not an
+      integer is a coordinate into nothing.
     - If no valid segments remain but ``content`` is provided, fall back to a
       single ``text`` segment so callers can rely on a consistent shape.
     """
@@ -131,7 +170,7 @@ def normalize_content_struct(
         return None
     normalized_segments: List[ContentSegment] = []
     for raw in segments:
-        normalized = _coerce_segment(raw)
+        normalized = _coerce_segment(raw, content)
         if normalized:
             normalized_segments.append(normalized)
     if not normalized_segments:

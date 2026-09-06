@@ -1,0 +1,1119 @@
+"""What the model may cite, and what it actually cited.
+
+The turn's registry says what was consulted; its bindings say what may support
+this answer. Neither is a thing the model can be handed. `source_id` is minted
+per registry and restarts at `src_1` every turn, so a handle built from it
+would be forged by ordinary copying: yesterday's assistant message is replayed
+verbatim into today's prompt, and yesterday's `[src_1]` is a different document
+from today's. A retrieved page, note or earlier message can contain the string
+just as easily, and every one of those reaches the model as data.
+
+So the model is given a per-turn handle instead:
+
+    [cite:K7Q2ABCD-1]
+
+The nonce is minted once per turn and the mapping back to `src_#` stays here,
+parent-side. A handle from another turn does not resolve, and neither does one
+a source wrote, because neither could know this turn's nonce. `src_#` remains
+the internal authority; the handle is only how the model names it.
+
+What that does and does not buy, stated plainly: a wrong guess resolves to
+nothing and is dropped, and the nonce is not visible before the turn that
+mints it. A correct guess would misattribute one span among the sources this
+turn already grounded on - handles exist only for those - rather than reach
+anything the turn did not read.
+
+None of that rests on the namespace staying secret once the model has seen
+it. A model can encode a nonce past any scrubber, so what makes a leaked one
+worthless is where citations are read from: the response the model actually
+produced, and only when the answer coming back is that response unchanged.
+`scrub_namespace` keeps the plain forms off the wire; it is not the boundary.
+"""
+
+from __future__ import annotations
+
+import bisect
+import hashlib
+import json
+import re
+import secrets
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+
+from liminallm.service.provenance import Binding, ProvenanceError, SourceRegistry
+
+#: The nonce alphabet, without the characters a reader or a small model
+#: confuses: no O/0 and no I/1.
+ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+#: The namespace a hostile document has to guess. This is the number that
+#: matters, not uniqueness: a retrieved page is attacker-controlled text of
+#: some tens of kilobytes, so it can carry on the order of a thousand
+#: candidate markers and pay nothing for a miss. At four characters the
+#: namespace is about a million, which gives such a page roughly one chance in
+#: a thousand of naming a source it never was - far too generous for the one
+#: mechanism whose whole purpose is refusing source-authored citations.
+#:
+#: Eight characters is 2**40. The cost is four more characters in a token the
+#: model copies, and the claim that a shorter one is easier for a weak model to
+#: reproduce is a guess nobody has measured, while the loss in guess resistance
+#: is arithmetic. `test_the_namespace_is_too_large_to_guess` pins the floor.
+NONCE_LENGTH = 8
+MIN_NONCE_BITS = 40
+
+#: Anything the model meant as a citation. Deliberately broad, because
+#: resolution is the gate and lexing is not: a marker whose handle this turn
+#: did not issue is refused whether it was mistyped or invented, so matching
+#: only the well-formed shape would buy no safety and would hide the mistyped
+#: ones from the one pass that has to remove them.
+#:
+#: The keyword is matched case-insensitively for the same reason - `[CITE:x]`
+#: is a typo that must still be taken back out - while the handle inside stays
+#: exact, because that is the part resolution gates on.
+#:
+#: The shape of a real handle is defined where handles are minted, which is
+#: the only place that can be authoritative about it.
+#:
+#: Bounded, and stopping at the first `]` or newline, so an unclosed `[cite:`
+#: cannot swallow the rest of a sentence.
+CITATION_RE = re.compile(r"\[(?i:cite):([^\]\n]{0,64})\]")
+
+#: An empty table's mappings. Frozen like a built one's, so the default is not
+#: the one writable `CitationTable` in the system. Behind a factory because
+#: `dataclasses` refuses a mappingproxy as a bare default.
+_EMPTY: Mapping[str, Any] = MappingProxyType({})
+
+
+def mint_nonce() -> str:
+    """One turn's citation namespace."""
+    return "".join(secrets.choice(ALPHABET) for _ in range(NONCE_LENGTH))
+
+
+@dataclass(frozen=True)
+class CitationOccurrence:
+    """One citation marker the model wrote, and where it wrote it.
+
+    `start` and `end` are the marker's own span in the answer, not the span of
+    the claim it supports. Which words a citation covers is a question about
+    the prose, and answering it by guessing would put a boundary in the record
+    that nothing measured. The marker's position is what this stage knows.
+
+    Occurrences are a list rather than a set on purpose: one source cited in
+    two places is one source and two citations, and collapsing them would lose
+    the second position before anything could render or persist it.
+
+    `evidence_ids` is what the table says this source was grounded on in this
+    turn, carried here because it is the only thing that can say *which
+    reading* was cited. A source's own identity names an object - a file, a
+    note, a page - and objects change; the evidence is the passage the answer
+    rested on, and it has a fingerprint. Read from the table rather than
+    guessed later: whatever resolves these has to be the turn's own record.
+    """
+
+    handle: str
+    source_id: str
+    start: int
+    end: int
+    evidence_ids: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CitationTable:
+    """This turn's citable sources, by the name the model is given for them.
+
+    Built from bindings and not from the registry: the registry is everything
+    the turn consulted, including what the prompt budget dropped and what a
+    failed node retrieved. Only what may support the answer gets a handle, so
+    a source with no handle is not citable however well the model describes it.
+
+    One handle per source, so two routes to one deduped source - a context
+    retrieval and an explicit search reaching the same file - share one
+    citation identity rather than inviting the model to cite the same document
+    twice under two names.
+
+    Deeply frozen, not merely a frozen dataclass. This is the object the next
+    stage makes authority, and a frozen dataclass does not freeze what its
+    attributes point at: plain dicts here would let anything holding a
+    reference add a handle after the table was built, which is the whole
+    conservation rule undone through a side door. S1 froze source metadata for
+    this reason and the same applies here.
+    """
+
+    nonce: str
+    #: handle -> source_id, and the reverse. Both directions are needed: the
+    #: offer is built from sources and the validator resolves from handles.
+    by_handle: Mapping[str, str] = field(default_factory=lambda: _EMPTY)
+    by_source: Mapping[str, str] = field(default_factory=lambda: _EMPTY)
+    #: source_id -> the evidence ids bound to it, in binding order. What the
+    #: answer may rest on within that source, for whatever later checks a
+    #: claim against a passage.
+    evidence: Mapping[str, Tuple[str, ...]] = field(
+        default_factory=lambda: _EMPTY
+    )
+
+    def __post_init__(self) -> None:
+        """Enforce the type's own invariants, wherever it was built.
+
+        The builder is not the only way to get one of these, and a rule kept
+        there is a rule the constructor does not have. Both live here so there
+        is one boundary rather than one convention: the mappings are copied
+        and wrapped so a caller's dict cannot be written through afterwards,
+        and the nonce is checked, so a namespace narrower than the floor
+        cannot be supplied by a caller that the default mint would never have
+        produced.
+        """
+        if len(self.nonce) != NONCE_LENGTH or any(
+            character not in ALPHABET for character in self.nonce
+        ):
+            raise ProvenanceError(
+                f"a citation nonce must be {NONCE_LENGTH} characters of "
+                f"{ALPHABET!r}, got {self.nonce!r}"
+            )
+        object.__setattr__(self, "by_handle", MappingProxyType(dict(self.by_handle)))
+        object.__setattr__(self, "by_source", MappingProxyType(dict(self.by_source)))
+        object.__setattr__(
+            self,
+            "evidence",
+            MappingProxyType(
+                {key: tuple(value) for key, value in self.evidence.items()}
+            ),
+        )
+
+    def source_for(self, handle: str) -> Optional[str]:
+        return self.by_handle.get(handle)
+
+    def handle_for(self, source_id: str) -> Optional[str]:
+        return self.by_source.get(source_id)
+
+    def evidence_for(self, source_id: str) -> Tuple[str, ...]:
+        return self.evidence.get(source_id, ())
+
+    def __bool__(self) -> bool:
+        return bool(self.by_handle)
+
+
+def build_citation_table(
+    registry: SourceRegistry,
+    bindings: Sequence[Binding],
+    *,
+    nonce: Optional[str] = None,
+) -> CitationTable:
+    """The handles this turn may offer, from what actually grounded it.
+
+    Both halves of every binding are resolved through the registry, and the
+    relation between them is checked: the evidence has to exist and has to
+    belong to the source named beside it. A binding naming a source the
+    registry does not hold cannot be described to a reader - there is no
+    title, kind or locator to show - and one pairing a real source with
+    another source's passage would attach a citation to text that source
+    never contained.
+
+    Today's producers do not manufacture either shape, and this does not
+    depend on them continuing not to. The gate that grants citation authority
+    is the wrong place to inherit an upstream invariant.
+
+    A source is not given a handle until it has one binding that passes, so a
+    source whose only binding is malformed is uncitable rather than citable
+    with nothing under it.
+    """
+    # `is None` rather than falsy: omitting the nonce asks for one, and
+    # supplying an empty string is a caller naming a namespace. The second
+    # is refused below rather than quietly replaced with a good one.
+    token = mint_nonce() if nonce is None else nonce
+    by_handle: Dict[str, str] = {}
+    by_source: Dict[str, str] = {}
+    evidence: Dict[str, List[str]] = {}
+    # Two of these four checks cannot currently fire, and both are kept.
+    # `add_evidence` refuses a source the registry does not hold, so no
+    # evidence can name a missing one and the relation check below already
+    # covers the source lookup; and `get_evidence("")` returns None, so the
+    # empty-id guard is covered too. Each is redundant *because of an
+    # invariant this function does not own*, which is the one place not to
+    # rely on that: this is the gate that grants citation authority. They are
+    # deliberately unkillable by mutation - recorded here rather than left for
+    # a later reader to simplify away.
+    for entry in bindings:
+        source_id = entry.get("source_id")
+        evidence_id = entry.get("evidence_id")
+        if not source_id or not evidence_id:
+            continue
+        if registry.get_source(source_id) is None:
+            continue
+        record = registry.get_evidence(evidence_id)
+        if record is None or record.source_id != source_id:
+            continue
+        if source_id not in by_source:
+            handle = f"{token}-{len(by_source) + 1}"
+            by_source[source_id] = handle
+            by_handle[handle] = source_id
+            evidence[source_id] = []
+        if evidence_id not in evidence[source_id]:
+            evidence[source_id].append(evidence_id)
+    # Freezing and nonce validation belong to the type, so an explicitly
+    # supplied narrow nonce is refused here by the same rule that refuses it
+    # anywhere else.
+    return CitationTable(
+        nonce=token,
+        by_handle=by_handle,
+        by_source=by_source,
+        evidence=evidence,
+    )
+
+
+def _handle_number(nonce: str, handle: str) -> Optional[int]:
+    """The source number in a handle this allocator could have produced.
+
+    Canonical only. `-0`, `-01` and `-0007` all parse as numbers but none is
+    a handle the allocator makes, and accepting them would let two spellings
+    stand for one slot - `-1` and `-01` naming the same source through two
+    different tokens the model could be offered. The question being asked is
+    whether this table could have come from the allocator, not whether a
+    number can be read out of it.
+    """
+    prefix = f"{nonce}-"
+    if not handle.startswith(prefix):
+        return None
+    tail = handle[len(prefix) :]
+    if not tail.isdigit():
+        return None
+    number = int(tail)
+    if number < 1 or handle != f"{prefix}{number}":
+        return None
+    return number
+
+
+def _require_consistent(
+    registry: SourceRegistry, table: CitationTable
+) -> List[int]:
+    """Check an inherited table whole, and return its allocated numbers.
+
+    Every part of it, not only the part extension happens to read. The maps
+    have to be exact inverses, each source has to resolve here, and each
+    eligible passage has to exist and belong to the source it is filed under -
+    the same relation new bindings are held to, applied to state arriving
+    already built. Checking only what the loop below touches would let a
+    malformed table pass its own contents straight through into the grown one,
+    which is the defect fixed for new bindings reappearing by inheritance.
+
+    An extra `by_source` entry is refused rather than ignored for a second
+    reason: it silently suppresses allocation when that source later becomes
+    genuinely eligible, and reached the loop below as a raw `KeyError`.
+
+    The source-existence check here cannot currently be the sole reason for a
+    refusal, and is kept anyway. Every route to it is covered by something
+    else: a cited source with no evidence trips the starved check, and one
+    with evidence trips the relation check, because `add_evidence` refuses a
+    source the registry does not hold and so no valid passage can name a
+    missing one. It is redundant because of an invariant this function does
+    not own - the same reason the equivalent guards in `build_citation_table`
+    are kept, at the same gate.
+    """
+    numbers = []
+    for handle, source_id in table.by_handle.items():
+        number = _handle_number(table.nonce, handle)
+        if number is None:
+            raise ProvenanceError(
+                f"citation handle {handle!r} is not of namespace {table.nonce!r}"
+            )
+        if table.by_source.get(source_id) != handle:
+            raise ProvenanceError(
+                f"citation handle {handle!r} and source {source_id!r} disagree"
+            )
+        if registry.get_source(source_id) is None:
+            raise ProvenanceError(
+                f"citation handle {handle!r} names {source_id!r}, "
+                "which this registry does not hold"
+            )
+        numbers.append(number)
+
+    orphaned = set(table.by_source) - set(table.by_handle.values())
+    if orphaned:
+        raise ProvenanceError(
+            f"citation sources {sorted(orphaned)} have no handle of their own"
+        )
+
+    # Exactly the cited sources, not a subset of them. A source earns its
+    # handle from a binding, and a binding always carries a passage, so a
+    # cited source with no eligible evidence is a handle no valid binding
+    # could have granted - citable with nothing under it, and a `KeyError` in
+    # the allocation loop the moment a real binding for it arrives.
+    starved = set(table.by_source) - set(table.evidence)
+    if starved:
+        raise ProvenanceError(
+            f"citation sources {sorted(starved)} are cited with no evidence"
+        )
+
+    for source_id, evidence_ids in table.evidence.items():
+        if source_id not in table.by_source:
+            raise ProvenanceError(
+                f"citation evidence is filed under {source_id!r}, "
+                "which this table does not cite"
+            )
+        if not evidence_ids:
+            raise ProvenanceError(
+                f"citation source {source_id!r} is cited with no evidence"
+            )
+        for evidence_id in evidence_ids:
+            record = registry.get_evidence(evidence_id)
+            if record is None:
+                raise ProvenanceError(
+                    f"citation evidence {evidence_id!r} is not in this registry"
+                )
+            if record.source_id != source_id:
+                raise ProvenanceError(
+                    f"citation evidence {evidence_id!r} belongs to "
+                    f"{record.source_id!r}, not to {source_id!r}"
+                )
+    return numbers
+
+
+def extend_citation_table(
+    registry: SourceRegistry,
+    table: CitationTable,
+    bindings: Sequence[Binding],
+) -> CitationTable:
+    """The same namespace, grown by whatever became eligible since.
+
+    One assembly offers the model handles more than once - a tool round adds
+    sources, then another round adds more - and each offer has to extend the
+    previous one rather than start over. Building a second table from the
+    second round's bindings alone would allocate `-1` again, to a different
+    source, under the same nonce: two documents with one name, in one
+    conversation the model can see both halves of.
+
+    So an existing source keeps the handle it already has, a new one takes the
+    next unused number, and a source seen again only adds to what may be cited
+    within it.
+
+    The table handed in is re-checked whole against the registry rather than
+    trusted for being immutable - see `_require_consistent`. `CitationTable`
+    guarantees its representation cannot be edited and that its nonce is well
+    formed; it cannot guarantee that its contents mean anything here, and
+    extension is another authority gate. A table whose entries do not resolve
+    is a programming error rather than a data condition, so it raises instead
+    of being silently repaired - dropping an entry would renumber the
+    namespace under text that already quotes it.
+    """
+    numbers = _require_consistent(registry, table)
+    by_handle = dict(table.by_handle)
+    by_source = dict(table.by_source)
+    evidence = {key: list(value) for key, value in table.evidence.items()}
+    allocated = max(numbers, default=0)
+    for entry in bindings:
+        source_id = entry.get("source_id")
+        evidence_id = entry.get("evidence_id")
+        if not source_id or not evidence_id:
+            continue
+        if registry.get_source(source_id) is None:
+            continue
+        record = registry.get_evidence(evidence_id)
+        if record is None or record.source_id != source_id:
+            continue
+        if source_id not in by_source:
+            allocated += 1
+            handle = f"{table.nonce}-{allocated}"
+            by_source[source_id] = handle
+            by_handle[handle] = source_id
+            evidence.setdefault(source_id, [])
+        if evidence_id not in evidence[source_id]:
+            evidence[source_id].append(evidence_id)
+    return CitationTable(
+        nonce=table.nonce,
+        by_handle=by_handle,
+        by_source=by_source,
+        evidence=evidence,
+    )
+
+
+def validate_citations(answer: str, table: CitationTable) -> List[CitationOccurrence]:
+    """The citations in this answer that this turn actually issued.
+
+    In the order they appear, so a renderer can walk the text once. Anything
+    that does not resolve is dropped rather than repaired into a neighbour:
+    a marker naming a source this turn did not ground on is not evidence of
+    anything, and guessing which one was meant would invent the relation the
+    whole layer exists to stop being invented.
+
+    Prose with no citation is not an error here. Whether an answer cites
+    enough is a different question from whether what it cited is real.
+    """
+    found: List[CitationOccurrence] = []
+    for match in CITATION_RE.finditer(answer or ""):
+        source_id = table.source_for(match.group(1))
+        if source_id is None:
+            continue
+        found.append(
+            CitationOccurrence(
+                handle=match.group(1),
+                source_id=source_id,
+                start=match.start(),
+                end=match.end(),
+                evidence_ids=table.evidence_for(source_id),
+            )
+        )
+    return found
+
+
+def transfer_citations(
+    canonical: Optional[Mapping[str, Any]],
+    table: CitationTable,
+    worker_content: Any,
+) -> List[Dict[str, Any]]:
+    """The citations the model wrote, if this is the answer it wrote them in.
+
+    The parent kept what the model said; the worker returned what it claims
+    the answer is. Those are different objects with different trust, and this
+    is the only place the first becomes authority for the second.
+
+    The rule is one exact comparison. What the worker returned must equal the
+    canonical answer with this turn's namespace taken out of it - the string
+    the worker was handed. Then, and only then, the citations are read out of
+    the canonical text. Two asymmetries carry the whole boundary:
+
+    * equality is checked against the worker's text, because that is the
+      thing being vouched for;
+    * markers are parsed only from the parent's text, because a worker that
+      could write a marker could cite a source it never read.
+
+    So a worker that edits one word - `400 hours` to `800 hours` - transfers
+    nothing. It can still return whatever it likes; it just cannot have the
+    parent call it cited.
+
+    Exact, with no normalization. A worker that trims or rewraps the answer
+    loses its citations, which is the safe direction: the alternative is a
+    comparison that accepts an answer the model did not write. The blocking
+    agent path returns the terminal response unchanged, so this costs nothing
+    there, and the cases where it does differ - an empty terminal response,
+    the "could not derive an answer" default - are answers the model did not
+    write and should carry nothing.
+
+    `canonical` is replacement state, not a history: the last model turn of
+    the assembly is the only candidate. Two turns whose public text is the
+    same but whose citations differ must not both be eligible, and searching
+    backwards for one that happens to match would make them so.
+    """
+    # Two contract statements rather than two behaviours, and neither is
+    # separately killable: drop the first and the second catches a missing
+    # response, drop the second and the empty text compares equal to an empty
+    # answer and validates to nothing anyway. Drop both and this raises on
+    # `None`. Written out because "no canonical answer text, no transfer" is
+    # the rule, and leaving it to be re-derived from how the validator treats
+    # an empty string is how it stops being true.
+    if not canonical:
+        return []
+    canonical_text = str(canonical.get("content") or "")
+    if not canonical_text:
+        return []
+    public, origins = scrub_positions(canonical_text, table.nonce)
+    if worker_content != public:
+        return []
+    return citation_payload(validate_citations(canonical_text, table), origins)
+
+
+def citation_payload(
+    occurrences: Sequence[CitationOccurrence],
+    origins: Sequence[int],
+) -> List[Dict[str, Any]]:
+    """Validated citations as plain data, for one turn's transport.
+
+    Two coordinate spaces, each named for the string it indexes, because they
+    are not the same string and a record that said only `start` would be read
+    as indexing whichever one the reader had in hand:
+
+    * `canonical_start` and `canonical_end` span the marker in the answer the
+      model produced. That string is parent-side and goes no further, so these
+      are measurement, not something to render against.
+    * `public_offset` is where the marker was in the answer the caller holds -
+      an insertion point, since the marker is not there any more. This is the
+      coordinate anything rendering or persisting a citation wants.
+
+    `public_offset` comes from the scrub that removed the marker rather than
+    from arithmetic over marker widths, because the scrub also takes out bare
+    nonces, leading whitespace and case variants, and repeats until nothing is
+    left. Recovering it later by re-parsing is the work this layer exists to
+    avoid, so it is carried.
+
+    The handle stops here. It is the model-facing name for a source and its
+    job ended when it resolved to `source_id`; carrying it further would push
+    the nonce past the invocation that minted it and blur the line between
+    what the model called a source and what the parent decided it was.
+
+    Mapping the marker's start or its end gives the same number, since the
+    span between them is exactly what was removed. The start is used because
+    that is where the marker was.
+    """
+    return [
+        {
+            "source_id": item.source_id,
+            "canonical_start": item.start,
+            "canonical_end": item.end,
+            "public_offset": public_index(origins, item.start),
+            # What the answer rested on inside that source. Carried because
+            # a source names an object and an object changes: the passage's
+            # fingerprint is the only thing that can still say, later, which
+            # reading was cited.
+            "evidence_ids": list(item.evidence_ids),
+        }
+        for item in occurrences
+    ]
+
+
+class Answer(NamedTuple):
+    """A turn's answer, and the two records that describe *that string*."""
+
+    content: str
+    bindings: List[Binding]
+    citations: List[Dict[str, Any]]
+
+
+def replaced_answer(
+    content: Any,
+    bindings: Optional[Sequence[Binding]],
+    citations: Optional[Sequence[Dict[str, Any]]],
+) -> Optional[Answer]:
+    """One node's answer as a replacement, or nothing when it produced none.
+
+    A workflow's answer is replacement state: a later node that produces one
+    replaces the earlier answer rather than adding to it. These three move
+    together because the other two are measurements of the content and of
+    nothing else. Provenance says what may support this string; a citation's
+    `public_offset` is an index into it. Take the new content and keep the old
+    citations and the turn publishes an offset measured in a string nobody was
+    shown, naming a source the new answer may never have read - and the
+    turn-wide registry is a consulted superset, so that stale name still
+    resolves instead of dangling visibly.
+
+    Returned whole rather than assigned in place because partial replacement
+    is the failure this exists to stop. Both runners have shipped a site that
+    replaced two of the three; a caller here unpacks all three or takes none.
+
+    `None` when there is no answer to take. A node that produced no content
+    changes nothing, which is what keeps the server-authored fallback
+    sentence from inheriting the model's grounding and citations.
+    """
+    if not content:
+        return None
+    return Answer(content, list(bindings or []), list(citations or []))
+
+
+#: Source kinds whose `locator` is a reference a reader can follow.
+#:
+#: An allowlist, and fail-closed, because the one kind that is missing is the
+#: reason this exists: a `file` locator is the server's own path to the bytes -
+#: `<shared_fs_root>/users/<user_id>/files/report.md` for an upload - and a
+#: durable citation is public data. Its public name is the title, which is
+#: already the file's own name. A `web` locator is the URL, which is both the
+#: reference and the identity.
+#:
+#: Every other producer identifies its source by `origin_id` and records no
+#: locator at all, so the list is short by construction rather than by
+#: omission. A kind added later gets no locator until someone decides its
+#: locator is safe to publish, which is the direction a leak should fail in.
+PUBLIC_LOCATOR_KINDS = frozenset({"web"})
+
+#: Identities the owner of a conversation may be shown, by kind and by form.
+#:
+#: `origin_id` is the producer's internal identity for an object, and being
+#: the right internal identity does not make it the right public one. What is
+#: listed here names something the owner already holds: their own note, their
+#: own conversation, or an attachment identified by the digest of its own
+#: bytes.
+#:
+#: Keyed by form and not by kind alone, because one kind already carries two
+#: identity schemes with different semantics: a `file` is either an attachment
+#: generation - `attachment-generation:<sha256>:<ext>`, immutable by
+#: construction - or a plain context file, which has no identity at all. A
+#: future producer that starts issuing file identities of some third shape
+#: publishes nothing until someone reviews that shape, rather than inheriting
+#: this approval from the kind.
+#:
+#: The prefix is written here rather than imported from `attachments`, which
+#: would make this module depend on that one; `tests/test_citation_projection`
+#: pins it against the real `generation_key()` so the two cannot drift.
+#:
+#: `web` is absent because a web source has no `origin_id`: its identity is
+#: the URL, which travels as the locator.
+PUBLIC_IDENTITY_FORMS: Dict[str, Tuple[str, ...]] = {
+    "note": ("note:",),
+    "conversation": ("conversation:",),
+    "file": ("attachment-generation:",),
+}
+
+#: Source kinds whose `origin_id` is published as a stable opaque token.
+#:
+#: An MCP source is identified by the admin-owned artifact row of the server
+#: plus the remote tool name, which is exactly right internally - two admins
+#: may both configure a server called `inventory` - and is a deployment's
+#: configuration seen from a user's chat. Hashed, a citation still groups
+#: with every other citation of that tool and names nothing.
+#:
+#: Only high-entropy identities belong here. A digest of an enumerable id is
+#: not opaque: anyone who wants to know whether a citation is row 42 can hash
+#: 42 and compare. That is why the inline `unknown` kind, whose identity is a
+#: `knowledge_chunk:<row id>`, is in neither set and publishes nothing.
+OPAQUE_IDENTITY_KINDS = frozenset({"mcp"})
+
+#: Evidence locator fields that say *where in a source* a passage sits.
+#:
+#: The rest of `EvidenceLocator` says *which row*: `chunk_id` is a knowledge
+#: chunk's own id and `block_id` is a message's. A citation needs the first
+#: question answered and does not need the second, so the second is not
+#: exported - the same decision as `origin_id`, made field by field because
+#: the locator is one object carrying both kinds of answer.
+PUBLIC_LOCATOR_FIELDS = ("chunk_index", "page", "section", "start", "end")
+
+
+def public_source_id(kind: str, origin_id: str) -> str:
+    """The producer's identity for a source, in a form that may be published.
+
+    `content_struct` is an API field, so a durable citation's `source_id` is
+    a public one whether or not today's client renders it. Three outcomes,
+    and a kind nobody has classified gets the third:
+
+    * published as it stands, for an identity in a form the owner holds -
+      by form, not by kind, so one producer's new identity scheme does not
+      inherit another's approval;
+    * published as a stable digest, for one that names the deployment rather
+      than the reader - the same source still gets the same token in every
+      turn, so a client can group by it;
+    * not published, which is also what an empty `origin_id` produces.
+
+    The digest covers the identity alone, which is safe because every
+    producer's identity is already self-prefixed - `note:`, `conversation:`,
+    `mcp:`, `gen:` - so two kinds cannot collide on one string.
+    """
+    if not origin_id:
+        return ""
+    if any(
+        origin_id.startswith(prefix)
+        for prefix in PUBLIC_IDENTITY_FORMS.get(kind, ())
+    ):
+        return origin_id
+    if kind in OPAQUE_IDENTITY_KINDS:
+        digest = hashlib.sha256(origin_id.encode("utf-8")).hexdigest()
+        return f"opaque:{digest[:32]}"
+    return ""
+
+
+
+
+def shared_citation(segment: Mapping[str, Any]) -> Dict[str, Any]:
+    """One stored citation as an anonymous reader of a share may see it.
+
+    Two audiences, and the stored form is the first one's. "Public to the
+    owner of the conversation" and "public to whoever has the link" are
+    different boundaries: the owner holds the note, the attachment and the
+    passage a citation names, and a share viewer holds none of them. So the
+    identity goes, and so do the fingerprints - a content hash of a private
+    passage is a checkable claim about bytes the reader cannot read, which is
+    the sort of thing an oracle is made of.
+
+    What is left is what a share is for: where the citation sits in the
+    answer, what kind of source it was, what it is called, and a link where
+    the source has an address anyone can follow.
+
+    The locator is re-checked against the kind rather than trusted from the
+    row. Storage already applies that rule, so this is a second statement of
+    it at the boundary where being wrong is worse.
+    """
+    meta = segment.get("meta")
+    meta = meta if isinstance(meta, Mapping) else {}
+    kind = str(meta.get("kind") or "")
+    return {
+        "type": "citation",
+        "start": segment.get("start"),
+        "end": segment.get("end"),
+        "locator": (
+            str(segment.get("locator") or "")
+            if kind in PUBLIC_LOCATOR_KINDS else ""
+        ),
+        "meta": {"kind": kind, "title": str(meta.get("title") or "")},
+    }
+
+
+def shared_content_struct(struct: Any) -> Optional[Dict[str, Any]]:
+    """A stored `content_struct` as a shared conversation may show it.
+
+    Projected citations, and nothing else at all. Not an allowlist of segment
+    types with the others copied through: the share already carries the
+    message's own `content`, so a second structured copy of its text buys the
+    page nothing and can differ from it. A `content_struct` on a *user*
+    message is whatever that client sent - the normalizer checks its shape and
+    its coordinates, not that a text segment says what the message says - so a
+    text segment's `text`, `tags` and `meta` are fields nobody promised an
+    anonymous reader, carrying values the share page does not render.
+
+    The same reasoning refuses a `tool_call` segment, which carries a call's
+    arguments and result: a stranger is being shown an answer, not a trace.
+
+    Structured text or code on a share is a feature someone can add later,
+    with its own projection and its own statement of how it relates to the
+    public `content`. `None` when nothing is kept, because the message's own
+    text is what a share renders when there is no structure to add to it.
+    """
+    if not isinstance(struct, Mapping):
+        return None
+    segments = struct.get("segments")
+    if not isinstance(segments, Sequence) or isinstance(segments, (str, bytes)):
+        return None
+    kept = [
+        shared_citation(segment)
+        for segment in segments
+        if isinstance(segment, Mapping) and segment.get("type") == "citation"
+    ]
+    return {"segments": kept} if kept else None
+
+
+def _resolve_evidence(
+    snapshot: Optional[Mapping[str, Any]],
+    *,
+    source_id: str,
+    evidence_ids: Optional[Sequence[Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    """The fingerprints of the passages a citation rested on, or nothing.
+
+    The hash and the position, never the text. Copying the passage would put
+    corpus prose in a message row, where deleting the document does not reach
+    it; the fingerprint says which reading was cited without keeping it.
+
+    That is what makes an old citation still mean what it meant. The source
+    may be gone, or the path may hold different bytes now - the stored hash
+    matches neither, so the citation reads as being about something that is
+    no longer there rather than silently pointing at whatever replaced it.
+
+    All or nothing, and `None` says so. A citation with no fingerprint is not
+    a weaker citation, it is a citation that has stopped identifying anything
+    durable - for a plain file it would be a title and two empty strings - so
+    a caller that cannot resolve one drops the citation instead of storing it
+    unpinned. Zero evidence cannot happen upstream either: a handle is only
+    issued once a valid binding exists, so an empty list here is already two
+    representations of one turn disagreeing.
+
+    Four things every record must satisfy, and each of them is a way the two
+    sides could disagree:
+
+    * it exists, so no wanted fingerprint is silently missing;
+    * it belongs to the source being cited. `build_citation_table` refuses a
+      binding whose evidence names a different source, and the registry is a
+      consulted superset, so an id from a source the answer never cited is
+      one that legitimately exists - it just is not this citation's;
+    * it carries its passage, since a record with no text cannot be checked;
+    * its hash is the hash of that passage. The snapshot carries both and the
+      durable row will carry only one, so this is the last place the claim can
+      be checked at all. Deliberately redundant - the registry computes the
+      same digest - which is what a check at an authority boundary should be.
+    """
+    wanted = [str(item) for item in evidence_ids or []]
+    if not wanted:
+        return None
+    records = (snapshot or {}).get("evidence") or []
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        return None
+    by_id: Dict[str, Mapping[str, Any]] = {}
+    for record in records:
+        if isinstance(record, Mapping):
+            by_id[str(record.get("evidence_id") or "")] = record
+    found: List[Dict[str, Any]] = []
+    for evidence_id in wanted:
+        record = by_id.get(evidence_id)
+        if record is None:
+            return None
+        if str(record.get("source_id") or "") != source_id:
+            return None
+        text = record.get("text")
+        if not isinstance(text, str):
+            return None
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest != str(record.get("content_hash") or ""):
+            return None
+        locator = record.get("locator")
+        found.append({
+            "content_hash": digest,
+            "locator": {
+                field: locator[field]
+                for field in PUBLIC_LOCATOR_FIELDS
+                if isinstance(locator, Mapping) and locator.get(field) is not None
+            },
+        })
+    return found
+
+
+def durable_citations(
+    citations: Optional[Sequence[Mapping[str, Any]]],
+    snapshot: Optional[Mapping[str, Any]],
+    content: str,
+) -> List[Dict[str, Any]]:
+    """The citations that may outlive the turn, as `content_struct` segments.
+
+    Everything upstream of here is turn-scoped. The nonce is minted per turn,
+    the handle is only how the model named a source, and `src_3` restarts at
+    `src_1` on the next one - so none of the three may be written down. What
+    survives is where the citation is in the answer the caller kept, and what
+    the source was.
+
+    Two inputs, and only one of them is authority. `citations` are the
+    occurrences already validated against the handles this turn committed:
+    that list, and nothing else, decides what is cited. `snapshot` is the
+    turn's registry, which is everything *consulted* - so it is read as a
+    lookup table and never as a source of eligibility. A source sitting in
+    the snapshot that no validated citation names does not become a citation,
+    which is the difference between "the turn read this" and "the answer
+    rests on this".
+
+    Three ways an entry is dropped rather than written, all of them meaning
+    the two sides disagree about a fact one of them measured:
+
+    * it names a source the snapshot cannot resolve, so nothing durable
+      could say what was cited;
+    * its offset is not a position in `content`, so the coordinate was
+      measured against a different string - which is also how `content` not
+      being the string the offsets were computed for is detected at all;
+    * its evidence does not resolve, exactly and to this source. See
+      `_resolve_evidence`: the fingerprints are what identify the reading,
+      so a citation that loses them is not a weaker citation but one that
+      has stopped identifying anything.
+
+    Dropping the citation and keeping the message is deliberate. An answer
+    that cites nothing is an ordinary answer; an answer stored with a
+    coordinate into text nobody has is a claim about a source, and the
+    conservative direction is not to make it.
+
+    A marker occupies no space in the public text - it was removed - so the
+    segment is a zero-width anchor: `start` and `end` are both the insertion
+    point.
+
+    What the record says the source *is*, and what it deliberately does not
+    say. `source_id` is the producer's own identity for the object, in the
+    form `public_source_id` allows to be published - `note:7`, a conversation
+    id, an attachment's `gen:<sha256>:<ext>`, an opaque token for a tool, or
+    nothing. It is never the locator. A path is where a file was during this
+    turn, not what
+    it is: plain retrieval says so itself, since chunks under a path claim to
+    be the contents of that path *now*. Replace the file tomorrow and a
+    citation identified by the path would follow the name to bytes that never
+    supported the answer.
+
+    So the historical reading is carried by `meta.evidence` instead - the
+    fingerprint of each passage the citation rested on, with no passage text.
+    A source whose object identity does not exist is still pinned by that:
+    the hash matches the reading that was cited, and matches nothing else.
+
+    `meta.title` is the display name and `locator` is a reference a reader can
+    follow, kept only for the kinds where a locator is one - see
+    `PUBLIC_LOCATOR_KINDS`. For a file the durable record carries the name and
+    not the server's path to it.
+    """
+    sources = (snapshot or {}).get("sources") or {}
+    if not isinstance(sources, Mapping):
+        return []
+    segments: List[Dict[str, Any]] = []
+    for entry in citations or []:
+        source = sources.get(entry.get("source_id"))
+        if not isinstance(source, Mapping):
+            continue
+        offset = entry.get("public_offset")
+        if isinstance(offset, bool) or not isinstance(offset, int):
+            continue
+        if offset < 0 or offset > len(content or ""):
+            continue
+        evidence = _resolve_evidence(
+            snapshot,
+            source_id=str(entry.get("source_id") or ""),
+            evidence_ids=entry.get("evidence_ids"),
+        )
+        if evidence is None:
+            continue
+        kind = str(source.get("kind") or "")
+        segments.append({
+            "type": "citation",
+            "start": offset,
+            "end": offset,
+            "locator": (
+                str(source.get("locator") or "")
+                if kind in PUBLIC_LOCATOR_KINDS else ""
+            ),
+            "source_id": public_source_id(
+                kind, str(source.get("origin_id") or "")
+            ),
+            "meta": {
+                "kind": kind,
+                "title": str(source.get("title") or ""),
+                "evidence": evidence,
+            },
+        })
+    return segments
+
+
+def _namespace_pattern(nonce: str) -> "re.Pattern[str]":
+    """Every plain form one turn's namespace can be written in.
+
+    Three of them: the well-formed marker, a handle whose brackets the model
+    omitted, and the nonce on its own. The leading-whitespace rule is shared,
+    so removing one does not leave a gap mid-sentence.
+
+    Matched case-insensitively. The alphabet is uppercase, so `k7q2abcd` is
+    not an encoding of the namespace but a lossless normalization of it: a
+    worker handed the lowercase form recovers the real one by uppercasing.
+
+    Only this nonce. Anything else shaped like a citation is left exactly as
+    the model wrote it, including another turn's marker - see the caller.
+    """
+    token = re.escape(nonce)
+    return re.compile(
+        rf"[ \t]*(?:\[cite:{token}(?:-\d+)?\]|{token}(?:-\d+)?)",
+        re.IGNORECASE,
+    )
+
+
+def scrub_namespace(value: Any, nonce: str) -> Any:
+    """A copy of `value` with this turn's citation namespace taken out of it.
+
+    For the wire rather than for a reader, and narrower than `strip_citations`
+    on purpose. Once the model has been offered `[cite:K7Q2ABCD-1]` it can put
+    that handle anywhere in its reply, and everything in that reply crosses
+    the pipe to a worker that is the untrusted half of the boundary. So this
+    turn's nonce goes, in the marker and on its own.
+
+    What does not go is anything else citation-shaped. `strip_citations` is
+    the reader's cleanup and deliberately removes every closed marker, this
+    turn's or not; using it here would rewrite text carrying no authority at
+    all. A model asked to search for the literal `[cite:OLDTURN-1]` must get
+    that tool call executed as it wrote it, and a turn that was offered no
+    handles must cross unchanged.
+
+    Recursive, because a model-controlled string is not only `content`: an
+    assistant message carries one, and a tool call's `arguments` carry
+    whatever the model decided to search for. Every container is rebuilt, so
+    the scrubbed copy shares no mutable structure with the original - the
+    canonical record must not change when something edits what crossed.
+
+    What this buys, stated at its real width: no plain representation of the
+    namespace crosses the wire. It is not a secrecy proof. A model that has
+    seen the nonce can encode it into text no scrubber recognises - reversed,
+    base64, spelled out - so this cannot be the control citation correctness
+    depends on. That control is the canonical-response transfer rule, which
+    grants nothing when the worker's answer differs from what the model
+    actually said. This keeps the namespace out of ordinary worker state.
+    """
+    return _scrub(value, _namespace_pattern(nonce))
+
+
+def scrub_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
+    """The scrubbed text, and where each surviving character came from.
+
+    `origins[i]` is the index in `text` of the character at `i` in the result,
+    so the two together say not only what crossed but where every removal
+    happened. `public_index` reads that back.
+
+    One transformation answers both questions on purpose. The same scrub
+    decides whether the worker returned the answer unchanged and where a
+    validated marker went, and deriving the second by subtracting marker
+    widths would be a second implementation that disagrees with the first:
+    this one also removes bare nonces, leading whitespace and case variants,
+    and repeats until nothing is left to find. Each of those shifts positions.
+    """
+    return _scrub_text(text, _namespace_pattern(nonce))
+
+
+def public_index(origins: Sequence[int], index: int) -> int:
+    """Where position `index` of the original text landed after scrubbing.
+
+    An insertion point rather than a character: a position inside a removed
+    span maps to where that span used to start, which is what a renderer
+    needs to put something back.
+    """
+    return bisect.bisect_left(origins, index)
+
+
+def _scrub_text(text: str, pattern: "re.Pattern[str]") -> Tuple[str, List[int]]:
+    current = text
+    origins = list(range(len(text)))
+    while True:
+        # Removing a substring can splice its neighbours into a fresh
+        # occurrence: `ABCD` + nonce + `EFGH` becomes the nonce again, for
+        # any nonce. A pass does not rescan what it has rewritten, so passes
+        # repeat until one finds nothing. Each pass is at least a nonce
+        # shorter than the last, so this ends.
+        matches = list(pattern.finditer(current))
+        if not matches:
+            return current, origins
+        kept: List[str] = []
+        kept_origins: List[int] = []
+        cursor = 0
+        for match in matches:
+            kept.append(current[cursor : match.start()])
+            kept_origins.extend(origins[cursor : match.start()])
+            cursor = match.end()
+        kept.append(current[cursor:])
+        kept_origins.extend(origins[cursor:])
+        current = "".join(kept)
+        origins = kept_origins
+
+
+def _scrub(value: Any, pattern: "re.Pattern[str]") -> Any:
+    if isinstance(value, str):
+        return _scrub_text(value, pattern)[0]
+    if isinstance(value, Mapping):
+        # Keys as well as values. Today every adapter re-serializes a tool
+        # call's arguments to a JSON string, so no key here is model-chosen;
+        # that is a property of the adapters rather than of this reply, and
+        # a key is a string like any other.
+        rebuilt: Dict[Any, Any] = {}
+        for key, item in value.items():
+            scrubbed_key = _scrub(key, pattern)
+            if scrubbed_key in rebuilt:
+                # Two distinct keys became one. Refused rather than resolved:
+                # for a primitive whose whole job is to protect the field
+                # nobody has added yet, dropping one of them quietly is the
+                # wrong half of the choice.
+                raise ProvenanceError(
+                    "scrubbing a citation namespace collapsed two mapping keys"
+                )
+            rebuilt[scrubbed_key] = _scrub(item, pattern)
+        return rebuilt
+    if isinstance(value, (list, tuple)):
+        items = [_scrub(item, pattern) for item in value]
+        return tuple(items) if isinstance(value, tuple) else items
+    return value
+
+
+def assert_scrubbed(value: Any, nonce: str) -> None:
+    """Refuse to hand the untrusted side anything naming this namespace.
+
+    Checked on the serialized whole rather than on the fields this module
+    happens to know about: a field added later is model-controlled the moment
+    it exists, and a scrubber that lists its keys would keep passing while a
+    new one carried the handle straight across.
+
+    Case-folded, for the same reason the scrubber is: the lowercase nonce is
+    the namespace, written differently.
+
+    Serialized without ASCII escaping so that this cannot fire on a payload
+    the scrubber correctly cleaned. `\\uXXXX` escapes are hex, and a nonce
+    drawn only from hex characters can be spliced out of one: `chr(0x2345)`
+    followed by `"6789"` escapes to `\\u23456789`, which contains a nonce the
+    string never held. Every escape that survives here is a control character
+    - always `\\u00XX`, and `0` is not in the alphabet - so no escape can
+    contribute. A real occurrence is ASCII and still appears verbatim.
+    """
+    serialized = json.dumps(value, ensure_ascii=False, default=repr)
+    if nonce.lower() in serialized.lower():
+        raise ProvenanceError(
+            "a citation namespace reached a public capability result"
+        )
+
+
+def strip_citations(answer: str) -> str:
+    """The answer with every citation marker removed.
+
+    Every closed marker-shaped token is removed, whether or not it resolves
+    and whether or not it is well formed. An unclosed `[cite:` is left alone:
+    there is no boundary at which deleting the rest of a sentence would be
+    the safer guess. This is what runs when the
+    markers must not reach a reader, and a mistyped one is exactly the kind
+    that would otherwise be left behind. Spacing left by a removed marker is
+    closed up, so a sentence does not end with a gap where a handle used to
+    be.
+    """
+    return re.sub(r"[ \t]*" + CITATION_RE.pattern, "", answer or "")

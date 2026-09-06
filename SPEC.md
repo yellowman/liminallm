@@ -228,6 +228,35 @@ trail.
   and audit; attachment references non-text payloads; redaction marks
   filtered spans and the policy that applied. Storage normalizes to these
   keys and drops invalid structures.
+- `start` and `end` are offsets into the same message's `content`, counted
+  in **Unicode code points**, and `0 <= start <= end <= len(content)`. The
+  unit is normative because the producer and the renderer count differently
+  by default: Python indexes code points and JavaScript indexes UTF-16 code
+  units, so an anchor after an emoji is 1 in the stored record and 2 in a
+  naive `String.prototype.slice`. A renderer converts; the record does not.
+  Storage enforces this: a segment whose coordinates are not positions in
+  the content is dropped, since a span is what several segment types are
+  for and one that indexes nothing is a record of nothing.
+- a citation segment is an anchor rather than a span: the model's marker is
+  removed from `content` before it is stored, so what survives is the
+  position it was written at and `start == end`. A citation on an assistant
+  message is produced only by validating the model's own markers against the
+  handles that turn issued (§17); a citation segment arriving from anywhere
+  else is dropped rather than stored.
+- a citation's `source_id`, `locator` and `meta` are public: `content_struct`
+  is an API field, so what is stored is what a client may read. A source's
+  internal identity is published only where it names something the reader
+  holds, as an opaque stable token where it names the deployment, and not at
+  all otherwise; a `locator` is published only for kinds whose locator is a
+  reference a reader can follow. `meta.title` is the presentation label - a
+  client must not derive a name from an identifier or a path.
+- a publicly shared conversation is a second audience, and the stored form is
+  the owner's. Its messages carry `content` and citation segments reduced to
+  the anchor, the kind, the title and a followable locator - no source
+  identity, no evidence fingerprint - and no other segment type at all. A
+  reader with the link holds none of the objects a citation names, so an
+  identity they cannot open, or a hash of a passage they cannot read, is a
+  claim to test a guess against rather than provenance.
 - summary messages are `sender='system', role='system',
   meta.summary=true`.
 

@@ -52,6 +52,7 @@ def _fake_exec(record=None):
         mcp_tools=None,
         source_registry=None,
         bindings_sink=None,
+        spans_sink=None,
     ):
         time.sleep(args.get("sleep", 0.15))
         if record is not None:

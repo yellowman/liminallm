@@ -26,6 +26,7 @@ from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service import turn_effects
 from liminallm.service.auth import AuthContext
+from liminallm.service.citations import durable_citations
 
 logger = get_logger(__name__)
 
@@ -138,6 +139,45 @@ def _unguarded(_capability: str, _payload: Any):
     yield SimpleNamespace(replayable=False, result=None)
 
 
+def _with_citations(
+    struct: Any, content: str, citations: list[dict[str, Any]]
+) -> Any:
+    """The turn's structured content, with its citation anchors in it.
+
+    One producer of citation segments on an assistant row, and it is the
+    projection. Whatever arrived in the orchestration's `content_struct` keeps
+    its text, code and attachment segments and loses its citation ones: a
+    citation is a claim that a source supported a span, and the only thing
+    entitled to make it is the list validated against the handles this turn
+    committed. Nothing today emits an assistant `content_struct` at all, which
+    is exactly why the rule is written here rather than left resting on that.
+
+    Sanitized before the citations are stripped, and stripped before the
+    validated ones are added, so the decisions are made against one list. The
+    normalizer drops segments of unknown type, so a struct holding one
+    malformed entry used to look non-empty here and empty to it - and the
+    answer's own text was then left out of a struct that kept the anchors.
+
+    Appended rather than woven in: a citation segment carries its own
+    position, so where it sits in the list says nothing.
+
+    A turn that cited nothing and carried no struct stores no struct, exactly
+    as before any of this existed.
+    """
+    base = normalize_content_struct(struct, content) or {}
+    segments = [
+        segment for segment in base.get("segments") or []
+        if segment.get("type") != "citation"
+    ]
+    if not citations and len(segments) == len(base.get("segments") or []):
+        return struct
+    if not segments and content:
+        segments.append({"type": "text", "text": content})
+    merged = dict(base)
+    merged["segments"] = segments + citations
+    return merged
+
+
 async def finish(
     runtime,
     turn: Turn,
@@ -160,11 +200,42 @@ async def finish(
     instead would record that a turn was attempted - which is what the
     idempotency slot already records, and is not the same claim as "the message
     is in the table".
+
+    The turn's citations become durable here too, in the same append, because
+    an anchor stored without the answer it indexes is a coordinate into
+    nothing.
     """
     turn.orchestration = orchestration if isinstance(orchestration, dict) else {}
     assistant_content = turn.orchestration.get(
         "content", content or "No response generated."
     )
+    # The turn's citations, made durable against the exact string being
+    # stored. Both are transient above this line: `validated_citations` is
+    # measured in the answer, and `provenance_snapshot` is the turn's registry
+    # travelling beside it so a name can still be resolved once the turn ends.
+    # Neither goes into the row as it stands - what is written is the anchor
+    # and the source, with the nonce, the handle and the turn-local `src_#`
+    # left behind.
+    #
+    # Here rather than in the workflow because this is where the answer stops
+    # being a value and becomes a record: the string the offsets index is the
+    # one `append_message` is about to store, and it is checked against that
+    # string rather than the one the workflow had.
+    offered = turn.orchestration.get("validated_citations") or []
+    citations = durable_citations(
+        offered, turn.orchestration.get("provenance_snapshot"), assistant_content
+    )
+    if len(citations) != len(offered):
+        # Not a failure of the turn - the answer is stored either way - but it
+        # means a validated citation and the answer it was measured in
+        # disagreed, which is a defect somewhere upstream rather than a thing
+        # users do.
+        logger.warning(
+            "citation_projection_dropped",
+            conversation_id=turn.conversation_id,
+            offered=len(offered),
+            durable=len(citations),
+        )
     guard = commit or _unguarded
     with guard(
         "message.assistant",
@@ -176,7 +247,12 @@ async def finish(
             role="assistant",
             content=assistant_content,
             content_struct=normalize_content_struct(
-                turn.orchestration.get("content_struct"), assistant_content
+                _with_citations(
+                    turn.orchestration.get("content_struct"),
+                    assistant_content,
+                    citations,
+                ),
+                assistant_content,
             ),
             meta={
                 "adapters": turn.orchestration.get("adapters", []),

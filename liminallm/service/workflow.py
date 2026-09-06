@@ -44,6 +44,19 @@ from liminallm.service import (
 from liminallm.service import attachments as attachments_service
 from liminallm.service import notes as notes_service
 from liminallm.service.broker import CapabilityBroker, InvocationContext
+from liminallm.service.citation_offers import (
+    CITATION_INSTRUCTION,
+    OfferRender,
+    choose_offers,
+    instruct,
+    label_snippets,
+    rebuild_agent_messages,
+)
+from liminallm.service.citations import (
+    CitationTable,
+    replaced_answer,
+    transfer_citations,
+)
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     cosine_similarity,
@@ -69,7 +82,14 @@ from liminallm.service.node_attempt import (
     NodeOutcome,
     bounded,
 )
-from liminallm.service.provenance import Binding, SourceRegistry
+from liminallm.service.provenance import (
+    Binding,
+    GroundedMessage,
+    GroundedPassage,
+    GroundedSpan,
+    ProvenanceError,
+    SourceRegistry,
+)
 from liminallm.service.rag import (
     RAGService,
     SourceHint,
@@ -98,6 +118,7 @@ from liminallm.service.tool_namespace import (
     ToolResolutionScope,
     resolve_executable_handler,
 )
+from liminallm.service.transcript import TrustedTranscript
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
@@ -608,7 +629,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # Namespace outputs by node ID
                 merged_outputs[node_id] = {
                     k: v for k, v in result.items()
-                    if k not in {"usage", "context_snippets", "provenance_bindings", "status"}
+                    if k
+                    not in {
+                        "usage",
+                        "context_snippets",
+                        "provenance_bindings",
+                        "validated_citations",
+                        "status",
+                    }
                 }
 
                 # Check for failure
@@ -739,6 +767,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # succeeded, so a citation cannot rest on evidence from an attempt
         # whose generation failed.
         provenance_bindings: List[Binding] = []
+        validated_citations: List[Dict[str, Any]] = []
         # The turn's provenance, created once here and passed by reference to
         # every node that can retrieve. Not in `vars_scope`, which a parallel
         # child deep-copies, and not on an `Invocation`, which is one tool
@@ -883,11 +912,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     vars_scope.update(parallel_result.merged_outputs)
 
                     # Update content if parallel nodes produced any
-                    if parallel_result.merged_content:
-                        content = parallel_result.merged_content
-                        # The block's answer is every successful child's
-                        # answer concatenated, so its grounding is theirs.
-                        provenance_bindings = list(parallel_result.merged_bindings)
+                    # The block's answer is every successful child's answer
+                    # concatenated, so its grounding is theirs. Citations are
+                    # not merged, and cannot be: their offsets index one
+                    # child's answer, which is not the concatenation.
+                    answer = replaced_answer(
+                        parallel_result.merged_content,
+                        parallel_result.merged_bindings,
+                        [],
+                    )
+                    if answer is not None:
+                        content, provenance_bindings, validated_citations = answer
 
                     # Merge usage
                     usage = self._merge_usage(usage, parallel_result.merged_usage)
@@ -932,9 +967,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # merely because that node also succeeded, and a union would let a
             # citation validator accept a reference to one. A node that
             # produces no content changes neither.
-            if result.get("content"):
-                content = result["content"]
-                provenance_bindings = list(result.get("provenance_bindings") or [])
+            answer = replaced_answer(
+                result.get("content"),
+                result.get("provenance_bindings"),
+                result.get("validated_citations"),
+            )
+            if answer is not None:
+                content, provenance_bindings, validated_citations = answer
             node_usage = result.get("usage")
             usage = self._merge_usage(usage, node_usage or {})
 
@@ -983,10 +1022,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "adapter_gates": adapter_gates,
             "context_snippets": context_snippets,
             "provenance_bindings": provenance_bindings,
+            "validated_citations": validated_citations,
             "workflow_trace": workflow_trace,
             "routing_trace": routing_trace,
             "vars": vars_scope,
         }
+        if validated_citations:
+            # Transient, and only where something names it. A citation says
+            # `src_3`, which means nothing once this registry goes out of
+            # scope with the turn, so whatever resolves the name has to
+            # travel beside it.
+            #
+            # Not eligibility. The registry is everything consulted, and the
+            # answer rests on the bindings; this is the lookup table for names
+            # already validated against those. S6 decides what is durable and
+            # in what shape - hence the explicit name, which is transport.
+            result["provenance_snapshot"] = source_registry.snapshot()
         await self._retire_workflow_state(state_key)
         await self.cache_conversation_state(conversation_id, history, user_id)
         return result
@@ -1851,21 +1902,37 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         leading: int,
         sink: Optional[List[Dict[str, str]]] = None,
-    ) -> List[Dict[str, str]]:
-        """Register the chunks that reached the model, and return the bindings.
+    ) -> List[Optional[Dict[str, str]]]:
+        """Register the chunks that reached the model, aligned to `snippets`.
 
         Called after budgeting, so the registry holds what grounded the answer
         rather than everything retrieval offered. The bindings say which
         context reached which evidence, which is the only place that relation
         survives: two contexts reaching one passage correctly dedupe to a
         single piece of evidence.
+
+        Returns one entry per snippet, `None` where the snippet is not a
+        retrieved chunk and so has nothing to cite - the digest and the recall
+        window ride in front of the retrieved tail and are the parent's own
+        summaries, not documents. The same aligned-`None` rule the six
+        explicit producers follow, and for the same reason: with a flat list
+        of eligible bindings, the only way to say which snippet a binding
+        belongs to is to count positions, and a later reader counting them
+        against a list of a different length attaches a source to a passage
+        it never grounded.
+
+        The leading entries are counted against what survived rather than
+        assumed present. Budget pruning takes snippets from the end, so it
+        reaches the retrieved tail first, but a budget small enough consumes
+        the digest and the recall entry too - and then a fixed `leading`
+        prefix of `None` would describe entries no longer in the prompt.
         """
         if source_registry is None:
-            return []
-        bindings = register_retrieved_chunks(
-            source_registry,
-            chunks_that_survived(chunks, snippets, leading=leading),
-        )
+            # Uniform shape: nothing is citable without a registry, which is
+            # what an all-`None` vector says. Callers need no special case.
+            return [None] * len(snippets)
+        survivors = chunks_that_survived(chunks, snippets, leading=leading)
+        bindings = register_retrieved_chunks(source_registry, survivors)
         # Into the parent's sink, never into the tool's own output. A tool's
         # declared `output_schema` may set `additionalProperties: false`, so
         # a new key in the validated result would refuse every published
@@ -1873,7 +1940,265 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # statement about the turn, not part of what the tool produced.
         if sink is not None:
             sink.extend(bindings)
-        return bindings
+        aligned: List[Optional[Dict[str, str]]] = [None] * min(leading, len(snippets))
+        aligned.extend(bindings)
+        if len(aligned) != len(snippets):
+            # Refuse rather than return a vector whose positions mean nothing.
+            # A short or long vector does not fail where it is built; it fails
+            # later, as a handle minted for one source and shown against
+            # another passage.
+            #
+            # One check, on the contract rather than on the intermediate. A
+            # second one comparing the bindings against the survivors was
+            # measured unkillable: registration is one binding per chunk, so
+            # a lossy registration arrives here as a short vector and this
+            # catches it by the same arithmetic.
+            raise ProvenanceError(
+                "grounding is not aligned: "
+                f"{len(aligned)} entries for {len(snippets)} snippets"
+            )
+        return aligned
+
+    def _unlabelled_agent_prompt(
+        self,
+        invocation: Invocation,
+        context: InvocationContext,
+        transcript: TrustedTranscript,
+    ) -> List[Dict[str, Any]]:
+        """The trusted conversation with nothing offered in it.
+
+        What every path that cannot carry citations sends. Rendered against a
+        table that cites nothing, so no marker is placed, and without the
+        instruction - a model told to copy markers and shown none is being
+        asked about something that is not there.
+
+        Still the parent's bytes rather than the worker's. Losing the offers
+        is not a reason to start trusting the message list that came back.
+
+        The transcript is passed in rather than read off the context, so this
+        and the offered form are cut at the same point. A fallback that ended
+        one exchange later than the prompt it replaces would be a different
+        conversation, which is the whole thing this layer is for.
+        """
+        messages, _markers, _placed = rebuild_agent_messages(
+            context.initial_messages,
+            context.initial_grounded_messages,
+            transcript,
+            CitationTable(nonce=invocation.citations.nonce),
+            context.source_registry,
+        )
+        return messages
+
+    def agent_prompt(
+        self,
+        invocation: Invocation,
+        context: InvocationContext,
+        *,
+        replace_terminal_answer: bool = False,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """One agent model call's conversation, as the parent builds it.
+
+        `None` means the feature is not operating - offers are off, or this
+        turn recorded no provenance - and the caller sends whatever it sent
+        before any of this existed. That is the only answer that returns the
+        worker into the picture, and it is what keeps production byte-identical.
+
+        Anything else is the parent's own conversation, rebuilt from the base
+        prompt it kept and the record it wrote. The worker's message list is
+        never model input once offers are on: a committed handle is text the
+        model has already read, so a call built from a list the worker
+        composed is one where the worker can ask for that handle by name - the
+        model writes it honestly, exact matching accepts it, and a citation
+        transfers for a claim no source made. Both integrity failures
+        therefore fall back to the unlabelled reconstruction rather than to
+        the worker.
+
+        Speculate, price the prepared form, commit only what a marker actually
+        reached, render once more from the table that was committed, and
+        refuse if the two disagree.
+
+        Two callers, one rule, and one difference between them.
+
+        The blocking seam runs this before each model call, continuing the
+        conversation. The streamed path runs it once to *replace* a turn: the
+        worker has already asked the model for a final answer and thrown the
+        reply away - its loop keeps that reply out of the conversation it
+        hands back, because the parent is about to produce the answer itself -
+        and `replace_terminal_answer` says to cut at the same point. Without
+        it the parent puts the discarded draft in the prompt the replacement
+        is written from, which is neither what the worker handed over nor
+        anything the model was ever shown.
+
+        The record keeps the draft either way. That the model produced one is
+        a fact about the turn; where a replacement starts from is a different
+        question, and the cut is a view rather than an edit.
+        """
+        registry = context.source_registry
+        if not self.CITATION_OFFERS_ENABLED or registry is None:
+            return None
+        transcript = context.transcript
+        if replace_terminal_answer:
+            transcript = transcript.without_trailing_answer()
+        if not context.citations_intact or not invocation.citation_budget_intact:
+            return self._unlabelled_agent_prompt(invocation, context, transcript)
+
+        def rebuild(table: CitationTable):
+            return rebuild_agent_messages(
+                context.initial_messages,
+                context.initial_grounded_messages,
+                transcript,
+                table,
+                registry,
+            )
+
+        def prepared(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            # What the backend will really be sent. `generate_with_tools` and
+            # `stream_messages` each run this themselves, so the priced tree
+            # and the sent tree are the same computation over the same input -
+            # and the raw messages are what gets passed on, or the adapter
+            # guidance lands twice.
+            ready, _adapters = self.llm._prepare_backend_messages(
+                messages, context.adapters
+            )
+            return ready
+
+        def render(table: CitationTable) -> OfferRender:
+            # Instructed first, then prepared. The two orders agree for every
+            # conversation the parent builds, because they all open with a
+            # system message and the guidance goes after it - measured, not
+            # assumed. They part when there is no leading system message:
+            # preparation then puts the guidance first and the instruction is
+            # appended to *it*, which reads as the adapter asking for
+            # citations rather than the service.
+            messages, markers, placed = rebuild(table)
+            return OfferRender(
+                messages=prepared(instruct(messages) if markers else messages),
+                markers=tuple(markers),
+                placed=tuple(placed),
+            )
+
+        choice = choose_offers(
+            registry=registry,
+            committed=invocation.citations,
+            candidates=context.provenance_bindings,
+            render=render,
+            counter=self.llm.token_counter(),
+            budget=self.prompt_budget(),
+        )
+        if not choice.fits:
+            invocation.poison_citation_budget()
+            return self._unlabelled_agent_prompt(invocation, context, transcript)
+        table = invocation.extend_citations(registry, list(choice.granted))
+        final, markers, _placed = rebuild(table)
+        instructed = instruct(final) if markers else final
+        if prepared(instructed) != choice.messages:
+            # The table that was committed did not reproduce the prompt that
+            # was priced from its speculative twin. What the model would be
+            # sent is not what was measured, so nothing here is trustworthy
+            # enough to send - and it will not become so on the next call.
+            invocation.poison_citation_budget()
+            return self._unlabelled_agent_prompt(invocation, context, transcript)
+        return instructed
+
+    def _offered_context(
+        self,
+        invocation: Optional[Invocation],
+        registry: Optional[SourceRegistry],
+        snippets: List[str],
+        aligned: Sequence[Optional[Binding]],
+        *,
+        prompt: str,
+        adapters: List[dict],
+        history: List[Any],
+    ) -> Tuple[List[str], Optional[str]]:
+        """The context snippets as the model will see them, and the rule.
+
+        The automatic route's whole prompt is these snippets plus the
+        question, so labelling them is the entire offer: there is no
+        transcript to rebuild and no worker message list to distrust. What it
+        shares with the agent seam is the arithmetic - speculate, render,
+        price the prepared form, commit only what a marker reached, render
+        once more from the committed table, and refuse if the two disagree.
+
+        Returns the snippets unchanged and no instruction whenever citations
+        cannot be carried, which is also what the gate does. A model told to
+        copy markers and shown none is being asked about something that is
+        not there.
+
+        `aligned` is what makes this safe to do positionally: one entry per
+        snippet, `None` for the parent's own digest and recall window. Those
+        are summaries of the conversation rather than documents, and a marker
+        on one would offer the model a citation for text no source said.
+
+        The budget is not applied again afterwards. Pruning here would drop a
+        snippet out of a prompt that was already priced with it, and the
+        handles committed for it would then name text the model never read.
+        A prompt that cannot afford its markers gives them up whole instead.
+        """
+        if (
+            not self.CITATION_OFFERS_ENABLED
+            or invocation is None
+            or registry is None
+            or not invocation.citation_budget_intact
+        ):
+            return list(snippets), None
+
+        def build(labelled: List[str], markers: Sequence[str]) -> List[dict]:
+            # The rule only when there is something to apply it to. Sent with
+            # no marker in the prompt it describes something that is not
+            # there, and it is not free: its own tokens can push an ordinary
+            # prompt over the budget after every offer has already been given
+            # up, which fails in the wrong direction.
+            messages, _adapters = self.llm._prepare_generation(
+                prompt, adapters, labelled, history,
+                instruction=CITATION_INSTRUCTION if markers else None,
+            )
+            return messages
+
+        def render(table) -> OfferRender:
+            labelled, markers, placed = label_snippets(
+                snippets, aligned, table, registry
+            )
+            return OfferRender(
+                messages=build(labelled, markers),
+                markers=tuple(markers),
+                placed=tuple(placed),
+            )
+
+        choice = choose_offers(
+            registry=registry,
+            committed=invocation.citations,
+            candidates=[found for found in aligned if found],
+            render=render,
+            counter=self.llm.token_counter(),
+            budget=self.prompt_budget(),
+        )
+        if not choice.fits:
+            # Measured equivalent today, and kept for the same reason the
+            # broker keeps its twin: a `fits` false choice carries no
+            # messages, so the comparison below would refuse it anyway. What
+            # this line adds is that the two refusals stay different facts -
+            # a prompt with no room for markers, and a namespace that moved -
+            # rather than one branch standing in for both.
+            invocation.poison_citation_budget()
+            return list(snippets), None
+        table = invocation.extend_citations(registry, list(choice.granted))
+        labelled, markers, _placed = label_snippets(
+            snippets, aligned, table, registry
+        )
+        if build(labelled, markers) != choice.messages:
+            # The committed table did not reproduce the prompt priced from its
+            # speculative twin, so what would go is not what was measured.
+            #
+            # The handles are committed by now - the second render is only
+            # possible against the table the invocation actually got - so
+            # dropping the markers here is not the whole answer. The
+            # invocation is poisoned as well, which is what stops the final
+            # transfer from resolving a handle out of an answer the model
+            # wrote without ever being shown it.
+            invocation.poison_citation_budget()
+            return list(snippets), None
+        return labelled, CITATION_INSTRUCTION if markers else None
 
     @staticmethod
     def _merge_bindings(
@@ -2657,7 +2982,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             outputs = {
                 k: v
                 for k, v in tool_result.items()
-                if k not in {"usage", "context_snippets", "provenance_bindings"}
+                if k
+                not in {
+                    "usage",
+                    "context_snippets",
+                    "provenance_bindings",
+                    "validated_citations",
+                }
             }
         next_nodes_list = self._successors(node, tool_result)
         result_payload: Dict[str, Any] = {
@@ -2669,7 +3000,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "outputs": outputs,
         }
         if isinstance(tool_result, dict):
-            for k in ("content", "usage", "context_snippets", "provenance_bindings"):
+            for k in (
+                "content",
+                "usage",
+                "context_snippets",
+                "provenance_bindings",
+                "validated_citations",
+            ):
                 if k in tool_result:
                     result_payload[k] = tool_result[k]
         return result_payload, next_nodes_list
@@ -2830,6 +3167,59 @@ class WorkflowEngine(WorkflowStreamingMixin):
         succeeded = sanitized.get("status") != "error"
         if succeeded and context.provenance_bindings:
             sanitized["provenance_bindings"] = list(context.provenance_bindings)
+        # Citations, on the same terms and from the same side. A canonical
+        # response exists for the bodies that produce the turn's answer - the
+        # agent loop through `llm.generate_with_tools`, and the plain and
+        # retrieval bodies through `tool.host` - so the transfer is gated on
+        # the resolved body being one of them.
+        #
+        # The body gate is not a formality. The intent classifier is a model
+        # call whose result reaches this seam like any other, and it answers a
+        # routing question rather than the user's: it records no canonical
+        # response, and naming the set here says which results may become
+        # citable rather than leaving it to be inferred from what happens to
+        # be filled in.
+        #
+        # `stream_final` never arrives here at all: that path calls
+        # `_serve_invocation` directly and streams its own final turn. Its
+        # worker `content` is the last *tool* round's text, which can equal
+        # the canonical public text exactly - measured, not assumed - so a
+        # refactor routing streaming through this seam would attach citations
+        # to an answer that had not been written yet. Deliberately unkillable,
+        # and kept for what it refuses next.
+        #
+        # `citations_intact` refuses something reachable today. Once a round
+        # of this assembly diverged from the turn that asked for it, the
+        # parent can no longer say what conversation the final answer was
+        # written in - so an answer quoting a handle from an earlier, honest
+        # round is a handle the model wrote in a prompt the worker composed.
+        # Exact matching accepts it, because the model did write it; this is
+        # what does not.
+        #
+        # `citation_budget_intact` refuses the same thing arrived at from the
+        # other side. The parent, not the worker, gave up materializing the
+        # table; but the handles committed before it gave up are still in the
+        # namespace, and the prompts after it are ones no offer was rendered
+        # into. An answer quoting such a handle is quoting one this turn can
+        # no longer say the model was shown, and the two flags have to be read
+        # together or the second is only a prompt-building preference.
+        if (
+            succeeded
+            and (
+                worker_tool == "agent.files_v1"
+                or worker_tool in self.MODEL_ANSWER_HOSTS
+            )
+            and not plan.get("stream_final")
+            and context.citations_intact
+            and invocation.citation_budget_intact
+        ):
+            citations = transfer_citations(
+                context.canonical_model_response,
+                invocation.citations,
+                sanitized.get("content"),
+            )
+            if citations:
+                sanitized["validated_citations"] = citations
         return refusal or sanitized
 
     def tool_postflight(
@@ -2919,6 +3309,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         plan: Dict[str, Any] = {"inputs": dict(inputs or {}), "message": user_message}
         worker_tool = self._resolve_worker_tool(tool_name, tool_spec)
         if worker_tool != "agent.files_v1":
+            # The one host call this plan authorizes: its own body, with its
+            # own inputs. A worker whose body runs in the worker never sends
+            # `tool.host` at all, and one that does gets its own name back -
+            # which resolves to no host body, so it reaches nothing. What it
+            # cannot do is name a different body.
+            context.remember_host_call(worker_tool, plan["inputs"])
             return worker_tool, plan, context, ""
 
         # The agent loop's prompt is assembled here because assembling it reads
@@ -2929,6 +3325,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         explicit_ids, grounding, ctx_chunks = self._explicit_context_grounding(
             message, context_id, user_id=user_id, tenant_id=tenant_id
         )
+        context_ranges: List[Tuple[int, int]] = []
         messages, tools, preamble, mcp_tools, grounded = self._build_agent_context(
             message,
             attachments,
@@ -2937,12 +3334,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
             conversation_id,
             explicit_context_ids=explicit_ids,
             grounding=grounding,
+            context_ranges=context_ranges,
         )
         # Computed from `grounded`, the subset that survived budgeting, but
         # held locally until this plan is known to be the answer path.
-        agent_bindings = self._record_grounding(
+        aligned = self._record_grounding(
             source_registry, ctx_chunks, grounded, leading=0
         )
+        # Flat: `provenance_bindings` is the set of relations the turn may
+        # cite, and the aligned vector's positions belong to a snippet list it
+        # does not carry.
+        agent_bindings = [found for found in aligned if found]
+        # The positions do get kept, married to their relations here because
+        # this is the only place that holds both: the builder measured where
+        # each snippet landed and the registration says what each one is.
+        initial_grounded = self._initial_grounding(messages, aligned, context_ranges)
         # On the context, never in the plan: the plan is what the worker reads.
         context.mcp_tools = mcp_tools
         if not tools or not self.llm.supports_tools:
@@ -2954,11 +3360,23 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # the sink from the prompt it actually builds - which is a
             # different assembly with its own budget.
             fallback = {"inputs": {**dict(inputs or {}), "message": message}}
+            # The context reaches the worker from here too, so the fallback
+            # authorizes its own host call. Without this the abandoned agent
+            # plan would leave an invocation that runs `llm.generic` and has
+            # authorized nothing, and every honest fallback would be refused.
+            context.remember_host_call("llm.generic", fallback["inputs"])
             return "llm.generic", fallback, context, preamble
         # Past the fallback, so this plan is the one that answers. On the
         # context rather than in the plan: a worker that could name what
         # supported the answer could name a source it never read.
         context.provenance_bindings = agent_bindings
+        # The parent's own copy of what it is about to hand over, taken
+        # from the objects budgeting produced rather than rebuilt later from
+        # sources that can move. It copies on the way in, so what the plan
+        # carries below and what the parent keeps are already separate.
+        context.remember_base_prompt(
+            messages, tools, grounded_messages=initial_grounded
+        )
         plan.update(
             {
                 "messages": messages,
@@ -2974,6 +3392,47 @@ class WorkflowEngine(WorkflowStreamingMixin):
             }
         )
         return worker_tool, plan, context, ""
+
+    @staticmethod
+    def _initial_grounding(
+        messages: Sequence[Dict[str, Any]],
+        aligned: Sequence[Optional[Binding]],
+        ranges: Sequence[Tuple[int, int]],
+    ) -> Tuple[GroundedMessage, ...]:
+        """Where the selected context sits in the prompt, and what each piece is.
+
+        The builder measured the positions and the registration named the
+        relations; this is the only place holding both. The system message is
+        index 0 because that is where the builder puts it.
+
+        A mismatch loses the citations, not the turn. The two lists describe
+        the same snippets and are produced two statements apart, so a
+        disagreement is a programming error - but the cost of refusing here
+        would be a failed answer, and the cost of continuing is an answer that
+        carries no markers. Under-offering is the safe direction, and a turn
+        the user still gets is the better failure.
+        """
+        if not messages or not ranges or len(aligned) != len(ranges):
+            return ()
+        spans = tuple(
+            GroundedSpan(
+                start=start,
+                end=end,
+                source_id=str(ground.get("source_id") or ""),
+                evidence_id=str(ground.get("evidence_id") or ""),
+            )
+            for (start, end), ground in zip(ranges, aligned)
+            if ground
+        )
+        if not spans:
+            return ()
+        return (
+            GroundedMessage(
+                message_index=0,
+                text=str(messages[0].get("content") or ""),
+                spans=spans,
+            ),
+        )
 
     def _resolve_worker_tool(
         self, tool_name: str, tool_spec: Optional[dict] = None
@@ -3112,6 +3571,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         inputs: Dict[str, Any],
         *,
         context: InvocationContext,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         """Run a builtin whose body still belongs in the parent.
 
@@ -3122,10 +3582,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         than none. The worker process, its rlimits, the ledger and the liveness
         check all still apply; only the body runs here.
         """
-        handler = self._builtin_tool_handlers().get(tool_name)
-        if handler is None:
-            spec = self.tool_registry.get(tool_name) or {}
-            handler = self._builtin_tool_handlers().get(spec.get("handler"))
+        handler = self._builtin_tool_handlers().get(self._host_body_name(tool_name))
         if handler is None:
             return {"status": "error", "content": f"unknown tool {tool_name}"}
         return handler(
@@ -3139,7 +3596,56 @@ class WorkflowEngine(WorkflowStreamingMixin):
             context.tenant_id,
             source_registry=context.source_registry,
             bindings_sink=context.provenance_bindings,
+            invocation=invocation,
         )
+
+    #: The host bodies whose result is the turn's answer.
+    #:
+    #: Only these record a canonical model response. Every host body is
+    #: scrubbed on the way out, because any of them may carry text the model
+    #: wrote; the question this set answers is narrower - which one produced
+    #: the reply a citation could honestly be read out of.
+    #:
+    #: `canonical_model_response` is replacement state, so the cost of a body
+    #: being wrongly in this set is not that its own result becomes citable.
+    #: It is that a later call overwrites the answer, which then loses
+    #: citations it had earned. Separate workflow nodes cannot reach that -
+    #: each gets its own invocation - so what does is a worker sending a
+    #: second `tool.host` inside the invocation it already has.
+    MODEL_ANSWER_HOSTS = frozenset(
+        {"llm.generic", "llm.generic_chat_v1", "rag.answer_with_context_v1"}
+    )
+
+    def _host_body_name(self, tool_name: str) -> str:
+        """Which builtin body a host-tool request runs, or `""` for none.
+
+        One resolution, asked twice: `_run_host_tool` picks its handler with
+        it, and the broker decides with it whether what came back is the
+        turn's answer. Two implementations would eventually run one body and
+        describe another - the reason `resolve_executable_handler` exists for
+        the worker bodies.
+
+        Not asked by planning, which records the worker body's name as it
+        stands. What a plan authorizes is a name the worker may present, and
+        that is a different question from which parent handler it lands on.
+
+        A name only resolves when it lands on a body that runs *here*. A
+        seeded deployment stores a spec for every tool, including the ones
+        whose bodies run in the worker, and those specs name their own tool as
+        their handler - so returning whatever the spec says would answer
+        `web.search_v1` for a body this side never runs.
+
+        That last rule is measured unkillable: both callers look the answer up
+        in the same table, so a worker body's name and the empty string reach
+        the same nothing. It is a statement about what this function means
+        rather than about what it currently changes, and the next caller to
+        read it as "is this a host body" is the one it is for.
+        """
+        handlers = self._builtin_tool_handlers()
+        if tool_name in handlers:
+            return tool_name
+        resolved = str((self.tool_registry.get(tool_name) or {}).get("handler") or "")
+        return resolved if resolved in handlers else ""
 
     def _builtin_tool_handlers(
         self,
@@ -3181,6 +3687,26 @@ class WorkflowEngine(WorkflowStreamingMixin):
     RUN_PYTHON_SCHEMA = agent_tools.RUN_PYTHON_SCHEMA
     HISTORY_SEARCH_SCHEMA = agent_tools.HISTORY_SEARCH_SCHEMA
     NOTE_SEARCH_SCHEMA = agent_tools.NOTE_SEARCH_SCHEMA
+
+    #: Whether the model is shown citation markers at all.
+    #:
+    #: On. A turn that grounds on something offers the model a handle for it,
+    #: takes the namespace back out of everything that crosses to the worker
+    #: or the client, and keeps what the model wrote as the only thing a
+    #: citation is read from.
+    #:
+    #: Off, and the whole citation transformation is skipped rather than
+    #: performed and undone: no speculative table, no instruction, no labels,
+    #: no reconstruction standing in for the worker's messages, no handles
+    #: committed. What the model is sent is byte-for-byte what it was sent
+    #: before any of this existed, which is the rollback - a deploy-time one,
+    #: since this is a class attribute rather than a managed setting.
+    #:
+    #: A populated `CitationTable` is not this gate. Every turn mints a
+    #: namespace whether or not anything is offered, so reading one as
+    #: "offers are on" would turn the feature on for every turn that grounded
+    #: anything.
+    CITATION_OFFERS_ENABLED = True
 
     MAX_AGENT_ROUNDS = 3
     # Leave headroom under the node timeout for the final model turn.
@@ -3252,17 +3778,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
         context_id: Optional[str],
         user_id: Optional[str],
         tenant_id: Optional[str],
+        source_registry: Optional[SourceRegistry] = None,
+        bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> Tuple[str, List[str], List[Any], Dict[str, SourceHint]]:
         """Resolve what this user may search, then hand off to the tool.
 
-        The rendered chunks come back with the text so the caller can record
-        where the grounding came from. Scoping has already happened by then -
+        The rendered chunks come back with the text so a caller that keeps no
+        record can still see them. Scoping has already happened by then -
         authorize first, record second.
 
-        The hints come back with them, from the same reading of the records
-        that authorized the search. Registration happens in the caller, and
-        two reads could disagree: what the model was told an excerpt is
-        called and what the turn records it as have to be one answer.
+        Registration runs inside the render, through the sinks, from the same
+        reading of the records that authorized the search. It has to: an
+        excerpt's position in the text is only knowable while the text is
+        being written, and what the model was told an excerpt is called and
+        what the turn records it as have to be one answer.
         """
         attachment_ctx_ids = self._attachment_context_ids(conversation_id, user_id) or []
         ctx_ids = list(attachment_ctx_ids)
@@ -3276,6 +3806,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # follows paths on purpose, and its rows are its own answer.
         records = self._conversation_attachments(conversation_id, user_id)
         hints = self._attachment_source_hints(records)
+        ground = None
+        if source_registry is not None:
+
+            def ground(scoped: Sequence[Any]) -> Sequence[Optional[Binding]]:
+                """One binding per rendered excerpt, in render order.
+
+                `register_retrieved_chunks` records exactly one per chunk, so
+                this is aligned by construction rather than by hope.
+                """
+                recorded = register_retrieved_chunks(
+                    source_registry, scoped, hints=hints
+                )
+                if bindings_sink is not None:
+                    bindings_sink.extend(recorded)
+                return recorded
+
         text, snippets, chunks = agent_tools.run_file_search(
             query, limit, ctx_ids, rag=self.rag,
             user_id=user_id, tenant_id=tenant_id,
@@ -3284,6 +3830,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 attachments_service.authorized_generation_keys(records)
             ),
             source_hints=hints,
+            ground=ground,
+            spans_sink=spans_sink,
         )
         return text, snippets, chunks, hints
 
@@ -3367,10 +3915,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> Tuple[str, List[dict]]:
         return agent_tools.run_web_search(
             query, limit, settings=self.settings, logger=self.logger,
             source_registry=source_registry, bindings_sink=bindings_sink,
+            spans_sink=spans_sink,
         )
 
     def _run_web_fetch(
@@ -3379,10 +3929,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> Tuple[str, List[dict]]:
         return agent_tools.run_web_fetch(
             url, settings=self.settings, logger=self.logger,
             source_registry=source_registry, bindings_sink=bindings_sink,
+            spans_sink=spans_sink,
         )
 
     def _run_history_search(
@@ -3394,6 +3946,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_id: Optional[str],
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> str:
         """Check scope and read the record, then hand off to the tool.
 
@@ -3417,6 +3970,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             keep_tokens=self.history_budget(), count=self._count_fn(),
             conversation_id=conversation_id,
             source_registry=source_registry, bindings_sink=bindings_sink,
+            spans_sink=spans_sink,
         )
 
     def _notes_enabled(self) -> bool:
@@ -3431,6 +3985,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_id: Optional[str],
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> str:
         """Search the user's own vault. Empty when notes are off.
 
@@ -3447,11 +4002,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
             str(query),
             limit=max(1, min(int(limit or 6), 10)),
         )
+        grounds = None
         if source_registry is not None and bindings_sink is not None:
-            bindings_sink.extend(
-                notes_service.register_note_results(source_registry, results)
-            )
-        return notes_service.format_note_results(results)
+            grounds = notes_service.note_grounds(source_registry, results)
+            bindings_sink.extend(ground for ground in grounds if ground)
+        text, spans = notes_service.format_note_results(results, grounds)
+        if spans_sink is not None:
+            spans_sink.extend(spans)
+        return text
 
     def _discover_mcp_tools(self) -> Dict[str, "mcp_client.RemoteTool"]:
         """This turn's remote tools, keyed by the name the model will use.
@@ -3494,10 +4052,16 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         explicit_context_ids: Optional[Sequence[str]] = None,
         grounding: Optional[Sequence[str]] = None,
+        context_ranges: Optional[List[Tuple[int, int]]] = None,
     ) -> Tuple[
         List[dict], List[dict], str, Dict[str, "mcp_client.RemoteTool"], List[str]
     ]:
         """Messages, offered tools, the preamble, remote tools, and grounding.
+
+        `context_ranges` is filled, when given, with where each surviving
+        snippet landed in the system message - a sink rather than a return
+        value, the way every producer in this codebase reports positions,
+        so the callers that want only the prompt are untouched.
 
         The remote tools come back separately from their specs because the two
         halves go to different places: the specs are part of the plan the
@@ -3551,6 +4115,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 pass
         mcp_tools = self._discover_mcp_tools()
         tools.extend(tool.spec() for tool in mcp_tools.values())
+        # The builtin schemas above are module-level dicts appended by
+        # reference, so every turn in this process was offering the same
+        # objects. Nothing edits a plan's tools today, and this is now
+        # authority - `remember_base_prompt` keeps these as what the model was
+        # shown - so a plan gets its own copies rather than a shared one that
+        # any later in-process edit would change for every turn after it.
+        tools = [copy.deepcopy(tool) for tool in tools]
 
         instructions = [
             "You are a concise assistant.",
@@ -3598,8 +4169,23 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # assembles: both of those stand in for turns the model can no longer
         # read, so they survive pruning longest. Same "Context:" shape the
         # plain path injects, so a model that learned one reads the other.
+        #
+        # Written a snippet at a time so the offsets can be measured as the
+        # string is assembled. A later stage that wanted to label these would
+        # otherwise have to search for them, and a search lands in the wrong
+        # place for four reachable shapes: two identical snippets, one snippet
+        # inside another, a snippet that itself contains `" | "`, and a digest
+        # quoting the text it is summarizing. The join produces the same
+        # string either way.
         if kept:
-            system_content += "\n\nContext: " + " | ".join(kept)
+            system_content += "\n\nContext: "
+            for index, snippet in enumerate(kept):
+                if index:
+                    system_content += " | "
+                start = len(system_content)
+                system_content += snippet
+                if context_ranges is not None:
+                    context_ranges.append((start, len(system_content)))
         messages: List[dict] = [{"role": "system", "content": system_content}]
         for msg in history:
             role = getattr(msg, "role", None)
@@ -3627,6 +4213,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        spans_sink: Optional[List[GroundedSpan]] = None,
     ) -> str:
         """Run one model-requested tool and return its text result.
 
@@ -3651,23 +4238,24 @@ class WorkflowEngine(WorkflowStreamingMixin):
             )
             return taint.refusal(session)
         if name == "file_search":
-            result, found, chunks, hints = self._run_file_search(
+            result, found, _chunks, _hints = self._run_file_search(
                 str(args.get("query") or fallback_query),
                 int(args.get("limit") or 4),
                 conversation_id=conversation_id,
                 context_id=context_id,
                 user_id=user_id,
                 tenant_id=tenant_id,
+                source_registry=source_registry,
+                bindings_sink=(
+                    bindings_sink if source_registry is not None else None
+                ),
+                spans_sink=spans_sink,
             )
             snippets.extend(found)
             # Every rendered chunk, because nothing budgets between here and
             # the next model turn: this text is appended to the agent's
             # messages as it stands. Scoping already happened inside the
             # search - authorize first, record second.
-            if source_registry is not None and bindings_sink is not None:
-                bindings_sink.extend(
-                    register_retrieved_chunks(source_registry, chunks, hints=hints)
-                )
             return result
         if name == "run_python":
             return self._run_python_capability(
@@ -3687,6 +4275,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             text, found = self._run_web_search(
                 str(args.get("query") or fallback_query), int(args.get("limit") or 5),
                 source_registry=source_registry, bindings_sink=_grounds,
+                spans_sink=spans_sink,
             )
             taint.record_findings(session, found)
             return text
@@ -3694,6 +4283,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             text, found = self._run_web_fetch(
                 str(args.get("url") or ""),
                 source_registry=source_registry, bindings_sink=_grounds,
+                spans_sink=spans_sink,
             )
             taint.record_findings(session, found)
             return text
@@ -3704,6 +4294,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 conversation_id=conversation_id,
                 user_id=user_id,
                 source_registry=source_registry, bindings_sink=_grounds,
+                spans_sink=spans_sink,
             )
         if name == "note_search":
             return self._run_note_search(
@@ -3711,6 +4302,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 int(args.get("limit") or 6),
                 user_id=user_id,
                 source_registry=source_registry, bindings_sink=_grounds,
+                spans_sink=spans_sink,
             )
         remote = (mcp_tools or {}).get(name)
         if remote is not None:
@@ -3726,6 +4318,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         session=session,
                         source_registry=source_registry,
                         bindings_sink=_grounds,
+                        spans_sink=spans_sink,
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - a third party being down
@@ -3761,6 +4354,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         mcp_tools: Optional[Dict[str, "mcp_client.RemoteTool"]] = None,
         source_registry: Optional[SourceRegistry] = None,
         bindings: Optional[List[Binding]] = None,
+        passages: Optional[List[GroundedPassage]] = None,
     ) -> List[str]:
         """Execute one round's tool calls; results always in call order.
 
@@ -3790,6 +4384,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             args: Dict[str, Any],
             sink: List[str],
             binding_sink: List[Binding],
+            span_sink: List[GroundedSpan],
         ) -> str:
             with current_invocation(bound), tool_network_guard(
                 self.tool_network_policy
@@ -3814,6 +4409,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     mcp_tools=mcp_tools,
                     source_registry=source_registry,
                     bindings_sink=binding_sink,
+                    spans_sink=span_sink,
                 )
 
         if len(parsed) > 1 and all(
@@ -3826,14 +4422,20 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # thread-safe, but which relation was found first is not the order
             # the calls were made in.
             binding_sinks: List[List[Dict[str, str]]] = [[] for _ in parsed]
+            # And per-call span sinks. A span indexes one call's result, so a
+            # round-wide list would say only that some evidence appeared
+            # somewhere in some result.
+            span_sinks: List[List[GroundedSpan]] = [[] for _ in parsed]
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(4, len(parsed))
             ) as pool:
                 futures = [
-                    pool.submit(run_one, index, name, args, sink, binding_sink)
-                    for index, ((_, name, args), sink, binding_sink) in enumerate(
-                        zip(parsed, sinks, binding_sinks)
+                    pool.submit(
+                        run_one, index, name, args, sink, binding_sink, span_sink
                     )
+                    for index, (
+                        (_, name, args), sink, binding_sink, span_sink
+                    ) in enumerate(zip(parsed, sinks, binding_sinks, span_sinks))
                 ]
                 results = [future.result() for future in futures]
             for sink in sinks:
@@ -3843,12 +4445,56 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 self._merge_bindings(bindings, seen, [
                     binding for sink in binding_sinks for binding in sink
                 ])
+            self._collect_passages(
+                passages, results, span_sinks, parsed, operation_seq
+            )
             return results
         round_bindings = bindings if bindings is not None else []
-        return [
-            run_one(index, name, args, snippets, round_bindings)
+        serial_spans: List[List[GroundedSpan]] = [[] for _ in parsed]
+        results = [
+            run_one(index, name, args, snippets, round_bindings, serial_spans[index])
             for index, (_, name, args) in enumerate(parsed)
         ]
+        self._collect_passages(
+            passages, results, serial_spans, parsed, operation_seq
+        )
+        return results
+
+    @staticmethod
+    def _collect_passages(
+        passages: Optional[List[GroundedPassage]],
+        results: List[str],
+        span_sinks: List[List[GroundedSpan]],
+        parsed: List[tuple],
+        operation_seq: int,
+    ) -> None:
+        """One passage per call that grounded something, in call order.
+
+        Per result rather than per round: an offset means nothing without the
+        string it indexes, and a round returns one string per call.
+
+        Named by the call, not by its text. Two calls can return the same
+        string from different sources, and the worker chooses the order it
+        sends those results back in - so a later stage matching by text could
+        not tell them apart, and matching by position would trust an order the
+        untrusted side controls. `call_index` is the position this parent
+        dispatched, which is what a replay reproduces.
+        """
+        if passages is None:
+            return
+        for index, (result, spans) in enumerate(zip(results, span_sinks)):
+            if not spans:
+                continue
+            call = parsed[index][0] if index < len(parsed) else {}
+            passages.append(
+                GroundedPassage(
+                    text=str(result),
+                    spans=tuple(spans),
+                    operation_seq=operation_seq,
+                    call_index=index,
+                    tool_call_id=str(call.get("id") or "") or None,
+                )
+            )
 
     @staticmethod
     def _parse_tool_arguments(call: Dict[str, Any]) -> Dict[str, Any]:
@@ -3951,6 +4597,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         message = (
             inputs.get("message") or inputs.get("prompt") or inputs.get("text") or ""
@@ -3991,24 +4638,36 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # After the budget, never before it: a chunk the pruner dropped never
         # reached the model, and registering it would make it an eligible
         # citation target for an answer it did not ground.
-        self._record_grounding(
+        aligned = self._record_grounding(
             source_registry, ctx_chunks, context_snippets,
             leading=leading, sink=bindings_sink,
         )
+        shown, instruction = self._offered_context(
+            invocation, source_registry, context_snippets, aligned,
+            prompt=message or "", adapters=adapters, history=history,
+        )
+        # Passed only when there is one, so a turn that offers nothing calls
+        # exactly the signature it always called. What is calibrated below and
+        # returned to the caller stays the unlabelled text: the markers are
+        # prompt mechanics, and a snippet is not longer for having been shown
+        # with one.
+        offer = {"instruction": instruction} if instruction else {}
         try:
             resp = self.llm.generate(
                 message or "",
                 adapters=adapters,
-                context_snippets=context_snippets,
+                context_snippets=shown,
                 history=history,
                 user_id=user_id,
+                **offer,
             )
         except TypeError:
             resp = self.llm.generate(
                 message or "",
                 adapters=adapters,
-                context_snippets=context_snippets,
+                context_snippets=shown,
                 history=history,
+                **offer,
             )
         # The provider just told us exactly how many prompt tokens it counted;
         # that is ground truth for calibrating our estimate.
@@ -4064,6 +4723,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         question = inputs.get("question") or inputs.get("message") or ""
         ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
@@ -4077,23 +4737,30 @@ class WorkflowEngine(WorkflowStreamingMixin):
         snippets = [c.content for c in chunks]
         # No budgeting between here and the model: every retrieved chunk is
         # sent, so every one of them grounded the answer.
-        self._record_grounding(
+        aligned = self._record_grounding(
             source_registry, chunks, snippets, leading=0, sink=bindings_sink,
         )
+        shown, instruction = self._offered_context(
+            invocation, source_registry, snippets, aligned,
+            prompt=question or "", adapters=adapters, history=history,
+        )
+        offer = {"instruction": instruction} if instruction else {}
         try:
             resp = self.llm.generate(
                 question or "",
                 adapters=adapters,
-                context_snippets=snippets,
+                context_snippets=shown,
                 history=history,
                 user_id=user_id,
+                **offer,
             )
         except TypeError:
             resp = self.llm.generate(
                 question or "",
                 adapters=adapters,
-                context_snippets=snippets,
+                context_snippets=shown,
                 history=history,
+                **offer,
             )
         return {
             "content": resp["content"],
@@ -4115,6 +4782,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         message = inputs.get("message") or user_message or ""
         lowered = message.lower()
@@ -4136,6 +4804,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         prompt = inputs.get("message") or inputs.get("prompt") or ""
         resp = self.llm.generate(
@@ -4160,6 +4829,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         return {"content": inputs.get("message", ""), "usage": {}, "status": "end"}
 
