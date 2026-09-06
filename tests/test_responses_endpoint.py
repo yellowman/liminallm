@@ -231,6 +231,39 @@ def test_the_final_round_offers_no_tools_and_sends_none():
     assert "tools" not in seen and "tool_choice" not in seen
 
 
+def test_a_gpt_6_tool_round_goes_to_responses_without_a_temperature():
+    """GPT-6 needs both halves of this, and they come from different places.
+
+    Its tool calling is documented as Responses-only, which the transport
+    already gives it: the endpoint is chosen per client, not per model, so
+    `_no_chat` firing would mean a model gate had appeared. And it rejects
+    `temperature`, which is the table's job - so the operator configures one
+    here, because a policy of OMIT is only observable when there is a value
+    to omit.
+    """
+    seen = {}
+
+    def create(**kw):
+        seen.update(kw)
+        return _response("found it", calls=[
+            {"id": "call_1", "name": "web_search", "arguments": '{"q": "x"}'},
+        ])
+
+    backend = _backend(_client(create))
+    backend.base_model = "gpt-6-astra"
+    backend._temperature = 0.2
+    chat_tools = [{"type": "function", "function": {
+        "name": "web_search", "description": "search",
+        "parameters": {"type": "object"}}}]
+
+    out = backend.generate_with_tools(
+        [{"role": "user", "content": "find x"}], chat_tools, [])
+
+    assert seen["model"] == "gpt-6-astra"
+    assert "temperature" not in seen, seen
+    assert out["tool_calls"][0]["name"] == "web_search"
+
+
 def test_multimodal_parts_map_to_responses_types():
     items = rc.to_input_items([{
         "role": "user",
