@@ -228,6 +228,18 @@ trail.
   and audit; attachment references non-text payloads; redaction marks
   filtered spans and the policy that applied. Storage normalizes to these
   keys and drops invalid structures.
+- `start` and `end` are offsets into the same message's `content`, counted
+  in **Unicode code points**, and `0 <= start <= end <= len(content)`. The
+  unit is normative because the producer and the renderer count differently
+  by default: Python indexes code points and JavaScript indexes UTF-16 code
+  units, so an anchor after an emoji is 1 in the stored record and 2 in a
+  naive `String.prototype.slice`. A renderer converts; the record does not.
+- a citation segment is an anchor rather than a span: the model's marker is
+  removed from `content` before it is stored, so what survives is the
+  position it was written at and `start == end`. A citation on an assistant
+  message is produced only by validating the model's own markers against the
+  handles that turn issued (§17); a citation segment arriving from anywhere
+  else is dropped rather than stored.
 - summary messages are `sender='system', role='system',
   meta.summary=true`.
 

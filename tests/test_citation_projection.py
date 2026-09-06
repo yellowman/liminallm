@@ -24,7 +24,11 @@ from liminallm.service.auth import AuthContext
 from liminallm.service.citations import durable_citations
 from liminallm.service.runtime import get_runtime
 
-#: One source, as `SourceRegistry.snapshot()` exports it.
+#: A turn's registry as `SourceRegistry.snapshot()` exports it.
+#:
+#: The file's locator is the shape plain retrieval really records - the
+#: server's own path to the bytes, under the shared root and the owner's id -
+#: because that is what must not reach a stored row.
 SNAPSHOT = {
     "sources": {
         "src_1": {
@@ -32,7 +36,15 @@ SNAPSHOT = {
             "kind": "file",
             "title": "manual.md",
             "origin_id": None,
-            "locator": "/files/manual.md",
+            "locator": "/srv/liminal/users/8f14e45f/files/manual.md",
+            "metadata": {},
+        },
+        "src_2": {
+            "source_id": "src_2",
+            "kind": "web",
+            "title": "Turbine handbook",
+            "origin_id": None,
+            "locator": "https://example.test/handbook",
             "metadata": {},
         },
         # Consulted and never cited. Present in every case below, because the
@@ -43,11 +55,26 @@ SNAPSHOT = {
             "kind": "file",
             "title": "unrelated.md",
             "origin_id": None,
-            "locator": "/files/unrelated.md",
+            "locator": "/srv/liminal/users/8f14e45f/files/unrelated.md",
             "metadata": {},
         },
     },
-    "evidence": [],
+    "evidence": [
+        {
+            "evidence_id": "ev_1",
+            "source_id": "src_1",
+            "text": "SOURCE SAYS 400 HOURS",
+            "locator": {"chunk_index": 3},
+            "content_hash": "a" * 64,
+        },
+        {
+            "evidence_id": "ev_2",
+            "source_id": "src_2",
+            "text": "the handbook says otherwise",
+            "locator": {},
+            "content_hash": "b" * 64,
+        },
+    ],
 }
 
 ANSWER = "Beta"
@@ -59,6 +86,7 @@ CITED = [{
     "canonical_start": 5,
     "canonical_end": 22,
     "public_offset": 4,
+    "evidence_ids": ["ev_1"],
 }]
 
 
@@ -121,17 +149,48 @@ class TestACitationOutlivesItsTurnAsAnAnchor:
         assert len(cited) == 1, _segments(message)
         assert cited[0]["start"] == cited[0]["end"] == 4
         assert message.content[: cited[0]["start"]] == "Beta"
-        # And the source is named in a form that still means something after
-        # the registry that minted `src_1` is gone.
-        assert cited[0]["locator"] == "/files/manual.md"
-        assert cited[0]["source_id"] == "/files/manual.md"
+        # The source is named by what it is, not by where it was. Plain
+        # retrieval gives files no object identity, so the record claims
+        # none - and the path it happened to live at is not one.
+        assert cited[0]["source_id"] == ""
+        assert cited[0]["locator"] == ""
         assert cited[0]["meta"]["title"] == "manual.md"
+        assert cited[0]["meta"]["kind"] == "file"
+        # What pins the reading: the fingerprint of the passage the answer
+        # rested on, and no passage text.
+        assert cited[0]["meta"]["evidence"] == [
+            {"content_hash": "a" * 64, "locator": {"chunk_index": 3}}
+        ]
+        assert "SOURCE SAYS" not in json.dumps(message.content_struct)
         # The answer the anchors point into is in the struct too, and it is
         # the answer: a struct of anchors over absent or partial text would
         # place them in a string the renderer does not have.
         assert [
             s.get("text") for s in _segments(message) if s.get("type") == "text"
         ] == [ANSWER]
+
+    @pytest.mark.asyncio
+    async def test_the_anchor_is_counted_in_code_points(self, store):
+        """The unit is normative (SPEC §2.2) because the two sides of this
+        record count differently by default.
+
+        Python indexes code points and JavaScript indexes UTF-16 code units,
+        so an anchor after one emoji is 1 here and 2 in a naive `slice`. The
+        stored number is the Python one, and a renderer converts.
+        """
+        content = "\U0001F600 Alpha"
+        message = await _finish(store, {
+            "content": content,
+            "validated_citations": [{**CITED[0], "public_offset": 1}],
+            "provenance_snapshot": SNAPSHOT,
+        })
+
+        anchor = _citations(message)[0]["start"]
+        assert anchor == 1
+        assert message.content[:anchor] == "\U0001F600"
+        # The same position measured the other way, which is what a renderer
+        # must not use unconverted.
+        assert len(message.content[:anchor].encode("utf-16-le")) // 2 == 2
 
     @pytest.mark.asyncio
     async def test_nothing_turn_scoped_reaches_the_row(self, store):
@@ -184,9 +243,9 @@ class TestTheSnapshotResolvesNamesAndConfersNothing:
             "provenance_snapshot": SNAPSHOT,
         })
 
-        located = {item["locator"] for item in _citations(message)}
-        assert located == {"/files/manual.md"}
-        assert "/files/unrelated.md" not in json.dumps(message.content_struct)
+        titled = {item["meta"]["title"] for item in _citations(message)}
+        assert titled == {"manual.md"}
+        assert "unrelated" not in json.dumps(message.content_struct)
 
     @pytest.mark.asyncio
     async def test_a_citation_the_snapshot_cannot_resolve_is_refused(
@@ -334,7 +393,10 @@ class TestTheTurnAndTheRowAgreeEndToEnd:
         cited = _citations(stored)
         assert len(cited) == 1, _segments(stored)
         assert cited[0]["start"] == len("Four hundred hours")
-        assert cited[0]["locator"] == "/files/manual.md"
+        assert cited[0]["meta"]["title"] == "manual.md"
+        assert cited[0]["locator"] == ""
+        assert len(cited[0]["meta"]["evidence"]) == 1
+        assert len(cited[0]["meta"]["evidence"][0]["content_hash"]) == 64
         nonce = [inv for inv in opened if inv.citations][-1].citations.nonce
         row = json.dumps({
             "content": stored.content,
@@ -342,3 +404,297 @@ class TestTheTurnAndTheRowAgreeEndToEnd:
             "meta": stored.meta,
         })
         assert nonce not in row and "[cite:" not in row
+
+
+class TestALocatorIsPublishedOnlyWhereItIsAReference:
+    """A locator says where a source is, and only some of them say it in a
+    form a reader may have. A URL is the reference and the identity at once; a
+    file's locator is the server's own path to the bytes, which is deployment
+    layout rather than provenance."""
+
+    WEB = [{
+        "source_id": "src_2",
+        "canonical_start": 5,
+        "canonical_end": 22,
+        "public_offset": 4,
+        "evidence_ids": ["ev_2"],
+    }]
+
+    @pytest.mark.asyncio
+    async def test_a_web_citation_keeps_the_url(self, store):
+        message = await _finish(store, {
+            "content": ANSWER,
+            "validated_citations": self.WEB,
+            "provenance_snapshot": SNAPSHOT,
+        })
+
+        cited = _citations(message)
+        assert cited[0]["locator"] == "https://example.test/handbook"
+        assert cited[0]["meta"]["kind"] == "web"
+
+    @pytest.mark.asyncio
+    async def test_a_file_citation_carries_no_server_path(self, store):
+        message = await _finish(store, {
+            "content": ANSWER,
+            "validated_citations": CITED,
+            "provenance_snapshot": SNAPSHOT,
+        })
+
+        row = json.dumps({
+            "content": message.content,
+            "content_struct": message.content_struct,
+            "meta": message.meta,
+        })
+        assert "/srv/liminal" not in row
+        assert "8f14e45f" not in row
+        assert "/users/" not in row
+
+    def test_an_evidence_id_the_snapshot_does_not_hold_resolves_to_nothing(self):
+        """The lookup is a lookup: a fingerprint that cannot be found is
+        absent, not invented from a neighbouring record."""
+        segments = durable_citations(
+            [{**CITED[0], "evidence_ids": ["ev_missing"]}], SNAPSHOT, ANSWER
+        )
+        assert segments[0]["meta"]["evidence"] == []
+
+
+class TestOnlyTheValidatedListMakesACitationSegment:
+    """The projection obeys the rule on its own. This is the seam around it:
+    an assistant row's `content_struct` arrives from the orchestration, the
+    segment schema accepts `type="citation"`, and nothing else may write one.
+
+    No producer emits an assistant `content_struct` today, which is why the
+    rule is written rather than left resting on that.
+    """
+
+    FORGED = {
+        "type": "citation",
+        "source_id": "forged-source",
+        "locator": "https://attacker.test/page",
+        "start": 0,
+        "end": 0,
+    }
+
+    @pytest.mark.asyncio
+    async def test_a_citation_nothing_validated_is_stripped(self, store):
+        message = await _finish(store, {
+            "content": ANSWER,
+            "validated_citations": [],
+            "content_struct": {"segments": [dict(self.FORGED)]},
+        })
+
+        assert message.content == ANSWER
+        assert _citations(message) == []
+        assert "attacker.test" not in json.dumps(message.content_struct)
+        # The answer is still stored as text: stripping the only segment left
+        # a struct that would otherwise hold nothing.
+        assert [
+            s.get("text") for s in _segments(message) if s.get("type") == "text"
+        ] == [ANSWER]
+
+    @pytest.mark.asyncio
+    async def test_only_the_validated_one_survives_beside_a_forged_one(
+        self, store
+    ):
+        message = await _finish(store, {
+            "content": ANSWER,
+            "validated_citations": CITED,
+            "provenance_snapshot": SNAPSHOT,
+            "content_struct": {
+                "segments": [
+                    {"type": "text", "text": ANSWER},
+                    dict(self.FORGED),
+                ]
+            },
+        })
+
+        cited = _citations(message)
+        assert len(cited) == 1, cited
+        assert cited[0]["meta"]["title"] == "manual.md"
+        assert "forged-source" not in json.dumps(message.content_struct)
+
+    @pytest.mark.asyncio
+    async def test_the_other_segment_types_are_kept(self, store):
+        """Stripping is about citations. A code block the producer sent is
+        not a claim about a source."""
+        message = await _finish(store, {
+            "content": ANSWER,
+            "validated_citations": [],
+            "content_struct": {
+                "segments": [
+                    {"type": "text", "text": ANSWER},
+                    {"type": "code", "text": "print('hi')", "language": "python"},
+                ]
+            },
+        })
+
+        assert [s["type"] for s in _segments(message)] == ["text", "code"]
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_segment_does_not_hide_the_answer(self, store):
+        """The normalizer drops a segment of unknown type. Deciding whether
+        the answer's text is needed before that ran left a struct of anchors
+        over text nobody stored."""
+        message = await _finish(store, {
+            "content": ANSWER,
+            "validated_citations": CITED,
+            "provenance_snapshot": SNAPSHOT,
+            "content_struct": {"segments": [{"type": "not-a-segment"}]},
+        })
+
+        assert [
+            s.get("text") for s in _segments(message) if s.get("type") == "text"
+        ] == [ANSWER]
+        assert len(_citations(message)) == 1
+
+
+class TestACitationNamesTheReadingItRestedOn:
+    """The two properties a durable citation has to have over time, against a
+    file that really lives where uploads put one.
+
+    Plain retrieval is explicit that a chunk under a path claims to be the
+    contents of that path *now* - the schema records no generation. So a
+    record that identified the source by its path would follow the name to
+    whatever the file holds next, and present an old answer as resting on
+    bytes it never read.
+    """
+
+    #: Long enough to retrieve on, and different enough between the two
+    #: generations that their passages cannot hash alike.
+    OLD = "Turbine blade inspection interval detail. " * 60
+    NEW = "Turbine blade inspection revised schedule detail. " * 60
+    QUESTION = "turbine blade inspection"
+
+    @staticmethod
+    def _uploaded(store, text):
+        """A real user, a real context, and a real file under the user's own
+        files directory - the same shape the upload route ingests."""
+        import pathlib
+
+        runtime = get_runtime()
+        user = store.create_user(email=f"up_{uuid.uuid4().hex[:8]}@example.com")
+        context = store.upsert_context(
+            name=f"up-{uuid.uuid4().hex[:6]}", description="uploaded",
+            owner_user_id=user.id,
+        )
+        path = (
+            pathlib.Path(runtime.settings.shared_fs_root)
+            / "users" / user.id / "files" / "manual.md"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        written = runtime.rag.ingest_text(context.id, text, source_path=str(path))
+        assert written > 0, "the fixture indexed nothing"
+        return user, context, path
+
+    @staticmethod
+    async def _cited_turn(store, monkeypatch, user, context):
+        """One real turn over that context, whose answer cites what it read."""
+        engine = get_runtime().workflow
+        monkeypatch.setattr(
+            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
+        )
+        opened: list = []
+        real_open = engine.invocations.open
+
+        def _open(*a, **k):
+            invocation = real_open(*a, **k)
+            opened.append(invocation)
+            return invocation
+
+        monkeypatch.setattr(engine.invocations, "open", _open)
+
+        def _generate(*a, **k):
+            cited = [inv for inv in opened if inv.citations]
+            handle = next(iter(cited[-1].citations.by_handle), "") if cited else ""
+            return {"content": f"Four hundred hours [cite:{handle}]", "usage": {}}
+
+        monkeypatch.setattr(engine.llm, "generate", _generate, raising=False)
+        conversation = store.create_conversation(title="cited", user_id=user.id)
+        turn = chat_turn.Turn(
+            principal=AuthContext(user_id=user.id, role="user", tenant_id=None),
+            conversation_id=conversation.id,
+            context_id=context.id,
+            workflow_id=None,
+            user_content=TestACitationNamesTheReadingItRestedOn.QUESTION,
+            user_message=None,
+            needs_title=False,
+        )
+        orchestration = await engine.run(
+            None, conversation.id,
+            TestACitationNamesTheReadingItRestedOn.QUESTION, context.id,
+            user_id=user.id, tenant_id=None,
+        )
+        assert orchestration.get("validated_citations"), (
+            f"the turn cited nothing: {orchestration.get('content')!r}"
+        )
+        message = await chat_turn.finish(get_runtime(), turn, orchestration)
+        stored = store.get_message(message.id)
+        assert stored is not None
+        return stored
+
+    @pytest.mark.asyncio
+    async def test_the_row_carries_no_part_of_the_server_path(
+        self, store, monkeypatch
+    ):
+        """The path is `<shared_fs_root>/users/<user_id>/files/<name>`, and
+        every part of it is deployment layout or an account identifier. The
+        durable citation is public data - the client renders `source_id` and
+        `locator` - so none of it may be in there."""
+        user, context, path = self._uploaded(store, self.OLD)
+
+        stored = await self._cited_turn(store, monkeypatch, user, context)
+
+        row = json.dumps({
+            "content": stored.content,
+            "content_struct": stored.content_struct,
+            "meta": stored.meta,
+        })
+        assert str(get_runtime().settings.shared_fs_root) not in row
+        assert user.id not in row
+        assert str(path) not in row
+        # What is there instead: the file's own name, which is what the file
+        # routes address and what a reader can act on.
+        assert _citations(stored)[0]["meta"]["title"] == "manual.md"
+
+    @pytest.mark.asyncio
+    async def test_replacing_the_file_does_not_retarget_the_old_citation(
+        self, store, monkeypatch
+    ):
+        """Cite one reading of a path, then commit another at the same path.
+
+        The stored citation must still be about the first. It holds the
+        fingerprint of the passage it rested on, and that fingerprint matches
+        nothing the path holds now - so the old answer reads as resting on
+        something that is gone, rather than on the replacement.
+        """
+        import hashlib
+
+        user, context, path = self._uploaded(store, self.OLD)
+        stored = await self._cited_turn(store, monkeypatch, user, context)
+        fingerprints = {
+            item["content_hash"]
+            for item in _citations(stored)[0]["meta"]["evidence"]
+        }
+        assert fingerprints, "the citation recorded no evidence to be pinned by"
+
+        # A second generation of the same path, exactly as re-uploading does.
+        path.write_text(self.NEW, encoding="utf-8")
+        assert get_runtime().rag.ingest_text(
+            context.id, self.NEW, source_path=str(path)
+        ) > 0
+
+        now = {
+            hashlib.sha256(chunk.content.encode("utf-8")).hexdigest()
+            for chunk in get_runtime().rag.retrieve(
+                [context.id], self.QUESTION, user_id=user.id, tenant_id=None,
+            )
+        }
+        assert now, "the replacement indexed nothing"
+        assert fingerprints.isdisjoint(now), (
+            "the stored citation now matches the file's new contents"
+        )
+        # And nothing else in the row names the replacement either.
+        assert "revised schedule" not in json.dumps({
+            "content_struct": stored.content_struct, "meta": stored.meta,
+        })

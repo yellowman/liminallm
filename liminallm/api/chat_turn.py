@@ -144,23 +144,33 @@ def _with_citations(
 ) -> Any:
     """The turn's structured content, with its citation anchors in it.
 
-    Appended rather than woven in: a citation segment carries its own
-    position, so where it sits in the list says nothing. The text segment is
-    added when there is none, because a struct of anchors with no text would
-    lose the answer the anchors point into - the same fallback
-    `normalize_content_struct` applies, applied here so the two cannot
-    disagree.
+    One producer of citation segments on an assistant row, and it is the
+    projection. Whatever arrived in the orchestration's `content_struct` keeps
+    its text, code and attachment segments and loses its citation ones: a
+    citation is a claim that a source supported a span, and the only thing
+    entitled to make it is the list validated against the handles this turn
+    committed. Nothing today emits an assistant `content_struct` at all, which
+    is exactly why the rule is written here rather than left resting on that.
 
-    A turn that cited nothing returns exactly what it was given, `None`
-    included, so an ordinary answer is stored exactly as it was before any of
-    this existed. Anything that is not a struct is treated as none, which is
-    what `normalize_content_struct` does with it a line later; being stricter
-    here would turn a malformed field into a failed turn.
+    Sanitized before the citations are stripped, and stripped before the
+    validated ones are added, so the decisions are made against one list. The
+    normalizer drops segments of unknown type, so a struct holding one
+    malformed entry used to look non-empty here and empty to it - and the
+    answer's own text was then left out of a struct that kept the anchors.
+
+    Appended rather than woven in: a citation segment carries its own
+    position, so where it sits in the list says nothing.
+
+    A turn that cited nothing and carried no struct stores no struct, exactly
+    as before any of this existed.
     """
-    if not citations:
+    base = normalize_content_struct(struct, content) or {}
+    segments = [
+        segment for segment in base.get("segments") or []
+        if segment.get("type") != "citation"
+    ]
+    if not citations and len(segments) == len(base.get("segments") or []):
         return struct
-    base = struct if isinstance(struct, dict) else {}
-    segments = list(base.get("segments") or [])
     if not segments and content:
         segments.append({"type": "text", "text": content})
     merged = dict(base)

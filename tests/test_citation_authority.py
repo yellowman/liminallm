@@ -341,6 +341,9 @@ class TestThroughTheRealAgentLoop:
                 # The marker sat at the very end, after a space that goes
                 # with it, so it reopens exactly where the answer stops.
                 "public_offset": len(ANSWER),
+                # Which passage of that source the answer rested on, carried
+                # because a source names an object and an object changes.
+                "evidence_ids": ["ev_1"],
             }
         ], result.get("validated_citations")
 
@@ -893,6 +896,7 @@ class TestThePlainAnswerHasTheSameWireBoundary:
                 "canonical_start": len(ANSWER) + 1,
                 "canonical_end": len(ANSWER) + 1 + len(f"[cite:{handle}]"),
                 "public_offset": len(ANSWER),
+                "evidence_ids": ["ev_1"],
             }
         ], result.get("validated_citations")
 

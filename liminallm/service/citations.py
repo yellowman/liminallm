@@ -101,12 +101,20 @@ class CitationOccurrence:
     Occurrences are a list rather than a set on purpose: one source cited in
     two places is one source and two citations, and collapsing them would lose
     the second position before anything could render or persist it.
+
+    `evidence_ids` is what the table says this source was grounded on in this
+    turn, carried here because it is the only thing that can say *which
+    reading* was cited. A source's own identity names an object - a file, a
+    note, a page - and objects change; the evidence is the passage the answer
+    rested on, and it has a fingerprint. Read from the table rather than
+    guessed later: whatever resolves these has to be the turn's own record.
     """
 
     handle: str
     source_id: str
     start: int
     end: int
+    evidence_ids: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -440,6 +448,7 @@ def validate_citations(answer: str, table: CitationTable) -> List[CitationOccurr
                 source_id=source_id,
                 start=match.start(),
                 end=match.end(),
+                evidence_ids=table.evidence_for(source_id),
             )
         )
     return found
@@ -539,6 +548,11 @@ def citation_payload(
             "canonical_start": item.start,
             "canonical_end": item.end,
             "public_offset": public_index(origins, item.start),
+            # What the answer rested on inside that source. Carried because
+            # a source names an object and an object changes: the passage's
+            # fingerprint is the only thing that can still say, later, which
+            # reading was cited.
+            "evidence_ids": list(item.evidence_ids),
         }
         for item in occurrences
     ]
@@ -582,6 +596,56 @@ def replaced_answer(
     return Answer(content, list(bindings or []), list(citations or []))
 
 
+#: Source kinds whose `locator` is a reference a reader can follow.
+#:
+#: An allowlist, and fail-closed, because the one kind that is missing is the
+#: reason this exists: a `file` locator is the server's own path to the bytes -
+#: `<shared_fs_root>/users/<user_id>/files/report.md` for an upload - and a
+#: durable citation is public data. Its public name is the title, which is
+#: already the file's own name. A `web` locator is the URL, which is both the
+#: reference and the identity.
+#:
+#: Every other producer identifies its source by `origin_id` and records no
+#: locator at all, so the list is short by construction rather than by
+#: omission. A kind added later gets no locator until someone decides its
+#: locator is safe to publish, which is the direction a leak should fail in.
+PUBLIC_LOCATOR_KINDS = frozenset({"web"})
+
+
+def _evidence_descriptors(
+    snapshot: Optional[Mapping[str, Any]], wanted: Sequence[Any]
+) -> List[Dict[str, Any]]:
+    """The fingerprints of the passages a citation rested on.
+
+    The hash and the position, never the text. Copying the passage would put
+    corpus prose in a message row, where deleting the document does not reach
+    it; the fingerprint says which reading was cited without keeping it.
+
+    That is what makes an old citation still mean what it meant. The source
+    may be gone, or the path may hold different bytes now - the stored hash
+    matches neither, so the citation reads as being about something that is
+    no longer there rather than silently pointing at whatever replaced it.
+    """
+    if not wanted:
+        return []
+    keep = {str(item) for item in wanted}
+    records = (snapshot or {}).get("evidence") or []
+    if not isinstance(records, Sequence) or isinstance(records, (str, bytes)):
+        return []
+    found: List[Dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            continue
+        if str(record.get("evidence_id") or "") not in keep:
+            continue
+        locator = record.get("locator")
+        found.append({
+            "content_hash": str(record.get("content_hash") or ""),
+            "locator": dict(locator) if isinstance(locator, Mapping) else {},
+        })
+    return found
+
+
 def durable_citations(
     citations: Optional[Sequence[Mapping[str, Any]]],
     snapshot: Optional[Mapping[str, Any]],
@@ -621,12 +685,27 @@ def durable_citations(
 
     A marker occupies no space in the public text - it was removed - so the
     segment is a zero-width anchor: `start` and `end` are both the insertion
-    point. `source_id` is the durable name of the source, which is the
-    producer's own identity where it has one and the locator otherwise;
-    `title` and `kind` ride in `meta`, where the segment schema keeps what it
-    does not name. The passage itself is not copied here: the citation says
-    which source supported the span, and the evidence stays in the corpus,
-    where deleting a document still reaches it.
+    point.
+
+    What the record says the source *is*, and what it deliberately does not
+    say. `source_id` is the producer's own identity for the object and
+    nothing else - `note:7`, a conversation id, an attachment's
+    `gen:<sha256>:<ext>` - and is empty when the producer has none. It is
+    never the locator. A path is where a file was during this turn, not what
+    it is: plain retrieval says so itself, since chunks under a path claim to
+    be the contents of that path *now*. Replace the file tomorrow and a
+    citation identified by the path would follow the name to bytes that never
+    supported the answer.
+
+    So the historical reading is carried by `meta.evidence` instead - the
+    fingerprint of each passage the citation rested on, with no passage text.
+    A source whose object identity does not exist is still pinned by that:
+    the hash matches the reading that was cited, and matches nothing else.
+
+    `meta.title` is the display name and `locator` is a reference a reader can
+    follow, kept only for the kinds where a locator is one - see
+    `PUBLIC_LOCATOR_KINDS`. For a file the durable record carries the name and
+    not the server's path to it.
     """
     sources = (snapshot or {}).get("sources") or {}
     if not isinstance(sources, Mapping):
@@ -641,16 +720,22 @@ def durable_citations(
             continue
         if offset < 0 or offset > len(content or ""):
             continue
-        locator = str(source.get("locator") or "")
+        kind = str(source.get("kind") or "")
         segments.append({
             "type": "citation",
             "start": offset,
             "end": offset,
-            "locator": locator,
-            "source_id": str(source.get("origin_id") or "") or locator,
+            "locator": (
+                str(source.get("locator") or "")
+                if kind in PUBLIC_LOCATOR_KINDS else ""
+            ),
+            "source_id": str(source.get("origin_id") or ""),
             "meta": {
-                "kind": str(source.get("kind") or ""),
+                "kind": kind,
                 "title": str(source.get("title") or ""),
+                "evidence": _evidence_descriptors(
+                    snapshot, entry.get("evidence_ids") or ()
+                ),
             },
         })
     return segments
