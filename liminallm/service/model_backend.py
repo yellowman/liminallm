@@ -592,6 +592,13 @@ _TEMPERATURE_POLICIES: List[Tuple[str, TemperaturePolicy]] = [
     ("gpt-5.4", TemperaturePolicy.CONDITIONAL),
     ("gpt-5.4-mini", TemperaturePolicy.OMIT),
     ("gpt-5.4-nano", TemperaturePolicy.OMIT),
+    # GPT-6 documents temperature, top_p and top_logprobs as unsupported
+    # and asks callers to drop them rather than rely on the API ignoring
+    # them. Written at the generation, not at `gpt-6-astra`: the allowance
+    # the 5.x line had was per version, this removal is not, and omitting
+    # a parameter a sibling would have taken costs nothing while sending
+    # one it rejects fails the request.
+    ("gpt-6", TemperaturePolicy.OMIT),
     ("o1", TemperaturePolicy.OMIT),
     ("o3", TemperaturePolicy.OMIT),
     ("o4", TemperaturePolicy.OMIT),
@@ -689,6 +696,7 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     ("gpt-5.4-nano", 400_000),
     ("gpt-5.5", 1_050_000),
     ("gpt-5.6", 1_050_000),
+    ("gpt-6-astra", 1_050_000),
     ("gpt-5.3-codex", 400_000),
     ("gpt-5-chat-latest", 128_000),
     ("gpt-5.1-chat-latest", 128_000),
@@ -735,6 +743,7 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     ("glm-4.7", 200_000),
     ("glm-5", 200_000),
     ("glm-5.2", 1_000_000),
+    ("glm-5.3", 1_000_000),
     # Moonshot / Kimi.
     ("moonshot", 131_072),
     ("moonshot-v1-8k", 8_192),

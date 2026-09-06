@@ -35,6 +35,7 @@ class TestContextWindows:
         ("gemini-3-pro-image-preview", 131_072),
         # OpenAI - tier splits within one version.
         ("gpt-5.2", 400_000),
+        ("gpt-6-astra", 1_050_000),
         ("gpt-5.6-sol", 1_050_000),
         ("gpt-5.6-terra", 1_050_000),
         ("gpt-5.5-pro", 1_050_000),
@@ -57,6 +58,7 @@ class TestContextWindows:
         ("grok-4.20-0309-reasoning", 1_000_000),
         ("grok-build-0.1", 256_000),
         ("deepseek-reasoner", 128_000),
+        ("glm-5.3", 1_000_000),
         ("glm-5.2", 1_000_000),
         ("glm-5.1", 200_000),
         ("glm-4.7", 200_000),
@@ -208,6 +210,7 @@ class TestTemperaturePolicy:
         ("glm-4.7-flash", TemperaturePolicy.TUNABLE),
         ("deepseek-chat", TemperaturePolicy.TUNABLE),
         ("Baichuan4-Turbo", TemperaturePolicy.TUNABLE),
+        ("gpt-6-astra", TemperaturePolicy.OMIT),
         ("minimax-m3", TemperaturePolicy.TUNABLE),
         ("mistral-medium-3-5", TemperaturePolicy.TUNABLE),
         ("command-a-03-2025", TemperaturePolicy.TUNABLE),
