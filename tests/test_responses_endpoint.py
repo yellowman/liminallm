@@ -264,6 +264,95 @@ def test_a_gpt_6_tool_round_goes_to_responses_without_a_temperature():
     assert out["tool_calls"][0]["name"] == "web_search"
 
 
+# ---------------------------------------------------------------------------
+# Models whose tool calling exists only on /responses
+# ---------------------------------------------------------------------------
+
+TOOLS = [{"type": "function", "function": {
+    "name": "web_search", "description": "search", "parameters": {"type": "object"}}}]
+
+
+def _astra(client) -> APIBackend:
+    backend = _backend(client)
+    backend.base_model = "gpt-6-astra"
+    return backend
+
+
+def test_a_responses_only_model_does_not_send_tools_to_chat_when_the_sdk_lacks_it():
+    """The fallback is right for the endpoint and wrong for this request.
+
+    GPT-6 supports chat/completions in general and its tool calling only on
+    /responses, so the one path the generic fallback must not take is a tool
+    round. An older SDK surface has no `.responses` at all, which is the case
+    that never even reaches the probe.
+    """
+    chat_calls = []
+
+    def chat_create(**kw):
+        chat_calls.append(kw)
+        return _chat_completion()
+
+    backend = _astra(_client(responses_create=None, chat_create=chat_create))
+
+    with pytest.raises(RuntimeError, match="responses"):
+        backend.generate_with_tools([{"role": "user", "content": "x"}], TOOLS, [])
+
+    assert chat_calls == [], "a tool round reached chat/completions"
+
+
+def test_a_responses_only_model_does_not_fall_back_after_a_404():
+    """The other route in: an OpenAI-compatible gateway that answers 404 for
+    /responses, or an instance whose probe already cached that verdict."""
+    chat_calls = []
+
+    def responses_create(**kw):
+        raise _Unsupported(404)
+
+    def chat_create(**kw):
+        chat_calls.append(kw)
+        return _chat_completion()
+
+    backend = _astra(_client(responses_create, chat_create))
+
+    with pytest.raises(RuntimeError, match="responses"):
+        backend.generate_with_tools([{"role": "user", "content": "x"}], TOOLS, [])
+
+    assert chat_calls == [], "a tool round fell back to chat/completions"
+
+
+def test_a_responses_only_model_still_falls_back_when_it_asks_for_no_tools():
+    """Plain chat/completions is supported on this model - it is tool calling
+    that is not - so the loop's final round must still be served."""
+    def responses_create(**kw):
+        raise _Unsupported(404)
+
+    backend = _astra(_client(responses_create, lambda **kw: _chat_completion()))
+
+    out = backend.generate_with_tools([{"role": "user", "content": "x"}], [], [])
+
+    assert out["content"] == "from chat"
+
+
+def test_an_ordinary_model_keeps_its_chat_tool_fallback():
+    """The guard is per model, not a removal of the fallback: a chat-only
+    provider serving a model with no such restriction still runs its tools."""
+    seen = {}
+
+    def responses_create(**kw):
+        raise _Unsupported(404)
+
+    def chat_create(**kw):
+        seen.update(kw)
+        return _chat_completion()
+
+    backend = _backend(_client(responses_create, chat_create))
+
+    backend.generate_with_tools([{"role": "user", "content": "x"}], TOOLS, [])
+
+    assert seen["tools"] == TOOLS
+    assert seen["tool_choice"] == "auto"
+
+
 def test_multimodal_parts_map_to_responses_types():
     items = rc.to_input_items([{
         "role": "user",
