@@ -1446,7 +1446,18 @@ Together adapter APIs) behind the existing OpenAI-compatible transport:
   its wire cannot carry. provider values are opaque
   JSON - no encoding, encryption or interpretation of ours - and a native
   tape is never continued over `/chat/completions`, nor compacted or
-  rewritten by the parent.
+  rewritten by the parent. a reply is a turn only when its wire says it
+  finished, read by the adapter that knows that wire's words, before
+  anything becomes a candidate: OpenAI `status` must be `completed` under
+  the native contract (a compatible provider may omit it, never report
+  another state) and the output must hold at least one item; Gemini
+  `finishReason` must be `STOP`; a chat reply cut off at its output limit
+  or carrying no choice is refused too. a call that looks whole inside a
+  reply that was cut off is part of a reply that was cut off.
+  `reasoning.context=auto` is asked for by model profile
+  (`REASONING_CONTEXT_PREFIXES`) under the native strategy only; a
+  conventional model, or any compatible provider, is sent nothing it was
+  not measured against.
 - the kernel models this as `remote`/`adapter_param` providers (§5.0.2);
   adapters trained by the JAX pipeline are exported per-version to the
   shared filesystem and mounted by the server.
@@ -2736,7 +2747,15 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   priced against the rendered conversation, so what the accepted state
   costs beyond it - the provider-reported reasoning tokens of the accepted
   turns - is reserved from the budget. A change of representation needs an
-  explicit reset; nothing substitutes one quietly.
+  explicit reset; nothing substitutes one quietly. The final streamed
+  answer runs on the accepted state too: the stream is sent that state and
+  the record past it, on the wire that wrote it, and produces no
+  continuation, since nothing follows the final answer. When the record
+  already ends on an accepted answer without calls, that answer is
+  delivered as it stands rather than generated again - a second generation
+  would rewind the state just accepted for the sake of a token-by-token
+  stream - and its citations are read out of the canonical copy of that
+  same turn.
 - The worker confines itself before any body runs: environment replaced
   wholesale, network structurally absent, filesystem view limited to a
   scratch the parent owns. Linux: user + mount + network namespace and a

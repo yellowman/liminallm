@@ -171,6 +171,68 @@ class TestTheServiceNamesTheBackendItBuilds:
         assert isinstance(out, dict) and "continuation" not in out
 
 
+class TestTheStreamIsHandedTheStateItConsumes:
+    """The final answer's stream takes the record past the cursor and the
+    accepted state, from the backend that wrote it. A chat-shaped record
+    changes nothing: the whole conversation is prepared and streamed."""
+
+    class _Backend:
+        applies_lora_weights = False
+        declared = OPENAI_RESPONSES_NATIVE_V1
+
+        def __init__(self):
+            self.seen = []
+
+        def declared_continuation(self):
+            return self.declared
+
+        def generate_with_tools(self, messages, tools, adapters, *, user_id=None):
+            return {"content": "", "tool_calls": [], "usage": {}}
+
+        def generate_stream(self, messages, adapters, *, user_id=None, continuation=None):
+            self.seen.append((list(messages), continuation))
+            return iter([])
+
+    ADAPTER = {"id": "skill", "mode": "prompt", "prompt_instructions": "prefer tabs"}
+    TAIL = [{"role": "tool", "tool_call_id": "call_1", "name": "web_search",
+             "content": "result text"}]
+
+    def test_a_native_stream_gets_the_tail_as_it_is_and_the_state(self):
+        from liminallm.service.llm import LLMService
+
+        backend = self._Backend()
+        state = _state()
+        list(LLMService(base_model="m", backend=backend).stream_messages(
+            list(self.TAIL), [self.ADAPTER], continuation=state))
+
+        messages, handed = backend.seen[0]
+        assert messages == self.TAIL and handed == state
+
+    def test_a_backend_declaring_otherwise_does_not_stream_a_native_record(self):
+        from liminallm.service.llm import LLMService
+
+        from liminallm.service.continuation import ContinuationMismatch
+
+        backend = self._Backend()
+        backend.declared = CHAT_STRUCTURED_V1
+        with pytest.raises(ContinuationMismatch):
+            LLMService(base_model="m", backend=backend).stream_messages(
+                list(self.TAIL), [], continuation=_state())
+        assert backend.seen == []
+
+    def test_a_chat_shaped_record_streams_the_whole_prepared_conversation(self):
+        from liminallm.service.llm import LLMService
+
+        backend = self._Backend()
+        state = _state(strategy=CHAT_STRUCTURED_V1, transport="chat", payload={})
+        list(LLMService(base_model="m", backend=backend).stream_messages(
+            list(self.TAIL), [self.ADAPTER], continuation=state))
+
+        messages, handed = backend.seen[0]
+        assert messages[0]["role"] == "system" and "prefer tabs" in messages[0]["content"]
+        assert handed is None
+
+
 class TestTheTailIsNotPreparedTwice:
     """Adapter guidance is placed once, where the tape began. A tail sent
     under a native continuation is the rounds since, and preparing it would

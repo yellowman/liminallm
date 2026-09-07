@@ -26,10 +26,11 @@ from liminallm.service.continuation import (
     GEMINI_NATIVE_V1,
     OPENAI_RESPONSES_NATIVE_V1,
     ContinuationMismatch,
+    ModelTurnRejected,
     ProviderContinuation,
 )
 from liminallm.service.gemini_backend import GeminiBackend
-from tests.test_gemini_native import _backend
+from tests.test_gemini_native import _armed, _backend
 
 TOOLS = [{"type": "function", "function": {
     "name": "web_search", "description": "search", "parameters": {"type": "object"}}}]
@@ -50,10 +51,10 @@ PARTS = [
 ]
 
 
-def _reply(parts):
+def _reply(parts, finish="STOP"):
     return {
         "candidates": [{"content": {"role": "model", "parts": parts},
-                        "finishReason": "STOP"}],
+                        "finishReason": finish}],
         "usageMetadata": {"promptTokenCount": 8, "candidatesTokenCount": 4,
                           "totalTokenCount": 12},
     }
@@ -111,21 +112,41 @@ class TestTheCandidateIsTheWholeSelectedContent:
         assert "sig-" not in public
         assert "sig-call" in json.dumps(out["continuation"])
 
-    def test_a_reply_without_candidate_content_adds_nothing_and_invents_nothing(self):
-        """Both shapes an empty reply takes: no candidate at all, and a
-        candidate that stopped before it produced any content."""
-        for empty in (
+    @pytest.mark.parametrize("finish", ["MAX_TOKENS", "MALFORMED_FUNCTION_CALL", "SAFETY"])
+    def test_a_candidate_that_did_not_finish_is_refused_whole(self, finish):
+        """The wire's own word decides. A call that looks whole in a
+        candidate that hit its output limit is part of a candidate that was
+        cut off, and nothing of it - parts, signatures, calls - is a turn."""
+        backend, bodies = _scripted(_reply(PARTS, finish=finish))
+
+        with pytest.raises(ModelTurnRejected, match=finish):
+            backend.generate_with_tools(OPENING, TOOLS, [])
+        assert len(bodies) == 1
+
+    def test_a_reply_with_no_finished_candidate_is_refused(self):
+        """No candidate at all - a blocked prompt - is nothing to accept,
+        and so is a candidate that carries content but no word on whether
+        it finished: the wire says STOP or it did not stop."""
+        for reply in (
             {"promptFeedback": {"blockReason": "SAFETY"}, "usageMetadata": {}},
-            {"candidates": [{"finishReason": "SAFETY"}], "usageMetadata": {}},
-            {"candidates": [{"content": {"role": "model"}, "finishReason": "STOP"}],
+            {"candidates": [{"content": {"role": "model", "parts": PARTS}}],
              "usageMetadata": {}},
         ):
-            backend, bodies = _scripted(empty)
+            backend, _bodies = _scripted(reply)
 
-            out = backend.generate_with_tools(OPENING, TOOLS, [])
+            with pytest.raises(ModelTurnRejected, match="no candidate finished"):
+                backend.generate_with_tools(OPENING, TOOLS, [])
 
-            assert out["content"] == "" and out["tool_calls"] == []
-            assert out["continuation"]["payload"]["contents"] == bodies[0]["contents"]
+    def test_a_finished_candidate_without_content_adds_nothing_and_invents_nothing(self):
+        backend, bodies = _scripted(
+            {"candidates": [{"content": {"role": "model"}, "finishReason": "STOP"}],
+             "usageMetadata": {}}
+        )
+
+        out = backend.generate_with_tools(OPENING, TOOLS, [])
+
+        assert out["content"] == "" and out["tool_calls"] == []
+        assert out["continuation"]["payload"]["contents"] == bodies[0]["contents"]
 
     def test_the_keeper_reads_nothing_and_drops_nothing(self):
         future = {"inlineData": {"mimeType": "x/y", "data": "AAAA"},
@@ -164,6 +185,51 @@ class TestTheNextCallReplaysItWhole:
         items = second["continuation"]["payload"]["contents"]
         assert items[:-1] == sent["contents"]
         assert items[-1] == {"role": "model", "parts": [{"text": "done"}]}
+
+    def test_the_stream_replays_the_accepted_conversation_and_produces_nothing(self):
+        """The final answer streams from the accepted state: the accepted
+        contents first, the tail after, the system instruction carried."""
+        backend, bodies = _scripted(_reply(PARTS))
+        accepted = _accepted(backend.generate_with_tools(OPENING, TOOLS, []))
+        streamed_bodies = []
+        chunk = {"candidates": [{"content": {"role": "model", "parts": [{"text": "done"}]}}],
+                 "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1,
+                                   "totalTokenCount": 2}}
+        sse = f"data: {json.dumps(chunk)}\r\n\r\n"
+
+        def handler(request):
+            streamed_bodies.append(json.loads(request.read()))
+            return _armed(httpx.Response(200, content=sse.encode(),
+                                         headers={"Content-Type": "text/event-stream"}))
+
+        streamer = GeminiBackend("gemini-2.5-flash", api_key="g-key",
+                                 transport=httpx.MockTransport(handler))
+        events = list(streamer.generate_stream(self.TAIL, [], continuation=accepted))
+
+        assert [e["event"] for e in events] == ["token", "message_done"]
+        sent = streamed_bodies[0]
+        assert sent["contents"][:-1] == accepted.payload["contents"]
+        assert sent["contents"][-1]["parts"][0]["functionResponse"]["name"] == "web_search"
+        assert sent["systemInstruction"] == accepted.payload["systemInstruction"]
+        assert gb.THOUGHT_SIGNATURE_PLACEHOLDER not in json.dumps(sent)
+        assert "continuation" not in events[-1]["data"]
+
+    def test_the_stream_refuses_another_models_conversation_before_the_call(self):
+        backend, _bodies = _scripted(_reply(PARTS))
+        accepted = _accepted(backend.generate_with_tools(OPENING, TOOLS, []))
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(200, content=b"")
+
+        other = GeminiBackend("gemini-3-flash-preview", api_key="g-key",
+                              transport=httpx.MockTransport(handler))
+        events = list(other.generate_stream(self.TAIL, [], continuation=accepted))
+
+        assert events[-1]["event"] == "error"
+        assert events[-1]["data"]["code"] == "continuation_mismatch"
+        assert calls == []
 
     def test_a_continuation_written_by_another_strategy_is_not_replayed(self):
         for strategy, transport, provider in (

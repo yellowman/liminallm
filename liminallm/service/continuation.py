@@ -122,6 +122,21 @@ class ContinuationMismatch(RuntimeError):
     """
 
 
+class ModelTurnRejected(RuntimeError):
+    """The model's reply is not a turn the parent can accept whole.
+
+    All of it or none of it. A reply the provider itself reports as cut
+    off, failed, cancelled or still running; a reply with nothing in it; a
+    reply with one call whose arguments are not a JSON object - none of
+    these is a reply with the rest of it in it. A call that looks whole
+    inside a reply that was cut off is part of a reply that was cut off.
+    Raised by an adapter for what only its wire can say, and by the parent
+    for the shape it reads. Nothing of it is recorded, nothing in it runs,
+    and the provider's continuation stays where the last accepted turn left
+    it.
+    """
+
+
 @dataclass(frozen=True)
 class ProviderContinuation:
     """One provider's accepted continuation, through one operation.

@@ -25,6 +25,7 @@ from liminallm.logging import get_logger
 from liminallm.service.continuation import (
     GEMINI_NATIVE_V1,
     ContinuationMismatch,
+    ModelTurnRejected,
     ProviderContinuation,
 )
 from liminallm.service.model_backend import (
@@ -218,6 +219,23 @@ def _candidate_parts(payload: dict) -> List[dict]:
     if not candidates:
         return []
     return (candidates[0].get("content") or {}).get("parts") or []
+
+
+def finish_reason(payload: dict) -> Optional[str]:
+    """Why the selected candidate stopped, as the wire reports it, or None.
+
+    `STOP` is the one reason under which the candidate is a turn. The wire
+    also reports `MAX_TOKENS`, `SAFETY`, `RECITATION`,
+    `MALFORMED_FUNCTION_CALL` and others, and a candidate under any of them
+    is provisional at best: a call that looks whole in a candidate that hit
+    its output limit is part of a candidate that was cut off. A reply with
+    no candidate reports nothing, and nothing is nothing to accept.
+    """
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        return None
+    reason = candidates[0].get("finishReason")
+    return str(reason) if reason else None
 
 
 def candidate_text(payload: dict) -> str:
@@ -560,6 +578,14 @@ class GeminiBackend:
             if "systemInstruction" not in body and accepted.get("systemInstruction"):
                 body["systemInstruction"] = deepcopy(accepted["systemInstruction"])
         payload = self._post("generateContent", body).json()
+        # Provisional until the wire says the candidate finished. Read here
+        # because only this adapter knows the wire's words for it.
+        reason = finish_reason(payload)
+        if reason != "STOP":
+            raise ModelTurnRejected(
+                "the candidate is not a turn to accept: "
+                + (f"finishReason {reason}" if reason else "no candidate finished")
+            )
         content = candidate_text(payload)
         calls = function_calls_of(payload)
         selected = selected_content(payload)
@@ -593,13 +619,20 @@ class GeminiBackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         """SSE over streamGenerateContent?alt=sse: each `data:` line is a
         chunk whose candidate parts carry text deltas; the last one carries
-        usageMetadata."""
+        usageMetadata.
+
+        With a native `continuation`, the accepted conversation goes first
+        and the messages are the record past it. Consumed, never advanced:
+        what the stream says is the answer, and no continuation comes back.
+        """
         handle = StreamAbortHandle()
         return CancellableStream(
-            self._generate_stream_impl(messages, adapters, handle), handle
+            self._generate_stream_impl(messages, adapters, handle, continuation),
+            handle,
         )
 
     def _generate_stream_impl(
@@ -607,8 +640,23 @@ class GeminiBackend:
         messages: List[dict],
         adapters: List[dict],
         abort_handle: StreamAbortHandle,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         body, applied = self._request_body(messages, adapters)
+        accepted = self._accepted(continuation)
+        if accepted is not None:
+            if continuation.model != self.base_model:
+                yield {"event": "error", "data": {
+                    "code": "continuation_mismatch",
+                    "message": (
+                        f"the accepted continuation is for {continuation.model!r} "
+                        f"and this backend serves {self.base_model!r}"
+                    ),
+                }}
+                return
+            body["contents"] = deepcopy(accepted.get("contents") or []) + body["contents"]
+            if "systemInstruction" not in body and accepted.get("systemInstruction"):
+                body["systemInstruction"] = deepcopy(accepted["systemInstruction"])
         url = self._url(self.base_model, "streamGenerateContent") + "?alt=sse"
         full_content = ""
         usage: Dict[str, int] = {}

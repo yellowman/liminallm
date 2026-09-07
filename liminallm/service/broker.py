@@ -50,6 +50,7 @@ from liminallm.service.continuation import (
     OPENAI_RESPONSES_NATIVE_V1,
     STRATEGIES,
     ContinuationMismatch,
+    ModelTurnRejected,
     ProviderContinuation,
     declared_strategy,
 )
@@ -117,16 +118,6 @@ class CapabilityNotAllowed(RuntimeError):
 
 class RoundNotAsked(RuntimeError):
     """The submitted round is not the one the recorded model turn asked for."""
-
-
-class ModelTurnRejected(RuntimeError):
-    """The model's reply is not a turn the parent can accept whole.
-
-    All of it or none of it. A reply with one call whose arguments are not a
-    JSON object is not a reply with the other calls in it: nothing of it is
-    recorded, nothing in it runs, and the provider's continuation stays where
-    the last accepted turn left it.
-    """
 
 
 #: What a call reads back when its tool was not offered on the turn that asked

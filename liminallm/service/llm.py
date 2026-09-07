@@ -6,7 +6,11 @@ from typing import Any, Iterator, List, Optional
 from liminallm.config import AdapterMode, resolve_provider_endpoint
 from liminallm.logging import get_logger
 from liminallm.service import local_format
-from liminallm.service.continuation import NATIVE_STRATEGIES, ProviderContinuation
+from liminallm.service.continuation import (
+    NATIVE_STRATEGIES,
+    ContinuationMismatch,
+    ProviderContinuation,
+)
 from liminallm.service.model_backend import (
     ApiAdapterBackend,
     LocalJaxLoRABackend,
@@ -211,17 +215,39 @@ class LLMService:
         adapters: Optional[List[dict]] = None,
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         """Stream a reply for a caller-built message list.
 
         Used by the attachment agent to stream its final answer after the
         tool-calling rounds have assembled the message history.
+
+        With a native `continuation`, the messages are the record past the
+        accepted state and go as they are - the opening, guidance included,
+        is already in the provider's hands - and the backend must be the one
+        that wrote the state. A chat-shaped record changes nothing here: the
+        whole conversation is prepared and sent, as it always was.
         """
-        prepared, normalized_adapters = self._prepare_backend_messages(
-            messages, adapters
-        )
+        native = continuation is not None and continuation.strategy in NATIVE_STRATEGIES
+        if native:
+            declare = getattr(self.backend, "declared_continuation", None)
+            declared = declare() if callable(declare) else None
+            if declared != continuation.strategy:
+                raise ContinuationMismatch(
+                    f"the accepted continuation is {continuation.strategy} and "
+                    f"the backend streaming this answer declares {declared or 'nothing'}"
+                )
+            prepared = list(messages or [])
+            normalized_adapters = self._normalize_adapters(adapters or [])
+        else:
+            prepared, normalized_adapters = self._prepare_backend_messages(
+                messages, adapters
+            )
         return self.backend.generate_stream(
-            prepared, normalized_adapters, user_id=user_id
+            prepared,
+            normalized_adapters,
+            user_id=user_id,
+            **({"continuation": continuation} if native else {}),
         )
 
     @property

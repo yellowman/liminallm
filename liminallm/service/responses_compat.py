@@ -124,6 +124,32 @@ OUTPUT_ONLY_FIELDS: Dict[str, tuple] = {
 }
 
 
+#: The one status under which a reply is a turn. The wire also reports
+#: `failed`, `incomplete`, `cancelled`, `in_progress` and `queued`, and a
+#: reply under any of them is provisional at best: a call that looks whole
+#: inside a reply cut off at its output limit is part of a reply that was
+#: cut off.
+COMPLETED = "completed"
+
+
+def rejection_reason(response: Any, *, strict: bool) -> Optional[str]:
+    """Why this reply is not a turn to accept, or None when it is.
+
+    `strict` is the native contract: the status must say completed. A
+    compatible provider on this wire may omit the field, and is refused
+    only when it names a state that is not completion. Either way a reply
+    with no output items is nothing to accept.
+    """
+    status = getattr(response, "status", None)
+    if status != COMPLETED and (strict or status is not None):
+        details = getattr(response, "incomplete_details", None)
+        why = getattr(details, "reason", None)
+        return f"status {status!r}" + (f" ({why})" if why else "")
+    if not (getattr(response, "output", None) or []):
+        return "no output items"
+    return None
+
+
 def replayable_output(response: Any) -> List[Dict[str, Any]]:
     """`response.output` as the items the next request replays, exactly.
 

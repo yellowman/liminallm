@@ -537,6 +537,100 @@ class TestARejectedTurnLeavesNothingBehind:
         }]
 
 
+class TestOnlyAFinishedReplyBecomesHistory:
+    """End to end through the real adapters: the parent's ledger, the
+    adapter's reading of its own wire, and nothing of a reply the provider
+    reports unfinished reaching the record, the tools or the continuation."""
+
+    def _openai(self, monkeypatch, engine, replies):
+        from tests.test_openai_native_adapter import _native
+
+        queue = list(replies)
+        backend = _native(lambda **kw: queue.pop(0))
+        monkeypatch.setattr(engine.llm, "backend", backend)
+        return backend
+
+    def test_an_incomplete_openai_reply_is_refused_whole(self, store, monkeypatch):
+        from tests.test_openai_native_adapter import (
+            _call,
+            _reasoning,
+            _wire_response,
+        )
+
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        self._openai(monkeypatch, engine, [
+            _wire_response([_reasoning(), _call(call_id="c1", name="web_search",
+                                                 arguments='{"query": "hours"}')]),
+            _wire_response([_reasoning("rs_2"), _call("fc_2", "c2", "web_fetch",
+                                                     '{"url": "https://a.example"}')],
+                           status="incomplete", incomplete={"reason": "max_output_tokens"}),
+        ])
+        ran = _watch_rounds(engine, monkeypatch)
+        assert _model(broker, invocation, 1)["ok"]
+        assert _round(broker, invocation, 2)["ok"]
+        accepted = context.continuation
+
+        reply = _model(broker, invocation, 3)
+
+        assert reply["ok"] is False and reply["code"] == "model_turn_rejected"
+        assert "max_output_tokens" in reply["error"]
+        assert invocation.ledger.get(3).state == FAILED
+        assert len(context.transcript.entries) == 2
+        assert context.continuation == accepted
+        fetch = {"id": "c2", "name": "web_fetch", "arguments": {"url": "https://a.example"}}
+        again = _round(broker, invocation, 4, calls=[fetch])
+        assert again["ok"] is False and again["code"] == "round_not_asked"
+        assert ran == [["web_search"]]
+
+    def test_a_gemini_candidate_cut_off_at_its_limit_is_refused_whole(
+        self, store, monkeypatch
+    ):
+        import httpx
+
+        from liminallm.service.gemini_backend import GeminiBackend
+
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch,
+                                                       mode="gemini_native")
+        replies = [
+            {"candidates": [{"content": {"role": "model", "parts": [
+                {"functionCall": {"name": "web_search", "args": {"query": "hours"}},
+                 "thoughtSignature": "sig-1"}]}, "finishReason": "STOP"}],
+             "usageMetadata": {}},
+            {"candidates": [{"content": {"role": "model", "parts": [
+                {"functionCall": {"name": "web_fetch", "args": {"url": "https://a.example"}},
+                 "thoughtSignature": "sig-2"}]}, "finishReason": "MAX_TOKENS"}],
+             "usageMetadata": {}},
+        ]
+        def handler(request):
+            # The context-window probe is a GET to the models endpoint and
+            # must not eat a scripted reply.
+            if "generateContent" not in str(request.url):
+                return httpx.Response(404, json={})
+            return httpx.Response(200, json=replies.pop(0))
+
+        backend = GeminiBackend("gemini-3-flash-preview", api_key="g-key",
+                                transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(engine.llm, "backend", backend)
+        ran = _watch_rounds(engine, monkeypatch)
+        opening = _model(broker, invocation, 1)
+        assert opening["ok"], opening
+        assert _round(broker, invocation, 2, calls=[
+            {"id": "gemini-call-0-web_search", "name": "web_search",
+             "arguments": {"query": "hours"}}])["ok"]
+        accepted = context.continuation
+
+        reply = _model(broker, invocation, 3)
+
+        assert reply["ok"] is False and reply["code"] == "model_turn_rejected"
+        assert "MAX_TOKENS" in reply["error"]
+        assert invocation.ledger.get(3).state == FAILED
+        assert len(context.transcript.entries) == 2
+        assert context.continuation == accepted
+        assert ran == [["web_search"]]
+
+
 class TestTheStrategyIsStickyForTheInvocation:
     def test_a_backend_declaring_otherwise_is_refused_before_it_is_asked(
         self, store, monkeypatch

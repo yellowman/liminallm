@@ -25,8 +25,10 @@ from liminallm.service.continuation import (
     CHAT_STRUCTURED_V1,
     OPENAI_RESPONSES_NATIVE_V1,
     ContinuationMismatch,
+    ModelTurnRejected,
     ProviderContinuation,
 )
+from liminallm.service.model_backend import supports_reasoning_context
 from tests.test_responses_endpoint import _Unsupported, _backend, _client
 
 SENTINEL = "gAAAAB+/x9Q==étape"
@@ -50,27 +52,40 @@ def _message(ident="msg_1", text="found it"):
             "content": [{"type": "output_text", "text": text, "annotations": []}]}
 
 
-def _raw(output, model):
-    return {
+def _raw(output, model, status="completed", incomplete=None):
+    raw = {
         "id": "resp_1", "object": "response", "created_at": 0, "model": model,
-        "status": "completed", "parallel_tool_calls": True, "tool_choice": "auto",
+        "status": status, "parallel_tool_calls": True, "tool_choice": "auto",
         "tools": [], "output": output,
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
                   "input_tokens_details": {"cached_tokens": 0},
                   "output_tokens_details": {"reasoning_tokens": 4}},
     }
+    if incomplete is not None:
+        raw["incomplete_details"] = incomplete
+    return raw
 
 
-def _sdk_response(output, model="gpt-6-astra"):
+def _sdk_response(output, model="gpt-6-astra", **shape):
     """A real `Response`, validated by the SDK the backend actually uses."""
-    return Response.model_validate(_raw(output, model))
+    return Response.model_validate(_raw(output, model, **shape))
 
 
-def _wire_response(output, model="gpt-6-astra"):
+def _wire_response(output, model="gpt-6-astra", **shape):
     """A `Response` as the client itself builds one from the wire: without
     validation, optional fields it did not receive filled in as None, an item
     type it has no class for held in the first class that takes it."""
-    return construct_type(type_=Response, value=_raw(output, model))
+    return construct_type(type_=Response, value=_raw(output, model, **shape))
+
+
+def _stream_events(text="done"):
+    """A responses stream as the SDK yields it: deltas, then completion."""
+    from types import SimpleNamespace as NS
+
+    return iter([
+        NS(type="response.output_text.delta", delta=text),
+        NS(type="response.completed", response=_sdk_response([_message(text=text)])),
+    ])
 
 
 def _native(create, chat_create=None, *, mode="openai", model="gpt-6-astra"):
@@ -142,6 +157,41 @@ class TestTheRequestIsStatelessByContract:
         assert seen["store"] is False and "include" in seen
         assert out["continuation"]["strategy"] == OPENAI_RESPONSES_NATIVE_V1
 
+    def test_a_reasoning_context_model_is_asked_to_keep_its_context(self):
+        """`reasoning.context` is what makes a replayed encrypted reasoning
+        item worth replaying, and it is asked for by profile: the models
+        known to honour it, under the native strategy only."""
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _sdk_response([_reasoning(), _message()])
+
+        _native(create).generate_with_tools(USER, TOOLS, [])
+        assert seen["reasoning"] == {"context": "auto"}
+
+        backend = _native(create)
+        backend._reasoning_effort = "high"
+        backend.generate_with_tools(USER, TOOLS, [])
+        assert seen["reasoning"] == {"effort": "high", "context": "auto"}
+
+        assert supports_reasoning_context("gpt-5.6") and supports_reasoning_context("gpt-6-astra")
+        assert not supports_reasoning_context("gpt-5.4")
+
+    def test_a_conventional_model_is_not_sent_a_context_it_was_not_measured_against(self):
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _sdk_response([_message()])
+
+        _native(create, model="gpt-4o-mini").generate_with_tools(USER, TOOLS, [])
+        assert "reasoning" not in seen
+        # The wire alone does not qualify a model: a compatible provider
+        # serving the same name is sent nothing of it either.
+        _native(create, mode="xai", model="gpt-6-astra").generate_with_tools(USER, TOOLS, [])
+        assert "reasoning" not in seen
+
     def test_a_compatible_provider_on_responses_gets_none_of_it(self):
         """Answering `/responses` is the wire, not the entitlement: a
         gateway declared as a compatible provider is not asked for encrypted
@@ -185,6 +235,182 @@ class TestTheRequestIsStatelessByContract:
         out = backend.generate_with_tools(USER, TOOLS, [])
 
         assert "continuation" not in out
+
+
+class TestOnlyAFinishedReplyIsATurn:
+    """The wire's own word decides. A call that looks whole inside a reply
+    the provider reports as cut off is part of a reply that was cut off, and
+    nothing of it - reasoning, text, calls, tape - is accepted."""
+
+    def test_an_incomplete_reply_with_a_whole_looking_call_is_refused(self):
+        calls = []
+
+        def create(**kw):
+            calls.append(kw)
+            return _wire_response(
+                [_reasoning(), _call()], status="incomplete",
+                incomplete={"reason": "max_output_tokens"},
+            )
+
+        with pytest.raises(ModelTurnRejected, match="incomplete.*max_output_tokens"):
+            _native(create).generate_with_tools(USER, TOOLS, [])
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("status", ["failed", "cancelled", "in_progress", "queued"])
+    def test_a_reply_in_any_other_state_is_refused(self, status):
+        def create(**kw):
+            return _wire_response([_reasoning(), _message()], status=status)
+
+        with pytest.raises(ModelTurnRejected, match=status):
+            _native(create).generate_with_tools(USER, TOOLS, [])
+
+    def test_the_native_contract_requires_the_status_to_say_completed(self):
+        """A reply that says nothing about whether it finished is not one
+        the native contract accepts; only a compatible provider is allowed
+        that silence."""
+        def silent(**kw):
+            return _wire_response([_message()], status=None)
+
+        with pytest.raises(ModelTurnRejected, match="status None"):
+            _native(silent).generate_with_tools(USER, TOOLS, [])
+
+    def test_a_completed_reply_with_no_output_is_refused(self):
+        def create(**kw):
+            return _wire_response([], status="completed")
+
+        with pytest.raises(ModelTurnRejected, match="no output"):
+            _native(create).generate_with_tools(USER, TOOLS, [])
+
+    def test_a_compatible_provider_may_omit_the_status_but_not_report_another(self):
+        """Strictness is the native contract. A compatible provider on this
+        wire is held to what it says: nothing said is accepted, a state
+        that is not completion is refused, and an empty output is still
+        nothing to accept."""
+        def silent(**kw):
+            return _wire_response([_message()], status=None)
+
+        out = _native(silent, mode="xai", model="grok-4.5").generate_with_tools(USER, TOOLS, [])
+        assert out["content"] == "found it"
+
+        def cut_off(**kw):
+            return _wire_response([_message()], status="incomplete")
+
+        with pytest.raises(ModelTurnRejected):
+            _native(cut_off, mode="xai", model="grok-4.5").generate_with_tools(USER, TOOLS, [])
+
+        def empty(**kw):
+            return _wire_response([], status=None)
+
+        with pytest.raises(ModelTurnRejected):
+            _native(empty, mode="xai", model="grok-4.5").generate_with_tools(USER, TOOLS, [])
+
+    def test_a_chat_reply_cut_off_at_its_limit_is_refused(self):
+        """The chat wire says the same thing in its own words."""
+        from types import SimpleNamespace as NS
+
+        def responses_create(**kw):
+            raise _Unsupported(404)
+
+        def cut_off(**kw):
+            return NS(choices=[NS(message=NS(content="partial", tool_calls=None),
+                                  finish_reason="length")], usage=None)
+
+        with pytest.raises(ModelTurnRejected, match="cut off"):
+            _native(responses_create, cut_off, mode="xai", model="grok-4.5").generate_with_tools(
+                USER, [], [])
+
+        def nothing(**kw):
+            return NS(choices=[], usage=None)
+
+        with pytest.raises(ModelTurnRejected, match="no choices"):
+            _native(responses_create, nothing, mode="xai", model="grok-4.5").generate_with_tools(
+                USER, [], [])
+
+
+class TestTheStreamConsumesTheTape:
+    """The final answer streams from the accepted state: the whole tape
+    first, then only the record past it, on the responses endpoint alone.
+    Consumed and not advanced - nothing comes back from a stream to accept."""
+
+    ACCEPTED = ProviderContinuation(
+        strategy=OPENAI_RESPONSES_NATIVE_V1, provider="openai", transport="responses",
+        model="gpt-6-astra", through_operation_seq=3,
+        payload={"items": [
+            {"role": "user", "content": [{"type": "input_text", "text": "find x"}]},
+            _reasoning(), _call(), _message(text=""),
+        ]},
+    )
+    TAIL = [{"role": "tool", "tool_call_id": "call_1", "name": "web_search",
+             "content": "result text"}]
+
+    def test_the_tape_goes_first_and_only_the_tail_follows(self):
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _stream_events("done")
+
+        events = list(_native(create).generate_stream(self.TAIL, [], continuation=self.ACCEPTED))
+
+        assert [e["event"] for e in events] == ["token", "message_done"]
+        assert seen["input"][:4] == self.ACCEPTED.payload["items"]
+        assert seen["input"][4:] == [{"type": "function_call_output",
+                                      "call_id": "call_1", "output": "result text"}]
+        assert seen["stream"] is True and seen["store"] is False
+        # Nothing is asked back: the stream produces no continuation.
+        assert "include" not in seen
+
+    def test_a_tape_never_streams_over_chat(self):
+        chat_calls = []
+
+        def responses_create(**kw):
+            raise _Unsupported(404)
+
+        def chat_create(**kw):
+            chat_calls.append(kw)
+            return iter([])
+
+        events = list(_native(responses_create, chat_create).generate_stream(
+            self.TAIL, [], continuation=self.ACCEPTED))
+
+        assert events[-1]["event"] == "error"
+        assert events[-1]["data"]["code"] == "continuation_mismatch"
+        assert chat_calls == []
+
+    def test_a_tape_is_refused_by_a_backend_already_known_chat_only(self):
+        """The verdict about the endpoint was reached earlier in the process.
+        A tape still has no chat form, and the stream says so rather than
+        sending the tail alone."""
+        chat_calls = []
+
+        def chat_create(**kw):
+            chat_calls.append(kw)
+            return iter([])
+
+        backend = _native(lambda **kw: _stream_events(), chat_create)
+        backend._responses_ok = False
+        events = list(backend.generate_stream(self.TAIL, [], continuation=self.ACCEPTED))
+
+        assert events[-1]["event"] == "error"
+        assert events[-1]["data"]["code"] == "continuation_mismatch"
+        assert chat_calls == []
+
+    def test_a_tape_for_another_model_is_refused_before_the_call(self):
+        calls = []
+
+        def create(**kw):
+            calls.append(kw)
+            return _stream_events()
+
+        events = list(_native(create, model="gpt-6-other").generate_stream(
+            self.TAIL, [], continuation=self.ACCEPTED))
+
+        assert events == [{"event": "error", "data": {
+            "code": "continuation_mismatch",
+            "message": "the accepted continuation is for 'gpt-6-astra' and this "
+                       "backend serves 'gpt-6-other'",
+        }}]
+        assert calls == []
 
 
 class TestTheCandidateIsTheWholeTape:

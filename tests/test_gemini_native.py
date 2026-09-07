@@ -123,7 +123,8 @@ def _payload(text="answer", calls=(), thoughts=0):
     meta = {"promptTokenCount": 8, "candidatesTokenCount": 4, "totalTokenCount": 12}
     if thoughts:
         meta["thoughtsTokenCount"] = thoughts
-    return {"candidates": [{"content": {"role": "model", "parts": parts}}],
+    return {"candidates": [{"content": {"role": "model", "parts": parts},
+                            "finishReason": "STOP"}],
             "usageMetadata": meta}
 
 

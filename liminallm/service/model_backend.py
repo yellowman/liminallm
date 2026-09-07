@@ -9,11 +9,11 @@ import socket
 import struct
 import threading
 import time
-from urllib.parse import urlparse
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Protocol, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
@@ -29,6 +29,7 @@ from liminallm.service.continuation import (
     OPENAI_RESPONSES_NATIVE_V1,
     TRANSCRIPT_V1,
     ContinuationMismatch,
+    ModelTurnRejected,
     ProviderContinuation,
     declared_strategy,
 )
@@ -938,6 +939,21 @@ def requires_responses_for_tools(model_id: str) -> bool:
     return any(tail.startswith(prefix) for prefix in RESPONSES_ONLY_TOOL_PREFIXES)
 
 
+#: Models whose reasoning items carry context the Responses API lets a
+#: stateless caller ask to have kept across turns (`reasoning.context`),
+#: which is what makes a replayed encrypted reasoning item worth replaying.
+#: A profile, like the allowlist above: asked for only where the model is
+#: known to honour it, and omitted for a conventional model, whose request
+#: would otherwise carry a parameter nobody measured against it.
+REASONING_CONTEXT_PREFIXES: Tuple[str, ...] = ("gpt-5.6", "gpt-6-astra")
+
+
+def supports_reasoning_context(model_id: str) -> bool:
+    """Whether native continuation on this model asks for `reasoning.context`."""
+    tail = (model_id or "").strip().lower().rsplit("/", 1)[-1]
+    return any(tail.startswith(prefix) for prefix in REASONING_CONTEXT_PREFIXES)
+
+
 def model_can_rerank(model_id: str) -> bool:
     """Whether `auto` should turn reranking on for this model.
 
@@ -1422,9 +1438,15 @@ class ApiAdapterBackend:
         not depend on a default that can move.
         """
         kwargs: Dict[str, Any] = {"model": model, **self._sampling_params(model)}
-        if self._declared_strategy() == OPENAI_RESPONSES_NATIVE_V1:
+        native = self._declared_strategy() == OPENAI_RESPONSES_NATIVE_V1
+        if native:
             kwargs["store"] = False
         reasoning = responses_compat.reasoning_param(self._reasoning_effort)
+        if native and supports_reasoning_context(model):
+            # The reasoning context kept across the tape, on the models
+            # known to honour the request; a conventional model is sent
+            # nothing it was not measured against.
+            reasoning = {**(reasoning or {}), "context": "auto"}
         if reasoning:
             kwargs["reasoning"] = reasoning
         if extra_body:
@@ -1574,6 +1596,16 @@ class ApiAdapterBackend:
                 input=items, **kwargs
             ))
             if response is not None:
+                # Provisional until the wire says it finished. A call that
+                # looks whole inside a reply cut off at its output limit is
+                # part of a reply that was cut off, and a reply with nothing
+                # in it is nothing to accept. The provider's own word, read
+                # here because only this adapter knows the wire's words.
+                reason = responses_compat.rejection_reason(response, strict=native)
+                if reason:
+                    raise ModelTurnRejected(
+                        f"the responses reply is not a turn to accept: {reason}"
+                    )
                 content = responses_compat.output_text(response)
                 calls = responses_compat.tool_calls_of(response)
                 result: Dict[str, Any] = {
@@ -1642,6 +1674,12 @@ class ApiAdapterBackend:
         )
         choices = getattr(completion, "choices", None) or []
         first = next(iter(choices), None)
+        # The chat wire's word on the same question: no choice is nothing
+        # to accept, and a reply cut off at its output limit is not whole.
+        if first is None:
+            raise ModelTurnRejected("the chat reply has no choices")
+        if getattr(first, "finish_reason", None) == "length":
+            raise ModelTurnRejected("the chat reply was cut off at its output limit")
         message = getattr(first, "message", None) if first else None
         raw_calls = list(getattr(message, "tool_calls", None) or []) if message else []
         tool_calls = [
@@ -1700,15 +1738,22 @@ class ApiAdapterBackend:
     def _stream_via_responses(
         self, messages: List[dict], model: str, processed: dict,
         abort_handle: Optional[StreamAbortHandle] = None,
+        accepted: List[dict] = (),
     ):
         """Stream via /responses. Returns True if any event was emitted (the
         caller must not fall through to chat), False to fall back - which is
-        only safe when nothing has been yielded yet."""
+        only safe when nothing has been yielded yet. With an accepted tape
+        the caller refuses rather than falls through: a tape has no chat
+        form, and that rule lives in one place, on the caller.
+
+        `accepted` is the tape to replay first, when the stream continues a
+        native record; the messages are then the record past it. Consumed
+        and not advanced - nothing comes back from a stream to accept."""
         full_content = ""
         usage: Dict[str, Any] = {}
         # Converted before the try for the same reason as the blocking paths:
         # our own AttributeError must not read as "provider has no /responses".
-        items = responses_compat.to_input_items(messages)
+        items = list(accepted) + responses_compat.to_input_items(messages)
         kwargs = self._responses_kwargs(model, processed["extra_body"])
         try:
             if abort_handle is not None:
@@ -1786,6 +1831,7 @@ class ApiAdapterBackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         """Stream tokens from the model per SPEC §13.7.
 
@@ -1793,10 +1839,16 @@ class ApiAdapterBackend:
         - {"event": "token", "data": "token_text"}
         - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
         - {"event": "error", "data": {"code": "...", "message": "..."}}
+
+        With a native `continuation`, the messages are the record past the
+        accepted state, the whole accepted tape goes first, and only the
+        responses endpoint may carry it. Consumed, never advanced: what the
+        stream says is the answer, and no continuation comes back from it.
         """
         handle = StreamAbortHandle()
         return CancellableStream(
-            self._generate_stream_impl(messages, adapters, handle), handle
+            self._generate_stream_impl(messages, adapters, handle, continuation),
+            handle,
         )
 
     def _generate_stream_impl(
@@ -1804,6 +1856,7 @@ class ApiAdapterBackend:
         messages: List[dict],
         adapters: List[dict],
         abort_handle: StreamAbortHandle,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         self._ensure_client()
 
@@ -1817,12 +1870,38 @@ class ApiAdapterBackend:
         augmented_messages = list(messages or [])
         extra_body = self._with_reasoning_effort(extra_body)
 
+        accepted = self._accepted_items(continuation)
+        if accepted and continuation.model != target_model:
+            # One model's tape, refused before anything is sent - as an
+            # event, because a stream reports what stops it as one.
+            yield {"event": "error", "data": {
+                "code": "continuation_mismatch",
+                "message": (
+                    f"the accepted continuation is for {continuation.model!r} "
+                    f"and this backend serves {target_model!r}"
+                ),
+            }}
+            return
+
         if self.client and self._responses_available():
             emitted = yield from self._stream_via_responses(
-                augmented_messages, target_model, processed, abort_handle
+                augmented_messages, target_model, processed, abort_handle, accepted
             )
             if emitted:
                 return
+
+        if accepted:
+            # A tape has no chat form. The answer would continue nothing
+            # and be reported as if it did.
+            yield {"event": "error", "data": {
+                "code": "continuation_mismatch",
+                "message": (
+                    "the accepted native continuation needs the responses "
+                    "endpoint, which this provider did not answer; "
+                    "chat/completions cannot continue it"
+                ),
+            }}
+            return
 
         if self.client:
             try:
