@@ -255,9 +255,26 @@ class OperationLedger:
                 op.parent_state = parent_state
 
     def fail(self, operation_seq: int, error: str, *, step: str = "") -> None:
+        """Record why an in-flight step did not finish.
+
+        Only a step that is in flight. A request that never reached `begin`
+        has no outcome to record here, and what it would overwrite belongs to
+        another attempt: a committed result that stops being committed is one
+        the next attempt runs again. For a read that binds the continuation to
+        a second, later view of a corpus that may have moved; for a durable
+        step it is the repeat this ledger exists to prevent. An `unknown` is
+        worse still - it would turn "may have landed, so refuse to repeat"
+        into "did not land".
+
+        A transition out of `pending`, then, rather than an assignment. The
+        alternative is for every caller to know whether it began the operation
+        it is reporting on, and the refusals that never began one share this
+        path with the failures that did: a lease revoked before the handler
+        and a lease revoked inside it arrive at the same `except`.
+        """
         with self._lock:
             op = self._ops.get((operation_seq, step))
-            if op is not None:
+            if op is not None and op.state == PENDING:
                 op.state = FAILED
                 op.result = error
 

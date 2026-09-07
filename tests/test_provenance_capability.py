@@ -46,7 +46,12 @@ def _broker(user_id, ctx_id, registry, bindings):
         source_registry=registry,
         provenance_bindings=bindings,
     )
-    return CapabilityBroker(get_runtime().workflow, context), context
+    return (
+        CapabilityBroker(
+            get_runtime().workflow, context, worker_tool="file.search_v1"
+        ),
+        context,
+    )
 
 
 def _ask(broker, invocation, seq=1, query=QUERY):

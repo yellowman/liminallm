@@ -416,7 +416,7 @@ def _conversation_with_older_turns(store, monkeypatch):
     return user, conversation.id
 
 
-def _broker(registry, *, user_id=None, conversation_id=None):
+def _broker(registry, *, user_id=None, conversation_id=None, worker_tool):
     from liminallm.service.broker import CapabilityBroker, InvocationContext
 
     context = InvocationContext(
@@ -425,7 +425,12 @@ def _broker(registry, *, user_id=None, conversation_id=None):
         source_registry=registry,
         provenance_bindings=[],
     )
-    return CapabilityBroker(get_runtime().workflow, context), context
+    return (
+        CapabilityBroker(
+            get_runtime().workflow, context, worker_tool=worker_tool
+        ),
+        context,
+    )
 
 
 def _open(user_id=None):
@@ -469,7 +474,9 @@ class TestTheWorkerGetsTheTextAndNotTheAuthority:
         )
         user = store.create_user(email=f"s_{uuid.uuid4().hex[:8]}@t.local")
         registry = SourceRegistry()
-        broker, context = _broker(registry, user_id=user.id)
+        broker, context = _broker(
+            registry, user_id=user.id, worker_tool="web.search_v1"
+        )
         reply = _ask(
             broker, _open(user.id), "web.search",
             {"query": "turbine inspection", "limit": 2},
@@ -484,7 +491,9 @@ class TestTheWorkerGetsTheTextAndNotTheAuthority:
             content="Blades are inspected every 400 flight hours.",
         )
         registry = SourceRegistry()
-        broker, context = _broker(registry, user_id=user.id)
+        broker, context = _broker(
+            registry, user_id=user.id, worker_tool="notes.search_v1"
+        )
         reply = _ask(
             broker, _open(user.id), "notes.search",
             {"query": "inspected", "limit": 4},
@@ -492,16 +501,28 @@ class TestTheWorkerGetsTheTextAndNotTheAuthority:
         self._no_ids(reply, context)
 
     def test_a_history_search_reply_carries_no_ids(self, store, monkeypatch):
+        """The handler directly, because no worker may ask for it.
+
+        `history.search` is a capability with no worker body behind it: the
+        conversation's own record is searched inside a round, through
+        `_run_history_search`, and nothing sends the capability. So this runs
+        the handler and applies its state the way `_answer` would, rather than
+        submitting a request the broker is right to refuse.
+        """
         user, conversation_id = _conversation_with_older_turns(store, monkeypatch)
         registry = SourceRegistry()
         broker, context = _broker(
-            registry, user_id=user.id, conversation_id=conversation_id
+            registry,
+            user_id=user.id,
+            conversation_id=conversation_id,
+            worker_tool="agent.files_v1",
         )
-        reply = _ask(
-            broker, _open(user.id), "history.search",
-            {"query": "turbine inspection", "limit": 4},
+        outcome = broker._history_search(
+            _open(user.id), 1, {"query": "turbine inspection", "limit": 4}
         )
-        self._no_ids(reply, context)
+        broker._apply_parent_state(outcome.parent_state)
+
+        self._no_ids({"ok": True, "result": outcome.public}, context)
         # One conversation, many passages - and each names the message it is.
         assert len(registry.sources) == 1, registry.sources
         assert all(e.locator.block_id for e in registry.evidence)
@@ -514,7 +535,9 @@ class TestTheWorkerGetsTheTextAndNotTheAuthority:
             content="Blades are inspected every 400 flight hours.",
         )
         registry = SourceRegistry()
-        broker, context = _broker(registry, user_id=user.id)
+        broker, context = _broker(
+            registry, user_id=user.id, worker_tool="notes.search_v1"
+        )
         _ask(broker, _open(user.id), "notes.search", {"query": "inspected", "limit": 4})
 
         assert context.provenance_bindings, "the vault grounded nothing"
@@ -547,11 +570,15 @@ class TestAReplayedProducerStillCarriesItsProvenance:
         invocation = _open(user.id)
         payload = {"query": "inspected", "limit": 4}
 
-        broker_a, ctx_a = _broker(registry, user_id=user.id)
+        broker_a, ctx_a = _broker(
+            registry, user_id=user.id, worker_tool="notes.search_v1"
+        )
         _ask(broker_a, invocation, "notes.search", payload)
         assert ctx_a.provenance_bindings, "attempt A recorded nothing"
 
-        broker_b, ctx_b = _broker(registry, user_id=user.id)
+        broker_b, ctx_b = _broker(
+            registry, user_id=user.id, worker_tool="notes.search_v1"
+        )
         ran = {"handler": False}
         real = broker_b._notes_search
 

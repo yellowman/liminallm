@@ -58,7 +58,11 @@ from liminallm.service.provenance import (
     SourceRegistry,
 )
 from liminallm.service.sandbox import tool_network_guard
-from liminallm.service.tool_worker import FrameBudget
+from liminallm.service.tool_worker import (
+    DEFAULT_CAPABILITIES,
+    WORKER_CAPABILITIES,
+    FrameBudget,
+)
 from liminallm.service.transcript import (
     ModelTurn,
     ToolRound,
@@ -95,6 +99,20 @@ class CapabilityOutcome:
 
 class UnknownCapability(RuntimeError):
     """The worker asked for something no capability serves."""
+
+
+class CapabilityNotAllowed(RuntimeError):
+    """The worker asked for a capability its own body never uses."""
+
+
+class RoundNotAsked(RuntimeError):
+    """The submitted round is not the one the recorded model turn asked for."""
+
+
+#: What a call reads back when its tool was not offered on the turn that asked
+#: for it. Model-facing, so it says what to do next rather than what went
+#: wrong internally.
+UNOFFERED_TOOL_RESULT = "That tool is not available. Answer without it."
 
 
 def _is_error(result: Any) -> bool:
@@ -320,10 +338,25 @@ class CapabilityBroker:
         engine: Any,
         context: InvocationContext,
         *,
+        worker_tool: str,
         on_capability: Optional[Callable[[dict], None]] = None,
     ) -> None:
         self._engine = engine
         self._ctx = context
+        #: Which body this broker is serving, and so which capabilities it
+        #: answers at all. The resolved implementation, not the name the node
+        #: used: a persisted spec's `handler` decides which body runs, and the
+        #: capability list belongs to the body.
+        #:
+        #: Required rather than defaulted. A default would be a capability set
+        #: chosen by forgetting, and the two readings - "everything" and
+        #: "nothing" - are a hole and a silent refusal respectively. The
+        #: caller always knows: `_serve_invocation` resolved it to pick the
+        #: body in the first place.
+        self._worker_tool = str(worker_tool or "")
+        self._capabilities = WORKER_CAPABILITIES.get(
+            self._worker_tool, DEFAULT_CAPABILITIES
+        )
         #: Called as each capability starts, so a streaming caller can say what
         #: the model is doing while it is slow rather than afterwards.
         self._on_capability = on_capability
@@ -430,6 +463,12 @@ class CapabilityBroker:
         capability = str(message.get("capability") or "")
         payload = message.get("payload") or {}
         operation_seq = int(message.get("operation_seq") or 0)
+        #: Whether this request put an operation in flight at that position.
+        #: Only then is a failure below this request's to record: the entry
+        #: may be an earlier attempt's, and `pending` is a state a refusal is
+        #: allowed to leave - it is what teardown turns into `unknown`, which
+        #: is what makes a durable retry refuse instead of repeating.
+        began = False
         try:
             # Liveness first, before anything is looked up or dispatched. The
             # ordering is the control: after the handler runs, "revoked" is a
@@ -472,6 +511,22 @@ class CapabilityBroker:
                     },
                 }
             self._served = operation_seq
+            # Whether this worker may ask for this at all, which is not any of
+            # the questions below it. Whether a capability exists, whether the
+            # turn has since withdrawn it, and whether an earlier attempt
+            # already earned a result are all about the capability; this one
+            # is about the asker.
+            #
+            # So it goes first, and the replay behind it is the reason it has
+            # to. A committed result outlives the worker that earned it, and
+            # handing one back is the same grant by a quieter route - no
+            # handler runs, no allowlist is consulted, and the worker gets the
+            # answer anyway.
+            #
+            # Ahead of the handler lookup as well, so a worker probing for
+            # capability names learns only that it may not ask.
+            if capability not in self._capabilities:
+                raise CapabilityNotAllowed(capability)
             handler = self._handlers().get(capability)
             if handler is None:
                 raise UnknownCapability(capability)
@@ -512,6 +567,7 @@ class CapabilityBroker:
                 self._apply_parent_state(replayed.parent_state)
                 return {"ok": True, "result": replayed.result, "replayed": True}
             invocation.ledger.begin(operation_seq, capability, digest)
+            began = True
             self._notify(capability)
             started = time.monotonic()
             # SPEC §18.3/§21.1: tool egress is allowlisted. The guard is
@@ -548,10 +604,12 @@ class CapabilityBroker:
             )
             return {"ok": True, "result": result}
         except LeaseRevoked as exc:
-            invocation.ledger.fail(operation_seq, str(exc))
+            if began:
+                invocation.ledger.fail(operation_seq, str(exc))
             return {"ok": False, "code": "revoked", "error": str(exc)}
         except RetryDivergence as exc:
-            invocation.ledger.fail(operation_seq, str(exc))
+            if began:
+                invocation.ledger.fail(operation_seq, str(exc))
             logger.warning(
                 "capability_retry_divergence",
                 invocation_id=invocation.invocation_id,
@@ -559,11 +617,39 @@ class CapabilityBroker:
                 operation_seq=operation_seq,
             )
             return {"ok": False, "code": "retry_divergence", "error": str(exc)}
+        except RoundNotAsked as exc:
+            if began:
+                invocation.ledger.fail(operation_seq, "round_not_asked")
+            logger.warning(
+                "round_not_asked",
+                invocation_id=invocation.invocation_id,
+                operation_seq=operation_seq,
+            )
+            return {"ok": False, "code": "round_not_asked", "error": str(exc)}
+        except CapabilityNotAllowed:
+            # No ledger entry. This request never began an operation - it was
+            # refused for the asker, ahead of `begin` - so there is no outcome
+            # here to record. Its sequence is spent all the same, above, which
+            # is what the next honest request counts from.
+            logger.warning(
+                "capability_not_allowed",
+                invocation_id=invocation.invocation_id,
+                worker_tool=self._worker_tool,
+                capability=capability,
+                operation_seq=operation_seq,
+            )
+            return {
+                "ok": False,
+                "code": "capability_not_allowed",
+                "error": capability,
+            }
         except UnknownCapability:
-            invocation.ledger.fail(operation_seq, "unknown_capability")
+            if began:
+                invocation.ledger.fail(operation_seq, "unknown_capability")
             return {"ok": False, "code": "unknown_capability", "error": capability}
         except Exception as exc:  # noqa: BLE001 - the worker gets the error, not a crash
-            invocation.ledger.fail(operation_seq, str(exc))
+            if began:
+                invocation.ledger.fail(operation_seq, str(exc))
             logger.warning(
                 "capability_failed",
                 invocation_id=invocation.invocation_id,
@@ -904,6 +990,35 @@ class CapabilityBroker:
         )
         return offered, tools
 
+    def _offered_names(self, tools: Sequence[Any]) -> Tuple[str, ...]:
+        """The tool names this model call authorized, in the order sent.
+
+        The intersection of two sets, because neither one alone is authority.
+        What was sent bounds it from one side: a schema the model never saw
+        cannot be what it answered, and the worker is allowed to send fewer -
+        the loop's last round offers none so the model has to write an answer,
+        and re-offering there would hand back what it just gave up.
+
+        The parent's own set bounds it from the other. With offers off the
+        worker's schemas are forwarded verbatim, which is a legacy prompt
+        shape and not a way to declare authority: a worker that could write a
+        schema could describe any capability in words of its own and have the
+        round that came back treated as asked for. So the names that count
+        are the ones the parent put in the turn's tools, whatever bytes went
+        out. Subtract yes, invent no - the same rule `_model_prompt` follows,
+        applied to what it produced.
+        """
+        parent = {
+            str((dict(tool).get("function") or {}).get("name") or "")
+            for tool in self._ctx.initial_tools
+        }
+        names: List[str] = []
+        for tool in tools or ():
+            name = str((dict(tool).get("function") or {}).get("name") or "")
+            if name and name in parent and name not in names:
+                names.append(name)
+        return tuple(names)
+
     def _llm_generate_with_tools(
         self, invocation: Invocation, seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
@@ -981,6 +1096,11 @@ class CapabilityBroker:
             content=public["content"],
             tool_calls=tuple(dict(call) for call in public["tool_calls"]),
             assistant_message=public["assistant_message"],
+            # Measured while the call was being made, because afterwards there
+            # is nothing left to read it from: the tools are the parent's own
+            # local, and the worker's next request is free to describe a
+            # different turn.
+            offered_tools=self._offered_names(tools),
         )
         return CapabilityOutcome(
             public=public,
@@ -1017,6 +1137,57 @@ class CapabilityBroker:
             )
             for c in calls
         ]
+        # Whether this is the round the previous model turn asked for, decided
+        # before anything is emitted, logged or run. There has to be an
+        # unanswered turn, it has to have asked for calls, and these have to
+        # be them: `calls_match` compares name, decoded arguments, order and
+        # count, and ignores the provider's own ids.
+        #
+        # The empty round is why the first two conditions are written out.
+        # `calls_match([], [])` is true, so a round arriving after a terminal
+        # answer would otherwise authorize itself against a turn that asked
+        # for nothing. It has no effects, but it moves the transcript and the
+        # sequence, and a round the protocol never asked for should do
+        # neither.
+        asked = self._ctx.transcript.unanswered_turn()
+        if (
+            asked is None
+            or not asked.tool_calls
+            or not calls_match(
+                asked.tool_calls,
+                [{"name": name, "arguments": args} for _c, name, args in parsed],
+            )
+        ):
+            raise RoundNotAsked(
+                "a round was submitted that no model turn asked for"
+            )
+        # Faithfully relayed, but of a tool this turn did not put in front of
+        # the model. That is the other half of the authority and a different
+        # failure: the worker did as it was told, so the round is answered
+        # rather than refused.
+        #
+        # Answered means a tool result the loop can carry on from, not a
+        # promise that it will. A round with another model turn after it can
+        # recover - the refusal is in the messages the next turn reads. The
+        # loop's terminal round has no turn after it, so nothing executes and
+        # the loop ends on the content the model already produced. Both are
+        # the intended outcome: the tool was withheld on purpose, and running
+        # it because the model asked anyway is the behaviour this replaces.
+        #
+        # All of them or none. A round is one committed operation with one
+        # ledger entry and one transcript entry, and "which half ran" is not a
+        # question either can answer.
+        unoffered = [
+            name for _c, name, _args in parsed if name not in asked.offered_tools
+        ]
+        if unoffered:
+            logger.warning(
+                "round_tool_not_offered",
+                invocation_id=invocation.invocation_id,
+                tools=sorted(set(unoffered)),
+                offered=list(asked.offered_tools),
+            )
+            return self._unoffered_round(seq, parsed, asked)
         for _call, name, _args in parsed:
             # A remote tool's label is dynamic, so it cannot be in the static
             # set - but it is still matched rather than passed through: the
@@ -1031,23 +1202,13 @@ class CapabilityBroker:
                 conversation_id=self._ctx.conversation_id,
                 user_id=self._ctx.user_id,
             )
-        # Whether this is the round the previous model turn asked for.
-        # A round that is not still runs - what a worker may request is the
-        # capability layer's question and it answers that one unchanged - but
-        # the parent can no longer reconstruct the exchange faithfully, so
-        # nothing in it may carry a citation.
-        asked = self._ctx.transcript.unanswered_turn()
-        offerable = asked is not None and calls_match(
-            asked.tool_calls,
-            [{"name": name, "arguments": args} for _c, name, args in parsed],
-        )
         # The ids a reconstructed tool message must carry come from the turn
         # that asked, not from the round that answered. `calls_match` ignores
         # ids on purpose - a renamed round is the same calls - so a worker
         # that matched on name and arguments while renaming every id would
         # otherwise put its own bytes in the field that ties a result to the
         # call it answers.
-        offered_calls = list(asked.tool_calls) if offerable and asked else []
+        offered_calls = list(asked.tool_calls)
         snippets: List[str] = []
         round_bindings: List[Binding] = []
         round_passages: List[GroundedPassage] = []
@@ -1078,7 +1239,6 @@ class CapabilityBroker:
         }
         round_entry = ToolRound(
             operation_seq=seq,
-            offerable=offerable,
             results=tuple(
                 TrustedToolResult(
                     operation_seq=seq,
@@ -1107,6 +1267,53 @@ class CapabilityBroker:
             },
             round_bindings,
             passages=round_passages,
+            transcript=[round_entry.as_dict()],
+        )
+
+    def _unoffered_round(
+        self,
+        seq: int,
+        parsed: List[Tuple[Dict[str, Any], str, Dict[str, Any]]],
+        asked: ModelTurn,
+    ) -> CapabilityOutcome:
+        """A relayed round whose tools this turn never offered, answered.
+
+        Nothing runs, and the round is still recorded. The worker is about to
+        append a tool message for every call it sent, so the parent's copy of
+        the conversation has to contain the same ones or the next prompt it
+        rebuilds is not the conversation that happened.
+
+        Recorded as offerable, because it is: the calls are the calls the
+        model turn asked for, which is what that word means. The reason
+        nothing may be cited out of it is not correspondence but content -
+        every result here is a sentence the parent wrote, and no retrieval
+        stands behind it, so there are no spans for an offer to be built from.
+        """
+        results = [UNOFFERED_TOOL_RESULT for _ in parsed]
+        round_entry = ToolRound(
+            operation_seq=seq,
+            results=tuple(
+                TrustedToolResult(
+                    operation_seq=seq,
+                    call_index=index,
+                    tool_name=name,
+                    submitted_call_id=str(call.get("id") or ""),
+                    tool_message_id=_message_id(
+                        list(asked.tool_calls), index, name
+                    ),
+                    text=UNOFFERED_TOOL_RESULT,
+                )
+                for index, (call, name, _args) in enumerate(parsed)
+            ),
+        )
+        return self._grounded(
+            {
+                "results": results,
+                "snippets": [],
+                "artifacts": [],
+                "findings": [],
+            },
+            None,
             transcript=[round_entry.as_dict()],
         )
 

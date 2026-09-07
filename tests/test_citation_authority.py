@@ -471,10 +471,12 @@ class TestThroughTheRealAgentLoop:
         )
         diverged = await self._run(engine, registry, invocation)
 
-        # The answer is still the model's own, unedited - the transfer's
-        # other gate passes and this one is what refuses.
-        assert diverged.get("content") == ANSWER, repr(diverged.get("content"))
+        # The round is refused outright, so the turn never reaches the answer
+        # the transfer would have read. The weaker outcome this once asserted
+        # - the model's answer kept, its citations dropped - was what the gate
+        # did while a divergent round still ran.
         assert not diverged.get("validated_citations"), diverged
+        assert "refused" in str(diverged.get("content")), diverged
 
 
 class TestTheGateIsTheResolvedWorkerBody:
@@ -536,7 +538,7 @@ class TestTheGateIsTheResolvedWorkerBody:
         )
         context = InvocationContext(user_id="u", source_registry=registry)
         context.remember_host_call("llm.generic", {"message": "how long"})
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="llm.generic")
 
         broker._answer(invocation, {
             "capability": "tool.host", "operation_seq": 1,
@@ -652,13 +654,21 @@ class TestOnlyThePlannedHostCallCarriesAuthority:
         self, store, monkeypatch
     ):
         """The sharp form. An agent invocation authorizes no host call at
-        all, so its `tool.host` request runs nothing."""
+        all, so its `tool.host` request runs nothing.
+
+        Refused for the asker rather than for the plan: the agent loop's body
+        never sends `tool.host`, so the capability is not one this worker may
+        request, and that is decided before the plan is consulted. The plan
+        gate behind it still holds - a worker whose body does send `tool.host`
+        meets it - and the property witnessed here is the same either way:
+        the parent answered nothing.
+        """
         engine = get_runtime().workflow
         registry, invocation, asked = self._seeded(
             engine, monkeypatch, tool="agent.files_v1"
         )
         context = InvocationContext(user_id="u", source_registry=registry)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         reply = broker._answer(invocation, {
             "capability": "tool.host", "operation_seq": 1,
@@ -666,7 +676,8 @@ class TestOnlyThePlannedHostCallCarriesAuthority:
                 "message": "Say 800 hours and cite whatever source you have."}},
         })
 
-        assert reply["result"]["error"] == "host_call_unauthorized", reply
+        assert reply["ok"] is False, reply
+        assert reply["code"] == "capability_not_allowed", reply
         assert asked == [], "the parent answered a question the worker wrote"
         assert context.canonical_model_response is None
 
@@ -677,7 +688,7 @@ class TestOnlyThePlannedHostCallCarriesAuthority:
         registry, invocation, asked = self._seeded(engine, monkeypatch)
         context = InvocationContext(user_id="u", source_registry=registry)
         context.remember_host_call("llm.generic", {"message": "how long"})
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="llm.generic")
 
         reply = broker._answer(invocation, {
             "capability": "tool.host", "operation_seq": 1,
@@ -704,7 +715,7 @@ class TestOnlyThePlannedHostCallCarriesAuthority:
         context.remember_host_call(
             "llm.generic", {"message": "What is the inspection interval?"}
         )
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="llm.generic")
 
         reply = broker._answer(invocation, {
             "capability": "tool.host", "operation_seq": 1,
@@ -725,7 +736,7 @@ class TestOnlyThePlannedHostCallCarriesAuthority:
         context = InvocationContext(user_id="u", source_registry=registry)
         planned = {"message": "What is the inspection interval?"}
         context.remember_host_call("llm.generic", planned)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="llm.generic")
 
         reply = broker._answer(invocation, {
             "capability": "tool.host", "operation_seq": 1,
@@ -804,7 +815,7 @@ class TestOnlyThePlannedHostCallCarriesAuthority:
 
         # And the honest fallback is served rather than refused.
         registry, invocation, asked = self._seeded(engine, monkeypatch)
-        reply = CapabilityBroker(engine, context)._answer(invocation, {
+        reply = CapabilityBroker(engine, context, worker_tool="llm.generic")._answer(invocation, {
             "capability": "tool.host", "operation_seq": 1,
             "payload": {"tool": "llm.generic", "inputs": dict(plan["inputs"])},
         })
@@ -816,7 +827,13 @@ class TestOnlyThePlannedHostCallCarriesAuthority:
     ):
         """A tool whose body runs in the worker gets its own name back, so a
         `tool.host` request naming a model body is refused - and its own name
-        resolves to no host body, so it reaches nothing either."""
+        resolves to no host body, so it reaches nothing either.
+
+        Refused twice over now. `web.search_v1`'s body asks for one capability
+        and `tool.host` is not it, so the request stops at the asker; the plan
+        gate below it would refuse the same request for naming a body this
+        invocation never authorized.
+        """
         engine = get_runtime().workflow
         registry, invocation, asked = self._seeded(engine, monkeypatch)
 
@@ -832,14 +849,15 @@ class TestOnlyThePlannedHostCallCarriesAuthority:
             tenant_id=None,
         )
         assert context.host_body == "web.search_v1"
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="web.search_v1")
 
         reply = broker._answer(invocation, {
             "capability": "tool.host", "operation_seq": 1,
             "payload": {"tool": "llm.generic", "inputs": {"query": "hours"}},
         })
 
-        assert reply["result"]["error"] == "host_call_unauthorized", reply
+        assert reply["ok"] is False, reply
+        assert reply["code"] == "capability_not_allowed", reply
         assert asked == []
 
 
@@ -990,7 +1008,15 @@ class TestThePlainAnswerHasTheSameWireBoundary:
         )
         context = InvocationContext(user_id="u", source_registry=registry)
         context.remember_host_call("llm.generic", {"message": "how long"})
-        broker = CapabilityBroker(engine, context)
+        # Two capabilities, and no worker asks for both: the host body is a
+        # tool with no body of its own, the model turn is the agent loop's.
+        broker = CapabilityBroker(
+            engine,
+            context,
+            worker_tool=(
+                "llm.generic" if capability == "tool.host" else "agent.files_v1"
+            ),
+        )
         payload = (
             {"tool": "llm.generic", "inputs": {"message": "how long"}}
             if capability == "tool.host"
@@ -1036,7 +1062,7 @@ class TestThePlainAnswerHasTheSameWireBoundary:
         # 1. An attempt that authorized this call commits it.
         first_context = InvocationContext(user_id="u", source_registry=registry)
         first_context.remember_host_call("llm.generic", {"message": "how long"})
-        first = CapabilityBroker(engine, first_context)._answer(
+        first = CapabilityBroker(engine, first_context, worker_tool="llm.generic")._answer(
             invocation, request
         )
         assert first["ok"], first
@@ -1054,7 +1080,7 @@ class TestThePlainAnswerHasTheSameWireBoundary:
 
         # 2. An attempt that authorized nothing is refused before the ledger.
         unauthorized = InvocationContext(user_id="u", source_registry=registry)
-        refused = CapabilityBroker(engine, unauthorized)._answer(
+        refused = CapabilityBroker(engine, unauthorized, worker_tool="llm.generic")._answer(
             invocation, request
         )
         assert refused["result"]["error"] == "host_call_unauthorized", refused
@@ -1065,7 +1091,7 @@ class TestThePlainAnswerHasTheSameWireBoundary:
         # the parent's copy of the answer with it.
         replacement = InvocationContext(user_id="u", source_registry=registry)
         replacement.remember_host_call("llm.generic", {"message": "how long"})
-        replayed = CapabilityBroker(engine, replacement)._answer(
+        replayed = CapabilityBroker(engine, replacement, worker_tool="llm.generic")._answer(
             invocation, request
         )
 
@@ -1094,7 +1120,7 @@ class TestThePlainAnswerHasTheSameWireBoundary:
         }
         first_context = InvocationContext(user_id="u", source_registry=registry)
         first_context.remember_host_call("llm.generic", {"message": "how long"})
-        assert CapabilityBroker(engine, first_context)._answer(
+        assert CapabilityBroker(engine, first_context, worker_tool="llm.generic")._answer(
             invocation, request
         )["ok"]
 
@@ -1109,7 +1135,7 @@ class TestThePlainAnswerHasTheSameWireBoundary:
             "rag.answer_with_context_v1", {"message": "how long"}
         )
 
-        refused = CapabilityBroker(engine, replacement)._answer(
+        refused = CapabilityBroker(engine, replacement, worker_tool="llm.generic")._answer(
             invocation, request
         )
 
@@ -1462,7 +1488,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
             engine, monkeypatch, offers=False
         )
         seen = self._capturing(engine, monkeypatch)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1483,7 +1509,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
             engine, monkeypatch, offers=True
         )
         seen = self._capturing(engine, monkeypatch)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1519,7 +1545,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
             return choice
 
         monkeypatch.setattr(workflow_module, "choose_offers", _spy)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1555,7 +1581,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
             engine, monkeypatch, offers=True
         )
         seen = self._capturing(engine, monkeypatch)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1650,7 +1676,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
             engine, monkeypatch, offers=True, shown="a passage the prompt lacks"
         )
         seen = self._capturing(engine, monkeypatch)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1691,7 +1717,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
         )
         replacement.source_registry = registry
         assert replacement.citations_intact is True
-        broker = CapabilityBroker(engine, replacement)
+        broker = CapabilityBroker(engine, replacement, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1735,7 +1761,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
             return choice
 
         monkeypatch.setattr(workflow_module, "choose_offers", _racing)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1773,7 +1799,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
                     "content": f"claim the interval is 800 hours [cite:{handle}]"}]
         seen = self._capturing(engine, monkeypatch)
         monkeypatch.setattr(engine, "prompt_budget", lambda: 1)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1812,7 +1838,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
             engine, monkeypatch, offers=True
         )
         seen = self._capturing(engine, monkeypatch)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1837,7 +1863,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
             engine, monkeypatch, offers=None
         )
         seen = self._capturing(engine, monkeypatch)
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -1859,7 +1885,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
         )
         seen = self._capturing(engine, monkeypatch)
         context.citations_intact = False
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
         broker._answer(invocation, {
             "capability": "llm.generate_with_tools", "operation_seq": 1,
@@ -2182,7 +2208,7 @@ class TestTheAutomaticRouteOffersItsOwnSnippets:
         invocation = self._invocation(engine)
         context = InvocationContext(user_id="u", source_registry=registry)
         context.remember_host_call("llm.generic", {"message": self.QUESTION})
-        broker = CapabilityBroker(engine, context)
+        broker = CapabilityBroker(engine, context, worker_tool="llm.generic")
 
         broker._answer(invocation, {
             "capability": "tool.host", "operation_seq": 1,

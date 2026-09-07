@@ -17,6 +17,7 @@ import pytest
 
 from liminallm.service import taint
 from liminallm.service.runtime import get_runtime
+from liminallm.service.transcript import ModelTurn
 from tests.mcpfixture import MCPFixture, allow_local
 
 _CONVERSATION = "00000000-0000-4000-8000-0000000000d1"
@@ -291,11 +292,22 @@ class TestBothPathsCarryTheMapToTheRound:
                 "q", [], [], None, _CONVERSATION
             )
             model_name = f"mcp__{name}__read"
+            context = InvocationContext(
+                conversation_id=_CONVERSATION, mcp_tools=mcp_tools
+            )
+            # A round runs only for the turn the parent recorded, so the turn
+            # this one answers is written first. What is under test is the
+            # hand-off below it, not the authorization.
+            context.transcript.record(
+                ModelTurn(
+                    operation_seq=0,
+                    tool_calls=({"id": "1", "name": model_name,
+                                 "arguments": "{}"},),
+                    offered_tools=(model_name,),
+                )
+            )
             broker = CapabilityBroker(
-                engine,
-                InvocationContext(
-                    conversation_id=_CONVERSATION, mcp_tools=mcp_tools
-                ),
+                engine, context, worker_tool="agent.files_v1"
             )
             invocation = engine.invocations.open(uuid.uuid4().hex, tool="agent.files_v1")
 

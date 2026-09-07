@@ -219,7 +219,7 @@ class TestTheCapabilityReplyCarriesNoNamespace:
             registry, [binding(source.source_id, evidence.evidence_id)]
         )
         context = InvocationContext(user_id="u", source_registry=registry)
-        return engine, invocation, context, CapabilityBroker(engine, context)
+        return engine, invocation, context, CapabilityBroker(engine, context, worker_tool="agent.files_v1")
 
     def _ask(self, broker, invocation, seq=1):
         return broker._answer(
@@ -302,7 +302,7 @@ class TestTheCapabilityReplyCarriesNoNamespace:
         second_context = InvocationContext(
             user_id="u", source_registry=first_context.source_registry
         )
-        broker_b = CapabilityBroker(engine, second_context)
+        broker_b = CapabilityBroker(engine, second_context, worker_tool="agent.files_v1")
         ran = {"model": False}
 
         def _tripwire(*args, **kwargs):
@@ -342,7 +342,7 @@ class TestTheCapabilityReplyCarriesNoNamespace:
         context.canonical_model_response["content"] = "edited"
 
         second = InvocationContext(user_id="u", source_registry=SourceRegistry())
-        CapabilityBroker(engine, second)._answer(
+        CapabilityBroker(engine, second, worker_tool="agent.files_v1")._answer(
             invocation,
             {
                 "capability": "llm.generate_with_tools",
