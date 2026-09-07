@@ -1051,8 +1051,8 @@ class CapabilityBroker:
             instruct_opening=(
                 accepted is None and self._backend_strategy() in NATIVE_STRATEGIES
             ),
-            # The tape costs what its reasoning cost, on top of everything the
-            # rendered conversation is priced at.
+            # What the adapter says its state costs to replay, on top of
+            # everything the rendered conversation is priced at.
             reserved_tokens=accepted.replay_tokens if native else 0,
         )
         if offered is None:
@@ -1193,7 +1193,6 @@ class CapabilityBroker:
         raw: Any,
         accepted: Optional[ProviderContinuation],
         seq: int,
-        usage: Mapping[str, Any],
     ) -> Optional[ProviderContinuation]:
         """The continuation this turn would advance to, if accepted.
 
@@ -1204,9 +1203,10 @@ class CapabilityBroker:
         strategy, provider, wire and model - a change is refused here, not
         absorbed.
 
-        `usage` is this turn's, as the provider reported it: its reasoning
-        tokens are what the state will cost to replay on top of the rendered
-        transcript, and they accumulate on the record.
+        What the candidate state costs to replay is the adapter's to say,
+        and it is taken as said: only the adapter knows what its wire keeps
+        and what it dropped. The parent reserves the number; it does not
+        compute one.
         """
         if raw is None:
             if accepted is not None and accepted.strategy in NATIVE_STRATEGIES:
@@ -1222,7 +1222,6 @@ class CapabilityBroker:
         strategy = str(raw.get("strategy") or "")
         if strategy not in STRATEGIES:
             raise ModelTurnRejected("the continuation candidate names no known strategy")
-        reasoning = usage.get("reasoning_tokens") if isinstance(usage, Mapping) else 0
         proposed = ProviderContinuation(
             strategy=strategy,
             provider=str(raw.get("provider") or ""),
@@ -1230,8 +1229,7 @@ class CapabilityBroker:
             model=str(raw.get("model") or ""),
             through_operation_seq=seq,
             payload=dict(raw["payload"]),
-            replay_tokens=(accepted.replay_tokens if accepted is not None else 0)
-            + (int(reasoning) if isinstance(reasoning, (int, float)) else 0),
+            replay_tokens=int(raw.get("replay_tokens") or 0),
         )
         if accepted is not None:
             for name in ("strategy", "provider", "transport", "model"):
@@ -1285,9 +1283,7 @@ class CapabilityBroker:
         # A candidate until the ledger commits it. Both checks refuse the
         # whole turn: the reply is recorded nowhere, and the provider's
         # continuation stays where the last accepted turn left it.
-        continuation = self._candidate(
-            response.get("continuation"), accepted, seq, response.get("usage") or {}
-        )
+        continuation = self._candidate(response.get("continuation"), accepted, seq)
         self._validate_model_turn(response)
         canonical = {
             "content": response.get("content") or "",

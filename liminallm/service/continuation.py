@@ -166,11 +166,14 @@ class ProviderContinuation:
     #: they say a turn contained.
     through_operation_seq: int
     payload: Mapping[str, Any]
-    #: What the state costs on the next request beyond the rendered
-    #: transcript: the provider-reported reasoning tokens of every accepted
-    #: turn, summed. The parent's accounting, not the adapter's, and reserved
-    #: from the prompt budget when offers are priced - the transcript rebuild
-    #: is what gets measured, and it carries none of this.
+    #: The adapter's estimate of what this state costs on the next request
+    #: beyond the rendered transcript: the reasoning the items it still
+    #: replays carry. Not the reasoning ever spent on the conversation - a
+    #: state the provider compacted holds less than it did, and costs what
+    #: it holds now. Stated by the adapter, because only the adapter knows
+    #: what its wire kept, and reserved by the parent from the prompt budget
+    #: when offers are priced - the transcript rebuild is what gets
+    #: measured, and it carries none of this.
     replay_tokens: int = 0
 
     def __post_init__(self) -> None:

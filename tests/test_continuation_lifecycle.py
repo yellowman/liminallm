@@ -127,13 +127,17 @@ class _Provider:
 
 def native(content="", calls=(), *, tag="1", model="gpt-6-astra", transport="responses",
            reasoning=0):
-    """A native reply: the tape grows by what went and what came back."""
+    """A native reply: the tape grows by what went and what came back, and
+    the candidate says what that tape costs to replay - the accepted
+    estimate plus this turn's reasoning, as the adapter states it."""
     calls = [dict(c) for c in calls]
 
     def build(messages, continuation):
         accepted = []
+        cost = 0
         if continuation is not None and continuation.strategy == OPENAI_RESPONSES_NATIVE_V1:
             accepted = [dict(i) for i in continuation.payload.get("items") or []]
+            cost = continuation.replay_tokens
         output = [_reasoning(f"rs_{tag}")]
         output += [_function_call(f"fc_{tag}_{i}", c) for i, c in enumerate(calls)]
         if content:
@@ -149,6 +153,7 @@ def native(content="", calls=(), *, tag="1", model="gpt-6-astra", transport="res
                 "transport": transport,
                 "model": model,
                 "payload": {"items": accepted + rc.to_input_items(messages) + output},
+                "replay_tokens": cost + reasoning,
             },
         }
 

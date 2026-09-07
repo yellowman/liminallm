@@ -50,6 +50,7 @@ from liminallm.service.citation_offers import (
     choose_offers,
     instruct,
     label_snippets,
+    reachable_offers,
     rebuild_agent_messages,
 )
 from liminallm.service.citations import (
@@ -2123,10 +2124,19 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 placed=tuple(placed),
             )
 
+        candidates = context.provenance_bindings
+        if after_operation_seq is not None:
+            # The opening is in the provider's hands and is not sent again,
+            # so a relation only the opening could show is not offerable
+            # now - whatever the budget allows, this call or a later one.
+            candidates = reachable_offers(
+                registry, invocation.citations, candidates,
+                transcript.after(after_operation_seq),
+            )
         choice = choose_offers(
             registry=registry,
             committed=invocation.citations,
-            candidates=context.provenance_bindings,
+            candidates=candidates,
             render=render,
             counter=self.llm.token_counter(),
             budget=max(0, self.prompt_budget() - int(reserved_tokens or 0)),

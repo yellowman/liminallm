@@ -1456,7 +1456,23 @@ Together adapter APIs) behind the existing OpenAI-compatible transport:
   `reasoning.context=auto` is asked for by model profile
   (`REASONING_CONTEXT_PREFIXES`) under the native strategy only; a
   conventional model, or any compatible provider, is sent nothing it was
-  not measured against.
+  not measured against. by the same kind of profile
+  (`COMPACTION_PREFIXES`), and on the tool-calling path alone, a native
+  OpenAI backend asks the provider to compact its own tape:
+  `context_management: [{type: compaction, compact_threshold}]`, the
+  threshold derived from the window the backend discovered (§20.1: probe,
+  table, default - the admin override prices the prompt and does not move
+  the provider's threshold) less explicit headroom for the reply, the next
+  request's input and a safety share (`compact_threshold`), and not asked
+  for at all when what is left is under the floor. a reply carrying a `compaction` item is cut by the
+  adapter where the wire says: the candidate tape is the accepted tape,
+  the new input and the complete output in order, from the latest
+  compaction item on, every item type kept, `created_by` removed. the
+  parent's lifecycle is unchanged by it - a compacting reply the parent
+  refuses compacts nothing, and the retry starts from the state before
+  the attempt - and the readable transcript is not touched by it: this is
+  the provider's continuation compacted in the provider's terms (§20.5),
+  and no other provider is made to imitate it.
 - the kernel models this as `remote`/`adapter_param` providers (§5.0.2);
   adapters trained by the JAX pipeline are exported per-version to the
   shared filesystem and mounted by the server.
@@ -2744,9 +2760,15 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   past the turn it was accepted at, and that opening carries the citation
   instruction whether or not a marker is placed in it yet. Offers are
   priced against the rendered conversation, so what the accepted state
-  costs beyond it - the provider-reported reasoning tokens of the accepted
-  turns - is reserved from the budget. A change of representation needs an
-  explicit reset; nothing substitutes one quietly. The final streamed
+  costs beyond it is reserved from the budget: the adapter's estimate of
+  the current state's replay cost - the reasoning the items it still
+  replays carry, restarting where the provider compacted - and never the
+  reasoning ever spent on the conversation. And once a provider holds the
+  opening, a relation only the opening could have shown is not offerable
+  on any later call, whatever the budget then allows: only what the record
+  past the cursor can show is a candidate, and what was committed stays
+  committed. A change of representation needs an explicit reset; nothing
+  substitutes one quietly. The final streamed
   answer runs on the accepted state too: the stream is sent that state and
   the record past it, on the wire that wrote it, and produces no
   continuation, since nothing follows the final answer. When the record
@@ -3053,6 +3075,21 @@ importance:
    so no embeddings required). it is offered exactly when turns have fallen
    outside the verbatim window, and the digest block itself tells the model
    the summary is lossy and to call the tool for exact wording.
+
+### 20.5 the provider's compaction is a separate layer
+
+the digest above is product memory: readable, stored on the conversation,
+built by this service. a provider's own compaction (§5, provider
+continuation) is the provider's replayable state compacted in the
+provider's terms - an opaque item standing in for the items before it,
+kept on the invocation context for one invocation and replayed as
+required. the two are never derived from each other: no digest is built
+from a compaction item, and no compaction item from a digest. the
+provider's threshold comes from the same window discovery the budget
+falls back on (§20.1, steps 2 to 4), less explicit headroom, so the two
+layers are sized from one fact about the model and neither from a
+constant; the admin override of step 1 caps the prompt the parent
+renders and is not sent to the provider.
 
 the resulting division of labour: **narrative for continuity, anchors for
 what must not drift, retrieval for everything else.**

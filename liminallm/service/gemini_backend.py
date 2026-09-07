@@ -588,11 +588,12 @@ class GeminiBackend:
         content = candidate_text(payload)
         calls = function_calls_of(payload)
         selected = selected_content(payload)
+        usage = usage_dict(payload)
         return {
             "content": content,
             "tool_calls": calls,
             "assistant_message": _assistant_message(content, calls),
-            "usage": usage_dict(payload),
+            "usage": usage,
             "continuation": {
                 "strategy": GEMINI_NATIVE_V1,
                 "provider": self.provider,
@@ -603,6 +604,14 @@ class GeminiBackend:
                     "contents": deepcopy(body["contents"])
                     + ([selected] if selected is not None else []),
                 },
+                # What this state costs to replay beyond the rendered
+                # conversation. The tape only grows - nothing here compacts
+                # it - so it is what the accepted state cost plus what the
+                # provider says this turn's thinking cost.
+                "replay_tokens": (
+                    (continuation.replay_tokens if accepted is not None else 0)
+                    + int(usage.get("reasoning_tokens") or 0)
+                ),
             },
         }
 

@@ -256,6 +256,37 @@ def choose_offers(
         fresh.pop()
 
 
+def reachable_offers(
+    registry: SourceRegistry,
+    committed: CitationTable,
+    candidates: Sequence[Binding],
+    tail: TrustedTranscript,
+) -> List[Binding]:
+    """The candidates a marker can still reach, when only `tail` is sent.
+
+    A provider holding its own continuation is sent the record past the
+    turn it was accepted at and nothing before it: the opening is in its
+    hands, frozen as it went. A relation whose only placement is in that
+    frozen part can never be shown now, whatever the budget allows later -
+    and later budgets do move, as a compacted state stops reserving what it
+    no longer replays. Granting such a relation would put a handle in the
+    table for text the model was never offered, which is the conservation
+    rule this layer exists to hold, met here at the cursor.
+
+    So the candidates are rendered speculatively over the tail alone, under
+    the committed table grown by the fresh ones, and only what the tail
+    placed stays a candidate. A committed relation the tail does not show
+    needs no candidate to keep its handle: the table is only ever grown, so
+    the handle is in every table the caller renders from, and the floor
+    `choose_offers` never withholds is that table, not this list.
+    """
+    fresh = [entry for entry in candidates if not _already_offered(committed, entry)]
+    table = extend_citation_table(registry, committed, fresh)
+    _messages, _markers, placed = rebuild_agent_messages((), (), tail, table, registry)
+    shown = set(placed)
+    return [entry for entry in candidates if _relation(entry) in shown]
+
+
 def _eligible(table: CitationTable, span: GroundedSpan) -> Optional[str]:
     """The handle this span may be labelled with, if it may be labelled.
 
