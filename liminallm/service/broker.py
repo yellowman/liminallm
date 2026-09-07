@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
 from liminallm.service.citations import assert_scrubbed, scrub_namespace
+from liminallm.service.continuation import ProviderContinuation
 from liminallm.service.invocation import (
     Invocation,
     LeaseRevoked,
@@ -239,6 +240,16 @@ class InvocationContext:
     #: the worker's copy is one refactor away from running the wrong bytes.
     host_body: str = ""
     host_inputs: Dict[str, Any] = field(default_factory=dict)
+    #: The provider's own accepted continuation, through the last model turn
+    #: the parent accepted. Opaque here: the adapter that wrote it is the only
+    #: reader, and the common layer knows its lifecycle and identity alone.
+    #:
+    #: On the context and not on the backend, because the backend instance is
+    #: shared by every conversation this process serves - state kept there
+    #: would let one invocation continue from another's reasoning. And never
+    #: in the plan, which crosses to the worker. Replacement state, like the
+    #: canonical response: a replay restores the latest accepted one.
+    continuation: Optional[ProviderContinuation] = None
     #: Whether anything in this assembly may still carry a citation.
     #:
     #: False from the first round whose calls were not the calls the previous
@@ -842,6 +853,13 @@ class CapabilityBroker:
             # every later attempt, and an attempt that edited it in place
             # would change what the next one is told the model said.
             self._ctx.canonical_model_response = deepcopy(canonical)
+        continuation = parent_state.get("continuation")
+        if continuation is not None:
+            # Replacement state, for the same reason as the canonical
+            # response above: the provider's continuation is whatever the
+            # last accepted turn left, not an accumulation. `from_dict`
+            # copies the payload, so the ledger's record stays what it was.
+            self._ctx.continuation = ProviderContinuation.from_dict(continuation)
         collected = self._ctx.provenance_bindings
         seen = {
             (b.get("context_id"), b.get("source_id"), b.get("evidence_id"))
