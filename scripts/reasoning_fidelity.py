@@ -28,6 +28,14 @@ checkpoint so the model must put its answer into the call's arguments:
 the transcript then carries the result, and reconstruction should lose
 little. Arm order is counterbalanced by seed and repeat.
 
+Two designs. `forked`, the default, makes the pre-checkpoint call once per
+task and builds both successors from that exact reply - the same
+reasoning event, the same call, the same tool result, the same visible
+transcript; only the successor's representation differs, and which
+successor runs first alternates. `independent` runs each arm's two calls
+on its own, so a pair shares the task but samples the first call twice;
+it is kept for the exploratory runs made before the fork existed.
+
 Recorded per run: correctness, reasoning tokens before and after the
 checkpoint, prompt and total tokens, wall time per call, the
 `replay_tokens` and serialized bytes handed to the successor, and
@@ -55,6 +63,7 @@ import re
 import statistics
 import sys
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -402,6 +411,203 @@ def run_task(backend, task: Dict[str, Any], arm: str, visible: bool) -> Dict[str
     }
 
 
+# -- one fork: a shared first call, two successors ------------------------
+
+def _successor(backend, task: Dict[str, Any], arm: str, tool: dict,
+               base_messages: List[dict], first_reply: dict, tool_result: dict) -> dict:
+    """One successor from the shared branch point.
+
+    The native one is handed the continuation the first reply produced and
+    only the tool result; the transcript one is handed the visible history
+    - the first reply's chat-shaped message and the tool result - and no
+    continuation, so the adapter rebuilds it with the placeholder
+    signature. Each works on its own copies; neither touches what the
+    other is given.
+    """
+    if arm == "native":
+        c = first_reply["continuation"]
+        continuation = ProviderContinuation(
+            strategy=c["strategy"], provider=c["provider"], transport=c["transport"],
+            model=c["model"], through_operation_seq=1, payload=c["payload"],
+            replay_tokens=int(c.get("replay_tokens") or 0),
+        )
+        messages: List[dict] = []
+        tail = [dict(tool_result)]
+    else:
+        continuation = None
+        messages = [dict(m) for m in base_messages]
+        messages.append(deepcopy(first_reply.get("assistant_message")
+                                 or {"role": "assistant", "content": ""}))
+        messages.append(dict(tool_result))
+        tail = []
+    calls: List[dict] = []
+    final = ""
+    for index in range(3):
+        native = continuation is not None
+        handed = state_measures(continuation.payload if native else None)
+        began = time.monotonic()
+        reply = backend.generate_with_tools(
+            tail if native else messages, [tool], [],
+            **({"continuation": continuation} if native else {}),
+        )
+        elapsed = time.monotonic() - began
+        usage = reply.get("usage") or {}
+        calls.append({
+            "call": index + 2,
+            "wall_seconds": round(elapsed, 3),
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+            "replay_tokens_handed": continuation.replay_tokens if native else 0,
+            "replay_bytes_handed": handed["replay_bytes"],
+            "replay_items_handed": handed["replay_items"],
+            "tool_calls": len(reply.get("tool_calls") or []),
+        })
+        if native:
+            c = reply["continuation"]
+            continuation = ProviderContinuation(
+                strategy=c["strategy"], provider=c["provider"], transport=c["transport"],
+                model=c["model"], through_operation_seq=index + 2, payload=c["payload"],
+                replay_tokens=int(c.get("replay_tokens") or 0),
+            )
+        content = (reply.get("content") or "").strip()
+        requests = reply.get("tool_calls") or []
+        if not native:
+            messages.append(reply.get("assistant_message")
+                            or {"role": "assistant", "content": content})
+        if not requests:
+            final = content
+            break
+        results = [{"role": "tool", "tool_call_id": call.get("id") or "",
+                    "name": call.get("name") or "", "content": CHECKPOINT_RESULT}
+                   for call in requests]
+        if native:
+            tail = results
+        else:
+            messages.extend(results)
+    first = calls[0]
+    return {
+        "arm": arm,
+        "correct": correct(task, final),
+        "final": final[:80],
+        "answered": not (reply.get("tool_calls") or []),
+        "model_calls": len(calls),
+        "reasoning_after": sum(c["reasoning_tokens"] for c in calls),
+        "prompt_after": first["prompt_tokens"],
+        "total_tokens_after": sum(c["total_tokens"] for c in calls),
+        "wall_after": first["wall_seconds"],
+        "replay_tokens": first["replay_tokens_handed"],
+        "replay_bytes": first["replay_bytes_handed"],
+        "replay_items": first["replay_items_handed"],
+        "calls": calls,
+    }
+
+
+def run_fork(backend, task: Dict[str, Any], visible: bool, first_arm: str) -> Dict[str, Any]:
+    """The pre-checkpoint call once, then both successors from that reply.
+
+    The first reasoning event, the call, the task, the tool result and the
+    visible transcript are literally shared; only the successor's
+    representation differs. A first reply that breaks the protocol - no
+    checkpoint, more than one, answer text in the turn, or answer state in
+    the call's arguments under the hidden-state condition - is recorded
+    and gets no successors.
+    """
+    tool = VISIBLE_CHECKPOINT_TOOL if visible else CHECKPOINT_TOOL
+    messages = [{"role": "system", "content": VISIBLE_SYSTEM if visible else SYSTEM},
+                {"role": "user", "content": task["prompt"]}]
+    began = time.monotonic()
+    reply = backend.generate_with_tools([dict(m) for m in messages], [tool], [])
+    elapsed = time.monotonic() - began
+    usage = reply.get("usage") or {}
+    content = (reply.get("content") or "").strip()
+    requests = reply.get("tool_calls") or []
+    checkpoints = [call for call in requests if call.get("name") == "checkpoint"]
+    arguments = ""
+    argument_keys: List[str] = []
+    if checkpoints:
+        raw = checkpoints[0].get("arguments") or "{}"
+        arguments = raw if isinstance(raw, str) else json.dumps(raw)
+        try:
+            argument_keys = sorted((json.loads(arguments) if isinstance(raw, str) else raw).keys())
+        except (ValueError, AttributeError):
+            argument_keys = ["?"]
+    args_leak = (not visible) and (
+        bool(set(argument_keys) - {"stage"}) or correct(task, arguments)
+    )
+    first = {
+        "wall_seconds": round(elapsed, 3),
+        "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage.get("completion_tokens") or 0),
+        "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+        "checkpoint_calls": len(checkpoints),
+        "tool_calls": len(requests),
+        "content_chars": len(content),
+        "leaked": bool(content),
+        "leaked_answer": correct(task, content) if content else False,
+        "argument_keys": argument_keys,
+        "args_leak": args_leak,
+    }
+    record: Dict[str, Any] = {
+        "design": "forked",
+        "family": task["family"], "band": task["band"], "seed": task["seed"],
+        "visible": visible, "expected": task["expected"], "detail": task["detail"],
+        "first_arm": first_arm,
+        "first": first,
+        "successors": {},
+    }
+    honoured = len(checkpoints) == 1 and len(requests) == 1 and not content and not args_leak
+    record["excluded"] = not honoured
+    if not honoured:
+        record["reason"] = (
+            "no checkpoint" if not checkpoints else
+            "more than one call" if len(requests) != 1 else
+            "answer text in the first turn" if content else
+            "answer state in the call's arguments"
+        )
+        return record
+    tool_result = {"role": "tool", "tool_call_id": checkpoints[0].get("id") or "",
+                   "name": "checkpoint", "content": CHECKPOINT_RESULT}
+    second_arm = "transcript" if first_arm == "native" else "native"
+    for position, arm in enumerate((first_arm, second_arm)):
+        outcome = _successor(backend, task, arm, tool, messages, reply, tool_result)
+        outcome["order_position"] = position
+        record["successors"][arm] = outcome
+    return record
+
+
+def flatten(records: List[dict]) -> List[dict]:
+    """Every record as one row per arm, whichever design produced it, so
+    the summaries read both. A forked record's two rows share its first
+    call's numbers, because they share the call."""
+    rows = []
+    for record in records:
+        if "successors" not in record:
+            # An independent run, or a row already flattened: one arm each.
+            rows.append({**record, "design": record.get("design") or "independent"})
+            continue
+        for arm, outcome in (record.get("successors") or {}).items():
+            first = record["first"]
+            rows.append({
+                "design": "forked", "family": record["family"], "band": record["band"],
+                "seed": record["seed"], "repeat": record.get("repeat", 0),
+                "visible": bool(record.get("visible")), "arm": arm,
+                "correct": outcome["correct"], "final": outcome["final"],
+                "checkpoint_called": True, "leaked": False,
+                "reasoning_before": first["reasoning_tokens"],
+                "reasoning_after": outcome["reasoning_after"],
+                "prompt_after": outcome["prompt_after"],
+                "total_tokens": first["total_tokens"] + outcome["total_tokens_after"],
+                "wall_before": first["wall_seconds"], "wall_after": outcome["wall_after"],
+                "replay_tokens": outcome["replay_tokens"],
+                "replay_bytes": outcome["replay_bytes"],
+                "order_position": outcome.get("order_position"),
+            })
+    return rows
+
+
 # -- summaries ------------------------------------------------------------
 
 def _mean(rows, key):
@@ -417,58 +623,72 @@ def _cells(runs):
                   key=lambda c: (c[2], c[0], BANDS.index(c[1]) if c[1] in BANDS else 9))
 
 
-def summarize(runs: List[dict]) -> str:
+def summarize(records: List[dict]) -> str:
+    """Both designs, each on its own: the independent design's two runs of
+    a pair sampled the first call twice; the forked design's two rows of a
+    pair share one first call, so their `reason_before` is one number."""
+    rows_all = flatten(records)
     lines = []
-    lines.append("per cell (means; only runs that honoured the checkpoint and leaked no "
-                 "answer count, the rest are listed as excluded)")
-    lines.append("family   band    visible  arm         n  correct  reason_before  "
-                 "reason_after  prompt_after  total_tokens  wall_before  wall_after  "
-                 "replay_tokens  excluded")
-    for family, band, visible in _cells(runs):
-        for arm in ("transcript", "native"):
-            rows = [r for r in runs if r["family"] == family and r["band"] == band
-                    and bool(r.get("visible")) == visible and r["arm"] == arm]
-            kept = [r for r in rows if r["checkpoint_called"] and not r["leaked"]]
-            if not rows:
-                continue
-            good = sum(1 for r in kept if r["correct"])
-            lines.append(
-                f"{family:<8} {band:<7} {str(visible):<8} {arm:<10} {len(kept):>2}  "
-                f"{good:>3}/{len(kept):<3}  {_mean(kept, 'reasoning_before'):>13.0f}  "
-                f"{_mean(kept, 'reasoning_after'):>12.0f}  {_mean(kept, 'prompt_after'):>12.0f}  "
-                f"{_mean(kept, 'total_tokens'):>12.0f}  {_mean(kept, 'wall_before'):>11.2f}  "
-                f"{_mean(kept, 'wall_after'):>10.2f}  {_mean(kept, 'replay_tokens'):>13.0f}  "
-                f"{len(rows) - len(kept):>8}"
-            )
-    lines.append("")
-    lines.append("paired, native minus transcript on matched instances (same family, "
-                 "band, seed, repeat): successor reasoning, successor prompt overhead, "
-                 "and the correctness discordance")
-    lines.append("family   band    visible  pairs  d_reason_after  overhead_prompt  ratio  "
-                 "native_only_right  transcript_only_right")
-    for family, band, visible in _cells(runs):
-        pairs = matched_pairs(runs, family, band, visible)
-        if not pairs:
+    for design in ("independent", "forked"):
+        runs = [r for r in rows_all if r["design"] == design]
+        if not runs:
             continue
-        d_after = [n["reasoning_after"] - t["reasoning_after"] for n, t in pairs]
-        overhead = [n["prompt_after"] - t["prompt_after"] for n, t in pairs]
-        ratio = (-statistics.mean(d_after) / statistics.mean(overhead)
-                 if statistics.mean(overhead) > 0 else float("nan"))
-        n_only = sum(1 for n, t in pairs if n["correct"] and not t["correct"])
-        t_only = sum(1 for n, t in pairs if t["correct"] and not n["correct"])
-        lines.append(
-            f"{family:<8} {band:<7} {str(visible):<8} {len(pairs):>5}  "
-            f"{statistics.mean(d_after):>+14.0f}  {statistics.mean(overhead):>+15.0f}  "
-            f"{ratio:>5.2f}  {n_only:>17}  {t_only:>21}"
-        )
-    return "\n".join(lines)
+        excluded = [r for r in records if r.get("design") == "forked" and r.get("excluded")]
+        lines.append(f"== {design} design"
+                     + (f" ({len(excluded)} forks excluded for the protocol)"
+                        if design == "forked" and excluded else ""))
+        lines.append("per cell (means; only runs that honoured the checkpoint and leaked no "
+                     "answer count, the rest are listed as excluded)")
+        lines.append("family   band    visible  arm         n  correct  reason_before  "
+                     "reason_after  prompt_after  total_tokens  wall_before  wall_after  "
+                     "replay_tokens  excluded")
+        for family, band, visible in _cells(runs):
+            for arm in ("transcript", "native"):
+                rows = [r for r in runs if r["family"] == family and r["band"] == band
+                        and bool(r.get("visible")) == visible and r["arm"] == arm]
+                kept = [r for r in rows if r["checkpoint_called"] and not r["leaked"]]
+                if not rows:
+                    continue
+                good = sum(1 for r in kept if r["correct"])
+                lines.append(
+                    f"{family:<8} {band:<7} {str(visible):<8} {arm:<10} {len(kept):>2}  "
+                    f"{good:>3}/{len(kept):<3}  {_mean(kept, 'reasoning_before'):>13.0f}  "
+                    f"{_mean(kept, 'reasoning_after'):>12.0f}  {_mean(kept, 'prompt_after'):>12.0f}  "
+                    f"{_mean(kept, 'total_tokens'):>12.0f}  {_mean(kept, 'wall_before'):>11.2f}  "
+                    f"{_mean(kept, 'wall_after'):>10.2f}  {_mean(kept, 'replay_tokens'):>13.0f}  "
+                    f"{len(rows) - len(kept):>8}"
+                )
+        lines.append("")
+        lines.append("paired, native minus transcript on matched instances (same family, "
+                     "band, seed, repeat): successor reasoning, successor prompt overhead, "
+                     "and the correctness discordance")
+        lines.append("family   band    visible  pairs  d_reason_after  overhead_prompt  ratio  "
+                     "native_only_right  transcript_only_right")
+        for family, band, visible in _cells(runs):
+            pairs = matched_pairs(runs, family, band, visible)
+            if not pairs:
+                continue
+            d_after = [n["reasoning_after"] - t["reasoning_after"] for n, t in pairs]
+            overhead = [n["prompt_after"] - t["prompt_after"] for n, t in pairs]
+            ratio = (-statistics.mean(d_after) / statistics.mean(overhead)
+                     if statistics.mean(overhead) > 0 else float("nan"))
+            n_only = sum(1 for n, t in pairs if n["correct"] and not t["correct"])
+            t_only = sum(1 for n, t in pairs if t["correct"] and not n["correct"])
+            lines.append(
+                f"{family:<8} {band:<7} {str(visible):<8} {len(pairs):>5}  "
+                f"{statistics.mean(d_after):>+14.0f}  {statistics.mean(overhead):>+15.0f}  "
+                f"{ratio:>5.2f}  {n_only:>17}  {t_only:>21}"
+            )
+        lines.append("")
+    return "\n".join(lines).rstrip()
 
 
 def matched_pairs(runs, family, band, visible):
-    """(native, transcript) run pairs for one cell, both honouring the
-    protocol, keyed by seed and repeat."""
+    """(native, transcript) row pairs for one cell, both honouring the
+    protocol, keyed by seed and repeat. Rows, as `flatten` makes them: a
+    forked record's two rows pair with each other, sharing a first call."""
     by_key: Dict[Tuple, Dict[str, dict]] = {}
-    for r in runs:
+    for r in flatten(runs):
         if (r["family"], r["band"], bool(r.get("visible"))) != (family, band, visible):
             continue
         if not r["checkpoint_called"] or r["leaked"]:
@@ -488,6 +708,9 @@ def main() -> int:
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--visible", action="store_true",
                         help="the control: the checkpoint call carries the answer")
+    parser.add_argument("--design", default="forked", choices=("forked", "independent"),
+                        help="forked: one first call per task, both successors from that "
+                             "reply; independent: each arm runs its own two calls")
     parser.add_argument("--reasoning-effort", default=None)
     parser.add_argument("--out")
     parser.add_argument("--summarize")
@@ -517,22 +740,38 @@ def main() -> int:
     backend = build_backend(args.backend, args.model, args.reasoning_effort)
     profile = {"backend": args.backend, "model": args.model,
                "sdk": sdk_version(args.backend), "reasoning_effort": args.reasoning_effort,
-               "visible": args.visible}
+               "visible": args.visible, "design": args.design}
     print(json.dumps({"profile": profile}), flush=True)
+
+    def keep(record):
+        record.update(profile)
+        shown = {k: v for k, v in record.items() if k not in ("calls", "successors")}
+        if "successors" in record:
+            shown["successors"] = {
+                arm: {k: v for k, v in outcome.items() if k != "calls"}
+                for arm, outcome in record["successors"].items()
+            }
+        print(json.dumps(shown, ensure_ascii=False), flush=True)
+        if args.out:
+            with open(args.out, "a", encoding="utf-8") as sink:
+                sink.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     runs = []
     for repeat in range(args.repeat):
         for task in tasks:
             # Counterbalanced: which arm goes first alternates by seed and repeat.
             first = "native" if (task["seed"] + repeat) % 2 == 0 else "transcript"
+            if args.design == "forked":
+                record = run_fork(backend, task, args.visible, first)
+                record["repeat"] = repeat
+                keep(record)
+                runs.append(record)
+                continue
             for position, arm in enumerate((first, "transcript" if first == "native" else "native")):
                 run = run_task(backend, task, arm, args.visible)
-                run.update({"repeat": repeat, "order_position": position, **profile})
+                run.update({"repeat": repeat, "order_position": position})
+                keep(run)
                 runs.append(run)
-                print(json.dumps({k: v for k, v in run.items() if k != "calls"},
-                                 ensure_ascii=False), flush=True)
-                if args.out:
-                    with open(args.out, "a", encoding="utf-8") as sink:
-                        sink.write(json.dumps(run, ensure_ascii=False) + "\n")
     print()
     print(summarize(runs))
     return 0

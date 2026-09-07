@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib.util
 import itertools
+import json
 import sys
 from pathlib import Path
 
@@ -83,6 +84,133 @@ class TestScoring:
         assert rf.correct(order, "ada, bo, cy")
         assert rf.correct(order, "Ada Bo Cy")
         assert not rf.correct(order, "Bo, Ada, Cy")
+
+
+class _Scripted:
+    """A backend whose replies are scripted per call, recording what each
+    call was handed: the messages, and the continuation if any."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def generate_with_tools(self, messages, tools, adapters, *, continuation=None, **_kw):
+        self.calls.append({"messages": [dict(m) for m in messages],
+                           "continuation": continuation})
+        reply = self.replies.pop(0)
+        return reply(messages, continuation) if callable(reply) else reply
+
+
+def _checkpoint_reply(reasoning=500, content="", arguments='{"stage": 1}'):
+    call = {"id": "c1", "name": "checkpoint", "arguments": arguments}
+    return {
+        "content": content, "tool_calls": [call],
+        "assistant_message": {"role": "assistant", "content": content or None,
+                              "tool_calls": [{"id": "c1", "type": "function",
+                                              "function": {"name": "checkpoint",
+                                                           "arguments": arguments}}]},
+        "usage": {"prompt_tokens": 100, "completion_tokens": 10,
+                  "reasoning_tokens": reasoning, "total_tokens": 110 + reasoning},
+        "continuation": {"strategy": "gemini.native.v1", "provider": "gemini",
+                         "transport": "generateContent", "model": "m",
+                         "payload": {"systemInstruction": None,
+                                     "contents": [{"role": "model", "parts": [
+                                         {"functionCall": {"name": "checkpoint", "args": {}},
+                                          "thoughtSignature": "SIG"}]}]},
+                         "replay_tokens": reasoning},
+    }
+
+
+def _answer(text, reasoning=0, prompt=300):
+    return {"content": text, "tool_calls": [], "assistant_message": {"role": "assistant",
+                                                                     "content": text},
+            "usage": {"prompt_tokens": prompt, "completion_tokens": 5,
+                      "reasoning_tokens": reasoning, "total_tokens": prompt + 5 + reasoning},
+            "continuation": {"strategy": "gemini.native.v1", "provider": "gemini",
+                             "transport": "generateContent", "model": "m",
+                             "payload": {"contents": []}, "replay_tokens": reasoning}}
+
+
+class TestTheForkedDesign:
+    def test_one_first_call_feeds_both_successors_and_only_the_representation_differs(self):
+        task = {**rf.make_arith("light", 0), "family": "arith", "band": "light", "seed": 0}
+        expected = task["expected"]
+        backend = _Scripted([
+            _checkpoint_reply(reasoning=640),
+            _answer(expected, reasoning=0, prompt=900),     # native successor, runs first
+            _answer("wrong 1", reasoning=0, prompt=260),    # transcript successor
+        ])
+
+        record = rf.run_fork(backend, task, visible=False, first_arm="native")
+
+        assert not record["excluded"]
+        assert len(backend.calls) == 3, "the first call is made once"
+        assert record["first"]["reasoning_tokens"] == 640
+        assert record["first"]["argument_keys"] == ["stage"]
+        native, transcript = backend.calls[1], backend.calls[2]
+        # The native successor: the continuation the first reply produced,
+        # and only the tool result.
+        assert native["continuation"] is not None
+        assert native["continuation"].replay_tokens == 640
+        assert [m["role"] for m in native["messages"]] == ["tool"]
+        assert native["messages"][0]["content"] == "continue"
+        # The transcript successor: the visible history with the same
+        # call and the same tool result, and no continuation.
+        assert transcript["continuation"] is None
+        assert [m["role"] for m in transcript["messages"]] == ["system", "user", "assistant", "tool"]
+        assert transcript["messages"][2]["tool_calls"][0]["function"]["name"] == "checkpoint"
+        assert transcript["messages"][3] == native["messages"][0]
+        outcomes = record["successors"]
+        assert outcomes["native"]["correct"] and not outcomes["transcript"]["correct"]
+        assert outcomes["native"]["order_position"] == 0
+        assert outcomes["transcript"]["order_position"] == 1
+        assert outcomes["native"]["replay_tokens"] == 640
+        assert outcomes["native"]["prompt_after"] == 900
+        assert outcomes["transcript"]["prompt_after"] == 260
+
+    def test_the_other_order_runs_the_transcript_successor_first(self):
+        task = {**rf.make_trivial("light", 1), "family": "trivial", "band": "light", "seed": 1}
+        backend = _Scripted([
+            _checkpoint_reply(reasoning=50),
+            _answer(task["expected"]), _answer(task["expected"]),
+        ])
+        record = rf.run_fork(backend, task, visible=False, first_arm="transcript")
+        assert backend.calls[1]["continuation"] is None
+        assert backend.calls[2]["continuation"] is not None
+        assert record["successors"]["transcript"]["order_position"] == 0
+
+    def test_a_first_reply_that_breaks_the_protocol_gets_no_successors(self):
+        task = {**rf.make_arith("light", 2), "family": "arith", "band": "light", "seed": 2}
+        leaking = _checkpoint_reply(content=f"the answer is {task['expected']}")
+        record = rf.run_fork(_Scripted([leaking]), task, visible=False, first_arm="native")
+        assert record["excluded"] and record["reason"] == "answer text in the first turn"
+        assert record["successors"] == {}
+
+        in_arguments = _checkpoint_reply(arguments=json.dumps({"stage": 1, "result": task["expected"]}))
+        record = rf.run_fork(_Scripted([in_arguments]), task, visible=False, first_arm="native")
+        assert record["excluded"] and record["reason"] == "answer state in the call's arguments"
+
+        # The same arguments are the protocol under the visible-state control.
+        visible = _checkpoint_reply(arguments=json.dumps({"stage": 1, "result": task["expected"]}))
+        backend = _Scripted([visible, _answer(task["expected"]), _answer(task["expected"])])
+        record = rf.run_fork(backend, task, visible=True, first_arm="native")
+        assert not record["excluded"] and record["first"]["argument_keys"] == ["result", "stage"]
+
+    def test_flattening_gives_each_arm_a_row_that_shares_the_first_call(self):
+        task = {**rf.make_trace("light", 0), "family": "trace", "band": "light", "seed": 0}
+        backend = _Scripted([
+            _checkpoint_reply(reasoning=700),
+            _answer(task["expected"], prompt=1000), _answer("nope", prompt=300),
+        ])
+        record = rf.run_fork(backend, task, visible=False, first_arm="native")
+        record["repeat"] = 1
+        rows = rf.flatten([record])
+        assert {r["arm"] for r in rows} == {"native", "transcript"}
+        assert all(r["reasoning_before"] == 700 and r["design"] == "forked" for r in rows)
+        pairs = rf.matched_pairs([record], "trace", "light", False)
+        assert len(pairs) == 1 and pairs[0][0]["prompt_after"] - pairs[0][1]["prompt_after"] == 700
+        text = rf.summarize([record])
+        assert "== forked design" in text and "1                      0" in text
 
 
 def _run(family, band, seed, arm, *, correct, before, after, prompt_after, repeat=0,
