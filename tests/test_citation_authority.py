@@ -1670,8 +1670,15 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
 
         Citation mode stays healthy: nothing failed, there was simply nothing
         placeable to offer.
+
+        On a backend that sends the whole conversation every round. A backend
+        keeping the provider's own continuation instructs its opening
+        regardless - that opening is frozen in the provider's hands, and a
+        marker a later round places can only be answered by an instruction
+        already there - which `test_continuation_lifecycle` pins.
         """
         engine = get_runtime().workflow
+        monkeypatch.setattr(engine.llm.backend, "backend_mode", "xai", raising=False)
         _registry, invocation, context = self._grounded_context(
             engine, monkeypatch, offers=True, shown="a passage the prompt lacks"
         )

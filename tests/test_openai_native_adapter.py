@@ -105,8 +105,8 @@ class TestTheRequestIsStatelessByContract:
 
         assert "store" not in seen and "include" not in seen
         assert out["continuation"] == {
-            "strategy": CHAT_STRUCTURED_V1, "transport": "responses",
-            "model": "grok-4.5", "payload": {},
+            "strategy": CHAT_STRUCTURED_V1, "provider": "openai",
+            "transport": "responses", "model": "grok-4.5", "payload": {},
         }
 
     def test_a_compatible_provider_on_chat_says_so_and_keeps_nothing(self):
@@ -119,8 +119,8 @@ class TestTheRequestIsStatelessByContract:
                       mode="xai", model="grok-4.5").generate_with_tools(USER, [], [])
 
         assert out["continuation"] == {
-            "strategy": CHAT_STRUCTURED_V1, "transport": "chat",
-            "model": "grok-4.5", "payload": {},
+            "strategy": CHAT_STRUCTURED_V1, "provider": "openai",
+            "transport": "chat", "model": "grok-4.5", "payload": {},
         }
 
     def test_an_unnamed_backend_returns_no_candidate(self):

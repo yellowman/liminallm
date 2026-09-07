@@ -1525,6 +1525,7 @@ class ApiAdapterBackend:
                     # transcript is its whole state.
                     result["continuation"] = {
                         "strategy": OPENAI_RESPONSES_NATIVE_V1 if native else CHAT_STRUCTURED_V1,
+                        "provider": self.provider,
                         "transport": "responses",
                         "model": processed["model"],
                         "payload": {
@@ -1621,6 +1622,7 @@ class ApiAdapterBackend:
             # hold it there rather than let a later round move it.
             result["continuation"] = {
                 "strategy": CHAT_STRUCTURED_V1,
+                "provider": self.provider,
                 "transport": "chat",
                 "model": processed["model"],
                 "payload": {},

@@ -296,6 +296,21 @@ class TrustedTranscript:
                 entries.pop()
         return TrustedTranscript(entries=entries)
 
+    def after(self, operation_seq: int) -> "TrustedTranscript":
+        """The entries past one operation, as a record of their own.
+
+        What a provider holding its own continuation still needs to be told:
+        it has everything through the model turn the parent accepted, and
+        this is what the parent did since. Cut by sequence, never by text -
+        the provider's copy carries markers the public record does not, so
+        a textual diff would find differences where there is no new input.
+
+        A copy, like `without_trailing_answer`, and for the same reason.
+        """
+        return TrustedTranscript(
+            entries=[e for e in self.entries if e.operation_seq > operation_seq]
+        )
+
     def as_list(self) -> List[Dict[str, Any]]:
         return [entry.as_dict() for entry in self.entries]
 

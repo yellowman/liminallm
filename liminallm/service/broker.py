@@ -36,6 +36,7 @@ the body runs here, and the capability name says so.
 """
 from __future__ import annotations
 
+import json
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -43,7 +44,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
 from liminallm.service.citations import assert_scrubbed, scrub_namespace
-from liminallm.service.continuation import ProviderContinuation
+from liminallm.service.continuation import (
+    NATIVE_STRATEGIES,
+    STRATEGIES,
+    ProviderContinuation,
+    declared_strategy,
+)
 from liminallm.service.invocation import (
     Invocation,
     LeaseRevoked,
@@ -108,6 +114,26 @@ class CapabilityNotAllowed(RuntimeError):
 
 class RoundNotAsked(RuntimeError):
     """The submitted round is not the one the recorded model turn asked for."""
+
+
+class ModelTurnRejected(RuntimeError):
+    """The model's reply is not a turn the parent can accept whole.
+
+    All of it or none of it. A reply with one call whose arguments are not a
+    JSON object is not a reply with the other calls in it: nothing of it is
+    recorded, nothing in it runs, and the provider's continuation stays where
+    the last accepted turn left it.
+    """
+
+
+class ContinuationMismatch(RuntimeError):
+    """The backend serving this attempt is not on the continuation accepted.
+
+    A different strategy, wire, provider or model than the one the record
+    was written by. Refused rather than adapted: continuing a provider's
+    own state through something else is the substitution this record exists
+    to make impossible, and a change needs an explicit reset, not a quiet one.
+    """
 
 
 #: What a call reads back when its tool was not offered on the turn that asked
@@ -637,6 +663,30 @@ class CapabilityBroker:
                 operation_seq=operation_seq,
             )
             return {"ok": False, "code": "round_not_asked", "error": str(exc)}
+        except ModelTurnRejected as exc:
+            # Failed, not committed: the retry asks the model again from the
+            # continuation the last accepted turn left, and nothing of this
+            # reply - text, calls, or the provider's own items - survives
+            # into that request.
+            if began:
+                invocation.ledger.fail(operation_seq, "model_turn_rejected")
+            logger.warning(
+                "model_turn_rejected",
+                invocation_id=invocation.invocation_id,
+                operation_seq=operation_seq,
+                reason=str(exc),
+            )
+            return {"ok": False, "code": "model_turn_rejected", "error": str(exc)}
+        except ContinuationMismatch as exc:
+            if began:
+                invocation.ledger.fail(operation_seq, "continuation_mismatch")
+            logger.warning(
+                "continuation_mismatch",
+                invocation_id=invocation.invocation_id,
+                operation_seq=operation_seq,
+                reason=str(exc),
+            )
+            return {"ok": False, "code": "continuation_mismatch", "error": str(exc)}
         except CapabilityNotAllowed:
             # No ledger entry. This request never began an operation - it was
             # refused for the asker, ahead of `begin` - so there is no outcome
@@ -971,7 +1021,10 @@ class CapabilityBroker:
     # -- the model --------------------------------------------------------
 
     def _model_prompt(
-        self, invocation: Invocation, payload: Dict[str, Any]
+        self,
+        invocation: Invocation,
+        payload: Dict[str, Any],
+        accepted: Optional[ProviderContinuation],
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """The messages and tools this model call actually runs on.
 
@@ -995,11 +1048,39 @@ class CapabilityBroker:
         hand back the capability the worker just surrendered, and the model
         could spend the turn on another tool call. So: subtract yes, invent
         no.
+
+        With a native continuation accepted, the provider already holds the
+        conversation through the turn it was accepted at, and what goes now
+        is only the record past that operation - cut by sequence, never by
+        text. The opening of such a conversation is instructed for citations
+        whether or not one is placed in it yet, because that opening is the
+        last time the instruction can be put where the provider keeps it.
         """
         worker_messages = list(payload.get("messages") or [])
         worker_tools = list(payload.get("tools") or [])
-        offered = self._engine.agent_prompt(invocation, self._ctx)
+        native = accepted is not None and accepted.strategy in NATIVE_STRATEGIES
+        cursor = accepted.through_operation_seq if native else None
+        offered = self._engine.agent_prompt(
+            invocation,
+            self._ctx,
+            after_operation_seq=cursor,
+            instruct_opening=(
+                accepted is None and self._backend_strategy() in NATIVE_STRATEGIES
+            ),
+        )
         if offered is None:
+            if cursor is not None:
+                # Offers are off, so the opening went as the worker sent it.
+                # The tail is still the parent's: what happened since is in
+                # the record, and a list the worker composed is not what the
+                # provider holds.
+                return (
+                    self._engine._unlabelled_agent_prompt(
+                        invocation, self._ctx, self._ctx.transcript,
+                        after_operation_seq=cursor,
+                    ),
+                    worker_tools,
+                )
             return worker_messages, worker_tools
         tools = (
             []
@@ -1037,6 +1118,115 @@ class CapabilityBroker:
                 names.append(name)
         return tuple(names)
 
+    def _backend_strategy(self) -> Optional[str]:
+        """What the backend serving this attempt declares, or None.
+
+        None for a backend built without a mode, and for one whose mode
+        declares nothing: neither can continue a provider's own state, and
+        that is the only question asked of it here.
+        """
+        backend = getattr(self._engine.llm, "backend", None)
+        mode = str(getattr(backend, "backend_mode", "") or "")
+        if not mode:
+            return None
+        try:
+            return declared_strategy(mode)
+        except ValueError:
+            return None
+
+    def _check_can_continue(self, accepted: Optional[ProviderContinuation]) -> None:
+        """Refuse, before the provider is asked, a native record this
+        attempt's backend did not write and cannot replay.
+
+        A replacement attempt may run in a process configured differently
+        from the one that accepted the state. Sending the tail alone to a
+        backend that does not hold the opening would continue nothing and
+        report the answer as if it did.
+        """
+        if accepted is None or accepted.strategy not in NATIVE_STRATEGIES:
+            return
+        declared = self._backend_strategy()
+        if declared != accepted.strategy:
+            raise ContinuationMismatch(
+                f"the accepted continuation is {accepted.strategy} and the "
+                f"backend serving this attempt declares {declared or 'nothing'}"
+            )
+
+    @staticmethod
+    def _validate_model_turn(response: Mapping[str, Any]) -> None:
+        """Whole or nothing: every call structurally valid, every arguments
+        payload a JSON object, or the turn is not a turn."""
+        content = response.get("content")
+        if content is not None and not isinstance(content, str):
+            raise ModelTurnRejected("the reply's content is not text")
+        calls = response.get("tool_calls") or []
+        if not isinstance(calls, list):
+            raise ModelTurnRejected("the reply's tool calls are not a list")
+        for index, call in enumerate(calls):
+            where = f"call {index + 1} of {len(calls)}"
+            if not isinstance(call, Mapping) or not str(call.get("name") or ""):
+                raise ModelTurnRejected(f"{where} names no tool")
+            arguments = call.get("arguments")
+            if arguments is None or arguments == "":
+                continue
+            if isinstance(arguments, str):
+                try:
+                    decoded = json.loads(arguments)
+                except ValueError:
+                    decoded = None
+            else:
+                decoded = arguments
+            if not isinstance(decoded, dict):
+                raise ModelTurnRejected(f"{where}: arguments are not a JSON object")
+        assistant = response.get("assistant_message")
+        if assistant is not None and not isinstance(assistant, Mapping):
+            raise ModelTurnRejected("the reply's assistant message is not a mapping")
+
+    @staticmethod
+    def _candidate(
+        raw: Any, accepted: Optional[ProviderContinuation], seq: int
+    ) -> Optional[ProviderContinuation]:
+        """The continuation this turn would advance to, if accepted.
+
+        A backend that declares nothing returns none, and the parent keeps
+        none for it. A backend continuing a native record must return one:
+        silence there is a backend that did not do what the record says.
+        And once anything is accepted, what comes back must be on the same
+        strategy, provider, wire and model - a change is refused here, not
+        absorbed.
+        """
+        if raw is None:
+            if accepted is not None and accepted.strategy in NATIVE_STRATEGIES:
+                raise ContinuationMismatch(
+                    "the backend returned no continuation for a turn that was "
+                    f"continuing {accepted.strategy}"
+                )
+            return None
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("payload"), Mapping):
+            raise ModelTurnRejected(
+                "the continuation candidate is not a mapping with a payload"
+            )
+        strategy = str(raw.get("strategy") or "")
+        if strategy not in STRATEGIES:
+            raise ModelTurnRejected("the continuation candidate names no known strategy")
+        proposed = ProviderContinuation(
+            strategy=strategy,
+            provider=str(raw.get("provider") or ""),
+            transport=str(raw.get("transport") or ""),
+            model=str(raw.get("model") or ""),
+            through_operation_seq=seq,
+            payload=dict(raw["payload"]),
+        )
+        if accepted is not None:
+            for name in ("strategy", "provider", "transport", "model"):
+                before, now = getattr(accepted, name), getattr(proposed, name)
+                if before != now:
+                    raise ContinuationMismatch(
+                        f"the continuation's {name} changed from {before!r} to "
+                        f"{now!r}; a change needs an explicit reset"
+                    )
+        return proposed
+
     def _llm_generate_with_tools(
         self, invocation: Invocation, seq: int, payload: Dict[str, Any]
     ) -> CapabilityOutcome:
@@ -1064,13 +1254,23 @@ class CapabilityBroker:
         of this turn byte-identical.
         """
         invocation.check_live()
-        messages, tools = self._model_prompt(invocation, payload)
+        accepted = self._ctx.continuation
+        self._check_can_continue(accepted)
+        messages, tools = self._model_prompt(invocation, payload, accepted)
         response = self._engine.llm.generate_with_tools(
             messages,
             tools,
             self._ctx.adapters,
             user_id=self._ctx.user_id,
+            # Only when there is one: the doubles that stand in for a backend
+            # in the rest of the suite were written before the argument was.
+            **({"continuation": accepted} if accepted is not None else {}),
         )
+        # A candidate until the ledger commits it. Both checks refuse the
+        # whole turn: the reply is recorded nowhere, and the provider's
+        # continuation stays where the last accepted turn left it.
+        continuation = self._candidate(response.get("continuation"), accepted, seq)
+        self._validate_model_turn(response)
         canonical = {
             "content": response.get("content") or "",
             "tool_calls": response.get("tool_calls") or [],
@@ -1120,16 +1320,28 @@ class CapabilityBroker:
             # different turn.
             offered_tools=self._offered_names(tools),
         )
-        return CapabilityOutcome(
-            public=public,
-            # What the worker must not see, kept where a replay can restore
-            # it: the answer as the model wrote it, which is the only copy
-            # any citation can honestly be read out of.
-            parent_state={
-                "canonical_model_response": canonical,
-                "transcript": [turn.as_dict()],
-            },
-        )
+        # What the worker must not see, kept where a replay can restore it:
+        # the answer as the model wrote it, which is the only copy any
+        # citation can honestly be read out of - and beside it the
+        # provider's own continuation, which the worker is not shown either.
+        state: Dict[str, Any] = {
+            "canonical_model_response": canonical,
+            "transcript": [turn.as_dict()],
+        }
+        if continuation is not None:
+            state["continuation"] = continuation.as_dict()
+            # Identity and size only. The payload is the provider's and is
+            # not for a log: no item, no body, no encrypted content.
+            items = continuation.payload.get("items")
+            logger.info(
+                "continuation_candidate",
+                invocation_id=invocation.invocation_id,
+                operation_seq=seq,
+                strategy=continuation.strategy,
+                transport=continuation.transport,
+                items=len(items) if isinstance(items, list) else 0,
+            )
+        return CapabilityOutcome(public=public, parent_state=state)
 
     # -- one round of the agent loop --------------------------------------
 
