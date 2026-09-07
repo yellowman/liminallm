@@ -57,8 +57,11 @@ def _raw(output, model, status="completed", incomplete=None):
         "id": "resp_1", "object": "response", "created_at": 0, "model": model,
         "status": status, "parallel_tool_calls": True, "tool_choice": "auto",
         "tools": [], "output": output,
+        # The usage block as the wire sends it today: a newer SDK's
+        # validating constructor requires `cache_write_tokens`, and the
+        # fixture has to be a reply that SDK accepts, not only this one.
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
-                  "input_tokens_details": {"cached_tokens": 0},
+                  "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
                   "output_tokens_details": {"reasoning_tokens": 4}},
     }
     if incomplete is not None:
