@@ -1438,10 +1438,9 @@ Together adapter APIs) behind the existing OpenAI-compatible transport:
   `compaction.created_by`); unknown item types and fields go back as they
   came. Gemini: the selected
   candidate's complete parts with their signatures where they sat, plus
-  the systemInstruction; on a turn the parent continues natively the
-  placeholder signature never enters the conversation (the streamed final
-  answer is still rebuilt from the transcript, which the wire accepts at
-  the cost of the reasoning the tape would carry). an adapter refuses,
+  the systemInstruction; on a turn the parent continues natively - the
+  tool rounds and the final streamed answer alike - the placeholder
+  signature never enters the conversation. an adapter refuses,
   before the provider is asked, a record written for another model or one
   its wire cannot carry. provider values are opaque
   JSON - no encoding, encryption or interpretation of ours - and a native

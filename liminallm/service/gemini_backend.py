@@ -46,11 +46,12 @@ _UNSUPPORTED_SCHEMA_KEYS = {"$schema", "additionalProperties"}
 # Gemini attaches a thoughtSignature to functionCall parts and rejects a
 # resumed history whose functionCall lacks one (INVALID_ARGUMENT, live).
 # The signatures ride the native continuation, in the candidate the parent
-# accepted, and never the chat-shaped reply that crosses to the worker. A
-# history rebuilt from the chat shape - another provider's, a hand-written
-# test's, the streamed final answer's - gets the placeholder Google documents
-# as the accepted stand-in, which the wire takes (measured) at the cost of
-# the reasoning it stands in for:
+# accepted, and never the chat-shaped reply that crosses to the worker; the
+# tool rounds and the final streamed answer replay that continuation. A
+# history rebuilt from the chat shape with no accepted state behind it -
+# another provider's, a hand-written test's - gets the placeholder Google
+# documents as the accepted stand-in, which the wire takes (measured) at the
+# cost of the reasoning it stands in for:
 # https://ai.google.dev/gemini-api/docs/thought-signatures
 THOUGHT_SIGNATURE_PLACEHOLDER = "context_engineering_is_the_way_to_go"
 
@@ -273,13 +274,11 @@ def selected_content(payload: dict) -> Optional[dict]:
     a functionCall, on a text part, on a part whose text is empty, a thought
     part, a part type this code has no name for. The native continuation
     replays this whole. Nothing is read out of it here and nothing is put
-    back by a rule of ours: on a turn the parent continues natively, the
-    placeholder `to_contents` supplies for a history built elsewhere never
-    enters the conversation, and a signature the provider sent is never
-    described as intact by anything but its own bytes. (The streamed final
-    answer is still rebuilt from the transcript, placeholder and all - the
-    wire documents and accepts that; what it loses is the reasoning the
-    tape would have carried.)
+    back by a rule of ours: on a turn the parent continues natively - the
+    tool rounds and the final streamed answer alike - the placeholder
+    `to_contents` supplies for a history built elsewhere never enters the
+    conversation, and a signature the provider sent is never described as
+    intact by anything but its own bytes.
 
     None when there is no candidate content to keep: a blocked or empty
     reply adds nothing to the conversation, and nothing is invented for it.
