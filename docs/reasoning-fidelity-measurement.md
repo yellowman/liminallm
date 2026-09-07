@@ -288,84 +288,111 @@ successor in 42 forks.
 
 ### per fork
 
-Every fork of the hidden-state cells: the shared first call's reasoning,
-then each successor's correctness, reasoning and prompt tokens, and the
-`replay_tokens` the native successor was handed.
+Every fork of the hidden-state cells, one row per fork: the shared
+first call's reasoning tokens; for each successor, whether it was
+right, its reasoning tokens, its prompt tokens and its wall seconds;
+the `replay_tokens` and serialized bytes handed to the native
+successor; and the discordance of the pair.
 
-| family | band | seed | repeat | first arm | shared reasoning | native correct | native reasoning | native prompt | transcript correct | transcript reasoning | transcript prompt | replay_tokens |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| arith | light | 0 | 0 | native | 444 | yes | 0 | 679 | no | 8 | 235 | 444 |
-| arith | light | 0 | 1 | transcript | 488 | yes | 0 | 723 | no | 0 | 235 | 488 |
-| arith | light | 1 | 0 | transcript | 354 | yes | 0 | 584 | yes | 136 | 230 | 354 |
-| arith | light | 1 | 1 | native | 355 | yes | 0 | 585 | yes | 135 | 230 | 355 |
-| arith | light | 2 | 0 | native | 202 | yes | 17 | 424 | yes | 0 | 222 | 202 |
-| arith | light | 2 | 1 | transcript | 216 | yes | 9 | 438 | yes | 0 | 222 | 216 |
-| arith | light | 3 | 0 | transcript | 394 | yes | 0 | 641 | yes | 0 | 247 | 394 |
-| arith | light | 3 | 1 | native | 377 | yes | 0 | 624 | yes | 0 | 247 | 377 |
-| arith | medium | 0 | 0 | native | 576 | yes | 0 | 856 | no | 7 | 280 | 576 |
-| arith | medium | 0 | 1 | transcript | 685 | yes | 7 | 965 | no | 0 | 280 | 685 |
-| arith | medium | 1 | 0 | transcript | 503 | yes | 0 | 780 | no | 0 | 277 | 503 |
-| arith | medium | 1 | 1 | native | 403 | yes | 0 | 680 | yes | 0 | 277 | 403 |
-| arith | medium | 2 | 0 | native | 430 | yes | 0 | 714 | no | 0 | 284 | 430 |
-| arith | medium | 2 | 1 | transcript | 346 | yes | 0 | 630 | no | 0 | 284 | 346 |
-| arith | medium | 3 | 0 | transcript | 695 | yes | 0 | 993 | no | 0 | 298 | 695 |
-| arith | medium | 3 | 1 | native | 433 | yes | 0 | 731 | no | 0 | 298 | 433 |
-| arith | heavy | 0 | 0 | native | 900 | yes | 0 | 1225 | no | 0 | 325 | 900 |
-| arith | heavy | 0 | 1 | transcript | 848 | yes | 0 | 1173 | no | 0 | 325 | 848 |
-| arith | heavy | 1 | 0 | transcript | 951 | yes | 0 | 1317 | no | 0 | 366 | 951 |
-| arith | heavy | 1 | 1 | native | 938 | yes | 0 | 1304 | no | 0 | 366 | 938 |
-| arith | heavy | 2 | 0 | native | 1719 | yes | 0 | 2095 | no | 0 | 376 | 1719 |
-| arith | heavy | 2 | 1 | transcript | 1233 | yes | 0 | 1609 | no | 0 | 376 | 1233 |
-| arith | heavy | 3 | 0 | transcript | 936 | yes | 0 | 1278 | yes | 0 | 342 | 936 |
-| arith | heavy | 3 | 1 | native | 1020 | yes | 0 | 1362 | yes | 751 | 342 | 1020 |
-| order | light | 0 | 0 | native | 350 | yes | 0 | 574 | yes | 0 | 224 | 350 |
-| order | light | 0 | 1 | transcript | 395 | yes | 0 | 619 | yes | 0 | 224 | 395 |
-| order | light | 1 | 0 | transcript | 183 | yes | 0 | 392 | yes | 0 | 209 | 183 |
-| order | light | 1 | 1 | native | 241 | yes | 0 | 450 | yes | 0 | 209 | 241 |
-| order | light | 2 | 0 | native | 426 | yes | 0 | 637 | yes | 150 | 211 | 426 |
-| order | light | 2 | 1 | transcript | 361 | yes | 22 | 572 | yes | 0 | 211 | 361 |
-| order | light | 3 | 0 | transcript | 501 | yes | 0 | 712 | yes | 0 | 211 | 501 |
-| order | light | 3 | 1 | native | 514 | yes | 0 | 725 | yes | 0 | 211 | 514 |
-| order | medium | 0 | 0 | native | 840 | yes | 0 | 1092 | yes | 0 | 252 | 840 |
-| order | medium | 0 | 1 | transcript | 1106 | yes | 0 | 1358 | yes | 0 | 252 | 1106 |
-| order | medium | 1 | 0 | transcript | 916 | yes | 0 | 1174 | no | 33 | 258 | 916 |
-| order | medium | 1 | 1 | native | 911 | yes | 0 | 1169 | yes | 420 | 258 | 911 |
-| order | medium | 2 | 0 | native | 582 | yes | 0 | 816 | no | 0 | 234 | 582 |
-| order | medium | 2 | 1 | transcript | 761 | yes | 0 | 995 | no | 0 | 234 | 761 |
-| order | medium | 3 | 0 | transcript | 1595 | yes | 0 | 1850 | no | 0 | 255 | 1595 |
-| order | medium | 3 | 1 | native | 1286 | yes | 0 | 1541 | no | 0 | 255 | 1286 |
-| order | heavy | 0 | 0 | native | 1663 | yes | 0 | 1960 | yes | 0 | 297 | 1663 |
-| order | heavy | 0 | 1 | transcript | 1024 | yes | 0 | 1321 | yes | 0 | 297 | 1024 |
-| order | heavy | 1 | 0 | transcript | 1703 | yes | 0 | 1998 | no | 0 | 295 | 1703 |
-| order | heavy | 1 | 1 | native | 1804 | yes | 0 | 2099 | no | 0 | 295 | 1804 |
-| order | heavy | 2 | 0 | native | 1298 | yes | 0 | 1590 | yes | 0 | 292 | 1298 |
-| order | heavy | 2 | 1 | transcript | 1168 | yes | 0 | 1460 | yes | 0 | 292 | 1168 |
-| order | heavy | 3 | 0 | transcript | 1892 | yes | 0 | 2178 | yes | 0 | 286 | 1892 |
-| order | heavy | 3 | 1 | native | 1409 | yes | 0 | 1695 | yes | 0 | 286 | 1409 |
-| trace | light | 0 | 0 | native | 772 | yes | 0 | 1066 | no | 0 | 294 | 772 |
-| trace | light | 0 | 1 | transcript | 671 | yes | 27 | 965 | no | 0 | 294 | 671 |
-| trace | light | 1 | 0 | transcript | 512 | yes | 0 | 806 | no | 0 | 294 | 512 |
-| trace | light | 1 | 1 | native | 794 | yes | 0 | 1088 | no | 0 | 294 | 794 |
-| trace | light | 2 | 0 | native | 795 | yes | 28 | 1089 | no | 0 | 294 | 795 |
-| trace | light | 2 | 1 | transcript | 816 | yes | 28 | 1110 | no | 0 | 294 | 816 |
-| trace | light | 3 | 0 | transcript | 403 | yes | 0 | 694 | no | 0 | 291 | 403 |
-| trace | light | 3 | 1 | native | 593 | yes | 18 | 884 | no | 0 | 291 | 593 |
-| trace | medium | 0 | 0 | native | 1358 | yes | 0 | 1652 | no | 0 | 294 | 1358 |
-| trace | medium | 0 | 1 | transcript | 1475 | yes | 0 | 1769 | no | 0 | 294 | 1475 |
-| trace | medium | 1 | 0 | transcript | 1668 | yes | 0 | 1960 | no | 0 | 292 | 1668 |
-| trace | medium | 1 | 1 | native | 1553 | yes | 0 | 1845 | no | 0 | 292 | 1553 |
-| trace | medium | 2 | 0 | native | 1592 | yes | 0 | 1886 | no | 0 | 294 | 1592 |
-| trace | medium | 2 | 1 | transcript | 706 | yes | 0 | 1000 | no | 0 | 294 | 706 |
-| trace | medium | 3 | 0 | transcript | 1366 | yes | 0 | 1659 | no | 0 | 293 | 1366 |
-| trace | medium | 3 | 1 | native | 1179 | yes | 0 | 1472 | no | 0 | 293 | 1179 |
-| trace | heavy | 0 | 0 | native | 1741 | yes | 0 | 2035 | no | 0 | 294 | 1741 |
-| trace | heavy | 0 | 1 | transcript | 1664 | yes | 0 | 1958 | no | 0 | 294 | 1664 |
-| trace | heavy | 1 | 0 | transcript | 2113 | yes | 0 | 2409 | no | 0 | 296 | 2113 |
-| trace | heavy | 1 | 1 | native | 1523 | yes | 0 | 1819 | no | 0 | 296 | 1523 |
-| trace | heavy | 2 | 0 | native | 2197 | yes | 0 | 2491 | no | 0 | 294 | 2197 |
-| trace | heavy | 2 | 1 | transcript | 1839 | yes | 0 | 2133 | no | 0 | 294 | 1839 |
-| trace | heavy | 3 | 0 | transcript | 1453 | yes | 0 | 1745 | no | 0 | 292 | 1453 |
-| trace | heavy | 3 | 1 | native | 1923 | yes | 0 | 2215 | no | 0 | 292 | 1923 |
+| family | band | seed | repeat | first successor | shared reasoning | transcript right | transcript reasoning | transcript prompt | transcript wall s | native right | native reasoning | native prompt | native wall s | replay_tokens | replay bytes | discordance |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| arith | light | 0 | 0 | native | 444 | no | 8 | 235 | 0.58 | yes | 0 | 679 | 3.73 | 444 | 2293 | native only |
+| arith | light | 0 | 1 | transcript | 488 | no | 0 | 235 | 0.62 | yes | 0 | 723 | 0.54 | 488 | 2353 | native only |
+| arith | light | 1 | 0 | transcript | 354 | yes | 136 | 230 | 0.92 | yes | 0 | 584 | 0.61 | 354 | 2368 | both right |
+| arith | light | 1 | 1 | native | 355 | yes | 135 | 230 | 0.75 | yes | 0 | 585 | 0.49 | 355 | 2331 | both right |
+| arith | light | 2 | 0 | native | 202 | yes | 0 | 222 | 0.48 | yes | 17 | 424 | 0.60 | 202 | 1897 | both right |
+| arith | light | 2 | 1 | transcript | 216 | yes | 0 | 222 | 3.25 | yes | 9 | 438 | 0.53 | 216 | 1721 | both right |
+| arith | light | 3 | 0 | transcript | 394 | yes | 0 | 247 | 1.31 | yes | 0 | 641 | 0.49 | 394 | 2675 | both right |
+| arith | light | 3 | 1 | native | 377 | yes | 0 | 247 | 0.60 | yes | 0 | 624 | 0.64 | 377 | 2455 | both right |
+| arith | medium | 0 | 0 | native | 576 | no | 7 | 280 | 0.69 | yes | 0 | 856 | 0.44 | 576 | 3043 | native only |
+| arith | medium | 0 | 1 | transcript | 685 | no | 0 | 280 | 0.64 | yes | 7 | 965 | 0.44 | 685 | 3355 | native only |
+| arith | medium | 1 | 0 | transcript | 503 | no | 0 | 277 | 0.62 | yes | 0 | 780 | 0.52 | 503 | 2695 | native only |
+| arith | medium | 1 | 1 | native | 403 | yes | 0 | 277 | 0.43 | yes | 0 | 680 | 1.55 | 403 | 2442 | both right |
+| arith | medium | 2 | 0 | native | 430 | no | 0 | 284 | 0.60 | yes | 0 | 714 | 0.57 | 430 | 3063 | native only |
+| arith | medium | 2 | 1 | transcript | 346 | no | 0 | 284 | 1.19 | yes | 0 | 630 | 0.49 | 346 | 2410 | native only |
+| arith | medium | 3 | 0 | transcript | 695 | no | 0 | 298 | 0.62 | yes | 0 | 993 | 0.56 | 695 | 3665 | native only |
+| arith | medium | 3 | 1 | native | 433 | no | 0 | 298 | 0.60 | yes | 0 | 731 | 0.58 | 433 | 2986 | native only |
+| arith | heavy | 0 | 0 | native | 900 | no | 0 | 325 | 0.94 | yes | 0 | 1225 | 0.47 | 900 | 3708 | native only |
+| arith | heavy | 0 | 1 | transcript | 848 | no | 0 | 325 | 0.46 | yes | 0 | 1173 | 0.47 | 848 | 3385 | native only |
+| arith | heavy | 1 | 0 | transcript | 951 | no | 0 | 366 | 0.42 | yes | 0 | 1317 | 1.32 | 951 | 3774 | native only |
+| arith | heavy | 1 | 1 | native | 938 | no | 0 | 366 | 0.49 | yes | 0 | 1304 | 0.64 | 938 | 4010 | native only |
+| arith | heavy | 2 | 0 | native | 1719 | no | 0 | 376 | 0.42 | yes | 0 | 2095 | 1.16 | 1719 | 7706 | native only |
+| arith | heavy | 2 | 1 | transcript | 1233 | no | 0 | 376 | 0.62 | yes | 0 | 1609 | 0.43 | 1233 | 5330 | native only |
+| arith | heavy | 3 | 0 | transcript | 936 | yes | 0 | 342 | 2.37 | yes | 0 | 1278 | 0.52 | 936 | 3938 | both right |
+| arith | heavy | 3 | 1 | native | 1020 | yes | 751 | 342 | 2.29 | yes | 0 | 1362 | 0.58 | 1020 | 4250 | both right |
+| order | light | 0 | 0 | native | 350 | yes | 0 | 224 | 0.65 | yes | 0 | 574 | 0.61 | 350 | 2452 | both right |
+| order | light | 0 | 1 | transcript | 395 | yes | 0 | 224 | 0.70 | yes | 0 | 619 | 0.40 | 395 | 2735 | both right |
+| order | light | 1 | 0 | transcript | 183 | yes | 0 | 209 | 0.61 | yes | 0 | 392 | 0.69 | 183 | 1785 | both right |
+| order | light | 1 | 1 | native | 241 | yes | 0 | 209 | 0.49 | yes | 0 | 450 | 1.17 | 241 | 1921 | both right |
+| order | light | 2 | 0 | native | 426 | yes | 150 | 211 | 1.00 | yes | 0 | 637 | 0.64 | 426 | 2728 | both right |
+| order | light | 2 | 1 | transcript | 361 | yes | 0 | 211 | 1.65 | yes | 22 | 572 | 0.52 | 361 | 2546 | both right |
+| order | light | 3 | 0 | transcript | 501 | yes | 0 | 211 | 0.53 | yes | 0 | 712 | 0.78 | 501 | 2813 | both right |
+| order | light | 3 | 1 | native | 514 | yes | 0 | 211 | 0.71 | yes | 0 | 725 | 0.50 | 514 | 3033 | both right |
+| order | medium | 0 | 0 | native | 840 | yes | 0 | 252 | 0.47 | yes | 0 | 1092 | 0.43 | 840 | 4378 | both right |
+| order | medium | 0 | 1 | transcript | 1106 | yes | 0 | 252 | 0.41 | yes | 0 | 1358 | 0.57 | 1106 | 5066 | both right |
+| order | medium | 1 | 0 | transcript | 916 | no | 33 | 258 | 0.80 | yes | 0 | 1174 | 0.55 | 916 | 4239 | native only |
+| order | medium | 1 | 1 | native | 911 | yes | 420 | 258 | 1.77 | yes | 0 | 1169 | 0.70 | 911 | 4294 | both right |
+| order | medium | 2 | 0 | native | 582 | no | 0 | 234 | 1.02 | yes | 0 | 816 | 0.56 | 582 | 3564 | native only |
+| order | medium | 2 | 1 | transcript | 761 | no | 0 | 234 | 2.41 | yes | 0 | 995 | 0.49 | 761 | 4500 | native only |
+| order | medium | 3 | 0 | transcript | 1595 | no | 0 | 255 | 0.60 | yes | 0 | 1850 | 0.87 | 1595 | 5792 | native only |
+| order | medium | 3 | 1 | native | 1286 | no | 0 | 255 | 0.50 | yes | 0 | 1541 | 0.54 | 1286 | 5356 | native only |
+| order | heavy | 0 | 0 | native | 1663 | yes | 0 | 297 | 1.54 | yes | 0 | 1960 | 0.53 | 1663 | 7983 | both right |
+| order | heavy | 0 | 1 | transcript | 1024 | yes | 0 | 297 | 0.44 | yes | 0 | 1321 | 0.62 | 1024 | 5280 | both right |
+| order | heavy | 1 | 0 | transcript | 1703 | no | 0 | 295 | 0.73 | yes | 0 | 1998 | 0.66 | 1703 | 6983 | native only |
+| order | heavy | 1 | 1 | native | 1804 | no | 0 | 295 | 0.49 | yes | 0 | 2099 | 0.60 | 1804 | 7038 | native only |
+| order | heavy | 2 | 0 | native | 1298 | yes | 0 | 292 | 0.54 | yes | 0 | 1590 | 0.79 | 1298 | 5757 | both right |
+| order | heavy | 2 | 1 | transcript | 1168 | yes | 0 | 292 | 0.71 | yes | 0 | 1460 | 0.66 | 1168 | 5396 | both right |
+| order | heavy | 3 | 0 | transcript | 1892 | yes | 0 | 286 | 1.31 | yes | 0 | 2178 | 0.72 | 1892 | 7893 | both right |
+| order | heavy | 3 | 1 | native | 1409 | yes | 0 | 286 | 0.51 | yes | 0 | 1695 | 0.67 | 1409 | 6266 | both right |
+| trace | light | 0 | 0 | native | 772 | no | 0 | 294 | 0.46 | yes | 0 | 1066 | 1.88 | 772 | 3194 | native only |
+| trace | light | 0 | 1 | transcript | 671 | no | 0 | 294 | 1.07 | yes | 27 | 965 | 0.63 | 671 | 2702 | native only |
+| trace | light | 1 | 0 | transcript | 512 | no | 0 | 294 | 0.58 | yes | 0 | 806 | 0.56 | 512 | 2723 | native only |
+| trace | light | 1 | 1 | native | 794 | no | 0 | 294 | 1.02 | yes | 0 | 1088 | 0.45 | 794 | 3282 | native only |
+| trace | light | 2 | 0 | native | 795 | no | 0 | 294 | 0.40 | yes | 28 | 1089 | 0.72 | 795 | 3398 | native only |
+| trace | light | 2 | 1 | transcript | 816 | no | 0 | 294 | 0.62 | yes | 28 | 1110 | 0.59 | 816 | 3487 | native only |
+| trace | light | 3 | 0 | transcript | 403 | no | 0 | 291 | 0.67 | yes | 0 | 694 | 0.47 | 403 | 2563 | native only |
+| trace | light | 3 | 1 | native | 593 | no | 0 | 291 | 0.61 | yes | 18 | 884 | 0.51 | 593 | 3608 | native only |
+| trace | medium | 0 | 0 | native | 1358 | no | 0 | 294 | 0.46 | yes | 0 | 1652 | 0.48 | 1358 | 4422 | native only |
+| trace | medium | 0 | 1 | transcript | 1475 | no | 0 | 294 | 0.43 | yes | 0 | 1769 | 0.50 | 1475 | 4738 | native only |
+| trace | medium | 1 | 0 | transcript | 1668 | no | 0 | 292 | 0.71 | yes | 0 | 1960 | 1.50 | 1668 | 5112 | native only |
+| trace | medium | 1 | 1 | native | 1553 | no | 0 | 292 | 0.49 | yes | 0 | 1845 | 0.84 | 1553 | 4945 | native only |
+| trace | medium | 2 | 0 | native | 1592 | no | 0 | 294 | 0.45 | yes | 0 | 1886 | 0.66 | 1592 | 5182 | native only |
+| trace | medium | 2 | 1 | transcript | 706 | no | 0 | 294 | 0.60 | yes | 0 | 1000 | 0.42 | 706 | 3186 | native only |
+| trace | medium | 3 | 0 | transcript | 1366 | no | 0 | 293 | 0.52 | yes | 0 | 1659 | 0.53 | 1366 | 4565 | native only |
+| trace | medium | 3 | 1 | native | 1179 | no | 0 | 293 | 0.66 | yes | 0 | 1472 | 0.59 | 1179 | 3846 | native only |
+| trace | heavy | 0 | 0 | native | 1741 | no | 0 | 294 | 0.56 | yes | 0 | 2035 | 0.79 | 1741 | 5363 | native only |
+| trace | heavy | 0 | 1 | transcript | 1664 | no | 0 | 294 | 0.46 | yes | 0 | 1958 | 0.45 | 1664 | 5399 | native only |
+| trace | heavy | 1 | 0 | transcript | 2113 | no | 0 | 296 | 0.57 | yes | 0 | 2409 | 2.71 | 2113 | 5736 | native only |
+| trace | heavy | 1 | 1 | native | 1523 | no | 0 | 296 | 0.76 | yes | 0 | 1819 | 0.51 | 1523 | 4656 | native only |
+| trace | heavy | 2 | 0 | native | 2197 | no | 0 | 294 | 0.47 | yes | 0 | 2491 | 0.53 | 2197 | 5971 | native only |
+| trace | heavy | 2 | 1 | transcript | 1839 | no | 0 | 294 | 0.43 | yes | 0 | 2133 | 0.56 | 1839 | 5130 | native only |
+| trace | heavy | 3 | 0 | transcript | 1453 | no | 0 | 292 | 0.61 | yes | 0 | 1745 | 0.41 | 1453 | 5000 | native only |
+| trace | heavy | 3 | 1 | native | 1923 | no | 0 | 292 | 2.26 | yes | 0 | 2215 | 0.53 | 1923 | 5724 | native only |
+
+The 20 control forks, in the same columns:
+
+| control | family | seed | repeat | first successor | shared reasoning | transcript right | transcript reasoning | transcript prompt | transcript wall s | native right | native reasoning | native prompt | native wall s | replay_tokens | replay bytes | discordance |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| trivial | trivial | 0 | 0 | native | 129 | yes | 28 | 165 | 0.68 | yes | 14 | 294 | 0.73 | 129 | 1465 | both right |
+| trivial | trivial | 0 | 1 | transcript | 151 | yes | 37 | 165 | 0.84 | yes | 38 | 316 | 0.74 | 151 | 1605 | both right |
+| trivial | trivial | 1 | 0 | transcript | 99 | yes | 52 | 165 | 0.78 | yes | 37 | 264 | 4.78 | 99 | 1281 | both right |
+| trivial | trivial | 1 | 1 | native | 103 | yes | 48 | 165 | 0.79 | yes | 19 | 268 | 1.03 | 103 | 1289 | both right |
+| trivial | trivial | 2 | 0 | native | 105 | yes | 44 | 165 | 0.69 | yes | 37 | 270 | 0.83 | 105 | 1293 | both right |
+| trivial | trivial | 2 | 1 | transcript | 69 | yes | 40 | 165 | 0.62 | yes | 14 | 234 | 0.74 | 69 | 1113 | both right |
+| trivial | trivial | 3 | 0 | transcript | 115 | yes | 27 | 165 | 0.65 | yes | 35 | 280 | 0.71 | 115 | 1401 | both right |
+| trivial | trivial | 3 | 1 | native | 123 | yes | 32 | 165 | 0.87 | yes | 12 | 288 | 1.04 | 123 | 1397 | both right |
+| visible state | arith | 0 | 0 | native | 842 | yes | 0 | 357 | 4.83 | yes | 0 | 1199 | 0.64 | 842 | 3516 | both right |
+| visible state | arith | 1 | 0 | transcript | 1018 | yes | 0 | 397 | 0.54 | yes | 0 | 1415 | 0.49 | 1018 | 4260 | both right |
+| visible state | arith | 2 | 0 | native | 2247 | yes | 0 | 408 | 0.96 | yes | 0 | 2655 | 0.55 | 2247 | 9209 | both right |
+| visible state | arith | 3 | 0 | transcript | 985 | yes | 0 | 375 | 0.47 | yes | 0 | 1360 | 0.54 | 985 | 3767 | both right |
+| visible state | order | 0 | 0 | native | 1029 | yes | 0 | 342 | 0.54 | yes | 0 | 1371 | 0.70 | 1029 | 5159 | both right |
+| visible state | order | 1 | 0 | transcript | 1594 | yes | 0 | 340 | 0.72 | yes | 0 | 1934 | 0.89 | 1594 | 6530 | both right |
+| visible state | order | 2 | 0 | native | 1342 | yes | 0 | 338 | 0.92 | yes | 0 | 1680 | 0.73 | 1342 | 5713 | both right |
+| visible state | order | 3 | 0 | transcript | 1612 | yes | 0 | 331 | 0.72 | yes | 0 | 1943 | 1.87 | 1612 | 6822 | both right |
+| visible state | trace | 0 | 0 | native | 1840 | yes | 0 | 326 | 0.49 | yes | 0 | 2166 | 0.62 | 1840 | 5454 | both right |
+| visible state | trace | 1 | 0 | transcript | 2028 | yes | 0 | 329 | 0.53 | yes | 0 | 2357 | 0.50 | 2028 | 5665 | both right |
+| visible state | trace | 2 | 0 | native | 1994 | yes | 0 | 328 | 0.53 | yes | 0 | 2322 | 9.62 | 1994 | 5440 | both right |
+| visible state | trace | 3 | 0 | transcript | 1856 | yes | 0 | 324 | 0.59 | yes | 0 | 2180 | 0.53 | 1856 | 5528 | both right |
 
 ## results: the independent-first-call experiment (exploratory)
 
