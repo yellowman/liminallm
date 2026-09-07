@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Protocol, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
@@ -23,6 +24,15 @@ from liminallm.config import (
 )
 from liminallm.logging import get_logger
 from liminallm.service import local_format, responses_compat, transformer
+from liminallm.service.continuation import (
+    CHAT_STRUCTURED_V1,
+    OPENAI_RESPONSES_NATIVE_V1,
+    TRANSCRIPT_V1,
+    ContinuationMismatch,
+    ModelTurnRejected,
+    ProviderContinuation,
+    declared_strategy,
+)
 from liminallm.service.fs import adapter_dir_owner, safe_join
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
@@ -444,6 +454,7 @@ class StubBackend:
     """
 
     mode = "stub"
+    backend_mode = "stub"
     context_window = 8192
     #: In-memory and yields per word: it never blocks, so a stop between
     #: events is a complete interrupt and the promise above holds vacuously.
@@ -463,6 +474,10 @@ class StubBackend:
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
         }
 
+    @staticmethod
+    def declared_continuation() -> str:
+        return TRANSCRIPT_V1
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -470,8 +485,12 @@ class StubBackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> dict:
         """Deterministic tool-calling stand-in for tests.
+
+        `continuation` is accepted and ignored: this backend keeps nothing
+        beyond the transcript, and says so.
 
         Calls each offered tool exactly once (in order) before answering, so
         the agent loop is exercised end to end without a live model.
@@ -592,6 +611,14 @@ _TEMPERATURE_POLICIES: List[Tuple[str, TemperaturePolicy]] = [
     ("gpt-5.4", TemperaturePolicy.CONDITIONAL),
     ("gpt-5.4-mini", TemperaturePolicy.OMIT),
     ("gpt-5.4-nano", TemperaturePolicy.OMIT),
+    # GPT-6 Astra documents temperature, top_p and top_logprobs as
+    # unsupported and asks callers to drop them rather than rely on the API
+    # ignoring them. At the model, not the generation: the documentation
+    # establishes this for Astra and not for every future id beginning
+    # `gpt-6`, and this table's default is TUNABLE precisely because an
+    # unrecognized name is usually a conventional model on someone's own
+    # server. Dated Astra snapshots still match by prefix.
+    ("gpt-6-astra", TemperaturePolicy.OMIT),
     ("o1", TemperaturePolicy.OMIT),
     ("o3", TemperaturePolicy.OMIT),
     ("o4", TemperaturePolicy.OMIT),
@@ -689,6 +716,7 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     ("gpt-5.4-nano", 400_000),
     ("gpt-5.5", 1_050_000),
     ("gpt-5.6", 1_050_000),
+    ("gpt-6-astra", 1_050_000),
     ("gpt-5.3-codex", 400_000),
     ("gpt-5-chat-latest", 128_000),
     ("gpt-5.1-chat-latest", 128_000),
@@ -735,6 +763,7 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     ("glm-4.7", 200_000),
     ("glm-5", 200_000),
     ("glm-5.2", 1_000_000),
+    ("glm-5.3", 1_000_000),
     # Moonshot / Kimi.
     ("moonshot", 131_072),
     ("moonshot-v1-8k", 8_192),
@@ -891,6 +920,38 @@ RERANK_SMALL_VARIANTS: frozenset[str] = frozenset(
 # decides. Without it the size floor found no size and the small-variant
 # guard found no "mini", so auto turned reranking on for a 1.5B.
 _NAME_PARTS = re.compile(r"[-_./:]+")
+
+
+#: Models that serve tool calling only on /responses. Plain completions are
+#: supported on them, so this restricts one kind of request rather than the
+#: model: a round carrying tools has no chat/completions form to fall back to,
+#: and sending one anyway produces a request the provider rejects.
+#:
+#: An allowlist of documented restrictions, like the rerank set beside it. An
+#: unrecognized model reads as "no such restriction" and keeps the fallback,
+#: because that is the behaviour every other model has.
+RESPONSES_ONLY_TOOL_PREFIXES: Tuple[str, ...] = ("gpt-6-astra",)
+
+
+def requires_responses_for_tools(model_id: str) -> bool:
+    """Whether a tool round on this model may only go to /responses."""
+    tail = (model_id or "").strip().lower().rsplit("/", 1)[-1]
+    return any(tail.startswith(prefix) for prefix in RESPONSES_ONLY_TOOL_PREFIXES)
+
+
+#: Models whose reasoning items carry context the Responses API lets a
+#: stateless caller ask to have kept across turns (`reasoning.context`),
+#: which is what makes a replayed encrypted reasoning item worth replaying.
+#: A profile, like the allowlist above: asked for only where the model is
+#: known to honour it, and omitted for a conventional model, whose request
+#: would otherwise carry a parameter nobody measured against it.
+REASONING_CONTEXT_PREFIXES: Tuple[str, ...] = ("gpt-5.6", "gpt-6-astra")
+
+
+def supports_reasoning_context(model_id: str) -> bool:
+    """Whether native continuation on this model asks for `reasoning.context`."""
+    tail = (model_id or "").strip().lower().rsplit("/", 1)[-1]
+    return any(tail.startswith(prefix) for prefix in REASONING_CONTEXT_PREFIXES)
 
 
 def model_can_rerank(model_id: str) -> bool:
@@ -1059,6 +1120,17 @@ def context_window_from_model_dir(model_dir: str | Path) -> Optional[int]:
     return None
 
 
+def _is_openai_endpoint(base_url: Optional[str]) -> bool:
+    """Is this OpenAI's own endpoint - unset, or its host by name?
+
+    A configured fact, not a probe of the wire. A base URL naming any other
+    host is a compatible endpoint, whatever mode it was configured under.
+    """
+    if not base_url:
+        return True
+    return (urlparse(str(base_url)).hostname or "").lower() == "api.openai.com"
+
+
 class ApiAdapterBackend:
     """Backend that targets external APIs with capability-aware adapter handling.
 
@@ -1086,6 +1158,7 @@ class ApiAdapterBackend:
         api_key_env: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
         temperature: Optional[float] = None,
+        backend_mode: str = "",
     ) -> None:
         self.base_model = base_model
         self.adapter_server_model = adapter_server_model
@@ -1093,6 +1166,12 @@ class ApiAdapterBackend:
         self._temperature = temperature
         self.adapter_mode = adapter_mode
         self.mode = adapter_mode
+        #: The `ModelBackend` mode this backend was built for, which is what
+        #: its continuation strategy is declared by. `mode` above is the
+        #: adapter mode and `provider` is inferred - and inferred to "openai"
+        #: for anything unrecognised - so neither can carry a native claim.
+        #: Unset means unnamed, and an unnamed backend claims nothing.
+        self.backend_mode = str(backend_mode or "")
         self._api_key = api_key
         self._base_url = base_url
         # Thinking control for reasoning models (OpenAI o-series, Gemini 2.5/3
@@ -1351,9 +1430,23 @@ class ApiAdapterBackend:
 
     def _responses_kwargs(self, model: str, extra_body: Optional[dict]) -> dict:
         """Request kwargs for /responses. Reasoning effort travels as the
-        first-class `reasoning` parameter here, not extra_body."""
+        first-class `reasoning` parameter here, not extra_body.
+
+        A backend serving the native strategy is stateless on every call it
+        makes to this endpoint, not only the ones that keep a tape: the
+        provider is told to store nothing, explicitly, so the contract does
+        not depend on a default that can move.
+        """
         kwargs: Dict[str, Any] = {"model": model, **self._sampling_params(model)}
+        native = self._declared_strategy() == OPENAI_RESPONSES_NATIVE_V1
+        if native:
+            kwargs["store"] = False
         reasoning = responses_compat.reasoning_param(self._reasoning_effort)
+        if native and supports_reasoning_context(model):
+            # The reasoning context kept across the tape, on the models
+            # known to honour the request; a conventional model is sent
+            # nothing it was not measured against.
+            reasoning = {**(reasoning or {}), "context": "auto"}
         if reasoning:
             kwargs["reasoning"] = reasoning
         if extra_body:
@@ -1394,6 +1487,48 @@ class ApiAdapterBackend:
             usage["reasoning_tokens"] = int(reasoning)
         return usage
 
+    def _declared_strategy(self) -> Optional[str]:
+        """The continuation strategy this backend serves, or None for a
+        backend built without a mode or with one that declares nothing.
+
+        Declared, not detected: answering `/responses` is the wire, and a
+        compatible gateway that answers it is still a compatible gateway.
+        The `openai` mode with a base URL of its own is exactly that - the
+        documented way to point this client at any compatible endpoint - so
+        it serves the chat-shaped strategy; only OpenAI's own endpoint gets
+        OpenAI's rules. An unnamed backend returns no candidate and the
+        parent keeps nothing for it.
+        """
+        mode = getattr(self, "backend_mode", "") or ""
+        if not mode:
+            return None
+        try:
+            strategy = declared_strategy(mode)
+        except ValueError:
+            return None
+        if strategy == OPENAI_RESPONSES_NATIVE_V1 and not _is_openai_endpoint(
+            getattr(self, "_base_url", None)
+        ):
+            return CHAT_STRUCTURED_V1
+        return strategy
+
+    def declared_continuation(self) -> Optional[str]:
+        """What the parent holds this backend to, before any negotiation."""
+        return self._declared_strategy()
+
+    @staticmethod
+    def _accepted_items(continuation: Optional[ProviderContinuation]) -> List[dict]:
+        """The accepted tape, as the items that go first in the next request.
+
+        Only a continuation this strategy wrote is replayed. One written by
+        another strategy is another representation of the conversation, and
+        replaying it here would be the substitution the parent refuses.
+        """
+        if continuation is None or continuation.strategy != OPENAI_RESPONSES_NATIVE_V1:
+            return []
+        items = continuation.payload.get("items")
+        return [dict(item) for item in items] if isinstance(items, list) else []
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -1401,6 +1536,7 @@ class ApiAdapterBackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> dict:
         """One turn of an OpenAI-style tool-calling exchange.
 
@@ -1417,24 +1553,113 @@ class ApiAdapterBackend:
         # instructions once, on every path into a backend (SPEC §5.0.1).
         # Injecting here as well put them in twice.
         augmented = list(messages or [])
+        declared = self._declared_strategy()
+        native = declared == OPENAI_RESPONSES_NATIVE_V1
+        # An accepted tape is one model's. Refused here, before anything is
+        # sent, rather than after a paid call the parent would refuse anyway
+        # - and before that model's items are put in front of another.
+        if self._accepted_items(continuation) and continuation.model != processed["model"]:
+            raise ContinuationMismatch(
+                f"the accepted continuation is for {continuation.model!r} and "
+                f"this backend serves {processed['model']!r}"
+            )
+        # The other direction: a chat-shaped record was accepted, and this
+        # call would go native. The parent would refuse the reply; refusing
+        # here spares the call and keeps the record's wire the record's.
+        if (
+            continuation is not None
+            and continuation.strategy == CHAT_STRUCTURED_V1
+            and native
+            and self._responses_available()
+        ):
+            raise ContinuationMismatch(
+                "the accepted continuation is chat-structured and this backend "
+                "would continue it natively on the responses endpoint"
+            )
         if self._responses_available():
             kwargs = self._responses_kwargs(processed["model"], processed["extra_body"])
             if tools:
                 kwargs["tools"] = responses_compat.to_tools(tools)
                 kwargs["tool_choice"] = "auto"
             items = responses_compat.to_input_items(augmented)
+            if native:
+                # Stateless by contract. The whole accepted tape goes first
+                # and only the new input follows; the provider keeps nothing
+                # (`store=false`, set for every native call in
+                # `_responses_kwargs`) and is asked for the encrypted
+                # reasoning back, explicitly. No `previous_response_id` and
+                # no `conversation`: the tape is the one authority for what
+                # this conversation contains.
+                items = self._accepted_items(continuation) + items
+                kwargs["include"] = ["reasoning.encrypted_content"]
             response = self._try_responses(lambda: self.client.responses.create(
                 input=items, **kwargs
             ))
             if response is not None:
+                # Provisional until the wire says it finished. A call that
+                # looks whole inside a reply cut off at its output limit is
+                # part of a reply that was cut off, and a reply with nothing
+                # in it is nothing to accept. The provider's own word, read
+                # here because only this adapter knows the wire's words.
+                reason = responses_compat.rejection_reason(response, strict=native)
+                if reason:
+                    raise ModelTurnRejected(
+                        f"the responses reply is not a turn to accept: {reason}"
+                    )
                 content = responses_compat.output_text(response)
                 calls = responses_compat.tool_calls_of(response)
-                return {
+                result: Dict[str, Any] = {
                     "content": content,
                     "tool_calls": calls,
                     "assistant_message": responses_compat.assistant_message(content, calls),
                     "usage": responses_compat.usage_dict(response),
                 }
+                if declared:
+                    # A candidate, not accepted state: the parent decides
+                    # whether this turn advances anything, and holds the
+                    # invocation to the strategy and wire named here. The
+                    # native tape is the input that went and the output
+                    # that came, in order, serialized by the SDK and edited
+                    # only where the wire documents a field as output-only.
+                    # A compatible provider on this wire keeps nothing: the
+                    # transcript is its whole state.
+                    result["continuation"] = {
+                        "strategy": OPENAI_RESPONSES_NATIVE_V1 if native else CHAT_STRUCTURED_V1,
+                        "provider": self.provider,
+                        "transport": "responses",
+                        "model": processed["model"],
+                        "payload": {
+                            "items": items + responses_compat.replayable_output(response)
+                        } if native else {},
+                    }
+                return result
+
+        # A tape that was accepted on /responses has no chat form. Sending
+        # the tail alone to chat/completions would continue a conversation
+        # the provider no longer has any of, and report the answer as if it
+        # did: the substitution the parent's invariant forbids, made here.
+        if self._accepted_items(continuation):
+            raise ContinuationMismatch(
+                "the accepted native continuation needs the responses "
+                "endpoint, which this provider did not answer; "
+                "chat/completions cannot continue it"
+            )
+
+        # Falling back is right about the endpoint and wrong about this
+        # request. The choice of endpoint is per client - a provider without
+        # /responses is chat-only for everything - but on these models a round
+        # carrying tools has no chat form at all, so the fallback would send a
+        # request the provider refuses and report it as the model's answer.
+        # Refused here instead, where the reason can still be stated.
+        #
+        # Only when tools are on the request: ordinary completions are
+        # supported, and the loop's final round is one.
+        if tools and requires_responses_for_tools(processed["model"]):
+            raise RuntimeError(
+                f"{processed['model']} serves tool calling only on the "
+                "responses endpoint, which this provider did not answer; "
+                "chat/completions cannot carry this round"
+            )
 
         extra_body = self._with_reasoning_effort(processed["extra_body"])
         # The loop's final round offers no tools; OpenAI rejects an empty
@@ -1449,6 +1674,12 @@ class ApiAdapterBackend:
         )
         choices = getattr(completion, "choices", None) or []
         first = next(iter(choices), None)
+        # The chat wire's word on the same question: no choice is nothing
+        # to accept, and a reply cut off at its output limit is not whole.
+        if first is None:
+            raise ModelTurnRejected("the chat reply has no choices")
+        if getattr(first, "finish_reason", None) == "length":
+            raise ModelTurnRejected("the chat reply was cut off at its output limit")
         message = getattr(first, "message", None) if first else None
         raw_calls = list(getattr(message, "tool_calls", None) or []) if message else []
         tool_calls = [
@@ -1484,25 +1715,45 @@ class ApiAdapterBackend:
                     for tc in tool_calls
                 ]
         assistant_message.setdefault("role", "assistant")
-        return {
+        result = {
             "content": (getattr(message, "content", None) if message else None) or "",
             "tool_calls": tool_calls,
             "assistant_message": assistant_message,
             "usage": self._chat_usage(getattr(completion, "usage", None)),
         }
+        if declared:
+            # Negotiation found a chat-only endpoint. A legal start, and
+            # the candidate names the strategy this invocation is now on -
+            # the transcript's, with no opaque state - so the parent can
+            # hold it there rather than let a later round move it.
+            result["continuation"] = {
+                "strategy": CHAT_STRUCTURED_V1,
+                "provider": self.provider,
+                "transport": "chat",
+                "model": processed["model"],
+                "payload": {},
+            }
+        return result
 
     def _stream_via_responses(
         self, messages: List[dict], model: str, processed: dict,
         abort_handle: Optional[StreamAbortHandle] = None,
+        accepted: List[dict] = (),
     ):
         """Stream via /responses. Returns True if any event was emitted (the
         caller must not fall through to chat), False to fall back - which is
-        only safe when nothing has been yielded yet."""
+        only safe when nothing has been yielded yet. With an accepted tape
+        the caller refuses rather than falls through: a tape has no chat
+        form, and that rule lives in one place, on the caller.
+
+        `accepted` is the tape to replay first, when the stream continues a
+        native record; the messages are then the record past it. Consumed
+        and not advanced - nothing comes back from a stream to accept."""
         full_content = ""
         usage: Dict[str, Any] = {}
         # Converted before the try for the same reason as the blocking paths:
         # our own AttributeError must not read as "provider has no /responses".
-        items = responses_compat.to_input_items(messages)
+        items = list(accepted) + responses_compat.to_input_items(messages)
         kwargs = self._responses_kwargs(model, processed["extra_body"])
         try:
             if abort_handle is not None:
@@ -1580,6 +1831,7 @@ class ApiAdapterBackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         """Stream tokens from the model per SPEC §13.7.
 
@@ -1587,10 +1839,16 @@ class ApiAdapterBackend:
         - {"event": "token", "data": "token_text"}
         - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
         - {"event": "error", "data": {"code": "...", "message": "..."}}
+
+        With a native `continuation`, the messages are the record past the
+        accepted state, the whole accepted tape goes first, and only the
+        responses endpoint may carry it. Consumed, never advanced: what the
+        stream says is the answer, and no continuation comes back from it.
         """
         handle = StreamAbortHandle()
         return CancellableStream(
-            self._generate_stream_impl(messages, adapters, handle), handle
+            self._generate_stream_impl(messages, adapters, handle, continuation),
+            handle,
         )
 
     def _generate_stream_impl(
@@ -1598,6 +1856,7 @@ class ApiAdapterBackend:
         messages: List[dict],
         adapters: List[dict],
         abort_handle: StreamAbortHandle,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         self._ensure_client()
 
@@ -1611,12 +1870,38 @@ class ApiAdapterBackend:
         augmented_messages = list(messages or [])
         extra_body = self._with_reasoning_effort(extra_body)
 
+        accepted = self._accepted_items(continuation)
+        if accepted and continuation.model != target_model:
+            # One model's tape, refused before anything is sent - as an
+            # event, because a stream reports what stops it as one.
+            yield {"event": "error", "data": {
+                "code": "continuation_mismatch",
+                "message": (
+                    f"the accepted continuation is for {continuation.model!r} "
+                    f"and this backend serves {target_model!r}"
+                ),
+            }}
+            return
+
         if self.client and self._responses_available():
             emitted = yield from self._stream_via_responses(
-                augmented_messages, target_model, processed, abort_handle
+                augmented_messages, target_model, processed, abort_handle, accepted
             )
             if emitted:
                 return
+
+        if accepted:
+            # A tape has no chat form. The answer would continue nothing
+            # and be reported as if it did.
+            yield {"event": "error", "data": {
+                "code": "continuation_mismatch",
+                "message": (
+                    "the accepted native continuation needs the responses "
+                    "endpoint, which this provider did not answer; "
+                    "chat/completions cannot continue it"
+                ),
+            }}
+            return
 
         if self.client:
             try:
@@ -2054,6 +2339,7 @@ class LocalJaxLoRABackend:
         self.base_model = base_model
         self.fs_root = Path(fs_root)
         self.mode = "local_lora"
+        self.backend_mode = "local_lora"
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.max_new_tokens = max_new_tokens
@@ -2953,6 +3239,10 @@ class LocalJaxLoRABackend:
             "Otherwise answer normally."
         )
 
+    @staticmethod
+    def declared_continuation() -> str:
+        return TRANSCRIPT_V1
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -2960,8 +3250,12 @@ class LocalJaxLoRABackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> dict:
         """One tool-calling turn over the local forward pass.
+
+        `continuation` is accepted and ignored: local serving keeps nothing
+        beyond the transcript, and says so.
 
         Same dict shape as the API backend - content, tool_calls with
         arguments as a JSON string, assistant_message, usage - so nothing

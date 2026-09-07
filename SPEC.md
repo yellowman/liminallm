@@ -1415,6 +1415,48 @@ Together adapter APIs) behind the existing OpenAI-compatible transport:
   process and falls back to `/chat/completions` permanently for providers
   that answer 404/405; the internal message shape stays chat-format,
   translated at the wire (service/responses_compat.py).
+- **provider continuation**: every backend mode declares one continuation
+  strategy by name (service/continuation.py) - `openai.responses.native.v1`
+  for `openai`, `gemini.native.v1` for `gemini_native`, `chat.structured.v1`
+  for every other OpenAI-compatible mode including the service's own
+  `api_adapters` default, `transcript.v1` for local serving and the stub -
+  and an unregistered mode is refused rather than defaulted. the
+  declaration is by mode: never inferred from a wire answering `/responses`,
+  never from the inferred provider. one configured fact narrows it: the
+  `openai` mode pointed at a base URL of another host is a compatible
+  endpoint named by URL and serves `chat.structured.v1`; only OpenAI's own
+  endpoint gets OpenAI's rules. a native adapter returns a candidate
+  with every tool-calling turn - the request as it went and the provider's
+  complete reply as it came, in the provider's own terms - and the next
+  request replays the accepted state first and only the new input after.
+  OpenAI: the whole ordered `response.output` with
+  `include=["reasoning.encrypted_content"]`, no `previous_response_id` or
+  `conversation`, and `store=false` on every call the native backend makes
+  to the endpoint; serialized as the fields the provider sent - a null it
+  sent stays, a default the SDK filled in is not replayed - and edited only
+  where the wire documents a field as output-only (`reasoning.status`,
+  `compaction.created_by`); unknown item types and fields go back as they
+  came. Gemini: the selected
+  candidate's complete parts with their signatures where they sat, plus
+  the systemInstruction; on a turn the parent continues natively - the
+  tool rounds and the final streamed answer alike - the placeholder
+  signature never enters the conversation. an adapter refuses,
+  before the provider is asked, a record written for another model or one
+  its wire cannot carry. provider values are opaque
+  JSON - no encoding, encryption or interpretation of ours - and a native
+  tape is never continued over `/chat/completions`, nor compacted or
+  rewritten by the parent. a reply is a turn only when its wire says it
+  finished, read by the adapter that knows that wire's words, before
+  anything becomes a candidate: OpenAI `status` must be `completed` under
+  the native contract (a compatible provider may omit it, never report
+  another state) and the output must hold at least one item; Gemini
+  `finishReason` must be `STOP`; a chat reply cut off at its output limit
+  or carrying no choice is refused too. a call that looks whole inside a
+  reply that was cut off is part of a reply that was cut off.
+  `reasoning.context=auto` is asked for by model profile
+  (`REASONING_CONTEXT_PREFIXES`) under the native strategy only; a
+  conventional model, or any compatible provider, is sent nothing it was
+  not measured against.
 - the kernel models this as `remote`/`adapter_param` providers (§5.0.2);
   adapters trained by the JAX pipeline are exported per-version to the
   shared filesystem and mounted by the server.
@@ -2685,6 +2727,34 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   confer no authority. A relayed round naming an unoffered tool is answered
   rather than refused, since the worker did as it was told, and none of its
   calls run.
+- The parent keeps each provider's own replayable continuation beside the
+  transcript (§5): on the invocation context and in the ledger's
+  parent_state, never on the shared backend, in the plan, on the wire, in
+  a reply, or in a log beyond strategy, wire and counts. It advances only
+  when the ledger commits a model turn the parent accepts whole - every
+  call structurally valid, every arguments payload a JSON object, the
+  candidate on a known strategy and, once anything is accepted, the same
+  strategy, provider, wire and model. A turn refused for any of that is
+  recorded nowhere, runs nothing, and leaves the continuation where the
+  last accepted turn put it; a replacement attempt is restored that state
+  from the ledger without the provider being asked, and its retry carries
+  nothing of the rejected reply. A backend declaring another strategy is
+  refused before it is called. New input is cut by operation sequence,
+  never by text: a provider holding its opening is sent only the record
+  past the turn it was accepted at, and that opening carries the citation
+  instruction whether or not a marker is placed in it yet. Offers are
+  priced against the rendered conversation, so what the accepted state
+  costs beyond it - the provider-reported reasoning tokens of the accepted
+  turns - is reserved from the budget. A change of representation needs an
+  explicit reset; nothing substitutes one quietly. The final streamed
+  answer runs on the accepted state too: the stream is sent that state and
+  the record past it, on the wire that wrote it, and produces no
+  continuation, since nothing follows the final answer. When the record
+  already ends on an accepted answer without calls, that answer is
+  delivered as it stands rather than generated again - a second generation
+  would rewind the state just accepted for the sake of a token-by-token
+  stream - and its citations are read out of the canonical copy of that
+  same turn.
 - The worker confines itself before any body runs: environment replaced
   wholesale, network structurally absent, filesystem view limited to a
   scratch the parent owns. Linux: user + mount + network namespace and a

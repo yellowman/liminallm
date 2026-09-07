@@ -31,8 +31,10 @@ from liminallm.service.citation_stream import ScrubbedTokenStream
 from liminallm.service.citations import (
     citation_payload,
     replaced_answer,
+    transfer_citations,
     validate_citations,
 )
+from liminallm.service.continuation import NATIVE_STRATEGIES
 from liminallm.service.invocation import Invocation, LeaseRevoked
 from liminallm.service.node_attempt import (
     BreakerObservation,
@@ -49,6 +51,7 @@ from liminallm.service.tool_namespace import (
     ResolvedWorkflow,
     ToolResolutionScope,
 )
+from liminallm.service.transcript import ModelTurn
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
     DEFAULT_WORKFLOW_TIMEOUT_MS,
@@ -1013,6 +1016,38 @@ class WorkflowStreamingMixin:
             stream.origins,
         )
 
+    @staticmethod
+    def _accepted_terminal_answer(context: InvocationContext) -> Optional[ModelTurn]:
+        """The worker's own final answer, if the record ends on one.
+
+        A model turn with no calls, last in the transcript, is an answer the
+        parent already accepted - and under a native continuation, one the
+        provider's own state already holds. It is delivered rather than
+        regenerated: a second generation would rewind that state for the
+        sake of a token-by-token stream. A record ending on a tool round has
+        no answer yet, and the stream produces one from the accepted state.
+        """
+        entries = context.transcript.entries
+        last = entries[-1] if entries else None
+        if isinstance(last, ModelTurn) and not last.tool_calls:
+            return last
+        return None
+
+    def _recorded_citations(
+        self, context: InvocationContext, invocation: Invocation, content: str
+    ) -> List[Dict[str, Any]]:
+        """What a delivered accepted answer earned, read the way the blocking
+        path reads it: out of the canonical copy of that same turn. This
+        answer was never streamed, so there is no stream to read it out of,
+        and the canonical copy is of exactly the turn that was delivered."""
+        if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
+            return []
+        if not context.citations_intact or not invocation.citation_budget_intact:
+            return []
+        return transfer_citations(
+            context.canonical_model_response, invocation.citations, content
+        )
+
     async def _pumped(
         self,
         invocation: Invocation,
@@ -1195,6 +1230,12 @@ class WorkflowStreamingMixin:
         # Once a token has reached the client, restarting on the plain node
         # would append a second answer to the same bubble.
         emitted_tokens = False
+        #: The worker's own final answer, when the provider's state holds it.
+        answer: Optional[ModelTurn] = None
+        # Built and pulled on the producer thread, kept afterwards, and
+        # built only for a turn that committed a handle - all three for
+        # the reasons the plain node states.
+        streamed: Dict[str, ScrubbedTokenStream] = {}
 
         # Everything above is planning - attachments, grounding, agent
         # context - and a deadline spent there proves nothing about the
@@ -1282,13 +1323,6 @@ class WorkflowStreamingMixin:
             # the answer will be written from, so a `[cite:...]` the worker
             # put in that history is one the model would copy into an answer
             # the parent then treats as its own.
-            offered = self.agent_prompt(
-                invocation, stream_context, replace_terminal_answer=True
-            )
-            messages = (
-                offered if offered is not None
-                else (result.get("messages") or messages)
-            )
             usage = self._merge_usage(usage, result.get("usage") or {})
             snippets.extend(result.get("context_snippets") or [])
             tool_trace.extend(result.get("tool_calls") or [])
@@ -1297,57 +1331,99 @@ class WorkflowStreamingMixin:
                 result.get("injection_findings") or []
             )
 
-            # Final turn: no tools offered, so the model must answer - streamed.
-            # Through the same pump as the plain node: `to_thread` moved the
-            # *call* off the loop and then iterated the result on it, which is
-            # where the tokens actually arrive.
-            content_parts: List[str] = []
-            # Built and pulled on the producer thread, kept afterwards, and
-            # built only for a turn that committed a handle - all three for
-            # the reasons the plain node states.
-            streamed: Dict[str, ScrubbedTokenStream] = {}
-
-            def produce():
-                raw = self.llm.stream_messages(messages, adapters, user_id=user_id)
-                if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
-                    return raw
-                filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
-                streamed["stream"] = filtered
-                return filtered
-
-            async for event in self._pumped(
-                invocation,
-                produce,
-                label="agent.files_v1",
-                cancel_event=cancel_event,
-                observation=observation,
-            ):
-                kind = event.get("event")
-                if kind == "token":
-                    content_parts.append(str(event.get("data") or ""))
+            # With a provider that keeps its own continuation, the state the
+            # rounds just accepted is what the final answer runs on. Either
+            # the record already ends on an accepted answer, which is then
+            # the answer, or it ends on a tool round and the stream consumes
+            # the accepted state with only the record past it - producing
+            # nothing to accept, since nothing follows the final answer.
+            accepted = stream_context.continuation
+            native = accepted is not None and accepted.strategy in NATIVE_STRATEGIES
+            answer = self._accepted_terminal_answer(stream_context) if native else None
+            if answer is not None:
+                # The worker's last model call answered without tools and
+                # the parent accepted that answer into the provider's own
+                # state. Asking the provider again would rewind the state
+                # it just accepted for the sake of a token-by-token stream,
+                # so the accepted text goes to the client as it stands -
+                # one chunk rather than many.
+                content = answer.content
+                if content:
                     emitted_tokens = True
-                    yield event
-                elif kind == "message_done":
-                    data = event.get("data") or {}
-                    usage = self._merge_usage(usage, data.get("usage") or {})
-                    if data.get("content"):
-                        content_parts = [str(data["content"])]
-                elif kind == "error":
-                    if emitted_tokens:
-                        # A backend failure used to reach the handler below as
-                        # an exception; the pump reports it as an event,
-                        # because it happens on a thread. Same handling, so
-                        # the answer already on the client's screen still gets
-                        # its turn closed instead of a bare error after it.
-                        raise _StreamFailed(
-                            (event.get("data") or {}).get("message", "stream failed")
+                    yield {"event": "token", "data": content}
+            else:
+                if native:
+                    cursor = accepted.through_operation_seq
+                    offered = self.agent_prompt(
+                        invocation, stream_context, after_operation_seq=cursor
+                    )
+                    messages = (
+                        offered if offered is not None
+                        else self._unlabelled_agent_prompt(
+                            invocation, stream_context, stream_context.transcript,
+                            after_operation_seq=cursor,
                         )
-                    yield event
-                    return
-                elif kind == "cancel_ack":
-                    yield event
-                    return
-            content = "".join(content_parts)
+                    )
+                else:
+                    offered = self.agent_prompt(
+                        invocation, stream_context, replace_terminal_answer=True
+                    )
+                    messages = (
+                        offered if offered is not None
+                        else (result.get("messages") or messages)
+                    )
+
+                # Final turn: no tools offered, so the model must answer -
+                # streamed. Through the same pump as the plain node:
+                # `to_thread` moved the *call* off the loop and then iterated
+                # the result on it, which is where the tokens actually arrive.
+                content_parts: List[str] = []
+
+                def produce():
+                    raw = self.llm.stream_messages(
+                        messages, adapters, user_id=user_id,
+                        **({"continuation": accepted} if native else {}),
+                    )
+                    if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
+                        return raw
+                    filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
+                    streamed["stream"] = filtered
+                    return filtered
+
+                async for event in self._pumped(
+                    invocation,
+                    produce,
+                    label="agent.files_v1",
+                    cancel_event=cancel_event,
+                    observation=observation,
+                ):
+                    kind = event.get("event")
+                    if kind == "token":
+                        content_parts.append(str(event.get("data") or ""))
+                        emitted_tokens = True
+                        yield event
+                    elif kind == "message_done":
+                        data = event.get("data") or {}
+                        usage = self._merge_usage(usage, data.get("usage") or {})
+                        if data.get("content"):
+                            content_parts = [str(data["content"])]
+                    elif kind == "error":
+                        if emitted_tokens:
+                            # A backend failure used to reach the handler
+                            # below as an exception; the pump reports it as
+                            # an event, because it happens on a thread. Same
+                            # handling, so the answer already on the client's
+                            # screen still gets its turn closed instead of a
+                            # bare error after it.
+                            raise _StreamFailed(
+                                (event.get("data") or {}).get("message", "stream failed")
+                            )
+                        yield event
+                        return
+                    elif kind == "cancel_ack":
+                        yield event
+                        return
+                content = "".join(content_parts)
         except Exception as exc:  # noqa: BLE001 - degrade to a plain answer
             # Tool health before salvage: the serve began and then failed,
             # which is a breaker failure whatever the client-facing recovery
@@ -1428,13 +1504,20 @@ class WorkflowStreamingMixin:
             "injection_findings": session.get("injection_findings", []),
         }
         # Read out of the stream the parent just served, never out of
-        # `canonical_model_response`. That field holds the worker's discarded
-        # pre-stream draft - correctly, it happened - and the answer this turn
-        # is delivering is the one that came out of the producer above.
-        citations = self._streamed_citations(
-            streamed.get("stream"), invocation,
-            citations_intact=stream_context.citations_intact,
-        )
+        # `canonical_model_response` - unless the answer is that record. On
+        # a transcript-shaped backend that field holds the worker's
+        # discarded pre-stream draft, correctly, and the answer this turn is
+        # delivering came out of the producer above. Under a native
+        # continuation the accepted answer was delivered as it stands, and
+        # its citations are read the way the blocking path reads them: out
+        # of the canonical copy of exactly the turn that was delivered.
+        if answer is not None:
+            citations = self._recorded_citations(stream_context, invocation, content)
+        else:
+            citations = self._streamed_citations(
+                streamed.get("stream"), invocation,
+                citations_intact=stream_context.citations_intact,
+            )
         if citations:
             completed["validated_citations"] = citations
         yield {"event": "tool_result", "data": dict(completed)}

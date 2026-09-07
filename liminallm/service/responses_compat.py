@@ -114,6 +114,81 @@ def to_tools(tools: List[dict]) -> List[dict]:
     return out
 
 
+#: The fields the wire documents as output-only, by item type. A field
+#: listed here is removed before an item is replayed; every other field on
+#: every item goes back as it came. This is the whole of what the serializer
+#: knows about the items it carries, and it stays this short on purpose.
+OUTPUT_ONLY_FIELDS: Dict[str, tuple] = {
+    "reasoning": ("status",),
+    "compaction": ("created_by",),
+}
+
+
+#: The one status under which a reply is a turn. The wire also reports
+#: `failed`, `incomplete`, `cancelled`, `in_progress` and `queued`, and a
+#: reply under any of them is provisional at best: a call that looks whole
+#: inside a reply cut off at its output limit is part of a reply that was
+#: cut off.
+COMPLETED = "completed"
+
+
+def rejection_reason(response: Any, *, strict: bool) -> Optional[str]:
+    """Why this reply is not a turn to accept, or None when it is.
+
+    `strict` is the native contract: the status must say completed. A
+    compatible provider on this wire may omit the field, and is refused
+    only when it names a state that is not completion. Either way a reply
+    with no output items is nothing to accept.
+    """
+    status = getattr(response, "status", None)
+    if status != COMPLETED and (strict or status is not None):
+        details = getattr(response, "incomplete_details", None)
+        why = getattr(details, "reason", None)
+        return f"status {status!r}" + (f" ({why})" if why else "")
+    if not (getattr(response, "output", None) or []):
+        return "no output items"
+    return None
+
+
+def replayable_output(response: Any) -> List[Dict[str, Any]]:
+    """`response.output` as the items the next request replays, exactly.
+
+    The SDK's own serialization rather than a field list of ours, and only
+    the fields the provider actually sent. The client builds a reply without
+    validating it: an optional field the wire omitted is filled with None,
+    and an item type this SDK has no class for is held in the first class
+    that will take it, defaults and all. `exclude_unset` returns each item to
+    its wire keys - a null the provider sent is set and stays, a null the SDK
+    supplied was never set and goes - so the tape is the provider's, not a
+    function of which SDK happened to be installed. Fields the SDK has no
+    name for ride along as extras. The only edits made here are the ones
+    `OUTPUT_ONLY_FIELDS` names. Order is kept because order is meaning, and
+    an item type nobody has seen passes through whole for the same reason.
+    Serializer warnings are off: on a coerced item the serializer would print
+    the item's repr, opaque values included, to stderr.
+
+    Refuses rather than degrades. A reply with no `model_dump` is one the SDK
+    did not model, and an output that is not a list of mappings is one nothing
+    could replay. Either would put a broken turn in front of the model next
+    time, so neither becomes a candidate.
+    """
+    dump = getattr(response, "model_dump", None)
+    if not callable(dump):
+        raise ValueError("a Responses reply without model_dump cannot be replayed")
+    output = dump(mode="json", exclude_unset=True, warnings=False).get("output")
+    if not isinstance(output, list):
+        raise ValueError("a Responses reply without an output list cannot be replayed")
+    items: List[Dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            raise ValueError("a Responses output item that is not a mapping cannot be replayed")
+        kept = dict(item)
+        for name in OUTPUT_ONLY_FIELDS.get(str(kept.get("type") or ""), ()):
+            kept.pop(name, None)
+        items.append(kept)
+    return items
+
+
 def usage_dict(response: Any) -> Dict[str, int]:
     """Responses usage, mapped to the internal shape plus the richer fields.
 
@@ -174,9 +249,11 @@ def tool_calls_of(response: Any) -> List[Dict[str, str]]:
 
 def assistant_message(content: str, calls: List[Dict[str, str]]) -> Dict[str, Any]:
     """A chat-shaped assistant message for the loop to append, so the next
-    round's history converts back through to_input_items. (Reasoning items
-    are not carried between rounds; o-series models redo their reasoning per
-    round, which costs tokens but keeps the loop provider-agnostic.)"""
+    round's history converts back through to_input_items. Reasoning items
+    are not on it: the transcript is provider-agnostic on purpose. A backend
+    declared OpenAI-native carries them in its own tape instead (see
+    `replayable_output`); any other one has the model reason again per
+    round."""
     msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
     if calls:
         msg["tool_calls"] = [

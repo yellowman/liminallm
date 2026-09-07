@@ -35,6 +35,7 @@ class TestContextWindows:
         ("gemini-3-pro-image-preview", 131_072),
         # OpenAI - tier splits within one version.
         ("gpt-5.2", 400_000),
+        ("gpt-6-astra", 1_050_000),
         ("gpt-5.6-sol", 1_050_000),
         ("gpt-5.6-terra", 1_050_000),
         ("gpt-5.5-pro", 1_050_000),
@@ -57,6 +58,7 @@ class TestContextWindows:
         ("grok-4.20-0309-reasoning", 1_000_000),
         ("grok-build-0.1", 256_000),
         ("deepseek-reasoner", 128_000),
+        ("glm-5.3", 1_000_000),
         ("glm-5.2", 1_000_000),
         ("glm-5.1", 200_000),
         ("glm-4.7", 200_000),
@@ -208,6 +210,7 @@ class TestTemperaturePolicy:
         ("glm-4.7-flash", TemperaturePolicy.TUNABLE),
         ("deepseek-chat", TemperaturePolicy.TUNABLE),
         ("Baichuan4-Turbo", TemperaturePolicy.TUNABLE),
+        ("gpt-6-astra", TemperaturePolicy.OMIT),
         ("minimax-m3", TemperaturePolicy.TUNABLE),
         ("mistral-medium-3-5", TemperaturePolicy.TUNABLE),
         ("command-a-03-2025", TemperaturePolicy.TUNABLE),
@@ -265,6 +268,23 @@ class TestTemperaturePolicy:
         """Most unknown ids are conventional open models on a self-hosted
         server, and nothing is sent unless someone asked for it anyway."""
         assert temperature_policy("acme-llm-9") is TemperaturePolicy.TUNABLE
+
+    def test_a_documented_removal_does_not_spread_to_its_whole_generation(self):
+        """The removal is written where the evidence is.
+
+        OpenAI documents the unsupported sampling parameters for GPT-6 Astra,
+        not for every id that starts `gpt-6`, and this table's default exists
+        because an unrecognized name is usually somebody's own server. A row
+        at the generation would drop an operator's configured temperature for
+        a model whose contract nobody checked - so Astra and its dated
+        snapshots are covered, and a sibling keeps the default until it is
+        looked up.
+        """
+        assert temperature_policy("gpt-6-astra") is TemperaturePolicy.OMIT
+        assert (
+            temperature_policy("gpt-6-astra-2026-09-03") is TemperaturePolicy.OMIT
+        )
+        assert temperature_policy("gpt-6-custom") is TemperaturePolicy.TUNABLE
 
     def test_the_backend_sends_no_temperature_by_default(self):
         from liminallm.service.model_backend import ApiAdapterBackend

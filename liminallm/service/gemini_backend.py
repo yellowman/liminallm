@@ -16,11 +16,18 @@ conversation resumes mid-history on this provider the same as on any other.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import httpx
 
 from liminallm.logging import get_logger
+from liminallm.service.continuation import (
+    GEMINI_NATIVE_V1,
+    ContinuationMismatch,
+    ModelTurnRejected,
+    ProviderContinuation,
+)
 from liminallm.service.model_backend import (
     CancellableStream,
     StreamAbortHandle,
@@ -38,10 +45,13 @@ _UNSUPPORTED_SCHEMA_KEYS = {"$schema", "additionalProperties"}
 
 # Gemini attaches a thoughtSignature to functionCall parts and rejects a
 # resumed history whose functionCall lacks one (INVALID_ARGUMENT, live).
-# The signature rides the chat-shaped assistant_message as a vendor extra so
-# the provider-agnostic loop round-trips it untouched. For a history built
-# elsewhere (another provider, a hand-written test), Google documents this
-# placeholder as the accepted stand-in:
+# The signatures ride the native continuation, in the candidate the parent
+# accepted, and never the chat-shaped reply that crosses to the worker; the
+# tool rounds and the final streamed answer replay that continuation. A
+# history rebuilt from the chat shape with no accepted state behind it -
+# another provider's, a hand-written test's - gets the placeholder Google
+# documents as the accepted stand-in, which the wire takes (measured) at the
+# cost of the reasoning it stands in for:
 # https://ai.google.dev/gemini-api/docs/thought-signatures
 THOUGHT_SIGNATURE_PLACEHOLDER = "context_engineering_is_the_way_to_go"
 
@@ -170,8 +180,7 @@ def to_contents(messages: List[dict]) -> Tuple[Optional[dict], List[dict]]:
                         "name": fn.get("name") or tc.get("name") or "",
                         "args": _parse_args(fn.get("arguments") or tc.get("arguments")),
                     },
-                    "thoughtSignature": tc.get("thought_signature")
-                    or THOUGHT_SIGNATURE_PLACEHOLDER,
+                    "thoughtSignature": THOUGHT_SIGNATURE_PLACEHOLDER,
                 })
             emit("model", parts)
             continue
@@ -213,6 +222,23 @@ def _candidate_parts(payload: dict) -> List[dict]:
     return (candidates[0].get("content") or {}).get("parts") or []
 
 
+def finish_reason(payload: dict) -> Optional[str]:
+    """Why the selected candidate stopped, as the wire reports it, or None.
+
+    `STOP` is the one reason under which the candidate is a turn. The wire
+    also reports `MAX_TOKENS`, `SAFETY`, `RECITATION`,
+    `MALFORMED_FUNCTION_CALL` and others, and a candidate under any of them
+    is provisional at best: a call that looks whole in a candidate that hit
+    its output limit is part of a candidate that was cut off. A reply with
+    no candidate reports nothing, and nothing is nothing to accept.
+    """
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        return None
+    reason = candidates[0].get("finishReason")
+    return str(reason) if reason else None
+
+
 def candidate_text(payload: dict) -> str:
     return "".join(
         p.get("text") or "" for p in _candidate_parts(payload) if "text" in p
@@ -222,28 +248,55 @@ def candidate_text(payload: dict) -> str:
 def function_calls_of(payload: dict) -> List[Dict[str, str]]:
     """functionCall parts in the internal {id, name, arguments} shape.
 
-    Gemini carries no call id; a synthetic one keyed by position keeps the
-    loop's bookkeeping working, and the resume path keys functionResponse by
-    name, so nothing downstream depends on the id surviving a round trip.
+    A synthetic id keyed by position keeps the loop's bookkeeping working
+    whether or not the wire sent one (3.x models do), and the resume path
+    keys functionResponse by name, which the wire accepts with or without
+    the provider's id (measured). Nothing of the part beyond name and
+    arguments comes out here: its signature is the provider's state, kept in
+    the native continuation and not on anything that crosses to the worker.
     """
     calls = []
     for i, part in enumerate(_candidate_parts(payload)):
         fc = part.get("functionCall")
         if fc:
-            call = {
+            calls.append({
                 "id": f"gemini-call-{i}-{fc.get('name') or 'fn'}",
                 "name": fc.get("name") or "",
                 "arguments": json.dumps(fc.get("args") or {}),
-            }
-            if part.get("thoughtSignature"):
-                call["thought_signature"] = part["thoughtSignature"]
-            calls.append(call)
+            })
     return calls
 
 
+def selected_content(payload: dict) -> Optional[dict]:
+    """The selected candidate's complete `content`, as the model produced it.
+
+    Every part, in order, with whatever rides on it: a `thoughtSignature` on
+    a functionCall, on a text part, on a part whose text is empty, a thought
+    part, a part type this code has no name for. The native continuation
+    replays this whole. Nothing is read out of it here and nothing is put
+    back by a rule of ours: on a turn the parent continues natively - the
+    tool rounds and the final streamed answer alike - the placeholder
+    `to_contents` supplies for a history built elsewhere never enters the
+    conversation, and a signature the provider sent is never described as
+    intact by anything but its own bytes.
+
+    None when there is no candidate content to keep: a blocked or empty
+    reply adds nothing to the conversation, and nothing is invented for it.
+    """
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        return None
+    content = candidates[0].get("content")
+    if not isinstance(content, dict) or not content.get("parts"):
+        return None
+    kept = deepcopy(content)
+    kept.setdefault("role", "model")
+    return kept
+
+
 def _assistant_message(content: str, calls: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Chat-shaped assistant message, carrying each call's thoughtSignature as
-    a vendor extra so the loop's verbatim round trip preserves it."""
+    """Chat-shaped assistant message for the loop to append. It carries no
+    signature: that is the provider's state, in the native continuation."""
     msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
     if calls:
         msg["tool_calls"] = [
@@ -251,8 +304,6 @@ def _assistant_message(content: str, calls: List[Dict[str, str]]) -> Dict[str, A
                 "id": c["id"],
                 "type": "function",
                 "function": {"name": c["name"], "arguments": c["arguments"]},
-                **({"thought_signature": c["thought_signature"]}
-                   if c.get("thought_signature") else {}),
             }
             for c in calls
         ]
@@ -269,6 +320,7 @@ class GeminiBackend:
 
     mode = "gemini_native"
     provider = "gemini"
+    backend_mode = "gemini_native"
 
     def __init__(
         self,
@@ -476,6 +528,22 @@ class GeminiBackend:
             "adapters_applied": applied,
         }
 
+    @staticmethod
+    def declared_continuation() -> str:
+        return GEMINI_NATIVE_V1
+
+    @staticmethod
+    def _accepted(continuation: Optional[ProviderContinuation]) -> Optional[dict]:
+        """The accepted state this adapter wrote, or None.
+
+        Only its own strategy's. Another strategy's payload is another
+        representation of the conversation, and replaying it here would be
+        the substitution the parent refuses.
+        """
+        if continuation is None or continuation.strategy != GEMINI_NATIVE_V1:
+            return None
+        return continuation.payload
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -483,16 +551,59 @@ class GeminiBackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> dict:
+        """One tool-calling turn, and the candidate continuation it makes.
+
+        The wire is stateless, so the whole accepted conversation goes first
+        and only what the parent did since follows. The system instruction
+        is part of that state: a tail carries none, and a request without
+        one is a different conversation. What comes back as the candidate is
+        the request's contents plus the selected candidate's complete
+        content, verbatim - the parent decides whether it is accepted.
+        """
+        accepted = self._accepted(continuation)
+        if accepted is not None and continuation.model != self.base_model:
+            # One model's conversation, signatures included. Refused before
+            # anything is sent rather than after a paid call the parent
+            # would refuse anyway.
+            raise ContinuationMismatch(
+                f"the accepted continuation is for {continuation.model!r} and "
+                f"this backend serves {self.base_model!r}"
+            )
         body, _ = self._request_body(messages, adapters, tools=tools)
+        if accepted is not None:
+            body["contents"] = deepcopy(accepted.get("contents") or []) + body["contents"]
+            if "systemInstruction" not in body and accepted.get("systemInstruction"):
+                body["systemInstruction"] = deepcopy(accepted["systemInstruction"])
         payload = self._post("generateContent", body).json()
+        # Provisional until the wire says the candidate finished. Read here
+        # because only this adapter knows the wire's words for it.
+        reason = finish_reason(payload)
+        if reason != "STOP":
+            raise ModelTurnRejected(
+                "the candidate is not a turn to accept: "
+                + (f"finishReason {reason}" if reason else "no candidate finished")
+            )
         content = candidate_text(payload)
         calls = function_calls_of(payload)
+        selected = selected_content(payload)
         return {
             "content": content,
             "tool_calls": calls,
             "assistant_message": _assistant_message(content, calls),
             "usage": usage_dict(payload),
+            "continuation": {
+                "strategy": GEMINI_NATIVE_V1,
+                "provider": self.provider,
+                "transport": "generateContent",
+                "model": self.base_model,
+                "payload": {
+                    "systemInstruction": deepcopy(body.get("systemInstruction")),
+                    "contents": deepcopy(body["contents"])
+                    + ([selected] if selected is not None else []),
+                },
+            },
         }
 
     #: The stream below attaches its response's socket to the abort handle,
@@ -507,13 +618,20 @@ class GeminiBackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         """SSE over streamGenerateContent?alt=sse: each `data:` line is a
         chunk whose candidate parts carry text deltas; the last one carries
-        usageMetadata."""
+        usageMetadata.
+
+        With a native `continuation`, the accepted conversation goes first
+        and the messages are the record past it. Consumed, never advanced:
+        what the stream says is the answer, and no continuation comes back.
+        """
         handle = StreamAbortHandle()
         return CancellableStream(
-            self._generate_stream_impl(messages, adapters, handle), handle
+            self._generate_stream_impl(messages, adapters, handle, continuation),
+            handle,
         )
 
     def _generate_stream_impl(
@@ -521,8 +639,23 @@ class GeminiBackend:
         messages: List[dict],
         adapters: List[dict],
         abort_handle: StreamAbortHandle,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         body, applied = self._request_body(messages, adapters)
+        accepted = self._accepted(continuation)
+        if accepted is not None:
+            if continuation.model != self.base_model:
+                yield {"event": "error", "data": {
+                    "code": "continuation_mismatch",
+                    "message": (
+                        f"the accepted continuation is for {continuation.model!r} "
+                        f"and this backend serves {self.base_model!r}"
+                    ),
+                }}
+                return
+            body["contents"] = deepcopy(accepted.get("contents") or []) + body["contents"]
+            if "systemInstruction" not in body and accepted.get("systemInstruction"):
+                body["systemInstruction"] = deepcopy(accepted["systemInstruction"])
         url = self._url(self.base_model, "streamGenerateContent") + "?alt=sse"
         full_content = ""
         usage: Dict[str, int] = {}

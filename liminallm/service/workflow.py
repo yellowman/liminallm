@@ -1964,6 +1964,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         invocation: Invocation,
         context: InvocationContext,
         transcript: TrustedTranscript,
+        *,
+        after_operation_seq: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """The trusted conversation with nothing offered in it.
 
@@ -1979,13 +1981,27 @@ class WorkflowEngine(WorkflowStreamingMixin):
         and the offered form are cut at the same point. A fallback that ended
         one exchange later than the prompt it replaces would be a different
         conversation, which is the whole thing this layer is for.
+
+        With `after_operation_seq`, only the tail: the record past that
+        operation, with no base prompt in front of it. What a provider that
+        already holds the opening in its own continuation is sent.
         """
+        table = CitationTable(nonce=invocation.citations.nonce)
+        # A registry is needed to render, even when nothing in the table can
+        # be looked up in it. The tail is asked for from the path that has
+        # offers off, where the context may carry none.
+        registry = context.source_registry or SourceRegistry()
+        if after_operation_seq is not None:
+            messages, _markers, _placed = rebuild_agent_messages(
+                (), (), transcript.after(after_operation_seq), table, registry
+            )
+            return messages
         messages, _markers, _placed = rebuild_agent_messages(
             context.initial_messages,
             context.initial_grounded_messages,
             transcript,
-            CitationTable(nonce=invocation.citations.nonce),
-            context.source_registry,
+            table,
+            registry,
         )
         return messages
 
@@ -1995,6 +2011,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
         context: InvocationContext,
         *,
         replace_terminal_answer: bool = False,
+        after_operation_seq: Optional[int] = None,
+        instruct_opening: bool = False,
+        reserved_tokens: int = 0,
     ) -> Optional[List[Dict[str, Any]]]:
         """One agent model call's conversation, as the parent builds it.
 
@@ -2032,7 +2051,29 @@ class WorkflowEngine(WorkflowStreamingMixin):
         The record keeps the draft either way. That the model produced one is
         a fact about the turn; where a replacement starts from is a different
         question, and the cut is a view rather than an edit.
+
+        Two more for a provider that keeps its own continuation. With
+        `after_operation_seq` the whole conversation is still priced and
+        committed - the provider replays all of it - but what comes back is
+        only the record past that operation, since the opening is already in
+        the provider's hands and is not sent again. And `instruct_opening`
+        puts the citation instruction on the opening whether or not a marker
+        is placed in it yet: that opening is frozen in the provider's
+        continuation, so a marker that a later round places can only be
+        answered by an instruction that was already there. `reserved_tokens`
+        is what the provider's continuation costs on top of the rendered
+        conversation - the conversation is what gets priced, and the tape
+        carries reasoning it does not.
+
+        A cursor and a replaced terminal answer do not compose: the cut
+        removes the draft from the view, and the provider's continuation
+        still holds it. Refused rather than rendered as an empty tail.
         """
+        if replace_terminal_answer and after_operation_seq is not None:
+            raise ValueError(
+                "a provider continuation cannot replace a terminal answer: "
+                "the draft the cut removes is still in the accepted state"
+            )
         registry = context.source_registry
         if not self.CITATION_OFFERS_ENABLED or registry is None:
             return None
@@ -2040,7 +2081,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
         if replace_terminal_answer:
             transcript = transcript.without_trailing_answer()
         if not context.citations_intact or not invocation.citation_budget_intact:
-            return self._unlabelled_agent_prompt(invocation, context, transcript)
+            return self._unlabelled_agent_prompt(
+                invocation, context, transcript,
+                after_operation_seq=after_operation_seq,
+            )
 
         def rebuild(table: CitationTable):
             return rebuild_agent_messages(
@@ -2072,7 +2116,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # citations rather than the service.
             messages, markers, placed = rebuild(table)
             return OfferRender(
-                messages=prepared(instruct(messages) if markers else messages),
+                messages=prepared(
+                    instruct(messages) if markers or instruct_opening else messages
+                ),
                 markers=tuple(markers),
                 placed=tuple(placed),
             )
@@ -2083,22 +2129,36 @@ class WorkflowEngine(WorkflowStreamingMixin):
             candidates=context.provenance_bindings,
             render=render,
             counter=self.llm.token_counter(),
-            budget=self.prompt_budget(),
+            budget=max(0, self.prompt_budget() - int(reserved_tokens or 0)),
         )
         if not choice.fits:
             invocation.poison_citation_budget()
-            return self._unlabelled_agent_prompt(invocation, context, transcript)
+            return self._unlabelled_agent_prompt(
+                invocation, context, transcript,
+                after_operation_seq=after_operation_seq,
+            )
         table = invocation.extend_citations(registry, list(choice.granted))
         final, markers, _placed = rebuild(table)
-        instructed = instruct(final) if markers else final
+        instructed = instruct(final) if markers or instruct_opening else final
         if prepared(instructed) != choice.messages:
             # The table that was committed did not reproduce the prompt that
             # was priced from its speculative twin. What the model would be
             # sent is not what was measured, so nothing here is trustworthy
             # enough to send - and it will not become so on the next call.
             invocation.poison_citation_budget()
-            return self._unlabelled_agent_prompt(invocation, context, transcript)
-        return instructed
+            return self._unlabelled_agent_prompt(
+                invocation, context, transcript,
+                after_operation_seq=after_operation_seq,
+            )
+        if after_operation_seq is None:
+            return instructed
+        # The same table the whole conversation was just committed against,
+        # over the record past the cursor alone. Rendering is per entry, so
+        # this is the suffix of `final` and nothing else.
+        tail, _markers, _placed = rebuild_agent_messages(
+            (), (), transcript.after(after_operation_seq), table, registry
+        )
+        return tail
 
     def _offered_context(
         self,

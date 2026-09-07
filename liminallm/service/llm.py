@@ -6,6 +6,11 @@ from typing import Any, Iterator, List, Optional
 from liminallm.config import AdapterMode, resolve_provider_endpoint
 from liminallm.logging import get_logger
 from liminallm.service import local_format
+from liminallm.service.continuation import (
+    NATIVE_STRATEGIES,
+    ContinuationMismatch,
+    ProviderContinuation,
+)
 from liminallm.service.model_backend import (
     ApiAdapterBackend,
     LocalJaxLoRABackend,
@@ -172,22 +177,36 @@ class LLMService:
         adapters: Optional[List[dict]] = None,
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> dict:
         """One tool-calling turn over a caller-built message list.
 
         Unlike generate(), the caller owns the messages so it can append tool
         results and iterate.
+
+        With a native `continuation`, the messages are the tail of a
+        conversation whose opening is already in the provider's tape - and
+        the adapter guidance with it, placed once when that opening was
+        prepared. Preparing the tail would put the guidance in front of a tool
+        result, a second time, on every round. So the tail goes as it is, and
+        "exactly once" stays true by being placed where the tape began.
         """
         if not self.supports_tools:
             raise RuntimeError("active backend does not support tool calling")
-        prepared, normalized_adapters = self._prepare_backend_messages(
-            messages, adapters
-        )
+        if continuation is not None and continuation.strategy in NATIVE_STRATEGIES:
+            prepared = list(messages or [])
+            normalized_adapters = self._normalize_adapters(adapters or [])
+        else:
+            prepared, normalized_adapters = self._prepare_backend_messages(
+                messages, adapters
+            )
+        extra = {"continuation": continuation} if continuation is not None else {}
         return self.backend.generate_with_tools(
             prepared,
             tools,
             normalized_adapters,
             user_id=user_id,
+            **extra,
         )
 
     def stream_messages(
@@ -196,17 +215,39 @@ class LLMService:
         adapters: Optional[List[dict]] = None,
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> Iterator[dict]:
         """Stream a reply for a caller-built message list.
 
         Used by the attachment agent to stream its final answer after the
         tool-calling rounds have assembled the message history.
+
+        With a native `continuation`, the messages are the record past the
+        accepted state and go as they are - the opening, guidance included,
+        is already in the provider's hands - and the backend must be the one
+        that wrote the state. A chat-shaped record changes nothing here: the
+        whole conversation is prepared and sent, as it always was.
         """
-        prepared, normalized_adapters = self._prepare_backend_messages(
-            messages, adapters
-        )
+        native = continuation is not None and continuation.strategy in NATIVE_STRATEGIES
+        if native:
+            declare = getattr(self.backend, "declared_continuation", None)
+            declared = declare() if callable(declare) else None
+            if declared != continuation.strategy:
+                raise ContinuationMismatch(
+                    f"the accepted continuation is {continuation.strategy} and "
+                    f"the backend streaming this answer declares {declared or 'nothing'}"
+                )
+            prepared = list(messages or [])
+            normalized_adapters = self._normalize_adapters(adapters or [])
+        else:
+            prepared, normalized_adapters = self._prepare_backend_messages(
+                messages, adapters
+            )
         return self.backend.generate_stream(
-            prepared, normalized_adapters, user_id=user_id
+            prepared,
+            normalized_adapters,
+            user_id=user_id,
+            **({"continuation": continuation} if native else {}),
         )
 
     @property
@@ -508,6 +549,7 @@ class LLMService:
             return ApiAdapterBackend(
                 self.base_model,
                 adapter_mode="api_adapters",
+                backend_mode=mode,
                 api_key=resolved_key,
                 base_url=resolved_base,
                 adapter_server_model=adapter_server_model,
@@ -525,6 +567,7 @@ class LLMService:
         return ApiAdapterBackend(
             self.base_model,
             adapter_mode=adapter_mode,
+            backend_mode=mode,
             api_key=api_key,
             base_url=base_url,
             adapter_server_model=adapter_server_model,
