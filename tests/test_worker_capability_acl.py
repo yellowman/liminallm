@@ -96,7 +96,8 @@ def _model_asks(engine, monkeypatch, calls, content=""):
     """The backend answering one turn with the tool calls it wants."""
     seen: dict = {}
 
-    def _generate_with_tools(messages, tools, adapters, *, user_id=None):
+    def _generate_with_tools(messages, tools, adapters, *, user_id=None,
+                             context_window=None):
         seen["tools"] = list(tools or [])
         return {
             "content": content,

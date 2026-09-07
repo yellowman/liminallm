@@ -132,6 +132,28 @@ OUTPUT_ONLY_FIELDS: Dict[str, tuple] = {
 COMPLETED = "completed"
 
 
+#: The item the wire emits when it compacts the conversation on its own
+#: side: an encrypted summary that stands in for everything before it, and
+#: is replayed in their place. Opaque here like every other value.
+COMPACTION = "compaction"
+
+
+def replay_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The tape the next request replays: from the latest compaction item on.
+
+    A compaction item stands in for what precedes it, so what precedes it is
+    not sent again, and the latest one stands in for every earlier one too.
+    From it on, every item goes back in the order it came, whatever its type
+    - reasoning, message, call, or a type nobody here has a name for. A tape
+    with no compaction item is replayed whole. The rule reads one field, the
+    type, and reads nothing inside any item.
+    """
+    for index in range(len(items) - 1, -1, -1):
+        if items[index].get("type") == COMPACTION:
+            return list(items[index:])
+    return list(items)
+
+
 def rejection_reason(response: Any, *, strict: bool) -> Optional[str]:
     """Why this reply is not a turn to accept, or None when it is.
 

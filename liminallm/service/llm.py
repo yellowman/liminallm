@@ -178,6 +178,7 @@ class LLMService:
         *,
         user_id: Optional[str] = None,
         continuation: Optional[ProviderContinuation] = None,
+        context_window: Optional[int] = None,
     ) -> dict:
         """One tool-calling turn over a caller-built message list.
 
@@ -190,6 +191,12 @@ class LLMService:
         prepared. Preparing the tail would put the guidance in front of a tool
         result, a second time, on every round. So the tail goes as it is, and
         "exactly once" stays true by being placed where the tape began.
+
+        `context_window` is the window the caller resolved for this request
+        (`WorkflowEngine.resolved_context_window`): one fact, handed down so
+        a backend keeping provider state sizes that state inside the same
+        window the caller prices the prompt against. A backend keeping none
+        ignores it.
         """
         if not self.supports_tools:
             raise RuntimeError("active backend does not support tool calling")
@@ -201,6 +208,8 @@ class LLMService:
                 messages, adapters
             )
         extra = {"continuation": continuation} if continuation is not None else {}
+        if context_window is not None:
+            extra["context_window"] = context_window
         return self.backend.generate_with_tools(
             prepared,
             tools,

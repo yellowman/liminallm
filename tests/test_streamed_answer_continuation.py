@@ -43,7 +43,8 @@ class NativeModel:
         self.script = list(script)
         self.calls: list = []
 
-    def __call__(self, messages, tools, adapters=None, *, user_id=None, continuation=None):
+    def __call__(self, messages, tools, adapters=None, *, user_id=None, continuation=None,
+                 context_window=None):
         self.calls.append({"messages": [dict(m) for m in messages],
                            "continuation": continuation})
         n = len(self.calls)

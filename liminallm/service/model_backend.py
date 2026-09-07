@@ -12,7 +12,7 @@ import time
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Protocol, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Protocol, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -37,6 +37,7 @@ from liminallm.service.fs import adapter_dir_owner, safe_join
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
     DEFAULT_VOCAB_SIZE,
+    MAX_GENERATION_TOKENS,
     estimate_token_count,
     vocab_size_from_tokenizer,
 )
@@ -486,11 +487,12 @@ class StubBackend:
         *,
         user_id: Optional[str] = None,
         continuation: Optional[ProviderContinuation] = None,
+        context_window: Optional[int] = None,
     ) -> dict:
         """Deterministic tool-calling stand-in for tests.
 
-        `continuation` is accepted and ignored: this backend keeps nothing
-        beyond the transcript, and says so.
+        `continuation` and `context_window` are accepted and ignored: this
+        backend keeps nothing beyond the transcript, and says so.
 
         Calls each offered tool exactly once (in order) before answering, so
         the agent loop is exercised end to end without a live model.
@@ -946,6 +948,51 @@ def requires_responses_for_tools(model_id: str) -> bool:
 #: known to honour it, and omitted for a conventional model, whose request
 #: would otherwise carry a parameter nobody measured against it.
 REASONING_CONTEXT_PREFIXES: Tuple[str, ...] = ("gpt-5.6", "gpt-6-astra")
+
+#: The Responses models under the native strategy that are asked to compact
+#: their own tape (`context_management`), by prefix. The same profile as
+#: the reasoning context above, and kept as its own list because it is a
+#: separate request feature the wire may support on a different set later.
+#: A model outside it is sent no such request: an endpoint that does not
+#: know the parameter refuses the call, and a compaction nobody asked for
+#: is one nobody measured.
+COMPACTION_PREFIXES: Tuple[str, ...] = ("gpt-5.6", "gpt-6-astra")
+
+#: Headroom taken off the resolved window before the provider is told where
+#: to compact. What one more request adds to a tape sitting at the
+#: threshold before the provider sees it again: the reply this request may
+#: write (`MAX_GENERATION_TOKENS`), then the new input the next request
+#: carries - a round of tool results and the offers rendered with them -
+#: and a share of the window for the provider counting tokens differently
+#: from the tokenizer here. A threshold placed too high is refused as an
+#: overflow; one placed too low compacts turns early. Not a benchmark's
+#: number: the window is the deployment's, so the threshold is too.
+COMPACTION_INPUT_HEADROOM = 32_768
+COMPACTION_SAFETY_DIVISOR = 16
+#: Below this a window has no room for compaction to buy anything, and none
+#: is asked for. The 8192 default an unknown model resolves to is under it.
+MIN_COMPACT_THRESHOLD = 32_768
+
+
+def supports_native_compaction(model_id: str) -> bool:
+    """Whether this model is in the profile asked to compact its own tape."""
+    tail = (model_id or "").lower().rsplit("/", 1)[-1]
+    return any(tail.startswith(prefix) for prefix in COMPACTION_PREFIXES)
+
+
+def compact_threshold(window: int) -> Optional[int]:
+    """Where the provider is told to compact, for a window this size.
+
+    The window less the headroom named above, or None when what is left is
+    below the floor: a threshold has to leave the reply and the next input
+    room under the window, and a window that cannot afford that is not
+    compacted, it is budgeted the way it always was.
+    """
+    threshold = (
+        int(window) - int(window) // COMPACTION_SAFETY_DIVISOR
+        - MAX_GENERATION_TOKENS - COMPACTION_INPUT_HEADROOM
+    )
+    return threshold if threshold >= MIN_COMPACT_THRESHOLD else None
 
 
 def supports_reasoning_context(model_id: str) -> bool:
@@ -1529,6 +1576,34 @@ class ApiAdapterBackend:
         items = continuation.payload.get("items")
         return [dict(item) for item in items] if isinstance(items, list) else []
 
+    @staticmethod
+    def _replay_cost(
+        continuation: Optional[ProviderContinuation],
+        *,
+        compacted: bool,
+        usage: Mapping[str, Any],
+    ) -> int:
+        """What the candidate tape costs to replay beyond the rendered
+        conversation: the reasoning its retained items carry.
+
+        The conversation is priced as rendered, and the tape carries the
+        reasoning that rendering does not, so each accepted turn's reported
+        reasoning is what its items add on the next request. A reply the
+        provider compacted stands in for everything before its compaction
+        item; what that item stands in for is not replayed, so its reasoning
+        is not carried either, and the estimate restarts at this turn's own.
+        The compaction item itself is not charged: what it summarizes is
+        text the rendered conversation still prices in full. An estimate,
+        stated as one - over by at most this turn's reasoning when the
+        compaction item came after it - and never the reasoning ever spent
+        on the conversation.
+        """
+        reasoning = usage.get("reasoning_tokens")
+        reasoning = int(reasoning) if isinstance(reasoning, (int, float)) else 0
+        if compacted:
+            return reasoning
+        return (continuation.replay_tokens if continuation is not None else 0) + reasoning
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -1537,12 +1612,19 @@ class ApiAdapterBackend:
         *,
         user_id: Optional[str] = None,
         continuation: Optional[ProviderContinuation] = None,
+        context_window: Optional[int] = None,
     ) -> dict:
         """One turn of an OpenAI-style tool-calling exchange.
 
         Returns the assistant's content, any tool calls it requested, and the
         raw assistant message to append before sending tool results back - the
         caller drives the loop.
+
+        `context_window` is the window the caller resolved for this request,
+        the one it prices the prompt against. Where the provider is told to
+        compact its tape is derived from it and from nothing this adapter
+        discovers on its own - one window fact, not two answers to it.
+        Handed none, the adapter asks for no compaction.
         """
         self._ensure_client()
         if not self.client:
@@ -1592,6 +1674,25 @@ class ApiAdapterBackend:
                 # this conversation contains.
                 items = self._accepted_items(continuation) + items
                 kwargs["include"] = ["reasoning.encrypted_content"]
+                # And, by profile, told where to compact that tape on its
+                # side: at a threshold derived from the window the caller
+                # resolved and handed down. Through `extra_body`, the one
+                # spelling the pinned SDK and the current one both carry to
+                # the wire. Only here, on the path that keeps a tape - a
+                # compaction in a reply nothing continues from would be
+                # thrown away.
+                threshold = (
+                    compact_threshold(context_window)
+                    if context_window and supports_native_compaction(processed["model"])
+                    else None
+                )
+                if threshold is not None:
+                    kwargs["extra_body"] = {
+                        **(kwargs.get("extra_body") or {}),
+                        "context_management": [
+                            {"type": "compaction", "compact_threshold": threshold}
+                        ],
+                    }
             response = self._try_responses(lambda: self.client.responses.create(
                 input=items, **kwargs
             ))
@@ -1620,18 +1721,50 @@ class ApiAdapterBackend:
                     # invocation to the strategy and wire named here. The
                     # native tape is the input that went and the output
                     # that came, in order, serialized by the SDK and edited
-                    # only where the wire documents a field as output-only.
-                    # A compatible provider on this wire keeps nothing: the
-                    # transcript is its whole state.
+                    # only where the wire documents a field as output-only
+                    # - then cut where the provider compacted it, if it
+                    # did: from the latest compaction item on. A compatible
+                    # provider on this wire keeps nothing: the transcript
+                    # is its whole state.
                     result["continuation"] = {
                         "strategy": OPENAI_RESPONSES_NATIVE_V1 if native else CHAT_STRUCTURED_V1,
                         "provider": self.provider,
                         "transport": "responses",
                         "model": processed["model"],
-                        "payload": {
-                            "items": items + responses_compat.replayable_output(response)
-                        } if native else {},
+                        "payload": {},
                     }
+                    if native:
+                        output = responses_compat.replayable_output(response)
+                        tape = responses_compat.replay_items(items + output)
+                        # The wire orders output items as the model's and
+                        # promises nothing about where a compaction item
+                        # falls against a call. A call the cut removed is a
+                        # call the replay state cannot answer: refused
+                        # whole, before anything runs, rather than run on
+                        # an order nobody measured.
+                        retained = {
+                            item.get("call_id")
+                            for item in tape if item.get("type") == "function_call"
+                        }
+                        # Every call, as the rule reads. The cut is a prefix
+                        # cut, so a check of the first call alone would
+                        # answer the same today and a mutation to that form
+                        # survives; it is recorded here rather than left
+                        # for a reader to simplify to, because the rule
+                        # must not depend on the shape of the cut.
+                        lost = [call["id"] for call in calls if call["id"] not in retained]
+                        if lost:
+                            raise ModelTurnRejected(
+                                f"the reply's compaction stands in for {len(lost)} of "
+                                f"its {len(calls)} calls; a call the replay state does "
+                                "not hold is not a turn to accept"
+                            )
+                        result["continuation"]["payload"] = {"items": tape}
+                        result["continuation"]["replay_tokens"] = self._replay_cost(
+                            continuation,
+                            compacted=len(tape) < len(items) + len(output),
+                            usage=result["usage"],
+                        )
                 return result
 
         # A tape that was accepted on /responses has no chat form. Sending
@@ -3251,11 +3384,12 @@ class LocalJaxLoRABackend:
         *,
         user_id: Optional[str] = None,
         continuation: Optional[ProviderContinuation] = None,
+        context_window: Optional[int] = None,
     ) -> dict:
         """One tool-calling turn over the local forward pass.
 
-        `continuation` is accepted and ignored: local serving keeps nothing
-        beyond the transcript, and says so.
+        `continuation` and `context_window` are accepted and ignored: local
+        serving keeps nothing beyond the transcript, and says so.
 
         Same dict shape as the API backend - content, tool_calls with
         arguments as a JSON string, assistant_message, usage - so nothing
