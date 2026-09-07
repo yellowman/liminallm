@@ -16,11 +16,13 @@ conversation resumes mid-history on this provider the same as on any other.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import httpx
 
 from liminallm.logging import get_logger
+from liminallm.service.continuation import GEMINI_NATIVE_V1, ProviderContinuation
 from liminallm.service.model_backend import (
     CancellableStream,
     StreamAbortHandle,
@@ -239,6 +241,32 @@ def function_calls_of(payload: dict) -> List[Dict[str, str]]:
                 call["thought_signature"] = part["thoughtSignature"]
             calls.append(call)
     return calls
+
+
+def selected_content(payload: dict) -> Optional[dict]:
+    """The selected candidate's complete `content`, as the model produced it.
+
+    Every part, in order, with whatever rides on it: a `thoughtSignature` on
+    a functionCall, on a text part, on a part whose text is empty, a thought
+    part, a part type this code has no name for. The native continuation
+    replays this whole. Nothing is read out of it here and nothing is put
+    back by a rule of ours - the placeholder `to_contents` supplies for a
+    history built elsewhere never enters a conversation this provider
+    produced itself, and a signature the provider sent is never described
+    as intact by anything but its own bytes.
+
+    None when there is no candidate content to keep: a blocked or empty
+    reply adds nothing to the conversation, and nothing is invented for it.
+    """
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        return None
+    content = candidates[0].get("content")
+    if not isinstance(content, dict) or not content.get("parts"):
+        return None
+    kept = deepcopy(content)
+    kept.setdefault("role", "model")
+    return kept
 
 
 def _assistant_message(content: str, calls: List[Dict[str, str]]) -> Dict[str, Any]:
@@ -477,6 +505,18 @@ class GeminiBackend:
             "adapters_applied": applied,
         }
 
+    @staticmethod
+    def _accepted(continuation: Optional[ProviderContinuation]) -> Optional[dict]:
+        """The accepted state this adapter wrote, or None.
+
+        Only its own strategy's. Another strategy's payload is another
+        representation of the conversation, and replaying it here would be
+        the substitution the parent refuses.
+        """
+        if continuation is None or continuation.strategy != GEMINI_NATIVE_V1:
+            return None
+        return continuation.payload
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -484,16 +524,43 @@ class GeminiBackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> dict:
+        """One tool-calling turn, and the candidate continuation it makes.
+
+        The wire is stateless, so the whole accepted conversation goes first
+        and only what the parent did since follows. The system instruction
+        is part of that state: a tail carries none, and a request without
+        one is a different conversation. What comes back as the candidate is
+        the request's contents plus the selected candidate's complete
+        content, verbatim - the parent decides whether it is accepted.
+        """
         body, _ = self._request_body(messages, adapters, tools=tools)
+        accepted = self._accepted(continuation)
+        if accepted is not None:
+            body["contents"] = deepcopy(accepted.get("contents") or []) + body["contents"]
+            if "systemInstruction" not in body and accepted.get("systemInstruction"):
+                body["systemInstruction"] = deepcopy(accepted["systemInstruction"])
         payload = self._post("generateContent", body).json()
         content = candidate_text(payload)
         calls = function_calls_of(payload)
+        selected = selected_content(payload)
         return {
             "content": content,
             "tool_calls": calls,
             "assistant_message": _assistant_message(content, calls),
             "usage": usage_dict(payload),
+            "continuation": {
+                "strategy": GEMINI_NATIVE_V1,
+                "provider": self.provider,
+                "transport": "generateContent",
+                "model": self.base_model,
+                "payload": {
+                    "systemInstruction": deepcopy(body.get("systemInstruction")),
+                    "contents": deepcopy(body["contents"])
+                    + ([selected] if selected is not None else []),
+                },
+            },
         }
 
     #: The stream below attaches its response's socket to the abort handle,
