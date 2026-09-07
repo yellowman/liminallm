@@ -552,6 +552,7 @@ class GeminiBackend:
         *,
         user_id: Optional[str] = None,
         continuation: Optional[ProviderContinuation] = None,
+        context_window: Optional[int] = None,
     ) -> dict:
         """One tool-calling turn, and the candidate continuation it makes.
 
@@ -561,6 +562,9 @@ class GeminiBackend:
         one is a different conversation. What comes back as the candidate is
         the request's contents plus the selected candidate's complete
         content, verbatim - the parent decides whether it is accepted.
+
+        `context_window` is accepted and ignored: nothing here compacts the
+        tape, so nothing here sizes itself to the window.
         """
         accepted = self._accepted(continuation)
         if accepted is not None and continuation.model != self.base_model:

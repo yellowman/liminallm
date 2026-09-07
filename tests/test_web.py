@@ -427,7 +427,8 @@ class _FetchingBackend:
     def supports_tools(self):
         return True
 
-    def generate_with_tools(self, messages, tools, adapters, *, user_id=None):
+    def generate_with_tools(self, messages, tools, adapters, *, user_id=None,
+                            context_window=None):
         import json as _json
 
         if not any(m.get("role") == "tool" for m in messages):

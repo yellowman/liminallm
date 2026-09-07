@@ -66,7 +66,8 @@ class RecordingModel:
         self.calls: list[list[dict]] = []
         self.offered: list[list[dict]] = []
 
-    def __call__(self, messages, tools, adapters=None, *, user_id=None):
+    def __call__(self, messages, tools, adapters=None, *, user_id=None,
+                 context_window=None):
         self.calls.append([dict(m) for m in messages])
         self.offered.append(list(tools or []))
         prompt = "\n".join(str(m.get("content") or "") for m in messages)

@@ -487,11 +487,12 @@ class StubBackend:
         *,
         user_id: Optional[str] = None,
         continuation: Optional[ProviderContinuation] = None,
+        context_window: Optional[int] = None,
     ) -> dict:
         """Deterministic tool-calling stand-in for tests.
 
-        `continuation` is accepted and ignored: this backend keeps nothing
-        beyond the transcript, and says so.
+        `continuation` and `context_window` are accepted and ignored: this
+        backend keeps nothing beyond the transcript, and says so.
 
         Calls each offered tool exactly once (in order) before answering, so
         the agent loop is exercised end to end without a live model.
@@ -1611,12 +1612,19 @@ class ApiAdapterBackend:
         *,
         user_id: Optional[str] = None,
         continuation: Optional[ProviderContinuation] = None,
+        context_window: Optional[int] = None,
     ) -> dict:
         """One turn of an OpenAI-style tool-calling exchange.
 
         Returns the assistant's content, any tool calls it requested, and the
         raw assistant message to append before sending tool results back - the
         caller drives the loop.
+
+        `context_window` is the window the caller resolved for this request,
+        the one it prices the prompt against. Where the provider is told to
+        compact its tape is derived from it and from nothing this adapter
+        discovers on its own - one window fact, not two answers to it.
+        Handed none, the adapter asks for no compaction.
         """
         self._ensure_client()
         if not self.client:
@@ -1667,14 +1675,16 @@ class ApiAdapterBackend:
                 items = self._accepted_items(continuation) + items
                 kwargs["include"] = ["reasoning.encrypted_content"]
                 # And, by profile, told where to compact that tape on its
-                # side: at a threshold derived from the window this backend
-                # resolved. Through `extra_body`, the one spelling the
-                # pinned SDK and the current one both carry to the wire.
-                # Only here, on the path that keeps a tape - a compaction
-                # in a reply nothing continues from would be thrown away.
+                # side: at a threshold derived from the window the caller
+                # resolved and handed down. Through `extra_body`, the one
+                # spelling the pinned SDK and the current one both carry to
+                # the wire. Only here, on the path that keeps a tape - a
+                # compaction in a reply nothing continues from would be
+                # thrown away.
                 threshold = (
-                    compact_threshold(self.context_window)
-                    if supports_native_compaction(processed["model"]) else None
+                    compact_threshold(context_window)
+                    if context_window and supports_native_compaction(processed["model"])
+                    else None
                 )
                 if threshold is not None:
                     kwargs["extra_body"] = {
@@ -1726,6 +1736,29 @@ class ApiAdapterBackend:
                     if native:
                         output = responses_compat.replayable_output(response)
                         tape = responses_compat.replay_items(items + output)
+                        # The wire orders output items as the model's and
+                        # promises nothing about where a compaction item
+                        # falls against a call. A call the cut removed is a
+                        # call the replay state cannot answer: refused
+                        # whole, before anything runs, rather than run on
+                        # an order nobody measured.
+                        retained = {
+                            item.get("call_id")
+                            for item in tape if item.get("type") == "function_call"
+                        }
+                        # Every call, as the rule reads. The cut is a prefix
+                        # cut, so a check of the first call alone would
+                        # answer the same today and a mutation to that form
+                        # survives; it is recorded here rather than left
+                        # for a reader to simplify to, because the rule
+                        # must not depend on the shape of the cut.
+                        lost = [call["id"] for call in calls if call["id"] not in retained]
+                        if lost:
+                            raise ModelTurnRejected(
+                                f"the reply's compaction stands in for {len(lost)} of "
+                                f"its {len(calls)} calls; a call the replay state does "
+                                "not hold is not a turn to accept"
+                            )
                         result["continuation"]["payload"] = {"items": tape}
                         result["continuation"]["replay_tokens"] = self._replay_cost(
                             continuation,
@@ -3351,11 +3384,12 @@ class LocalJaxLoRABackend:
         *,
         user_id: Optional[str] = None,
         continuation: Optional[ProviderContinuation] = None,
+        context_window: Optional[int] = None,
     ) -> dict:
         """One tool-calling turn over the local forward pass.
 
-        `continuation` is accepted and ignored: local serving keeps nothing
-        beyond the transcript, and says so.
+        `continuation` and `context_window` are accepted and ignored: local
+        serving keeps nothing beyond the transcript, and says so.
 
         Same dict shape as the API backend - content, tool_calls with
         arguments as a JSON string, assistant_message, usage - so nothing

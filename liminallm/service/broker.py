@@ -1279,6 +1279,11 @@ class CapabilityBroker:
             # Only when there is one: the doubles that stand in for a backend
             # in the rest of the suite were written before the argument was.
             **({"continuation": accepted} if accepted is not None else {}),
+            # The window this deployment operates inside, resolved once by
+            # the engine for the budget and handed down here, so a backend
+            # keeping provider state sizes that state inside the same window
+            # the prompt was priced against - one fact, not two answers.
+            context_window=self._engine.resolved_context_window(),
         )
         # A candidate until the ledger commits it. Both checks refuse the
         # whole turn: the reply is recorded nowhere, and the provider's

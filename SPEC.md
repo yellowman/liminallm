@@ -1460,19 +1460,24 @@ Together adapter APIs) behind the existing OpenAI-compatible transport:
   (`COMPACTION_PREFIXES`), and on the tool-calling path alone, a native
   OpenAI backend asks the provider to compact its own tape:
   `context_management: [{type: compaction, compact_threshold}]`, the
-  threshold derived from the window the backend discovered (§20.1: probe,
-  table, default - the admin override prices the prompt and does not move
-  the provider's threshold) less explicit headroom for the reply, the next
-  request's input and a safety share (`compact_threshold`), and not asked
-  for at all when what is left is under the floor. a reply carrying a `compaction` item is cut by the
-  adapter where the wire says: the candidate tape is the accepted tape,
-  the new input and the complete output in order, from the latest
-  compaction item on, every item type kept, `created_by` removed. the
-  parent's lifecycle is unchanged by it - a compacting reply the parent
-  refuses compacts nothing, and the retry starts from the state before
-  the attempt - and the readable transcript is not touched by it: this is
-  the provider's continuation compacted in the provider's terms (§20.5),
-  and no other provider is made to imitate it.
+  threshold derived from the window the parent resolved for the request
+  under §20.1's one precedence rule - the same window the prompt budget is
+  derived from, handed to the adapter with each model call; the adapter
+  resolves no window of its own - less explicit headroom for the reply,
+  the next request's input and a safety share (`compact_threshold`), and
+  not asked for at all when what is left is under the floor. a reply
+  carrying a `compaction` item is cut by the adapter where the wire says:
+  the candidate tape is the accepted tape, the new input and the complete
+  output in order, from the latest compaction item on, every item type
+  kept, `created_by` removed. the wire orders output items as the model's
+  and promises nothing about where a compaction item falls against a
+  call, so a reply whose retained state no longer holds one of the calls
+  it asks the parent to run is refused whole: nothing runs, nothing is
+  recorded, the retry starts from the state before the attempt. the
+  parent's lifecycle is unchanged by any of it - a compacting reply the
+  parent refuses compacts nothing - and the readable transcript is not
+  touched by it: this is the provider's continuation compacted in the
+  provider's terms (§20.5), and no other provider is made to imitate it.
 - the kernel models this as `remote`/`adapter_param` providers (§5.0.2);
   adapters trained by the JAX pipeline are exported per-version to the
   shared filesystem and mounted by the server.
@@ -3085,11 +3090,10 @@ provider's terms - an opaque item standing in for the items before it,
 kept on the invocation context for one invocation and replayed as
 required. the two are never derived from each other: no digest is built
 from a compaction item, and no compaction item from a digest. the
-provider's threshold comes from the same window discovery the budget
-falls back on (§20.1, steps 2 to 4), less explicit headroom, so the two
-layers are sized from one fact about the model and neither from a
-constant; the admin override of step 1 caps the prompt the parent
-renders and is not sent to the provider.
+provider's threshold is derived from the same resolved window as the
+budget (§20.1, the one precedence rule, admin override first), handed
+down with each model call, less explicit headroom: one window fact
+inside liminallm, both layers sized from it, neither from a constant.
 
 the resulting division of labour: **narrative for continuity, anchors for
 what must not drift, retrieval for everything else.**

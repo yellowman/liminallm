@@ -1813,12 +1813,19 @@ class WorkflowEngine(WorkflowStreamingMixin):
     _BUDGET_CACHE_SECONDS = 60.0
     MIN_PROMPT_BUDGET = 2048
 
-    def prompt_budget(self) -> int:
-        """Tokens available for prompt+history+context with this deployment's model.
+    def resolved_context_window(self) -> int:
+        """The one window this deployment operates inside, in tokens.
 
         Precedence: admin override > MODEL_CONTEXT_WINDOW env > discovery
         (provider probe / known-family table / local config.json / default).
-        MAX_GENERATION_TOKENS is reserved for the reply.
+        The override exists to correct a discovery that guessed wrong, so it
+        comes first. Everything that sizes itself to the window derives from
+        this one answer: the prompt budget below, and the threshold a
+        provider keeping its own state is told to compact at (§5), which the
+        broker hands down with each model call. Cached briefly, so an admin
+        change applies without a restart and a turn does not pay a settings
+        read - and cached here, once, so the two derivations cannot turn
+        over at different moments.
         """
         now = time.monotonic()
         cached = getattr(self, "_budget_cache", None)
@@ -1837,9 +1844,16 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 window = 0
         if window <= 0:
             window = DEFAULT_CONTEXT_WINDOW
-        budget = max(window - MAX_GENERATION_TOKENS, self.MIN_PROMPT_BUDGET)
-        self._budget_cache = (budget, now)
-        return budget
+        self._budget_cache = (window, now)
+        return window
+
+    def prompt_budget(self) -> int:
+        """Tokens available for prompt+history+context with this deployment's
+        model: the resolved window less MAX_GENERATION_TOKENS for the reply,
+        never under MIN_PROMPT_BUDGET."""
+        return max(
+            self.resolved_context_window() - MAX_GENERATION_TOKENS, self.MIN_PROMPT_BUDGET
+        )
 
     def _recall_snippet(
         self,

@@ -115,11 +115,13 @@ class _Provider:
         self.replies = list(replies)
         monkeypatch.setattr(engine.llm, "generate_with_tools", self, raising=False)
 
-    def __call__(self, messages, tools, adapters, *, user_id=None, continuation=None):
+    def __call__(self, messages, tools, adapters, *, user_id=None, continuation=None,
+                 context_window=None):
         self.calls.append({
             "messages": [dict(m) for m in messages],
             "tools": list(tools or []),
             "continuation": continuation,
+            "context_window": context_window,
         })
         reply = self.replies.pop(0)
         return reply(messages, continuation) if callable(reply) else reply

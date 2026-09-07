@@ -84,7 +84,10 @@ def test_a_forced_compaction_keeps_the_conversation_going(monkeypatch):
                                       "state.\n\nReference manual:\n" + _manual(700)},
         {"role": "user", "content": QUESTION},
     ]
-    first = backend.generate_with_tools(opening, TOOLS, [])
+    # The parent hands the window it resolved down with each request; here
+    # the discovered one stands in for that resolution.
+    window = backend.context_window
+    first = backend.generate_with_tools(opening, TOOLS, [], context_window=window)
 
     calls = first["tool_calls"]
     assert calls and calls[0]["name"] == "lookup", first["content"]
@@ -108,7 +111,9 @@ def test_a_forced_compaction_keeps_the_conversation_going(monkeypatch):
              "content": ANSWER}]
     answer = None
     for _round in range(3):
-        second = backend.generate_with_tools(tail, TOOLS, [], continuation=accepted)
+        second = backend.generate_with_tools(
+            tail, TOOLS, [], continuation=accepted, context_window=window
+        )
         if not second["tool_calls"]:
             answer = second
             break

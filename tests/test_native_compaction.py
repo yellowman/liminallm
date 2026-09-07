@@ -247,7 +247,8 @@ class TestCompactionIsAskedForByProfileAndPricedFromTheWindow:
         """`context_management` rides in the request body - through
         `extra_body`, the one spelling both the pinned SDK and the current
         one carry to the wire - with a threshold derived from the window
-        this backend resolved, not from anyone's benchmark constant."""
+        the caller resolved and handed down with the request, not from
+        anyone's benchmark constant."""
         from liminallm.service.model_backend import compact_threshold
 
         seen = {}
@@ -257,15 +258,40 @@ class TestCompactionIsAskedForByProfileAndPricedFromTheWindow:
             return _sdk_response([_reasoning(), _call()])
 
         backend = _native(create)
-        backend.generate_with_tools(USER, TOOLS, [])
+        backend.generate_with_tools(USER, TOOLS, [], context_window=128_000)
 
-        assert backend.context_window == 128_000
         assert seen["extra_body"]["context_management"] == [
             {"type": "compaction", "compact_threshold": compact_threshold(128_000)}
         ]
         assert compact_threshold(128_000) == 83_136
         assert "context_management" not in seen
         assert "previous_response_id" not in seen and seen["store"] is False
+
+    def test_the_adapter_resolves_no_window_of_its_own(self):
+        """One window fact, resolved by the parent for the request. The
+        adapter's own discovery is one input to that resolution and is not
+        consulted here: handed nothing, it asks for no compaction; handed
+        the parent's answer, it sizes the threshold from that and not from
+        what it discovered."""
+        from liminallm.service.model_backend import compact_threshold
+
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _sdk_response([_reasoning(), _call()])
+
+        backend = _native(create)
+        backend._context_window = 1_050_000
+
+        backend.generate_with_tools(USER, TOOLS, [])
+        assert "extra_body" not in seen
+
+        backend.generate_with_tools(USER, TOOLS, [], context_window=128_000)
+        assert seen["extra_body"]["context_management"][0]["compact_threshold"] == (
+            compact_threshold(128_000)
+        )
+        assert compact_threshold(128_000) != compact_threshold(1_050_000)
 
     def test_the_threshold_is_the_window_less_explicit_headroom(self):
         """Reply, next input, and a share for the provider counting
@@ -301,8 +327,7 @@ class TestCompactionIsAskedForByProfileAndPricedFromTheWindow:
             return _sdk_response([_reasoning(), _call()])
 
         backend = _native(create)
-        backend._context_window = 8_192
-        backend.generate_with_tools(USER, TOOLS, [])
+        backend.generate_with_tools(USER, TOOLS, [], context_window=8_192)
 
         assert "extra_body" not in seen
         assert seen["store"] is False and "include" in seen
@@ -320,9 +345,11 @@ class TestCompactionIsAskedForByProfileAndPricedFromTheWindow:
             seen.update(kw)
             return _sdk_response([_message()])
 
-        _native(create, model="gpt-4o-mini").generate_with_tools(USER, TOOLS, [])
+        _native(create, model="gpt-4o-mini").generate_with_tools(
+            USER, TOOLS, [], context_window=128_000)
         assert "extra_body" not in seen
-        _native(create, mode="xai", model="gpt-6-astra").generate_with_tools(USER, TOOLS, [])
+        _native(create, mode="xai", model="gpt-6-astra").generate_with_tools(
+            USER, TOOLS, [], context_window=128_000)
         assert "extra_body" not in seen
 
         assert supports_native_compaction("gpt-5.6") and supports_native_compaction("gpt-6-astra")
@@ -363,7 +390,7 @@ class TestCompactionIsAskedForByProfileAndPricedFromTheWindow:
             return processed
 
         backend._process_adapters_for_provider = with_extra
-        backend.generate_with_tools(USER, TOOLS, [])
+        backend.generate_with_tools(USER, TOOLS, [], context_window=128_000)
 
         assert seen["extra_body"]["adapter_weights"] == {"a": 1.0}
         assert seen["extra_body"]["context_management"][0]["type"] == "compaction"
@@ -474,7 +501,8 @@ class TestWhatTheStateCostsToReplayIsTheCurrentStates:
 
 def _openai(monkeypatch, engine, replies):
     """The real adapter behind the broker, with the provider scripted and
-    every request it was sent kept."""
+    every request it was sent kept. The engine's window cache is cleared,
+    so the window it resolves for these calls is this backend's."""
     queue = list(replies)
     requests = []
 
@@ -484,6 +512,7 @@ def _openai(monkeypatch, engine, replies):
 
     backend = _native(create)
     monkeypatch.setattr(engine.llm, "backend", backend)
+    engine._budget_cache = None
     return backend, requests
 
 
@@ -547,6 +576,164 @@ class TestTheReserveFollowsTheStateThroughTheBroker:
             "compaction", "reasoning",
         ]
         assert requests[3]["input"][-1]["type"] == "function_call_output"
+
+
+def _threshold_sent(request):
+    return request["extra_body"]["context_management"][0]["compact_threshold"]
+
+
+class TestTheProviderCompactsInsideTheWindowTheParentResolved:
+    """One window fact. The parent resolves it - the admin override first,
+    which exists to correct a discovery that guessed wrong, then discovery
+    - prices the prompt from it, and hands it down with the request, so
+    the provider is told to compact inside the same window the parent
+    believes it is operating in. Not two answers to one question."""
+
+    def test_the_admin_override_is_the_window_the_provider_compacts_at(
+        self, store, monkeypatch
+    ):
+        from liminallm.service.model_backend import compact_threshold
+        from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
+
+        engine = get_runtime().workflow
+        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
+        backend, requests = _openai(monkeypatch, engine, [_search("rs_1", "c1")])
+        backend._context_window = 1_050_000
+        monkeypatch.setattr(engine.settings, "model_context_window", 128_000)
+
+        assert _model(broker, invocation, 1)["ok"]
+
+        window = engine.resolved_context_window()
+        assert window == 128_000
+        assert _threshold_sent(requests[0]) == compact_threshold(window)
+        assert engine.prompt_budget() == window - MAX_GENERATION_TOKENS
+        # Not the discovered window: the override corrected it.
+        assert _threshold_sent(requests[0]) != compact_threshold(backend.context_window)
+
+    def test_without_an_override_discovery_is_the_window(self, store, monkeypatch):
+        from liminallm.service.model_backend import compact_threshold
+        from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
+
+        engine = get_runtime().workflow
+        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
+        backend, requests = _openai(monkeypatch, engine, [_search("rs_1", "c1")])
+        backend._context_window = 1_050_000
+        monkeypatch.setattr(engine.settings, "model_context_window", 0)
+
+        assert _model(broker, invocation, 1)["ok"]
+
+        window = engine.resolved_context_window()
+        assert window == backend.context_window == 1_050_000
+        assert _threshold_sent(requests[0]) == compact_threshold(window)
+        assert engine.prompt_budget() == window - MAX_GENERATION_TOKENS
+
+    def test_a_changed_override_reaches_both_under_one_cache(self, store, monkeypatch):
+        """The parent caches the window it resolved, briefly, so an admin
+        change applies without a restart and a turn does not pay a settings
+        read. The threshold lives under that same cache: while the budget
+        is still priced from the old window, so is the threshold, and when
+        the cache turns over both move together."""
+        from liminallm.service.model_backend import compact_threshold
+        from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
+
+        engine = get_runtime().workflow
+        _registry, invocation, _context, broker = _turn(engine, monkeypatch)
+        backend, requests = _openai(monkeypatch, engine, [
+            _search("rs_1", "c1"), _search("rs_2", "c2"), _search("rs_3", "c3"),
+        ])
+        backend._context_window = 1_050_000
+        monkeypatch.setattr(engine.settings, "model_context_window", 128_000)
+
+        assert _model(broker, invocation, 1)["ok"]
+        assert _threshold_sent(requests[0]) == compact_threshold(128_000)
+
+        monkeypatch.setattr(engine.settings, "model_context_window", 200_000)
+        assert _round(broker, invocation, 2)["ok"]
+        assert _model(broker, invocation, 3)["ok"]
+        # Still the cached window, for the budget and the threshold alike.
+        assert engine.prompt_budget() == 128_000 - MAX_GENERATION_TOKENS
+        assert _threshold_sent(requests[1]) == compact_threshold(128_000)
+
+        engine._budget_cache = None
+        assert _round(broker, invocation, 4, calls=[
+            {"id": "c2", "name": "web_search", "arguments": {"query": "hours"}}])["ok"]
+        assert _model(broker, invocation, 5)["ok"]
+        assert engine.resolved_context_window() == 200_000
+        assert engine.prompt_budget() == 200_000 - MAX_GENERATION_TOKENS
+        assert _threshold_sent(requests[2]) == compact_threshold(200_000)
+
+
+class TestACallTheCompactionLeftBehindIsNotRun:
+    """The wire orders output items as the model's and promises nothing
+    about where a compaction item falls relative to a call. A call the cut
+    removed from the replay state is a call the state cannot answer: the
+    reply is refused whole, before anything runs, rather than run on an
+    order nobody measured."""
+
+    def test_a_call_after_the_compaction_item_is_retained_and_accepted(self):
+        out = _native(
+            lambda **kw: _wire_response([_compaction(), _reasoning("rs_1"), _call("fc_1", "c1")])
+        ).generate_with_tools(TAIL, TOOLS, [], continuation=_accepted(EARLIER))
+
+        assert [c["id"] for c in out["tool_calls"]] == ["c1"]
+        retained = [i for i in out["continuation"]["payload"]["items"]
+                    if i["type"] == "function_call"]
+        assert [i["call_id"] for i in retained] == ["c1"]
+
+    @pytest.mark.parametrize("output", [
+        [_call("fc_1", "c1"), _compaction()],
+        [_call("fc_1", "c1"), _compaction(), _reasoning("rs_1")],
+        [_reasoning("rs_1"), _call("fc_1", "c1"), _compaction(), _call("fc_2", "c2")],
+    ], ids=["call-then-compaction", "call-compaction-reasoning", "calls-either-side"])
+    def test_a_call_before_the_compaction_item_refuses_the_whole_reply(self, output):
+        from liminallm.service.continuation import ModelTurnRejected
+
+        with pytest.raises(ModelTurnRejected, match="call"):
+            _native(lambda **kw: _wire_response(output)).generate_with_tools(
+                TAIL, TOOLS, [], continuation=_accepted(EARLIER)
+            )
+
+    @pytest.mark.parametrize("output", [
+        [_call("fc_2", "c2", "web_search", '{"query": "hours"}'), _compaction()],
+        [_reasoning("rs_2"), _call("fc_2", "c2", "web_search", '{"query": "hours"}'),
+         _compaction(), _call("fc_3", "c3", "web_fetch", '{"url": "https://a.example"}')],
+    ], ids=["one-call", "calls-either-side"])
+    def test_nothing_runs_and_nothing_moves_and_the_retry_starts_from_the_old_state(
+        self, store, monkeypatch, output
+    ):
+        engine = get_runtime().workflow
+        registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _backend, requests = _openai(monkeypatch, engine, [
+            _search("rs_1", "c1"),
+            _wire_response(output),
+            _wire_response([_reasoning("rs_3"), _message("msg_3", "400 hours")]),
+        ])
+        ran = _watch_rounds(engine, monkeypatch)
+        assert _model(broker, invocation, 1)["ok"]
+        assert _round(broker, invocation, 2)["ok"]
+        accepted = context.continuation
+        before = [entry.as_dict() for entry in context.transcript.entries]
+
+        reply = _model(broker, invocation, 3)
+
+        assert reply["ok"] is False and reply["code"] == "model_turn_rejected"
+        assert invocation.ledger.get(3).state == FAILED
+        assert ran == [["web_search"]], "a call of the refused reply ran"
+        assert [entry.as_dict() for entry in context.transcript.entries] == before
+        assert context.continuation == accepted
+        assert CMARK not in json.dumps(accepted.as_dict())
+
+        second, replacement = _replacement(engine, registry)
+        assert _model(replacement, invocation, 1).get("replayed")
+        assert _round(replacement, invocation, 2).get("replayed")
+        retry = _model(replacement, invocation, 3)
+
+        assert retry["ok"] and not retry.get("replayed")
+        handed = requests[-1]["input"]
+        assert handed[: len(accepted.payload["items"])] == accepted.payload["items"]
+        assert CMARK not in json.dumps(handed) and "c2" not in json.dumps(handed)
+        assert second.continuation.through_operation_seq == 3
+        assert ran == [["web_search"]]
 
 
 class TestCompactionIsTransactional:
