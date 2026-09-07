@@ -73,8 +73,11 @@ _TRANSCRIPT_MODES = frozenset({"stub", "local_lora", "local_gpu_lora"})
 #: OpenAI-compatible modes that resolve to an endpoint outside
 #: `PROVIDER_ENDPOINTS` - a deployment-supplied URL, or a hosted adapter
 #: server. The same wire and the same declaration as the table's rows.
+#: `api_adapters` is the service's own default when it is built without a
+#: mode: a compatible endpoint named by URL, with no provider behind the name.
 _COMPAT_MODES_WITHOUT_ENDPOINT = frozenset({
-    "vertex", "bedrock", "lorax", "adapter_server", "sagemaker", "aws_sagemaker",
+    "api_adapters", "vertex", "bedrock", "lorax", "adapter_server",
+    "sagemaker", "aws_sagemaker",
 })
 
 

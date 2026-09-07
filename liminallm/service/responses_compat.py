@@ -114,6 +114,49 @@ def to_tools(tools: List[dict]) -> List[dict]:
     return out
 
 
+#: The fields the wire documents as output-only, by item type. A field
+#: listed here is removed before an item is replayed; every other field on
+#: every item goes back as it came. This is the whole of what the serializer
+#: knows about the items it carries, and it stays this short on purpose.
+OUTPUT_ONLY_FIELDS: Dict[str, tuple] = {
+    "reasoning": ("status",),
+    "compaction": ("created_by",),
+}
+
+
+def replayable_output(response: Any) -> List[Dict[str, Any]]:
+    """`response.output` as the items the next request replays, exactly.
+
+    The SDK's own serialization rather than a field list of ours. `model_dump`
+    keeps what the provider sent - including fields this SDK version has no
+    name for on the item types it does model - and the only edits made here
+    are the ones `OUTPUT_ONLY_FIELDS` names. Everything else goes back as it
+    came, nulls included: a value the provider set to nothing is a value it
+    set. Order is kept because order is meaning, and an item type nobody has
+    seen passes through whole for the same reason.
+
+    Refuses rather than degrades. A reply with no `model_dump` is one the SDK
+    did not model, and an output that is not a list of mappings is one nothing
+    could replay. Either would put a broken turn in front of the model next
+    time, so neither becomes a candidate.
+    """
+    dump = getattr(response, "model_dump", None)
+    if not callable(dump):
+        raise ValueError("a Responses reply without model_dump cannot be replayed")
+    output = dump(mode="json").get("output")
+    if not isinstance(output, list):
+        raise ValueError("a Responses reply without an output list cannot be replayed")
+    items: List[Dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict):
+            raise ValueError("a Responses output item that is not a mapping cannot be replayed")
+        kept = dict(item)
+        for name in OUTPUT_ONLY_FIELDS.get(str(kept.get("type") or ""), ()):
+            kept.pop(name, None)
+        items.append(kept)
+    return items
+
+
 def usage_dict(response: Any) -> Dict[str, int]:
     """Responses usage, mapped to the internal shape plus the richer fields.
 
@@ -174,9 +217,11 @@ def tool_calls_of(response: Any) -> List[Dict[str, str]]:
 
 def assistant_message(content: str, calls: List[Dict[str, str]]) -> Dict[str, Any]:
     """A chat-shaped assistant message for the loop to append, so the next
-    round's history converts back through to_input_items. (Reasoning items
-    are not carried between rounds; o-series models redo their reasoning per
-    round, which costs tokens but keeps the loop provider-agnostic.)"""
+    round's history converts back through to_input_items. Reasoning items
+    are not on it: the transcript is provider-agnostic on purpose. A backend
+    declared OpenAI-native carries them in its own tape instead (see
+    `replayable_output`); any other one has the model reason again per
+    round."""
     msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
     if calls:
         msg["tool_calls"] = [

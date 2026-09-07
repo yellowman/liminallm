@@ -1,0 +1,324 @@
+"""The OpenAI Responses adapter keeps the provider's own tape.
+
+Under `store=false` the provider keeps nothing, so what it said last time has
+to be handed back next time in its own terms - reasoning items with their
+encrypted content, messages, calls, and whatever item types it invents later.
+The adapter's job is to preserve that tape exactly and replay it exactly. It
+reads none of it.
+
+Driven against the real SDK's `Response` type where the SDK has one, so the
+serializer is exercised on the objects it will meet rather than on a
+namespace written to match it.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+from openai.types.responses import Response
+
+from liminallm.service import responses_compat as rc
+from liminallm.service.continuation import (
+    CHAT_STRUCTURED_V1,
+    OPENAI_RESPONSES_NATIVE_V1,
+    ProviderContinuation,
+)
+from tests.test_responses_endpoint import _Unsupported, _backend, _client
+
+SENTINEL = "gAAAAB+/x9Q==étape"
+
+TOOLS = [{"type": "function", "function": {
+    "name": "web_search", "description": "search", "parameters": {"type": "object"}}}]
+
+
+def _reasoning(ident="rs_1", encrypted=SENTINEL):
+    return {"type": "reasoning", "id": ident, "summary": [],
+            "encrypted_content": encrypted, "status": "completed"}
+
+
+def _call(ident="fc_1", call_id="call_1", name="web_search", arguments='{"q": "x"}'):
+    return {"type": "function_call", "id": ident, "call_id": call_id, "name": name,
+            "arguments": arguments, "status": "completed"}
+
+
+def _message(ident="msg_1", text="found it"):
+    return {"type": "message", "id": ident, "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]}
+
+
+def _sdk_response(output, model="gpt-6-astra"):
+    """A real `Response`, validated by the SDK the backend actually uses."""
+    return Response.model_validate({
+        "id": "resp_1", "object": "response", "created_at": 0, "model": model,
+        "status": "completed", "parallel_tool_calls": True, "tool_choice": "auto",
+        "tools": [], "output": output,
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+                  "input_tokens_details": {"cached_tokens": 0},
+                  "output_tokens_details": {"reasoning_tokens": 4}},
+    })
+
+
+def _native(create, chat_create=None, *, mode="openai", model="gpt-6-astra"):
+    backend = _backend(_client(create, chat_create))
+    backend.backend_mode = mode
+    backend.base_model = model
+    return backend
+
+
+USER = [{"role": "user", "content": "find x"}]
+
+
+class TestTheRequestIsStatelessByContract:
+    def test_native_mode_sends_store_false_and_asks_for_encrypted_reasoning(self):
+        """Explicit even where the provider's current default might agree:
+        the adapter's contract should not depend on a default moving."""
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _sdk_response([_reasoning(), _message()])
+
+        _native(create).generate_with_tools(USER, TOOLS, [])
+
+        assert seen["store"] is False
+        assert "reasoning.encrypted_content" in seen["include"]
+        # One authority for the conversation, and it is ours.
+        assert "previous_response_id" not in seen
+        assert "conversation" not in seen
+        assert seen.get("background") is not True
+
+    def test_a_compatible_provider_on_responses_gets_none_of_it(self):
+        """Answering `/responses` is the wire, not the entitlement: a
+        gateway declared as a compatible provider is not asked for encrypted
+        reasoning, is not told to keep nothing, and its candidate says what
+        it is - the chat-shaped strategy on the responses wire, with no
+        opaque state at all."""
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _sdk_response([_reasoning(), _message()])
+
+        out = _native(create, mode="xai", model="grok-4.5").generate_with_tools(
+            USER, TOOLS, [])
+
+        assert "store" not in seen and "include" not in seen
+        assert out["continuation"] == {
+            "strategy": CHAT_STRUCTURED_V1, "transport": "responses",
+            "model": "grok-4.5", "payload": {},
+        }
+
+    def test_a_compatible_provider_on_chat_says_so_and_keeps_nothing(self):
+        from tests.test_responses_endpoint import _chat_completion
+
+        def responses_create(**kw):
+            raise _Unsupported(404)
+
+        out = _native(responses_create, lambda **kw: _chat_completion(),
+                      mode="xai", model="grok-4.5").generate_with_tools(USER, [], [])
+
+        assert out["continuation"] == {
+            "strategy": CHAT_STRUCTURED_V1, "transport": "chat",
+            "model": "grok-4.5", "payload": {},
+        }
+
+    def test_an_unnamed_backend_returns_no_candidate(self):
+        """A backend built without a mode - the endpoint tests' own fixture
+        - declares nothing, and the parent keeps nothing for it."""
+        backend = _backend(_client(lambda **kw: _sdk_response([_message()])))
+
+        out = backend.generate_with_tools(USER, TOOLS, [])
+
+        assert "continuation" not in out
+
+
+class TestTheCandidateIsTheWholeTape:
+    def test_every_output_item_survives_in_order_with_its_fields(self):
+        response = _sdk_response([_reasoning(), _call(), _message()])
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return response
+
+        out = _native(create).generate_with_tools(USER, TOOLS, [])
+
+        candidate = out["continuation"]
+        assert candidate["strategy"] == OPENAI_RESPONSES_NATIVE_V1
+        assert candidate["transport"] == "responses"
+        assert candidate["model"] == "gpt-6-astra"
+        items = candidate["payload"]["items"]
+        # The input that was sent, then the output that came back, in order.
+        assert items[: len(seen["input"])] == seen["input"]
+        tail = items[len(seen["input"]):]
+        assert [i["type"] for i in tail] == ["reasoning", "function_call", "message"]
+        assert tail[0]["encrypted_content"] == SENTINEL
+        assert tail[0]["id"] == "rs_1"
+        assert tail[1]["call_id"] == "call_1" and tail[1]["id"] == "fc_1"
+        # Values the provider set to nothing are still values it set.
+        assert tail[0]["summary"] == []
+        assert "content" in tail[0] and tail[0]["content"] is None
+
+    def test_replay_strips_only_the_documented_output_only_fields(self):
+        """`reasoning.status` and `compaction.created_by` are the two the
+        wire refuses back. Nothing else is touched - `status` on a message or
+        a call goes back as it came, and the encrypted content is not
+        re-encoded on the way through."""
+        class _Duck:
+            def model_dump(self, mode="json"):
+                return {"output": [
+                    _reasoning(),
+                    {"type": "compaction", "id": "cmp_1",
+                     "encrypted_content": SENTINEL, "created_by": "server"},
+                    _call(),
+                    _message(),
+                ]}
+
+        items = rc.replayable_output(_Duck())
+
+        assert "status" not in items[0]
+        assert items[0]["encrypted_content"] == SENTINEL
+        assert "created_by" not in items[1]
+        assert items[1]["encrypted_content"] == SENTINEL
+        assert items[2]["status"] == "completed"
+        assert items[3]["status"] == "completed"
+
+    def test_an_item_type_nobody_has_seen_passes_through_untouched(self):
+        """Ordering and content are both semantic, so the serializer is not
+        an allowlist of interesting fields: it removes what is documented as
+        output-only and keeps everything else, including what it cannot
+        name."""
+        future = {"type": "future_item", "id": "fi_1",
+                  "opaque": {"x": [1, None, "é"]}, "phase": None}
+
+        class _Duck:
+            def model_dump(self, mode="json"):
+                return {"output": [_reasoning(), future, _message()]}
+
+        items = rc.replayable_output(_Duck())
+
+        assert items[1] == future
+        assert [i["type"] for i in items] == ["reasoning", "future_item", "message"]
+
+    def test_the_serializer_refuses_what_it_cannot_replay(self):
+        """A response the SDK did not model, or an output that is not a list
+        of mappings, is not a candidate. Refusing here is what keeps a broken
+        turn out of the next request."""
+        class _NoDump:
+            output = []
+
+        with pytest.raises(ValueError):
+            rc.replayable_output(_NoDump())
+
+        class _Odd:
+            def model_dump(self, mode="json"):
+                return {"output": ["not a mapping"]}
+
+        with pytest.raises(ValueError):
+            rc.replayable_output(_Odd())
+
+
+class TestTheNextCallReplaysTheTape:
+    def test_the_accepted_items_go_first_and_only_the_new_input_follows(self):
+        """Stateless replay: the whole accepted tape, then what the parent
+        accepted since. The base prompt is in the tape already and does not
+        go again."""
+        accepted = ProviderContinuation(
+            strategy=OPENAI_RESPONSES_NATIVE_V1, provider="openai",
+            transport="responses", model="gpt-6-astra", through_operation_seq=1,
+            payload={"items": [
+                {"role": "user", "content": [{"type": "input_text", "text": "find x"}]},
+                _reasoning(), _call(), _message(text=""),
+            ]},
+        )
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _sdk_response([_reasoning("rs_2", "second"), _message("msg_2", "done")])
+
+        new_input = [{"role": "tool", "tool_call_id": "call_1", "name": "web_search",
+                      "content": "result text"}]
+        out = _native(create).generate_with_tools(
+            new_input, TOOLS, [], continuation=accepted)
+
+        assert seen["input"][:4] == accepted.payload["items"]
+        assert seen["input"][4:] == [{"type": "function_call_output",
+                                      "call_id": "call_1", "output": "result text"}]
+        # And the new candidate is that whole input plus this turn's output.
+        items = out["continuation"]["payload"]["items"]
+        assert items[:5] == seen["input"]
+        assert [i["type"] for i in items[5:]] == ["reasoning", "message"]
+        assert items[5]["encrypted_content"] == "second"
+
+    def test_an_accepted_tape_is_never_continued_over_chat(self):
+        """A replacement process negotiates the endpoint afresh. If the
+        provider now answers 404, the tail alone must not go to
+        chat/completions as if it continued anything: the accepted tape has
+        no chat form, so the round is refused, the provider is not asked, and
+        the tape is left for the parent to decide about."""
+        from tests.test_responses_endpoint import _chat_completion
+
+        accepted = ProviderContinuation(
+            strategy=OPENAI_RESPONSES_NATIVE_V1, provider="openai",
+            transport="responses", model="gpt-6-astra", through_operation_seq=1,
+            payload={"items": [_reasoning(), _message(text="")]},
+        )
+        chat_calls = []
+
+        def responses_create(**kw):
+            raise _Unsupported(404)
+
+        def chat_create(**kw):
+            chat_calls.append(kw)
+            return _chat_completion()
+
+        backend = _native(responses_create, chat_create)
+        with pytest.raises(RuntimeError, match="responses"):
+            backend.generate_with_tools(USER, [], [], continuation=accepted)
+
+        assert chat_calls == []
+
+    def test_a_continuation_written_by_another_strategy_is_not_replayed(self):
+        """An accepted state is only usable by the strategy that wrote it.
+        Handed something else, the adapter starts from the new input alone
+        and says so in the candidate it returns."""
+        from liminallm.service.continuation import GEMINI_NATIVE_V1
+
+        # Another strategy's payload, in a shape this adapter would read if
+        # it read shapes. It reads the strategy.
+        foreign = ProviderContinuation(
+            strategy=GEMINI_NATIVE_V1, provider="gemini", transport="native",
+            model="gemini-3-pro", through_operation_seq=1,
+            payload={"items": [{"role": "user", "content": "from elsewhere"}]},
+        )
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _sdk_response([_message()])
+
+        out = _native(create).generate_with_tools(USER, TOOLS, [], continuation=foreign)
+
+        assert seen["input"] == rc.to_input_items(USER)
+        assert out["continuation"]["strategy"] == OPENAI_RESPONSES_NATIVE_V1
+        assert out["continuation"]["payload"]["items"][0] == seen["input"][0]
+
+
+class TestTheChatFallbackDeclaresItself:
+    def test_before_any_state_the_chat_path_returns_a_chat_structured_candidate(self):
+        """Negotiation may find a chat-only endpoint. That is a legal start,
+        and the candidate says which strategy this invocation is now on so
+        the parent can hold it there."""
+        from tests.test_responses_endpoint import _chat_completion
+
+        def responses_create(**kw):
+            raise _Unsupported(404)
+
+        out = _native(responses_create, lambda **kw: _chat_completion()).generate_with_tools(
+            USER, [], [])
+
+        assert out["continuation"]["strategy"] == CHAT_STRUCTURED_V1
+        assert out["continuation"]["transport"] == "chat"
+        assert out["continuation"]["payload"] == {}

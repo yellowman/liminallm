@@ -269,6 +269,7 @@ class GeminiBackend:
 
     mode = "gemini_native"
     provider = "gemini"
+    backend_mode = "gemini_native"
 
     def __init__(
         self,

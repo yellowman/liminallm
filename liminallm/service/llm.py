@@ -6,6 +6,7 @@ from typing import Any, Iterator, List, Optional
 from liminallm.config import AdapterMode, resolve_provider_endpoint
 from liminallm.logging import get_logger
 from liminallm.service import local_format
+from liminallm.service.continuation import NATIVE_STRATEGIES, ProviderContinuation
 from liminallm.service.model_backend import (
     ApiAdapterBackend,
     LocalJaxLoRABackend,
@@ -172,22 +173,36 @@ class LLMService:
         adapters: Optional[List[dict]] = None,
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> dict:
         """One tool-calling turn over a caller-built message list.
 
         Unlike generate(), the caller owns the messages so it can append tool
         results and iterate.
+
+        With a native `continuation`, the messages are the tail of a
+        conversation whose opening is already in the provider's tape - and
+        the adapter guidance with it, placed once when that opening was
+        prepared. Preparing the tail would put the guidance in front of a tool
+        result, a second time, on every round. So the tail goes as it is, and
+        "exactly once" stays true by being placed where the tape began.
         """
         if not self.supports_tools:
             raise RuntimeError("active backend does not support tool calling")
-        prepared, normalized_adapters = self._prepare_backend_messages(
-            messages, adapters
-        )
+        if continuation is not None and continuation.strategy in NATIVE_STRATEGIES:
+            prepared = list(messages or [])
+            normalized_adapters = self._normalize_adapters(adapters or [])
+        else:
+            prepared, normalized_adapters = self._prepare_backend_messages(
+                messages, adapters
+            )
+        extra = {"continuation": continuation} if continuation is not None else {}
         return self.backend.generate_with_tools(
             prepared,
             tools,
             normalized_adapters,
             user_id=user_id,
+            **extra,
         )
 
     def stream_messages(
@@ -508,6 +523,7 @@ class LLMService:
             return ApiAdapterBackend(
                 self.base_model,
                 adapter_mode="api_adapters",
+                backend_mode=mode,
                 api_key=resolved_key,
                 base_url=resolved_base,
                 adapter_server_model=adapter_server_model,
@@ -525,6 +541,7 @@ class LLMService:
         return ApiAdapterBackend(
             self.base_model,
             adapter_mode=adapter_mode,
+            backend_mode=mode,
             api_key=api_key,
             base_url=base_url,
             adapter_server_model=adapter_server_model,

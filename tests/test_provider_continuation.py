@@ -100,6 +100,109 @@ class TestEveryBackendDeclaresItsContinuation:
             declared_strategy("")
 
 
+class TestTheServiceNamesTheBackendItBuilds:
+    """The declaration is keyed on the mode the service was built for. The
+    backend's other names cannot carry it: `mode` is the adapter mode, and
+    `provider` is inferred - to "openai" for anything unrecognised."""
+
+    def test_an_openai_service_builds_a_backend_that_declares_native(self):
+        from liminallm.service.llm import LLMService
+
+        backend = LLMService(base_model="gpt-6-astra", backend_mode="openai",
+                             api_key="k").backend
+
+        assert backend.backend_mode == "openai"
+        assert declared_strategy(backend.backend_mode) == OPENAI_RESPONSES_NATIVE_V1
+
+    def test_the_default_service_is_a_compatible_endpoint_not_openai(self):
+        """Built without a mode, the service is an OpenAI-compatible client
+        of whatever URL it was given. Its provider is inferred as "openai";
+        its continuation is not."""
+        from liminallm.service.llm import LLMService
+
+        backend = LLMService(base_model="m", api_key="k").backend
+
+        assert backend.provider == "openai"
+        assert backend.backend_mode == "api_adapters"
+        assert declared_strategy(backend.backend_mode) == CHAT_STRUCTURED_V1
+
+    def test_a_compatible_service_carries_its_own_mode_name(self):
+        from liminallm.service.llm import LLMService
+
+        backend = LLMService(base_model="grok-4.5", backend_mode="xai",
+                             api_key="k").backend
+
+        assert backend.backend_mode == "xai"
+        assert declared_strategy(backend.backend_mode) == CHAT_STRUCTURED_V1
+
+    def test_local_serving_names_itself_too(self):
+        from liminallm.service.llm import LLMService
+
+        for mode in ("stub", "local_lora"):
+            backend = LLMService(base_model="m", backend_mode=mode,
+                                 fs_root="/tmp/x").backend
+            assert backend.backend_mode == mode
+            assert declared_strategy(backend.backend_mode) == TRANSCRIPT_V1
+
+
+class TestTheTailIsNotPreparedTwice:
+    """Adapter guidance is placed once, where the tape began. A tail sent
+    under a native continuation is the rounds since, and preparing it would
+    put the guidance in front of a tool result on every round."""
+
+    class _Backend:
+        applies_lora_weights = False
+
+        def __init__(self):
+            self.seen = []
+
+        def generate_with_tools(self, messages, tools, adapters, *, user_id=None,
+                                continuation=None):
+            self.seen.append((list(messages), continuation))
+            return {"content": "", "tool_calls": [], "usage": {}}
+
+    ADAPTER = {"id": "skill", "mode": "prompt", "prompt_instructions": "prefer tabs"}
+    TAIL = [{"role": "tool", "tool_call_id": "call_1", "name": "web_search",
+             "content": "result text"}]
+
+    def test_without_a_native_continuation_the_messages_are_prepared(self):
+        from liminallm.service.llm import LLMService
+
+        backend = self._Backend()
+        LLMService(base_model="m", backend=backend).generate_with_tools(
+            list(self.TAIL), [], [self.ADAPTER])
+
+        messages, _ = backend.seen[0]
+        assert messages[0]["role"] == "system" and "prefer tabs" in messages[0]["content"]
+        assert messages[1:] == self.TAIL
+
+    def test_under_a_native_continuation_the_tail_goes_as_it_is(self):
+        from liminallm.service.llm import LLMService
+
+        backend = self._Backend()
+        state = _state()
+        LLMService(base_model="m", backend=backend).generate_with_tools(
+            list(self.TAIL), [], [self.ADAPTER], continuation=state)
+
+        messages, handed = backend.seen[0]
+        assert messages == self.TAIL
+        assert handed == state
+
+    def test_a_chat_structured_continuation_still_prepares(self):
+        """Only a native strategy has a tape the opening already lives in.
+        The chat-shaped one sends the whole transcript every round, and the
+        guidance has to be in it."""
+        from liminallm.service.llm import LLMService
+
+        backend = self._Backend()
+        state = _state(strategy=CHAT_STRUCTURED_V1, transport="chat", payload={})
+        LLMService(base_model="m", backend=backend).generate_with_tools(
+            list(self.TAIL), [], [self.ADAPTER], continuation=state)
+
+        messages, _ = backend.seen[0]
+        assert messages[0]["role"] == "system" and "prefer tabs" in messages[0]["content"]
+
+
 class TestTheStateIsOpaqueAndExact:
     """The adapter that wrote the payload is the only thing that reads it.
     Everything between - the ledger, a replay, a restore - hands it back
