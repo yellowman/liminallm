@@ -45,8 +45,11 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from liminallm.logging import get_logger
 from liminallm.service.citations import assert_scrubbed, scrub_namespace
 from liminallm.service.continuation import (
+    CHAT_STRUCTURED_V1,
     NATIVE_STRATEGIES,
+    OPENAI_RESPONSES_NATIVE_V1,
     STRATEGIES,
+    ContinuationMismatch,
     ProviderContinuation,
     declared_strategy,
 )
@@ -123,16 +126,6 @@ class ModelTurnRejected(RuntimeError):
     JSON object is not a reply with the other calls in it: nothing of it is
     recorded, nothing in it runs, and the provider's continuation stays where
     the last accepted turn left it.
-    """
-
-
-class ContinuationMismatch(RuntimeError):
-    """The backend serving this attempt is not on the continuation accepted.
-
-    A different strategy, wire, provider or model than the one the record
-    was written by. Refused rather than adapted: continuing a provider's
-    own state through something else is the substitution this record exists
-    to make impossible, and a change needs an explicit reset, not a quiet one.
     """
 
 
@@ -1067,6 +1060,9 @@ class CapabilityBroker:
             instruct_opening=(
                 accepted is None and self._backend_strategy() in NATIVE_STRATEGIES
             ),
+            # The tape costs what its reasoning cost, on top of everything the
+            # rendered conversation is priced at.
+            reserved_tokens=accepted.replay_tokens if native else 0,
         )
         if offered is None:
             if cursor is not None:
@@ -1121,11 +1117,16 @@ class CapabilityBroker:
     def _backend_strategy(self) -> Optional[str]:
         """What the backend serving this attempt declares, or None.
 
-        None for a backend built without a mode, and for one whose mode
-        declares nothing: neither can continue a provider's own state, and
-        that is the only question asked of it here.
+        The backend's own answer where it has one - the OpenAI adapter's
+        depends on the endpoint it was pointed at - and the mode census
+        otherwise. None for a backend built without a mode, and for one
+        whose mode declares nothing: neither can continue a provider's own
+        state, and that is the only question asked of it here.
         """
         backend = getattr(self._engine.llm, "backend", None)
+        declare = getattr(backend, "declared_continuation", None)
+        if callable(declare):
+            return declare()
         mode = str(getattr(backend, "backend_mode", "") or "")
         if not mode:
             return None
@@ -1135,21 +1136,35 @@ class CapabilityBroker:
             return None
 
     def _check_can_continue(self, accepted: Optional[ProviderContinuation]) -> None:
-        """Refuse, before the provider is asked, a native record this
-        attempt's backend did not write and cannot replay.
+        """Refuse, before the provider is asked, a record this attempt's
+        backend cannot be the one to continue.
 
-        A replacement attempt may run in a process configured differently
-        from the one that accepted the state. Sending the tail alone to a
-        backend that does not hold the opening would continue nothing and
+        A replacement attempt may be served by a backend configured
+        differently from the one that accepted the state. A native record
+        needs the strategy that wrote it; a chat-shaped one needs an
+        OpenAI-compatible backend, which includes one declaring native that
+        negotiated chat - the adapter refuses the flip itself, before its
+        call. And any record is one provider's. Sending the tail, or the
+        whole conversation, to something else would continue nothing and
         report the answer as if it did.
         """
-        if accepted is None or accepted.strategy not in NATIVE_STRATEGIES:
+        if accepted is None:
             return
         declared = self._backend_strategy()
-        if declared != accepted.strategy:
+        if accepted.strategy == CHAT_STRUCTURED_V1:
+            serves = declared in (CHAT_STRUCTURED_V1, OPENAI_RESPONSES_NATIVE_V1)
+        else:
+            serves = declared == accepted.strategy
+        if not serves:
             raise ContinuationMismatch(
                 f"the accepted continuation is {accepted.strategy} and the "
                 f"backend serving this attempt declares {declared or 'nothing'}"
+            )
+        provider = getattr(getattr(self._engine.llm, "backend", None), "provider", None)
+        if isinstance(provider, str) and provider and provider != accepted.provider:
+            raise ContinuationMismatch(
+                f"the accepted continuation is {accepted.provider!r}'s and the "
+                f"backend serving this attempt is {provider!r}"
             )
 
     @staticmethod
@@ -1184,7 +1199,10 @@ class CapabilityBroker:
 
     @staticmethod
     def _candidate(
-        raw: Any, accepted: Optional[ProviderContinuation], seq: int
+        raw: Any,
+        accepted: Optional[ProviderContinuation],
+        seq: int,
+        usage: Mapping[str, Any],
     ) -> Optional[ProviderContinuation]:
         """The continuation this turn would advance to, if accepted.
 
@@ -1194,6 +1212,10 @@ class CapabilityBroker:
         And once anything is accepted, what comes back must be on the same
         strategy, provider, wire and model - a change is refused here, not
         absorbed.
+
+        `usage` is this turn's, as the provider reported it: its reasoning
+        tokens are what the state will cost to replay on top of the rendered
+        transcript, and they accumulate on the record.
         """
         if raw is None:
             if accepted is not None and accepted.strategy in NATIVE_STRATEGIES:
@@ -1209,6 +1231,7 @@ class CapabilityBroker:
         strategy = str(raw.get("strategy") or "")
         if strategy not in STRATEGIES:
             raise ModelTurnRejected("the continuation candidate names no known strategy")
+        reasoning = usage.get("reasoning_tokens") if isinstance(usage, Mapping) else 0
         proposed = ProviderContinuation(
             strategy=strategy,
             provider=str(raw.get("provider") or ""),
@@ -1216,6 +1239,8 @@ class CapabilityBroker:
             model=str(raw.get("model") or ""),
             through_operation_seq=seq,
             payload=dict(raw["payload"]),
+            replay_tokens=(accepted.replay_tokens if accepted is not None else 0)
+            + (int(reasoning) if isinstance(reasoning, (int, float)) else 0),
         )
         if accepted is not None:
             for name in ("strategy", "provider", "transport", "model"):
@@ -1269,7 +1294,9 @@ class CapabilityBroker:
         # A candidate until the ledger commits it. Both checks refuse the
         # whole turn: the reply is recorded nowhere, and the provider's
         # continuation stays where the last accepted turn left it.
-        continuation = self._candidate(response.get("continuation"), accepted, seq)
+        continuation = self._candidate(
+            response.get("continuation"), accepted, seq, response.get("usage") or {}
+        )
         self._validate_model_turn(response)
         canonical = {
             "content": response.get("content") or "",
@@ -1331,15 +1358,19 @@ class CapabilityBroker:
         if continuation is not None:
             state["continuation"] = continuation.as_dict()
             # Identity and size only. The payload is the provider's and is
-            # not for a log: no item, no body, no encrypted content.
-            items = continuation.payload.get("items")
+            # not for a log: no item, no body, no encrypted content. Sized
+            # without reading it - the lists at its top level, whatever the
+            # strategy calls them.
             logger.info(
                 "continuation_candidate",
                 invocation_id=invocation.invocation_id,
                 operation_seq=seq,
                 strategy=continuation.strategy,
                 transport=continuation.transport,
-                items=len(items) if isinstance(items, list) else 0,
+                entries=sum(
+                    len(v) for v in continuation.payload.values() if isinstance(v, list)
+                ),
+                replay_tokens=continuation.replay_tokens,
             )
         return CapabilityOutcome(public=public, parent_state=state)
 

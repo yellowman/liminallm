@@ -22,7 +22,11 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import httpx
 
 from liminallm.logging import get_logger
-from liminallm.service.continuation import GEMINI_NATIVE_V1, ProviderContinuation
+from liminallm.service.continuation import (
+    GEMINI_NATIVE_V1,
+    ContinuationMismatch,
+    ProviderContinuation,
+)
 from liminallm.service.model_backend import (
     CancellableStream,
     StreamAbortHandle,
@@ -40,10 +44,12 @@ _UNSUPPORTED_SCHEMA_KEYS = {"$schema", "additionalProperties"}
 
 # Gemini attaches a thoughtSignature to functionCall parts and rejects a
 # resumed history whose functionCall lacks one (INVALID_ARGUMENT, live).
-# The signature rides the chat-shaped assistant_message as a vendor extra so
-# the provider-agnostic loop round-trips it untouched. For a history built
-# elsewhere (another provider, a hand-written test), Google documents this
-# placeholder as the accepted stand-in:
+# The signatures ride the native continuation, in the candidate the parent
+# accepted, and never the chat-shaped reply that crosses to the worker. A
+# history rebuilt from the chat shape - another provider's, a hand-written
+# test's, the streamed final answer's - gets the placeholder Google documents
+# as the accepted stand-in, which the wire takes (measured) at the cost of
+# the reasoning it stands in for:
 # https://ai.google.dev/gemini-api/docs/thought-signatures
 THOUGHT_SIGNATURE_PLACEHOLDER = "context_engineering_is_the_way_to_go"
 
@@ -172,8 +178,7 @@ def to_contents(messages: List[dict]) -> Tuple[Optional[dict], List[dict]]:
                         "name": fn.get("name") or tc.get("name") or "",
                         "args": _parse_args(fn.get("arguments") or tc.get("arguments")),
                     },
-                    "thoughtSignature": tc.get("thought_signature")
-                    or THOUGHT_SIGNATURE_PLACEHOLDER,
+                    "thoughtSignature": THOUGHT_SIGNATURE_PLACEHOLDER,
                 })
             emit("model", parts)
             continue
@@ -224,22 +229,22 @@ def candidate_text(payload: dict) -> str:
 def function_calls_of(payload: dict) -> List[Dict[str, str]]:
     """functionCall parts in the internal {id, name, arguments} shape.
 
-    Gemini carries no call id; a synthetic one keyed by position keeps the
-    loop's bookkeeping working, and the resume path keys functionResponse by
-    name, so nothing downstream depends on the id surviving a round trip.
+    A synthetic id keyed by position keeps the loop's bookkeeping working
+    whether or not the wire sent one (3.x models do), and the resume path
+    keys functionResponse by name, which the wire accepts with or without
+    the provider's id (measured). Nothing of the part beyond name and
+    arguments comes out here: its signature is the provider's state, kept in
+    the native continuation and not on anything that crosses to the worker.
     """
     calls = []
     for i, part in enumerate(_candidate_parts(payload)):
         fc = part.get("functionCall")
         if fc:
-            call = {
+            calls.append({
                 "id": f"gemini-call-{i}-{fc.get('name') or 'fn'}",
                 "name": fc.get("name") or "",
                 "arguments": json.dumps(fc.get("args") or {}),
-            }
-            if part.get("thoughtSignature"):
-                call["thought_signature"] = part["thoughtSignature"]
-            calls.append(call)
+            })
     return calls
 
 
@@ -250,10 +255,13 @@ def selected_content(payload: dict) -> Optional[dict]:
     a functionCall, on a text part, on a part whose text is empty, a thought
     part, a part type this code has no name for. The native continuation
     replays this whole. Nothing is read out of it here and nothing is put
-    back by a rule of ours - the placeholder `to_contents` supplies for a
-    history built elsewhere never enters a conversation this provider
-    produced itself, and a signature the provider sent is never described
-    as intact by anything but its own bytes.
+    back by a rule of ours: on a turn the parent continues natively, the
+    placeholder `to_contents` supplies for a history built elsewhere never
+    enters the conversation, and a signature the provider sent is never
+    described as intact by anything but its own bytes. (The streamed final
+    answer is still rebuilt from the transcript, placeholder and all - the
+    wire documents and accepts that; what it loses is the reasoning the
+    tape would have carried.)
 
     None when there is no candidate content to keep: a blocked or empty
     reply adds nothing to the conversation, and nothing is invented for it.
@@ -270,8 +278,8 @@ def selected_content(payload: dict) -> Optional[dict]:
 
 
 def _assistant_message(content: str, calls: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Chat-shaped assistant message, carrying each call's thoughtSignature as
-    a vendor extra so the loop's verbatim round trip preserves it."""
+    """Chat-shaped assistant message for the loop to append. It carries no
+    signature: that is the provider's state, in the native continuation."""
     msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
     if calls:
         msg["tool_calls"] = [
@@ -279,8 +287,6 @@ def _assistant_message(content: str, calls: List[Dict[str, str]]) -> Dict[str, A
                 "id": c["id"],
                 "type": "function",
                 "function": {"name": c["name"], "arguments": c["arguments"]},
-                **({"thought_signature": c["thought_signature"]}
-                   if c.get("thought_signature") else {}),
             }
             for c in calls
         ]
@@ -506,6 +512,10 @@ class GeminiBackend:
         }
 
     @staticmethod
+    def declared_continuation() -> str:
+        return GEMINI_NATIVE_V1
+
+    @staticmethod
     def _accepted(continuation: Optional[ProviderContinuation]) -> Optional[dict]:
         """The accepted state this adapter wrote, or None.
 
@@ -535,8 +545,16 @@ class GeminiBackend:
         the request's contents plus the selected candidate's complete
         content, verbatim - the parent decides whether it is accepted.
         """
-        body, _ = self._request_body(messages, adapters, tools=tools)
         accepted = self._accepted(continuation)
+        if accepted is not None and continuation.model != self.base_model:
+            # One model's conversation, signatures included. Refused before
+            # anything is sent rather than after a paid call the parent
+            # would refuse anyway.
+            raise ContinuationMismatch(
+                f"the accepted continuation is for {continuation.model!r} and "
+                f"this backend serves {self.base_model!r}"
+            )
+        body, _ = self._request_body(messages, adapters, tools=tools)
         if accepted is not None:
             body["contents"] = deepcopy(accepted.get("contents") or []) + body["contents"]
             if "systemInstruction" not in body and accepted.get("systemInstruction"):

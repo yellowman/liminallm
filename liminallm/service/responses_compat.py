@@ -127,13 +127,19 @@ OUTPUT_ONLY_FIELDS: Dict[str, tuple] = {
 def replayable_output(response: Any) -> List[Dict[str, Any]]:
     """`response.output` as the items the next request replays, exactly.
 
-    The SDK's own serialization rather than a field list of ours. `model_dump`
-    keeps what the provider sent - including fields this SDK version has no
-    name for on the item types it does model - and the only edits made here
-    are the ones `OUTPUT_ONLY_FIELDS` names. Everything else goes back as it
-    came, nulls included: a value the provider set to nothing is a value it
-    set. Order is kept because order is meaning, and an item type nobody has
-    seen passes through whole for the same reason.
+    The SDK's own serialization rather than a field list of ours, and only
+    the fields the provider actually sent. The client builds a reply without
+    validating it: an optional field the wire omitted is filled with None,
+    and an item type this SDK has no class for is held in the first class
+    that will take it, defaults and all. `exclude_unset` returns each item to
+    its wire keys - a null the provider sent is set and stays, a null the SDK
+    supplied was never set and goes - so the tape is the provider's, not a
+    function of which SDK happened to be installed. Fields the SDK has no
+    name for ride along as extras. The only edits made here are the ones
+    `OUTPUT_ONLY_FIELDS` names. Order is kept because order is meaning, and
+    an item type nobody has seen passes through whole for the same reason.
+    Serializer warnings are off: on a coerced item the serializer would print
+    the item's repr, opaque values included, to stderr.
 
     Refuses rather than degrades. A reply with no `model_dump` is one the SDK
     did not model, and an output that is not a list of mappings is one nothing
@@ -143,7 +149,7 @@ def replayable_output(response: Any) -> List[Dict[str, Any]]:
     dump = getattr(response, "model_dump", None)
     if not callable(dump):
         raise ValueError("a Responses reply without model_dump cannot be replayed")
-    output = dump(mode="json").get("output")
+    output = dump(mode="json", exclude_unset=True, warnings=False).get("output")
     if not isinstance(output, list):
         raise ValueError("a Responses reply without an output list cannot be replayed")
     items: List[Dict[str, Any]] = []

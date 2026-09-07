@@ -4,9 +4,13 @@
 request. What the provider wants back is what it produced - the selected
 candidate's parts, in order, with the thought signatures riding on them,
 including the ones on a text part or on a part whose text is empty. The
-adapter keeps that whole and replays it whole. It reads none of it, and the
-placeholder it supplies for a history built elsewhere never enters a
-conversation the provider produced itself.
+adapter keeps that whole and replays it whole. It reads none of it, and on a
+turn the parent continues natively the placeholder it supplies for a history
+built elsewhere never enters the conversation. Measured on the live wire with
+3.x models: a candidate replayed whole with our functionResponse is accepted
+with or without the provider's call id on the response, thought parts
+included; an unsigned call is a 400; the placeholder is accepted, as
+documented, at the cost of the reasoning it stands in for.
 """
 
 from __future__ import annotations
@@ -14,14 +18,17 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 
 from liminallm.service import gemini_backend as gb
 from liminallm.service.continuation import (
     CHAT_STRUCTURED_V1,
     GEMINI_NATIVE_V1,
     OPENAI_RESPONSES_NATIVE_V1,
+    ContinuationMismatch,
     ProviderContinuation,
 )
+from liminallm.service.gemini_backend import GeminiBackend
 from tests.test_gemini_native import _backend
 
 TOOLS = [{"type": "function", "function": {
@@ -91,7 +98,18 @@ class TestTheCandidateIsTheWholeSelectedContent:
         # text parts joined, the calls with their signatures riding along.
         assert out["content"] == "consideringlooking"
         assert out["tool_calls"][0]["name"] == "web_search"
-        assert out["tool_calls"][0]["thought_signature"] == "sig-call"
+        assert "thought_signature" not in out["tool_calls"][0]
+
+    def test_the_public_reply_carries_no_signature(self):
+        """What crosses to the worker is the turn: text and calls. The
+        signatures are in the candidate and nowhere else."""
+        backend, _bodies = _scripted(_reply(PARTS))
+
+        out = backend.generate_with_tools(OPENING, TOOLS, [])
+
+        public = json.dumps({k: v for k, v in out.items() if k != "continuation"})
+        assert "sig-" not in public
+        assert "sig-call" in json.dumps(out["continuation"])
 
     def test_a_reply_without_candidate_content_adds_nothing_and_invents_nothing(self):
         """Both shapes an empty reply takes: no candidate at all, and a
@@ -165,6 +183,24 @@ class TestTheNextCallReplaysItWhole:
             assert "elsewhere" not in json.dumps(bodies[0])
             assert bodies[0]["systemInstruction"]["parts"][0]["text"] == "You are terse."
             assert out["continuation"]["strategy"] == GEMINI_NATIVE_V1
+
+    def test_an_accepted_conversation_for_another_model_is_refused_before_the_call(self):
+        """Signatures are one model's. A replacement process serving another
+        model refuses the record before anything is sent."""
+        backend, bodies = _scripted(_reply(PARTS))
+        accepted = _accepted(backend.generate_with_tools(OPENING, TOOLS, []))
+        other_bodies = []
+
+        def handler(request):
+            other_bodies.append(json.loads(request.read()))
+            return httpx.Response(200, json=_reply([{"text": "done"}]))
+
+        other = GeminiBackend("gemini-3-flash-preview", api_key="g-key",
+                              transport=httpx.MockTransport(handler))
+        with pytest.raises(ContinuationMismatch, match="gemini-3-flash-preview"):
+            other.generate_with_tools(self.TAIL, TOOLS, [], continuation=accepted)
+
+        assert other_bodies == []
 
     def test_a_signature_is_never_supplied_by_the_adapter_in_its_own_conversation(self):
         """The placeholder exists for a history built elsewhere. A

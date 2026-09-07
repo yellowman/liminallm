@@ -9,6 +9,7 @@ import socket
 import struct
 import threading
 import time
+from urllib.parse import urlparse
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
@@ -26,6 +27,8 @@ from liminallm.service import local_format, responses_compat, transformer
 from liminallm.service.continuation import (
     CHAT_STRUCTURED_V1,
     OPENAI_RESPONSES_NATIVE_V1,
+    TRANSCRIPT_V1,
+    ContinuationMismatch,
     ProviderContinuation,
     declared_strategy,
 )
@@ -470,6 +473,10 @@ class StubBackend:
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
         }
 
+    @staticmethod
+    def declared_continuation() -> str:
+        return TRANSCRIPT_V1
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -477,8 +484,12 @@ class StubBackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> dict:
         """Deterministic tool-calling stand-in for tests.
+
+        `continuation` is accepted and ignored: this backend keeps nothing
+        beyond the transcript, and says so.
 
         Calls each offered tool exactly once (in order) before answering, so
         the agent loop is exercised end to end without a live model.
@@ -1093,6 +1104,17 @@ def context_window_from_model_dir(model_dir: str | Path) -> Optional[int]:
     return None
 
 
+def _is_openai_endpoint(base_url: Optional[str]) -> bool:
+    """Is this OpenAI's own endpoint - unset, or its host by name?
+
+    A configured fact, not a probe of the wire. A base URL naming any other
+    host is a compatible endpoint, whatever mode it was configured under.
+    """
+    if not base_url:
+        return True
+    return (urlparse(str(base_url)).hostname or "").lower() == "api.openai.com"
+
+
 class ApiAdapterBackend:
     """Backend that targets external APIs with capability-aware adapter handling.
 
@@ -1392,8 +1414,16 @@ class ApiAdapterBackend:
 
     def _responses_kwargs(self, model: str, extra_body: Optional[dict]) -> dict:
         """Request kwargs for /responses. Reasoning effort travels as the
-        first-class `reasoning` parameter here, not extra_body."""
+        first-class `reasoning` parameter here, not extra_body.
+
+        A backend serving the native strategy is stateless on every call it
+        makes to this endpoint, not only the ones that keep a tape: the
+        provider is told to store nothing, explicitly, so the contract does
+        not depend on a default that can move.
+        """
         kwargs: Dict[str, Any] = {"model": model, **self._sampling_params(model)}
+        if self._declared_strategy() == OPENAI_RESPONSES_NATIVE_V1:
+            kwargs["store"] = False
         reasoning = responses_compat.reasoning_param(self._reasoning_effort)
         if reasoning:
             kwargs["reasoning"] = reasoning
@@ -1436,16 +1466,33 @@ class ApiAdapterBackend:
         return usage
 
     def _declared_strategy(self) -> Optional[str]:
-        """The continuation strategy this backend's mode declares, or None
-        for a backend built without a mode.
+        """The continuation strategy this backend serves, or None for a
+        backend built without a mode or with one that declares nothing.
 
         Declared, not detected: answering `/responses` is the wire, and a
         compatible gateway that answers it is still a compatible gateway.
-        An unnamed backend declares nothing, so it returns no candidate and
-        the parent keeps nothing for it.
+        The `openai` mode with a base URL of its own is exactly that - the
+        documented way to point this client at any compatible endpoint - so
+        it serves the chat-shaped strategy; only OpenAI's own endpoint gets
+        OpenAI's rules. An unnamed backend returns no candidate and the
+        parent keeps nothing for it.
         """
         mode = getattr(self, "backend_mode", "") or ""
-        return declared_strategy(mode) if mode else None
+        if not mode:
+            return None
+        try:
+            strategy = declared_strategy(mode)
+        except ValueError:
+            return None
+        if strategy == OPENAI_RESPONSES_NATIVE_V1 and not _is_openai_endpoint(
+            getattr(self, "_base_url", None)
+        ):
+            return CHAT_STRUCTURED_V1
+        return strategy
+
+    def declared_continuation(self) -> Optional[str]:
+        """What the parent holds this backend to, before any negotiation."""
+        return self._declared_strategy()
 
     @staticmethod
     def _accepted_items(continuation: Optional[ProviderContinuation]) -> List[dict]:
@@ -1486,6 +1533,27 @@ class ApiAdapterBackend:
         augmented = list(messages or [])
         declared = self._declared_strategy()
         native = declared == OPENAI_RESPONSES_NATIVE_V1
+        # An accepted tape is one model's. Refused here, before anything is
+        # sent, rather than after a paid call the parent would refuse anyway
+        # - and before that model's items are put in front of another.
+        if self._accepted_items(continuation) and continuation.model != processed["model"]:
+            raise ContinuationMismatch(
+                f"the accepted continuation is for {continuation.model!r} and "
+                f"this backend serves {processed['model']!r}"
+            )
+        # The other direction: a chat-shaped record was accepted, and this
+        # call would go native. The parent would refuse the reply; refusing
+        # here spares the call and keeps the record's wire the record's.
+        if (
+            continuation is not None
+            and continuation.strategy == CHAT_STRUCTURED_V1
+            and native
+            and self._responses_available()
+        ):
+            raise ContinuationMismatch(
+                "the accepted continuation is chat-structured and this backend "
+                "would continue it natively on the responses endpoint"
+            )
         if self._responses_available():
             kwargs = self._responses_kwargs(processed["model"], processed["extra_body"])
             if tools:
@@ -1495,12 +1563,12 @@ class ApiAdapterBackend:
             if native:
                 # Stateless by contract. The whole accepted tape goes first
                 # and only the new input follows; the provider keeps nothing
-                # and is asked for the encrypted reasoning back, explicitly,
-                # so the adapter does not depend on a default that can move.
-                # No `previous_response_id` and no `conversation`: the tape
-                # is the one authority for what this conversation contains.
+                # (`store=false`, set for every native call in
+                # `_responses_kwargs`) and is asked for the encrypted
+                # reasoning back, explicitly. No `previous_response_id` and
+                # no `conversation`: the tape is the one authority for what
+                # this conversation contains.
                 items = self._accepted_items(continuation) + items
-                kwargs["store"] = False
                 kwargs["include"] = ["reasoning.encrypted_content"]
             response = self._try_responses(lambda: self.client.responses.create(
                 input=items, **kwargs
@@ -1539,7 +1607,7 @@ class ApiAdapterBackend:
         # the provider no longer has any of, and report the answer as if it
         # did: the substitution the parent's invariant forbids, made here.
         if self._accepted_items(continuation):
-            raise RuntimeError(
+            raise ContinuationMismatch(
                 "the accepted native continuation needs the responses "
                 "endpoint, which this provider did not answer; "
                 "chat/completions cannot continue it"
@@ -3092,6 +3160,10 @@ class LocalJaxLoRABackend:
             "Otherwise answer normally."
         )
 
+    @staticmethod
+    def declared_continuation() -> str:
+        return TRANSCRIPT_V1
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -3099,8 +3171,12 @@ class LocalJaxLoRABackend:
         adapters: List[dict],
         *,
         user_id: Optional[str] = None,
+        continuation: Optional[ProviderContinuation] = None,
     ) -> dict:
         """One tool-calling turn over the local forward pass.
+
+        `continuation` is accepted and ignored: local serving keeps nothing
+        beyond the transcript, and says so.
 
         Same dict shape as the API backend - content, tool_calls with
         arguments as a JSON string, assistant_message, usage - so nothing

@@ -114,6 +114,19 @@ class TestTheServiceNamesTheBackendItBuilds:
         assert backend.backend_mode == "openai"
         assert declared_strategy(backend.backend_mode) == OPENAI_RESPONSES_NATIVE_V1
 
+    def test_the_openai_mode_pointed_elsewhere_serves_the_chat_shaped_strategy(self):
+        """A base URL naming another host is the documented way to reach any
+        compatible endpoint. The mode still says openai; what the backend
+        serves is what the parent holds it to."""
+        from liminallm.service.llm import LLMService
+
+        elsewhere = LLMService(base_model="m", backend_mode="openai", api_key="k",
+                               base_url="https://gateway.example/v1").backend
+        assert elsewhere.backend_mode == "openai"
+        assert elsewhere.declared_continuation() == CHAT_STRUCTURED_V1
+        own = LLMService(base_model="m", backend_mode="openai", api_key="k").backend
+        assert own.declared_continuation() == OPENAI_RESPONSES_NATIVE_V1
+
     def test_the_default_service_is_a_compatible_endpoint_not_openai(self):
         """Built without a mode, the service is an OpenAI-compatible client
         of whatever URL it was given. Its provider is inferred as "openai";
@@ -143,6 +156,19 @@ class TestTheServiceNamesTheBackendItBuilds:
                                  fs_root="/tmp/x").backend
             assert backend.backend_mode == mode
             assert declared_strategy(backend.backend_mode) == TRANSCRIPT_V1
+            assert backend.declared_continuation() == TRANSCRIPT_V1
+
+    def test_local_serving_accepts_a_continuation_and_keeps_nothing(self):
+        """The argument is part of the protocol for every backend. One that
+        keeps nothing beyond the transcript takes it and ignores it rather
+        than refusing the call."""
+        from liminallm.service.llm import LLMService
+
+        service = LLMService(base_model="m", backend_mode="stub")
+        record = _state(strategy=CHAT_STRUCTURED_V1, transport="chat", payload={})
+        out = service.generate_with_tools(
+            [{"role": "user", "content": "hi"}], [], [], continuation=record)
+        assert isinstance(out, dict) and "continuation" not in out
 
 
 class TestTheTailIsNotPreparedTwice:
@@ -236,6 +262,18 @@ class TestTheStateIsOpaqueAndExact:
             _state(strategy="provider_native")
         with pytest.raises(ValueError):
             ProviderContinuation.from_dict({**_state().as_dict(), "strategy": ""})
+
+    def test_the_repr_carries_identity_and_size_and_no_payload(self):
+        """A repr is one log line away from a leak."""
+        state = _state()
+        assert SENTINEL not in repr(state) and "payload_sizes" in repr(state)
+        assert SENTINEL not in repr(InvocationContext(user_id="u", continuation=state))
+
+    def test_the_replay_cost_rides_the_record(self):
+        state = _state(replay_tokens=42)
+        assert ProviderContinuation.from_dict(state.as_dict()).replay_tokens == 42
+        absent = {k: v for k, v in state.as_dict().items() if k != "replay_tokens"}
+        assert ProviderContinuation.from_dict(absent).replay_tokens == 0
 
     def test_the_payload_is_not_shared_with_whoever_supplied_or_read_it(self):
         """The ledger keeps this record for every later attempt. A caller

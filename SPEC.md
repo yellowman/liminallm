@@ -1422,18 +1422,28 @@ Together adapter APIs) behind the existing OpenAI-compatible transport:
   `api_adapters` default, `transcript.v1` for local serving and the stub -
   and an unregistered mode is refused rather than defaulted. the
   declaration is by mode: never inferred from a wire answering `/responses`,
-  never from the inferred provider. a native adapter returns a candidate
+  never from the inferred provider. one configured fact narrows it: the
+  `openai` mode pointed at a base URL of another host is a compatible
+  endpoint named by URL and serves `chat.structured.v1`; only OpenAI's own
+  endpoint gets OpenAI's rules. a native adapter returns a candidate
   with every tool-calling turn - the request as it went and the provider's
   complete reply as it came, in the provider's own terms - and the next
   request replays the accepted state first and only the new input after.
-  OpenAI: the whole ordered `response.output` under `store=false` with
+  OpenAI: the whole ordered `response.output` with
   `include=["reasoning.encrypted_content"]`, no `previous_response_id` or
-  `conversation`, edited only where the wire documents a field as
-  output-only (`reasoning.status`, `compaction.created_by`); unknown item
-  types and fields, and nulls, go back as they came. Gemini: the selected
+  `conversation`, and `store=false` on every call the native backend makes
+  to the endpoint; serialized as the fields the provider sent - a null it
+  sent stays, a default the SDK filled in is not replayed - and edited only
+  where the wire documents a field as output-only (`reasoning.status`,
+  `compaction.created_by`); unknown item types and fields go back as they
+  came. Gemini: the selected
   candidate's complete parts with their signatures where they sat, plus
-  the systemInstruction; the placeholder signature never enters a
-  conversation the provider produced itself. provider values are opaque
+  the systemInstruction; on a turn the parent continues natively the
+  placeholder signature never enters the conversation (the streamed final
+  answer is still rebuilt from the transcript, which the wire accepts at
+  the cost of the reasoning the tape would carry). an adapter refuses,
+  before the provider is asked, a record written for another model or one
+  its wire cannot carry. provider values are opaque
   JSON - no encoding, encryption or interpretation of ours - and a native
   tape is never continued over `/chat/completions`, nor compacted or
   rewritten by the parent.
@@ -2722,8 +2732,11 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   refused before it is called. New input is cut by operation sequence,
   never by text: a provider holding its opening is sent only the record
   past the turn it was accepted at, and that opening carries the citation
-  instruction whether or not a marker is placed in it yet. A change of
-  representation needs an explicit reset; nothing substitutes one quietly.
+  instruction whether or not a marker is placed in it yet. Offers are
+  priced against the rendered conversation, so what the accepted state
+  costs beyond it - the provider-reported reasoning tokens of the accepted
+  turns - is reserved from the budget. A change of representation needs an
+  explicit reset; nothing substitutes one quietly.
 - The worker confines itself before any body runs: environment replaced
   wholesale, network structurally absent, filesystem view limited to a
   scratch the parent owns. Linux: user + mount + network namespace and a

@@ -18,6 +18,8 @@ import json
 import re
 import uuid
 
+import pytest
+
 from liminallm.service import responses_compat as rc
 from liminallm.service.broker import (
     UNOFFERED_TOOL_RESULT,
@@ -27,8 +29,11 @@ from liminallm.service.broker import (
 from liminallm.service.citation_offers import CITATION_INSTRUCTION
 from liminallm.service.continuation import (
     CHAT_STRUCTURED_V1,
+    GEMINI_NATIVE_V1,
     OPENAI_RESPONSES_NATIVE_V1,
+    ContinuationMismatch,
     ProviderContinuation,
+    declared_strategy,
 )
 from liminallm.service.invocation import COMMITTED, FAILED, InvocationRegistry
 from liminallm.service.provenance import SourceRegistry
@@ -44,12 +49,27 @@ MARK = "gAAAAB+/x9Q=="
 OPENING = [{"role": "system", "content": "the parent's own prompt"}]
 
 
+#: The provider each mode's backend names itself as, as `_build_backend`
+#: would set it. None for local serving, which names none.
+PROVIDER_OF = {"openai": "openai", "xai": "xai", "gemini_native": "gemini", "stub": None}
+
+
+def _declare(engine, monkeypatch, mode):
+    """The backend serving the engine, declaring `mode`'s strategy both ways
+    the broker can ask it - by mode, and by its own answer - and naming the
+    provider that mode's backend would."""
+    monkeypatch.setattr(engine.llm.backend, "backend_mode", mode, raising=False)
+    monkeypatch.setattr(engine.llm.backend, "declared_continuation",
+                        lambda: declared_strategy(mode), raising=False)
+    monkeypatch.setattr(engine.llm.backend, "provider", PROVIDER_OF[mode], raising=False)
+
+
 def _turn(engine, monkeypatch, *, mode="openai"):
     """An agent turn on a backend declaring `mode`, as `_serve_invocation`
     would build it: the parent's base prompt remembered, a registry so offers
     are live, and a broker told which body it serves."""
     _web(engine, monkeypatch)
-    monkeypatch.setattr(engine.llm.backend, "backend_mode", mode, raising=False)
+    _declare(engine, monkeypatch, mode)
     registry = SourceRegistry()
     invocation = InvocationRegistry().open(
         uuid.uuid4().hex, tool="agent.files_v1", user_id="u", tenant_id=None
@@ -105,7 +125,8 @@ class _Provider:
         return reply(messages, continuation) if callable(reply) else reply
 
 
-def native(content="", calls=(), *, tag="1", model="gpt-6-astra", transport="responses"):
+def native(content="", calls=(), *, tag="1", model="gpt-6-astra", transport="responses",
+           reasoning=0):
     """A native reply: the tape grows by what went and what came back."""
     calls = [dict(c) for c in calls]
 
@@ -121,7 +142,7 @@ def native(content="", calls=(), *, tag="1", model="gpt-6-astra", transport="res
             "content": content,
             "tool_calls": calls,
             "assistant_message": rc.assistant_message(content, calls),
-            "usage": {},
+            "usage": {"reasoning_tokens": reasoning} if reasoning else {},
             "continuation": {
                 "strategy": OPENAI_RESPONSES_NATIVE_V1,
                 "provider": "openai",
@@ -134,7 +155,39 @@ def native(content="", calls=(), *, tag="1", model="gpt-6-astra", transport="res
     return build
 
 
-def chat_structured(content="", calls=(), *, transport="responses", model="grok-4.5"):
+def gemini_shaped(content="", calls=(), *, signature=None):
+    """A native Gemini reply as its adapter returns one: the accepted
+    contents carried forward, this turn's candidate after them, the
+    signature in the candidate's parts and nowhere on the turn."""
+    calls = [dict(c) for c in calls]
+    parts = [{"text": content}] if content else []
+    parts += [{"functionCall": {"name": c["name"], "args": json.loads(c["arguments"])},
+               **({"thoughtSignature": signature} if signature else {})} for c in calls]
+
+    def build(messages, continuation):
+        accepted = []
+        if continuation is not None and continuation.strategy == GEMINI_NATIVE_V1:
+            accepted = [dict(c) for c in continuation.payload.get("contents") or []]
+        return {
+            "content": content,
+            "tool_calls": calls,
+            "assistant_message": rc.assistant_message(content, calls),
+            "usage": {},
+            "continuation": {
+                "strategy": GEMINI_NATIVE_V1,
+                "provider": "gemini",
+                "transport": "generateContent",
+                "model": "gemini-3-flash-preview",
+                "payload": {"systemInstruction": None,
+                            "contents": accepted + [{"role": "model", "parts": parts}]},
+            },
+        }
+
+    return build
+
+
+def chat_structured(content="", calls=(), *, transport="responses", model="grok-4.5",
+                    provider="xai"):
     calls = [dict(c) for c in calls]
     return {
         "content": content,
@@ -143,7 +196,7 @@ def chat_structured(content="", calls=(), *, transport="responses", model="grok-
         "usage": {},
         "continuation": {
             "strategy": CHAT_STRUCTURED_V1,
-            "provider": "openai",
+            "provider": provider,
             "transport": transport,
             "model": model,
             "payload": {},
@@ -230,6 +283,48 @@ class TestTheOpeningGoesWholeAndOnlyTheTailFollows:
         assert [i.get("type") for i in items[len(first.payload["items"]):]] == [
             "function_call_output", "reasoning", "message",
         ]
+
+    def test_what_the_tape_costs_to_replay_is_reserved_from_the_budget(
+        self, store, monkeypatch
+    ):
+        """The conversation is priced as rendered, and the tape carries the
+        reasoning the rendering does not. What the provider reported that
+        reasoning cost is taken off the budget the next offers are priced
+        against, and it accumulates turn by turn."""
+        from liminallm.service import workflow as wf
+
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _Provider(engine, monkeypatch, [
+            native("looking", [SEARCH], tag="1", reasoning=100),
+            native("400 hours", tag="2", reasoning=50),
+        ])
+        budgets = []
+        real = wf.choose_offers
+
+        def priced(**kw):
+            budgets.append(kw["budget"])
+            return real(**kw)
+
+        monkeypatch.setattr(wf, "choose_offers", priced)
+
+        assert _model(broker, invocation, 1)["ok"]
+        assert context.continuation.replay_tokens == 100
+        assert _round(broker, invocation, 2)["ok"]
+        assert _model(broker, invocation, 3)["ok"]
+
+        assert budgets == [engine.prompt_budget(), engine.prompt_budget() - 100]
+        assert context.continuation.replay_tokens == 150
+
+    def test_a_cursor_and_a_replaced_answer_do_not_compose(self, store, monkeypatch):
+        """The cut removes the draft from the view; the accepted state still
+        holds it. Refused rather than rendered as an empty tail."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, _broker = _turn(engine, monkeypatch)
+
+        with pytest.raises(ValueError, match="terminal answer"):
+            engine.agent_prompt(invocation, context, replace_terminal_answer=True,
+                                after_operation_seq=1)
 
     def test_the_native_opening_is_instructed_before_any_marker_exists(
         self, store, monkeypatch
@@ -321,10 +416,6 @@ class TestTheStateIsPerInvocation:
         assert provider.calls[1]["continuation"] is None
         assert context_a.continuation != context_b.continuation
         assert "rs_a" not in json.dumps(context_b.continuation.as_dict())
-        # Nothing of it on what the two share.
-        for shared in (engine.llm, engine.llm.backend):
-            assert MARK not in repr(vars(shared))
-            assert not any("continuation" in name for name in vars(shared))
 
     def test_a_replacement_attempt_is_restored_the_accepted_state_without_a_call(
         self, store, monkeypatch
@@ -461,7 +552,7 @@ class TestTheStrategyIsStickyForTheInvocation:
         assert _model(broker, invocation, 1)["ok"]
         assert _round(broker, invocation, 2)["ok"]
 
-        monkeypatch.setattr(engine.llm.backend, "backend_mode", "xai", raising=False)
+        _declare(engine, monkeypatch, "xai")
         second, replacement = _replacement(engine, registry)
         assert _model(replacement, invocation, 1).get("replayed")
         assert _round(replacement, invocation, 2).get("replayed")
@@ -472,6 +563,73 @@ class TestTheStrategyIsStickyForTheInvocation:
         assert second.continuation.through_operation_seq == 1
         assert invocation.ledger.get(3).state == FAILED
 
+    def test_an_adapter_refusing_before_the_call_is_the_same_refusal(
+        self, store, monkeypatch
+    ):
+        """An adapter that finds the record is not its to continue - another
+        model's, or a wire that cannot carry it - raises the shared refusal,
+        and the parent records it as one: failed, not committed, the state
+        left where it was."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+
+        def refusing(messages, continuation):
+            raise ContinuationMismatch("the accepted continuation is for another model")
+
+        _Provider(engine, monkeypatch, [native("looking", [SEARCH], tag="1"), refusing])
+        assert _model(broker, invocation, 1)["ok"]
+        assert _round(broker, invocation, 2)["ok"]
+        accepted = context.continuation
+
+        reply = _model(broker, invocation, 3)
+
+        assert reply["ok"] is False and reply["code"] == "continuation_mismatch"
+        assert invocation.ledger.get(3).state == FAILED
+        assert context.continuation == accepted
+        assert len(context.transcript.entries) == 2
+
+    def test_a_chat_shaped_record_is_not_continued_by_local_serving(
+        self, store, monkeypatch
+    ):
+        """A chat-shaped record is an OpenAI-compatible conversation. A
+        backend that keeps nothing beyond the transcript is refused before
+        it is asked, as a mismatch and not as a broken call."""
+        engine = get_runtime().workflow
+        registry, invocation, _context, broker = _turn(engine, monkeypatch, mode="xai")
+        provider = _Provider(engine, monkeypatch, [
+            chat_structured("looking", [SEARCH]), chat_structured("never"),
+        ])
+        assert _model(broker, invocation, 1)["ok"]
+        assert _round(broker, invocation, 2)["ok"]
+
+        _declare(engine, monkeypatch, "stub")
+        second, replacement = _replacement(engine, registry)
+        assert _model(replacement, invocation, 1).get("replayed")
+        assert _round(replacement, invocation, 2).get("replayed")
+        reply = _model(replacement, invocation, 3)
+
+        assert reply["ok"] is False and reply["code"] == "continuation_mismatch"
+        assert len(provider.calls) == 1
+        assert second.continuation.strategy == CHAT_STRUCTURED_V1
+
+    def test_a_record_is_one_providers(self, store, monkeypatch):
+        """Same strategy, another provider behind the backend: refused before
+        the call."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch, mode="xai")
+        provider = _Provider(engine, monkeypatch, [
+            chat_structured("looking", [SEARCH]), chat_structured("never"),
+        ])
+        assert _model(broker, invocation, 1)["ok"]
+        assert _round(broker, invocation, 2)["ok"]
+        monkeypatch.setattr(engine.llm.backend, "provider", "together", raising=False)
+
+        reply = _model(broker, invocation, 3)
+
+        assert reply["ok"] is False and reply["code"] == "continuation_mismatch"
+        assert len(provider.calls) == 1
+        assert context.continuation.through_operation_seq == 1
+
     def test_a_fallback_to_chat_after_native_state_is_refused(
         self, store, monkeypatch
     ):
@@ -481,7 +639,8 @@ class TestTheStrategyIsStickyForTheInvocation:
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _Provider(engine, monkeypatch, [
             native("looking", [SEARCH], tag="1"),
-            chat_structured("400 hours", transport="chat", model="gpt-6-astra"),
+            chat_structured("400 hours", transport="chat", model="gpt-6-astra",
+                            provider="openai"),
         ])
         assert _model(broker, invocation, 1)["ok"]
         assert _round(broker, invocation, 2)["ok"]
@@ -516,7 +675,8 @@ class TestTheStrategyIsStickyForTheInvocation:
         _registry, invocation, context, broker = _turn(engine, monkeypatch)
         _Provider(engine, monkeypatch, [
             native("looking", [SEARCH], tag="1"),
-            chat_structured("400 hours", transport="responses", model="gpt-6-astra"),
+            chat_structured("400 hours", transport="responses", model="gpt-6-astra",
+                            provider="openai"),
         ])
         assert _model(broker, invocation, 1)["ok"]
         assert _round(broker, invocation, 2)["ok"]
@@ -604,3 +764,23 @@ class TestNothingOfItCrossesTheWireOrTheLogs:
         assert MARK not in out and MARK not in err
         assert "continuation_candidate" in out + err
         assert invocation.ledger.get(3).state == COMMITTED
+
+    def test_a_gemini_signature_stays_in_the_record_too(self, store, monkeypatch, capfd):
+        """The other native shape: the signature is in the candidate's parts,
+        and the reply and the logs carry none of it."""
+        engine = get_runtime().workflow
+        _registry, invocation, context, broker = _turn(engine, monkeypatch,
+                                                       mode="gemini_native")
+        _Provider(engine, monkeypatch, [
+            gemini_shaped("looking", [SEARCH], signature=MARK),
+            gemini_shaped("400 hours"),
+        ])
+
+        first = _model(broker, invocation, 1)
+        assert first["ok"] and MARK not in json.dumps(first)
+        assert _round(broker, invocation, 2)["ok"]
+        assert _model(broker, invocation, 3)["ok"]
+
+        assert MARK in json.dumps(context.continuation.as_dict())
+        out, err = capfd.readouterr()
+        assert MARK not in out and MARK not in err

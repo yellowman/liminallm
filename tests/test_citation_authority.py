@@ -1679,6 +1679,8 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
         """
         engine = get_runtime().workflow
         monkeypatch.setattr(engine.llm.backend, "backend_mode", "xai", raising=False)
+        monkeypatch.setattr(engine.llm.backend, "declared_continuation",
+                            lambda: "chat.structured.v1", raising=False)
         _registry, invocation, context = self._grounded_context(
             engine, monkeypatch, offers=True, shown="a passage the prompt lacks"
         )

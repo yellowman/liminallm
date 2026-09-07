@@ -340,18 +340,21 @@ def test_every_provider_reports_the_rich_usage_keys():
 # ---------------------------------------------------------------------------
 
 
-def test_the_thought_signature_survives_the_chat_shaped_round_trip():
+def test_the_thought_signature_rides_the_tape_and_not_the_chat_shaped_reply():
+    """The signature is the provider's state: it lives in the native
+    continuation the parent accepted, and nothing that crosses to the worker
+    carries it. A history rebuilt from the chat shape gets the placeholder,
+    which the wire accepts (measured) at the cost of the reasoning."""
     payload = _payload("", calls=[{"name": "run_tests", "args": {"fn": "median"}}])
     payload["candidates"][0]["content"]["parts"][0]["thoughtSignature"] = "sig-abc"
 
     calls = gb.function_calls_of(payload)
-    assert calls[0]["thought_signature"] == "sig-abc"
-
     am = gb._assistant_message("", calls)
-    assert am["tool_calls"][0]["thought_signature"] == "sig-abc"
+    assert "sig-abc" not in json.dumps(calls) and "sig-abc" not in json.dumps(am)
+    assert gb.selected_content(payload)["parts"][0]["thoughtSignature"] == "sig-abc"
 
     _, contents = gb.to_contents([am])
-    assert contents[0]["parts"][0]["thoughtSignature"] == "sig-abc"
+    assert contents[0]["parts"][0]["thoughtSignature"] == gb.THOUGHT_SIGNATURE_PLACEHOLDER
 
 
 def test_a_foreign_history_gets_the_documented_placeholder():

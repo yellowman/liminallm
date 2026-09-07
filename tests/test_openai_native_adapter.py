@@ -14,14 +14,17 @@ namespace written to match it.
 from __future__ import annotations
 
 import json
+import warnings
 
 import pytest
+from openai._models import construct_type
 from openai.types.responses import Response
 
 from liminallm.service import responses_compat as rc
 from liminallm.service.continuation import (
     CHAT_STRUCTURED_V1,
     OPENAI_RESPONSES_NATIVE_V1,
+    ContinuationMismatch,
     ProviderContinuation,
 )
 from tests.test_responses_endpoint import _Unsupported, _backend, _client
@@ -47,16 +50,27 @@ def _message(ident="msg_1", text="found it"):
             "content": [{"type": "output_text", "text": text, "annotations": []}]}
 
 
-def _sdk_response(output, model="gpt-6-astra"):
-    """A real `Response`, validated by the SDK the backend actually uses."""
-    return Response.model_validate({
+def _raw(output, model):
+    return {
         "id": "resp_1", "object": "response", "created_at": 0, "model": model,
         "status": "completed", "parallel_tool_calls": True, "tool_choice": "auto",
         "tools": [], "output": output,
         "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
                   "input_tokens_details": {"cached_tokens": 0},
                   "output_tokens_details": {"reasoning_tokens": 4}},
-    })
+    }
+
+
+def _sdk_response(output, model="gpt-6-astra"):
+    """A real `Response`, validated by the SDK the backend actually uses."""
+    return Response.model_validate(_raw(output, model))
+
+
+def _wire_response(output, model="gpt-6-astra"):
+    """A `Response` as the client itself builds one from the wire: without
+    validation, optional fields it did not receive filled in as None, an item
+    type it has no class for held in the first class that takes it."""
+    return construct_type(type_=Response, value=_raw(output, model))
 
 
 def _native(create, chat_create=None, *, mode="openai", model="gpt-6-astra"):
@@ -87,6 +101,46 @@ class TestTheRequestIsStatelessByContract:
         assert "previous_response_id" not in seen
         assert "conversation" not in seen
         assert seen.get("background") is not True
+
+    def test_every_responses_call_of_a_native_backend_keeps_nothing_on_the_provider(self):
+        """Not only the calls that keep a tape. The plain completion and the
+        stream build their kwargs the same way, and a compatible provider's
+        carry no such flag at all."""
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _sdk_response([_message()])
+
+        backend = _native(create)
+        backend.generate(USER, [])
+        assert seen["store"] is False
+        assert backend._responses_kwargs("gpt-6-astra", None)["store"] is False
+        assert "store" not in _native(create, mode="xai")._responses_kwargs("grok-4.5", None)
+
+    def test_the_openai_mode_pointed_at_another_host_is_a_compatible_endpoint(self):
+        """`adapter_openai_base_url` is the documented way to point this
+        client at any compatible endpoint. Under the `openai` mode that is
+        still a compatible endpoint: no tape, nothing asked of it that only
+        OpenAI's own endpoint answers."""
+        seen = {}
+
+        def create(**kw):
+            seen.update(kw)
+            return _sdk_response([_reasoning(), _message()])
+
+        backend = _native(create)
+        backend._base_url = "https://gateway.example/v1"
+        out = backend.generate_with_tools(USER, TOOLS, [])
+        assert "store" not in seen and "include" not in seen
+        assert out["continuation"]["strategy"] == CHAT_STRUCTURED_V1
+        assert backend.declared_continuation() == CHAT_STRUCTURED_V1
+
+        backend._base_url = "https://api.openai.com/v1"
+        seen.clear()
+        out = backend.generate_with_tools(USER, TOOLS, [])
+        assert seen["store"] is False and "include" in seen
+        assert out["continuation"]["strategy"] == OPENAI_RESPONSES_NATIVE_V1
 
     def test_a_compatible_provider_on_responses_gets_none_of_it(self):
         """Answering `/responses` is the wire, not the entitlement: a
@@ -135,7 +189,7 @@ class TestTheRequestIsStatelessByContract:
 
 class TestTheCandidateIsTheWholeTape:
     def test_every_output_item_survives_in_order_with_its_fields(self):
-        response = _sdk_response([_reasoning(), _call(), _message()])
+        response = _wire_response([_reasoning(), _call(), _message()])
         seen = {}
 
         def create(**kw):
@@ -156,9 +210,45 @@ class TestTheCandidateIsTheWholeTape:
         assert tail[0]["encrypted_content"] == SENTINEL
         assert tail[0]["id"] == "rs_1"
         assert tail[1]["call_id"] == "call_1" and tail[1]["id"] == "fc_1"
-        # Values the provider set to nothing are still values it set.
         assert tail[0]["summary"] == []
-        assert "content" in tail[0] and tail[0]["content"] is None
+        # A field the provider never sent is not invented for it: the client
+        # fills the reasoning item's optional `content` and the text part's
+        # `logprobs` with None, and those are the SDK's, not the wire's.
+        assert "content" not in tail[0]
+        assert "logprobs" not in tail[2]["content"][0]
+
+    def test_a_null_the_provider_sent_stays_and_a_default_is_not_added(self):
+        """The difference is whether the field was set: a null the wire
+        carried was, a null the SDK filled in was not."""
+        sent = {**_reasoning(), "content": None, "phase": None}
+
+        out = _native(lambda **kw: _wire_response([sent, _message()])).generate_with_tools(
+            USER, TOOLS, [])
+
+        item = out["continuation"]["payload"]["items"][-2]
+        assert "content" in item and item["content"] is None
+        assert "phase" in item and item["phase"] is None
+        assert "status" not in item
+        part = out["continuation"]["payload"]["items"][-1]["content"][0]
+        assert "logprobs" not in part and part["text"] == "found it"
+
+    def test_an_unknown_item_type_through_the_client_parse_path_keeps_its_wire_keys(self):
+        """The client holds an item type it has no class for in the first
+        class that takes it. What is replayed is the item's own keys and no
+        defaults of that class - and no serializer warning printing the
+        item, opaque value and all, to stderr."""
+        future = {"type": "future_item", "id": "fi_1",
+                  "opaque": {"x": [1, None, "é"]}, "encrypted_content": SENTINEL}
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            out = _native(
+                lambda **kw: _wire_response([_reasoning(), future, _message()])
+            ).generate_with_tools(USER, TOOLS, [])
+
+        items = out["continuation"]["payload"]["items"]
+        assert items[-2] == future
+        assert [i["type"] for i in items[-3:]] == ["reasoning", "future_item", "message"]
+        assert [w for w in caught if issubclass(w.category, UserWarning)] == []
 
     def test_replay_strips_only_the_documented_output_only_fields(self):
         """`reasoning.status` and `compaction.created_by` are the two the
@@ -166,7 +256,7 @@ class TestTheCandidateIsTheWholeTape:
         a call goes back as it came, and the encrypted content is not
         re-encoded on the way through."""
         class _Duck:
-            def model_dump(self, mode="json"):
+            def model_dump(self, mode="json", **_kw):
                 return {"output": [
                     _reasoning(),
                     {"type": "compaction", "id": "cmp_1",
@@ -193,7 +283,7 @@ class TestTheCandidateIsTheWholeTape:
                   "opaque": {"x": [1, None, "é"]}, "phase": None}
 
         class _Duck:
-            def model_dump(self, mode="json"):
+            def model_dump(self, mode="json", **_kw):
                 return {"output": [_reasoning(), future, _message()]}
 
         items = rc.replayable_output(_Duck())
@@ -212,7 +302,7 @@ class TestTheCandidateIsTheWholeTape:
             rc.replayable_output(_NoDump())
 
         class _Odd:
-            def model_dump(self, mode="json"):
+            def model_dump(self, mode="json", **_kw):
                 return {"output": ["not a mapping"]}
 
         with pytest.raises(ValueError):
@@ -275,10 +365,51 @@ class TestTheNextCallReplaysTheTape:
             return _chat_completion()
 
         backend = _native(responses_create, chat_create)
-        with pytest.raises(RuntimeError, match="responses"):
+        with pytest.raises(ContinuationMismatch, match="responses"):
             backend.generate_with_tools(USER, [], [], continuation=accepted)
 
         assert chat_calls == []
+
+    def test_an_accepted_tape_for_another_model_is_refused_before_the_call(self):
+        """A replacement process configured for a different model would put
+        one model's items in front of another. Refused before the provider
+        is asked, not after a paid call the parent would refuse anyway."""
+        accepted = ProviderContinuation(
+            strategy=OPENAI_RESPONSES_NATIVE_V1, provider="openai",
+            transport="responses", model="gpt-6-astra", through_operation_seq=1,
+            payload={"items": [_reasoning(), _message(text="")]},
+        )
+        calls = []
+
+        def create(**kw):
+            calls.append(kw)
+            return _sdk_response([_message()])
+
+        backend = _native(create, model="gpt-6-other")
+        with pytest.raises(ContinuationMismatch, match="gpt-6-other"):
+            backend.generate_with_tools(USER, TOOLS, [], continuation=accepted)
+
+        assert calls == []
+
+    def test_a_chat_structured_record_is_not_taken_native_before_the_call(self):
+        """The reverse of the chat guard: a record accepted on chat is the
+        chat-shaped conversation, and a backend that would now go native
+        refuses before the call rather than after the parent refuses the
+        reply - and every retry with it."""
+        accepted = ProviderContinuation(
+            strategy=CHAT_STRUCTURED_V1, provider="openai", transport="chat",
+            model="gpt-6-astra", through_operation_seq=1, payload={},
+        )
+        calls = []
+
+        def create(**kw):
+            calls.append(kw)
+            return _sdk_response([_message()])
+
+        with pytest.raises(ContinuationMismatch, match="chat-structured"):
+            _native(create).generate_with_tools(USER, TOOLS, [], continuation=accepted)
+
+        assert calls == []
 
     def test_a_continuation_written_by_another_strategy_is_not_replayed(self):
         """An accepted state is only usable by the strategy that wrote it.

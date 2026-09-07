@@ -2013,6 +2013,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         replace_terminal_answer: bool = False,
         after_operation_seq: Optional[int] = None,
         instruct_opening: bool = False,
+        reserved_tokens: int = 0,
     ) -> Optional[List[Dict[str, Any]]]:
         """One agent model call's conversation, as the parent builds it.
 
@@ -2059,8 +2060,20 @@ class WorkflowEngine(WorkflowStreamingMixin):
         puts the citation instruction on the opening whether or not a marker
         is placed in it yet: that opening is frozen in the provider's
         continuation, so a marker that a later round places can only be
-        answered by an instruction that was already there.
+        answered by an instruction that was already there. `reserved_tokens`
+        is what the provider's continuation costs on top of the rendered
+        conversation - the conversation is what gets priced, and the tape
+        carries reasoning it does not.
+
+        A cursor and a replaced terminal answer do not compose: the cut
+        removes the draft from the view, and the provider's continuation
+        still holds it. Refused rather than rendered as an empty tail.
         """
+        if replace_terminal_answer and after_operation_seq is not None:
+            raise ValueError(
+                "a provider continuation cannot replace a terminal answer: "
+                "the draft the cut removes is still in the accepted state"
+            )
         registry = context.source_registry
         if not self.CITATION_OFFERS_ENABLED or registry is None:
             return None
@@ -2116,7 +2129,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             candidates=context.provenance_bindings,
             render=render,
             counter=self.llm.token_counter(),
-            budget=self.prompt_budget(),
+            budget=max(0, self.prompt_budget() - int(reserved_tokens or 0)),
         )
         if not choice.fits:
             invocation.poison_citation_budget()

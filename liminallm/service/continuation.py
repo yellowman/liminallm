@@ -109,6 +109,19 @@ def declared_strategy(mode: str) -> str:
     raise ValueError(f"backend mode {mode!r} declares no continuation strategy")
 
 
+class ContinuationMismatch(RuntimeError):
+    """What is serving this attempt is not on the continuation accepted.
+
+    A different strategy, wire, provider or model than the record was
+    written by, or a wire that cannot carry it at all. Raised by an adapter
+    before it asks the provider, and by the parent when what came back is
+    not on the record. Refused rather than adapted: continuing a provider's
+    own state through something else is the substitution this record exists
+    to make impossible, and a change needs an explicit reset, not a quiet
+    one.
+    """
+
+
 @dataclass(frozen=True)
 class ProviderContinuation:
     """One provider's accepted continuation, through one operation.
@@ -138,6 +151,12 @@ class ProviderContinuation:
     #: they say a turn contained.
     through_operation_seq: int
     payload: Mapping[str, Any]
+    #: What the state costs on the next request beyond the rendered
+    #: transcript: the provider-reported reasoning tokens of every accepted
+    #: turn, summed. The parent's accounting, not the adapter's, and reserved
+    #: from the prompt budget when offers are priced - the transcript rebuild
+    #: is what gets measured, and it carries none of this.
+    replay_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.strategy not in STRATEGIES:
@@ -149,6 +168,19 @@ class ProviderContinuation:
         object.__setattr__(
             self, "through_operation_seq", int(self.through_operation_seq)
         )
+        object.__setattr__(self, "replay_tokens", max(0, int(self.replay_tokens or 0)))
+
+    def __repr__(self) -> str:
+        # Identity and size, never the payload: a repr is one log line away
+        # from a leak, and this one has nothing to leak.
+        sizes = {k: len(v) for k, v in self.payload.items() if isinstance(v, list)}
+        return (
+            f"ProviderContinuation(strategy={self.strategy!r}, "
+            f"provider={self.provider!r}, transport={self.transport!r}, "
+            f"model={self.model!r}, through_operation_seq="
+            f"{self.through_operation_seq}, replay_tokens={self.replay_tokens}, "
+            f"payload_sizes={sizes!r})"
+        )
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -158,6 +190,7 @@ class ProviderContinuation:
             "model": self.model,
             "through_operation_seq": self.through_operation_seq,
             "payload": deepcopy(dict(self.payload)),
+            "replay_tokens": self.replay_tokens,
         }
 
     @classmethod
@@ -169,4 +202,5 @@ class ProviderContinuation:
             model=str(raw.get("model") or ""),
             through_operation_seq=int(raw.get("through_operation_seq") or 0),
             payload=dict(raw.get("payload") or {}),
+            replay_tokens=int(raw.get("replay_tokens") or 0),
         )
