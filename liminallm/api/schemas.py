@@ -447,7 +447,6 @@ class ChatResponse(BaseModel):
     usage: dict = Field(default_factory=dict)
     context_snippets: List[str] = Field(default_factory=list)
     routing_trace: List[dict] = Field(default_factory=list)
-    workflow_trace: List[dict] = Field(default_factory=list)
 
 
 class _SchemaPayload(BaseModel):

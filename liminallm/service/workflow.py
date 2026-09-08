@@ -478,7 +478,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     "status": "rolling_back",
                     "reason": reason,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "workflow_trace": workflow_trace,
+                    # How far it got, not what it did. The trace nests node
+                    # outputs and tool arguments, and this record goes to the
+                    # cache with its own TTL while the delete below is best
+                    # effort - so a copy written here outlives the request
+                    # that made it whenever the cache cannot be reached.
+                    "trace_length": len(workflow_trace),
                 },
             )
 

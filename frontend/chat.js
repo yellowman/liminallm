@@ -1113,7 +1113,6 @@ const renderMessages = (messages) => {
       adapters: lastAssistant.adapters || [],
       adapterGates: lastAssistant.adapter_gates || [],
       routingTrace: lastAssistant.routing_trace || [],
-      workflowTrace: lastAssistant.workflow_trace || [],
       contextSnippets: lastAssistant.context_snippets || [],
     };
     renderPreferencePanel();
@@ -1229,19 +1228,6 @@ const toolIconsHtml = (names) =>
     })
     .join('');
 
-// Names of the tools the model called for a reply, for the message meta line.
-// A node's extra result keys land under `outputs`, so check both places.
-const toolNamesFromTrace = (trace) => {
-  const names = [];
-  for (const entry of Array.isArray(trace) ? trace : []) {
-    const calls = [...(entry?.tool_calls || []), ...(entry?.outputs?.tool_calls || [])];
-    for (const call of calls) {
-      if (call?.tool && !names.includes(call.tool)) names.push(call.tool);
-    }
-  }
-  return names;
-};
-
 // Only auto-scroll while the reader is already at the bottom, so scrolling
 // up to reread earlier output is never fought by the stream.
 const isNearBottom = () =>
@@ -1340,19 +1326,6 @@ const TOOL_ACTIVITY_LABELS = {
   run_python: 'Running code',
   web_search: 'Searching the web',
   web_fetch: 'Reading a web page',
-};
-
-// Injection attempts found in fetched pages, surfaced from the workflow trace.
-const injectionFindingsFromTrace = (trace) => {
-  const kinds = [];
-  for (const entry of Array.isArray(trace) ? trace : []) {
-    const found = [
-      ...(entry?.injection_findings || []),
-      ...(entry?.outputs?.injection_findings || []),
-    ];
-    for (const kind of found) if (!kinds.includes(kind)) kinds.push(kind);
-  }
-  return kinds;
 };
 
 const showTypingIndicator = (label = '') => {
@@ -1495,7 +1468,6 @@ const sendMessage = async (event) => {
       adapters: data.adapters || [],
       adapterGates: data.adapter_gates || [],
       routingTrace: data.routing_trace || [],
-      workflowTrace: data.workflow_trace || [],
       contextSnippets: data.context_snippets || [],
     };
     renderPreferencePanel();
@@ -1505,7 +1477,8 @@ const sendMessage = async (event) => {
 
   /**
    * SPEC §18: Streaming WebSocket chat with token events.
-   * Handles events: token, trace, message_done, streaming_complete, error, cancel_ack
+   * Handles events: token, tool_progress, message_done, streaming_complete,
+   * error, cancel_ack
    */
   const chatViaWebSocketStreaming = async () => {
     const ws = await openChatSocket();
@@ -1514,6 +1487,10 @@ const sendMessage = async (event) => {
       let streamingMsg = null;
       let messageDoneReceived = false;
       let messageDoneData = {};
+      // The tools this turn ran, named as they run. The server used to send
+      // its whole execution trace and this was mined out of it; now each
+      // capability announces itself and the icons are built from that.
+      const toolsUsed = [];
       let idleTimer = null;
 
       const cleanup = () => {
@@ -1559,13 +1536,12 @@ const sendMessage = async (event) => {
                 streamingMsg.update(msg.data || '');
                 break;
 
-              case 'trace':
-                // The attachment agent reports each tool it runs, so the
-                // indicator can say what is happening during the slow part.
-                if (msg.data?.tool && !streamingMsg) {
-                  showToolActivity(msg.data.tool);
-                } else {
-                  console.debug('Workflow trace:', msg.data);
+              case 'tool_progress':
+                // Each capability reports itself as it runs, so the indicator
+                // can say what is happening during the slow part.
+                if (msg.data?.tool) {
+                  if (!toolsUsed.includes(msg.data.tool)) toolsUsed.push(msg.data.tool);
+                  if (!streamingMsg) showToolActivity(msg.data.tool);
                 }
                 break;
 
@@ -1587,7 +1563,7 @@ const sendMessage = async (event) => {
                 }
                 if (streamingMsg) {
                   const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
-                  const tools = toolNamesFromTrace(messageDoneData.workflow_trace);
+                  const tools = toolsUsed;
                   const bits = [];
                   if (adapters.length) bits.push(`Adapters: ${adapters.join(', ')}`);
                   const text = bits.map(escapeHtml).join(' · ');
@@ -1598,7 +1574,7 @@ const sendMessage = async (event) => {
                   );
                   // A page tried to hijack the model: say so where the user
                   // reads the answer, not just in the server log.
-                  const injections = injectionFindingsFromTrace(messageDoneData.workflow_trace);
+                  const injections = messageDoneData.injection_findings || [];
                   if (injections.length) {
                     streamingMsg.warn(
                       `A fetched page attempted a prompt injection (${injections.join(', ')}). ` +
@@ -1738,7 +1714,6 @@ const sendMessage = async (event) => {
           adapters: data.adapters || [],
           adapterGates: data.adapter_gates || [],
           routingTrace: data.routing_trace || [],
-          workflowTrace: data.workflow_trace || [],
           contextSnippets: data.context_snippets || [],
         };
         setConversation(data.conversation_id);
@@ -2187,10 +2162,9 @@ const renderPreferencePanel = () => {
     adapter_gates: state.lastAssistant.adapterGates || [],
   };
   preferenceMetaEl.textContent = JSON.stringify(meta, null, 2);
-  if (state.lastAssistant.routingTrace?.length || state.lastAssistant.workflowTrace?.length) {
+  if (state.lastAssistant.routingTrace?.length) {
     preferenceRoutingEl.textContent = JSON.stringify({
       routing_trace: state.lastAssistant.routingTrace || [],
-      workflow_trace: state.lastAssistant.workflowTrace || [],
     }, null, 2);
   } else {
     preferenceRoutingEl.textContent = 'No routing trace';

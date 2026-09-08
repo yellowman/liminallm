@@ -986,3 +986,20 @@ END $$;
 
 -- The repair tool is not part of the schema.
 DROP FUNCTION IF EXISTS _jsonb_python_truthy(jsonb);
+
+-- Debt #2 data repair: the execution trace is not conversation history.
+-- Assistant rows used to carry `meta.workflow_trace` - which nodes ran, what
+-- each returned, tool arguments, failure text - and every later read of the
+-- conversation returned it. New rows no longer carry it; rows written before
+-- that are cleaned here, because stopping the writes does not undo the ones
+-- already made.
+--
+-- Only that key. `content` and `content_struct` are the message and are not
+-- touched, and the rest of `meta` - adapters, adapter_gates, routing_trace,
+-- usage - is legitimate metadata a reader still uses.
+--
+-- Repeat-safe: the WHERE matches only rows that still have the key, so a
+-- second run updates nothing. NULL `meta` never matches `?`.
+UPDATE message
+   SET meta = meta - 'workflow_trace'
+ WHERE meta ? 'workflow_trace';

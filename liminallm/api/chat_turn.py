@@ -30,6 +30,30 @@ from liminallm.service.citations import durable_citations
 
 logger = get_logger(__name__)
 
+#: Keys the engine produces for itself. `workflow_trace` is an execution
+#: diagnostic - which nodes ran, what each returned, which edge was taken -
+#: and it nests node outputs, tool arguments and failure text. Useful while a
+#: request runs, and read by the engine's own callers; not conversation
+#: history, not a client object. It stops here.
+INTERNAL_ORCHESTRATION_KEYS = frozenset({"workflow_trace"})
+
+
+def public(orchestration: Any) -> dict[str, Any]:
+    """The engine's result with its internal diagnostics removed.
+
+    Called where an orchestration crosses out of execution: `finish` below,
+    which is what makes it durable, and each transport that projects its own
+    completion payload. A copy rather than a mutation, because the caller's
+    object is the engine's and this is a projection of it.
+    """
+    if not isinstance(orchestration, dict):
+        return {}
+    return {
+        key: value
+        for key, value in orchestration.items()
+        if key not in INTERNAL_ORCHESTRATION_KEYS
+    }
+
 
 @dataclass
 class Turn:
@@ -205,7 +229,7 @@ async def finish(
     an anchor stored without the answer it indexes is a coordinate into
     nothing.
     """
-    turn.orchestration = orchestration if isinstance(orchestration, dict) else {}
+    turn.orchestration = public(orchestration)
     assistant_content = turn.orchestration.get(
         "content", content or "No response generated."
     )
@@ -258,7 +282,6 @@ async def finish(
                 "adapters": turn.orchestration.get("adapters", []),
                 "adapter_gates": turn.orchestration.get("adapter_gates", []),
                 "routing_trace": turn.orchestration.get("routing_trace", []),
-                "workflow_trace": turn.orchestration.get("workflow_trace", []),
                 "usage": turn.orchestration.get("usage", {}),
             },
             message_id=assistant_message_id,
@@ -303,5 +326,4 @@ def response(turn: Turn, assistant_message, adapter_names: list[str]) -> ChatRes
         usage=o.get("usage", {}),
         context_snippets=o.get("context_snippets", []),
         routing_trace=o.get("routing_trace", []),
-        workflow_trace=o.get("workflow_trace", []),
     )

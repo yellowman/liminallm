@@ -476,8 +476,8 @@ class TestResponsesUpstreamParity:
         from liminallm.service.runtime import get_runtime
 
         async def run_streaming(*args, **kwargs):
-            yield {"event": "trace", "data": {"tool": "file_search", "status": "running"}}
-            yield {"event": "trace", "data": {"tool": "note_search", "status": "running"}}
+            yield {"event": "tool_progress", "data": {"tool": "file_search", "status": "running"}}
+            yield {"event": "tool_progress", "data": {"tool": "note_search", "status": "running"}}
             yield {"event": "token", "data": "Answer."}
             yield {
                 "event": "message_done",
@@ -788,7 +788,7 @@ class TestTheWireIsTheDialectsOwnTypes:
         from liminallm.service.runtime import get_runtime
 
         async def run_streaming(*args, **kwargs):
-            yield {"event": "trace", "data": {"tool": "web_search", "status": "running"}}
+            yield {"event": "tool_progress", "data": {"tool": "web_search", "status": "running"}}
             yield {"event": "token", "data": "Answer."}
             yield {
                 "event": "message_done",
@@ -854,7 +854,7 @@ class TestEveryStreamedEventValidatesAsItsDialectType:
         from liminallm.service.runtime import get_runtime
 
         async def run_streaming(*args, **kwargs):
-            yield {"event": "trace", "data": {"tool": "web_search", "status": "running"}}
+            yield {"event": "tool_progress", "data": {"tool": "web_search", "status": "running"}}
             yield {"event": "token", "data": "An"}
             yield {"event": "token", "data": "swer."}
             yield {
@@ -942,7 +942,7 @@ class TestEveryStreamedEventValidatesAsItsDialectType:
         from liminallm.service.runtime import get_runtime
 
         async def run_streaming(*args, **kwargs):
-            yield {"event": "trace", "data": {"tool": tool, "status": "running"}}
+            yield {"event": "tool_progress", "data": {"tool": tool, "status": "running"}}
             yield {"event": "token", "data": "Answer."}
             yield {
                 "event": "message_done",

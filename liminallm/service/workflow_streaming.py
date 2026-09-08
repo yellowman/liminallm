@@ -68,6 +68,19 @@ class _StreamFailed(Exception):
 class WorkflowStreamingMixin:
     """Streaming execution for WorkflowEngine. Not usable on its own."""
 
+    @staticmethod
+    def _record_findings(collected: List[str], kinds: Any) -> None:
+        """Collect classified injection kinds, deduplicated, in order.
+
+        Strings only: a kind is the scanner's classification, and this list is
+        projected to the client so it can say a page attempted an injection.
+        Anything else a node put under that key - a finding object carrying the
+        matched text, say - is not a kind and is not projected.
+        """
+        for kind in kinds or []:
+            if isinstance(kind, str) and kind and kind not in collected:
+                collected.append(kind)
+
     async def run_streaming(
         self,
         workflow_id: Optional[str],
@@ -77,15 +90,22 @@ class WorkflowStreamingMixin:
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         cancel_event: Optional[asyncio.Event] = None,
+        trace_sink: Optional[List[Dict[str, Any]]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Execute workflow with streaming token output per SPEC §13.7.
 
         Yields events:
         - {"event": "token", "data": "token_text"}
-        - {"event": "trace", "data": {...workflow_trace...}}
+        - {"event": "tool_progress", "data": {"tool": "web_search", "status": "running"}}
         - {"event": "message_done", "data": {"content": "...", "usage": {...}, ...}}
         - {"event": "error", "data": {"code": "...", "message": "..."}}
         - {"event": "cancel_ack", "data": {}}
+
+        `trace_sink` is for a caller inside the process - the engine's own
+        tests - that needs to see which nodes ran on a turn that ends in an
+        error and therefore reaches no completion. It receives the transient
+        `workflow_trace` itself, live. Nothing that answers a client passes
+        one: the trace is execution evidence, not a client object.
         """
         loaded = None
         if workflow_id:
@@ -165,7 +185,11 @@ class WorkflowStreamingMixin:
         # including with none, or the previous node's offsets end up pointing
         # into a string that is no longer what anyone was shown.
         validated_citations: List[Dict[str, Any]] = []
-        workflow_trace: List[Dict[str, Any]] = []
+        workflow_trace: List[Dict[str, Any]] = trace_sink if trace_sink is not None else []
+        # The kinds a scanner classified untrusted content as, deduplicated in
+        # the order they were found. Kinds only - the client warns with them,
+        # and the evidence that produced them stays where it was found.
+        injection_findings: List[str] = []
         context_snippets: List[str] = []
         context_seen = set()
         content = ""
@@ -289,7 +313,7 @@ class WorkflowStreamingMixin:
                             continue
                         if event["event"] == "token":
                             yield event
-                        elif event["event"] == "trace":
+                        elif event["event"] == "tool_progress":
                             # Tool-activity notices from the attachment
                             # agent pass straight through for the UI.
                             yield event
@@ -330,12 +354,10 @@ class WorkflowStreamingMixin:
                                 trace_entry["injection_findings"] = data[
                                     "injection_findings"
                                 ]
+                                self._record_findings(
+                                    injection_findings, data["injection_findings"]
+                                )
                             self._append_trace(workflow_trace, trace_entry)
-                            # Emit trace event
-                            yield {
-                                "event": "trace",
-                                "data": {"workflow_trace": workflow_trace[-1]},
-                            }
                         elif event["event"] == "cancel_ack":
                             yield event
                             cancelled = True
@@ -347,10 +369,6 @@ class WorkflowStreamingMixin:
                     self._append_trace(
                         workflow_trace, {"node": node_id, **tool_result}
                     )
-                    yield {
-                        "event": "trace",
-                        "data": {"workflow_trace": workflow_trace[-1]},
-                    }
                     if self._error_edge(node) and not emitted_tokens:
                         pending.extend(self._successors(node, tool_result))
                         continue
@@ -374,10 +392,9 @@ class WorkflowStreamingMixin:
                     self._append_trace(
                         workflow_trace, {"node": node_id, **result}
                     )
-                    yield {
-                        "event": "trace",
-                        "data": {"workflow_trace": workflow_trace[-1]},
-                    }
+                    self._record_findings(
+                        injection_findings, result.get("injection_findings")
+                    )
                     if result.get("outputs"):
                         vars_scope.update(result["outputs"])
                     for snippet in result.get("context_snippets") or []:
@@ -478,7 +495,6 @@ class WorkflowStreamingMixin:
                                 "failed_nodes": parallel_result.failed_nodes,
                             },
                         )
-                        yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
 
                         # Merge parallel results
                         vars_scope.update(parallel_result.merged_outputs)
@@ -516,7 +532,9 @@ class WorkflowStreamingMixin:
                     continue
 
                 self._append_trace(workflow_trace, {"node": node_id, **result})
-                yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
+                self._record_findings(
+                    injection_findings, result.get("injection_findings")
+                )
 
                 if result.get("outputs"):
                     vars_scope.update(result["outputs"])
@@ -594,6 +612,7 @@ class WorkflowStreamingMixin:
             "validated_citations": validated_citations,
             "workflow_trace": workflow_trace,
             "routing_trace": routing_trace,
+            "injection_findings": injection_findings,
             "vars": vars_scope,
         }
         if validated_citations:
@@ -1305,7 +1324,7 @@ class WorkflowStreamingMixin:
                 timeout=self.AGENT_DEADLINE_SECONDS,
             )
             for entry in traces:
-                yield {"event": "trace", "data": entry}
+                yield {"event": "tool_progress", "data": entry}
             if cancel_event and cancel_event.is_set():
                 yield {"event": "cancel_ack", "data": {}}
                 return
