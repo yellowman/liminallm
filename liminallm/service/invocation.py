@@ -634,6 +634,7 @@ class Invocation:
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         registry: Optional["InvocationRegistry"] = None,
+        citation_offers: bool = True,
     ) -> None:
         self.invocation_id = invocation_id
         self.tool = tool
@@ -672,6 +673,30 @@ class Invocation:
         #: refuses together: no instruction, no labels, no new handles, and no
         #: final transfer. The turn still answers; it carries no citations.
         self.citation_budget_intact = True
+        #: Whether the deployment still permits this execution to *grant*
+        #: citation authority.
+        #:
+        #: A different failure domain from the budget beside it, and the two
+        #: are kept apart because they answer different questions.
+        #: `citation_budget_intact` is arithmetic about this table: can what
+        #: has been committed still be put in front of the model. This one is
+        #: policy about this deployment: may a live execution hand out
+        #: authority at all, which an operator may withdraw at any moment.
+        #: Collapsed into one bit, an operator's rollback would read in the
+        #: logs as a prompt that did not fit.
+        #:
+        #: Snapshotted from the registry when the execution opens, and
+        #: monotonic false afterwards. Turning the setting back on does not
+        #: revive an execution that was caught: half of its rounds would have
+        #: run without authority and half with, and an answer written across
+        #: that boundary quotes handles from prompts the parent can no longer
+        #: say were consistent.
+        #:
+        #: What it does *not* govern is containment. Handles already issued
+        #: were shown to the model, may sit in an accepted provider
+        #: continuation, and may be written again; removing this namespace
+        #: from what leaves the parent stays keyed on `citations` alone.
+        self.citation_offers_intact = citation_offers
         #: The registry that opened this execution, so `close` can retire the
         #: entry without any module-level lookup.
         self.registry = registry
@@ -708,8 +733,31 @@ class Invocation:
         with self._lock:
             if not self.citation_budget_intact:
                 return self.citations
+            if not self.citation_offers_intact:
+                # The deployment withdrew citation authority from this
+                # execution. Unlike the budget above, this one is not a
+                # prediction the callers already made: the setting can change
+                # between a caller's check and its extension, so refusing here
+                # is what makes rollback a property of the object rather than
+                # of every path's memory.
+                return self.citations
             self.citations = extend_citation_table(registry, self.citations, bindings)
             return self.citations
+
+    def disable_citation_offers(self) -> None:
+        """Withdraw this execution's authority to grant citations, for good.
+
+        Called when an operator turns citation offers off, on every execution
+        that is live at that moment and on every one opened afterwards while
+        it stays off. Monotonic, so turning the setting back on reaches only
+        executions opened after it.
+
+        The table is left exactly as it is. What was already issued was
+        already shown to the model, and forgetting it here would only mean
+        the parent could no longer recognize a handle the model repeats.
+        """
+        with self._lock:
+            self.citation_offers_intact = False
 
     def poison_citation_budget(self) -> None:
         """Give up materializing this execution's citations, for good.
@@ -1047,8 +1095,12 @@ class InvocationRegistry:
     attempt for the life of the process.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, citation_offers: bool = True) -> None:
         self._live: Dict[str, Invocation] = {}
+        #: Whether an execution opened now may grant citation authority. The
+        #: engine seeds it from the stored setting and `Runtime.refresh_settings`
+        #: moves it; nothing else writes it.
+        self._citation_offers = citation_offers
         self._lock = threading.RLock()
 
     def __len__(self) -> int:
@@ -1066,7 +1118,15 @@ class InvocationRegistry:
         """Register a new logical execution, or return the one already running.
 
         Returning the existing entry is what makes a retry a retry: the second
-        attempt finds the first attempt's ledger and replays against it.
+        attempt finds the first attempt's ledger and replays against it - and
+        with it the citation state, so a replacement attempt cannot read the
+        rollout setting afresh and recover authority the first attempt lost.
+
+        The rollout state is read here, under the same lock
+        `configure_citation_offers` takes, which is what leaves no third
+        outcome when the two race: an execution opened before a rollback is in
+        the live map and is disabled by it, and one opened after is born
+        disabled.
         """
         with self._lock:
             existing = self._live.get(invocation_id)
@@ -1078,9 +1138,46 @@ class InvocationRegistry:
                 user_id=user_id,
                 tenant_id=tenant_id,
                 registry=self,
+                citation_offers=self._citation_offers,
             )
             self._live[invocation_id] = invocation
             return invocation
+
+    def configure_citation_offers(self, enabled: bool) -> None:
+        """Apply the deployment's citation-offer policy, now.
+
+        Asymmetric, because the two directions are not the same statement.
+
+        Turning it off is a rollback and takes effect on everything that
+        exists: the default for executions opened later, and every execution
+        already live, which loses its authority permanently. Waiting for those
+        to finish would leave an operator's rollback true only for the next
+        turn, which is not what an operator disabling a feature means.
+
+        Turning it on is prospective. An execution that was caught by a
+        rollback stays caught: it has already run rounds without authority,
+        and an answer written across that boundary would quote handles from
+        prompts the parent can no longer describe as one conversation.
+
+        Lock order is registry then invocation, and only that way. Every other
+        method here releases this lock before it touches an execution -
+        `close` and `close_all` snapshot first, and `Invocation.close` releases
+        its own lock before calling `forget` - so nothing holds an execution's
+        lock while waiting for this one. Held across the loop on purpose: the
+        call returning is what "the rollback has finished" means.
+        """
+        with self._lock:
+            self._citation_offers = enabled
+            if enabled:
+                return
+            for invocation in self._live.values():
+                invocation.disable_citation_offers()
+
+    @property
+    def citation_offers(self) -> bool:
+        """The policy an execution opened now would be born with."""
+        with self._lock:
+            return self._citation_offers
 
     def get(self, invocation_id: str) -> Optional[Invocation]:
         with self._lock:

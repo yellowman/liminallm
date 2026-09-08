@@ -189,11 +189,23 @@ class WorkflowEngine(WorkflowStreamingMixin):
         settings: Optional[Settings] = None,
         embeddings=None,
     ) -> None:
+        # Never None: an optional settings object is what makes every read
+        # defensive, and a defensive read is a place for a stale default to
+        # hide. Absent one, the declared defaults are the right answer.
+        self.settings = settings or Settings()
         # The live logical executions of this engine. Not a module global: hot
         # reload replaces the engine while in-flight work finishes, and a
         # global would have an old attempt asking the new engine about an
         # execution it never opened (SPEC §18).
-        self.invocations = InvocationRegistry()
+        #
+        # Seeded with the stored citation-offer policy rather than defaulted
+        # to on. An engine rebuilt for an unrelated reason - a model change,
+        # a reload - would otherwise open its first execution with authority
+        # the operator had already withdrawn, and a rebuild would be a way
+        # around a rollback.
+        self.invocations = InvocationRegistry(
+            citation_offers=self.settings.citation_offers_enabled
+        )
         # A capability handler reaches its dependencies through the engine, so
         # the liveness check belongs on the engine's references to them rather
         # than at each call site - a handler cannot forget what it never had to
@@ -208,10 +220,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
         self.logger = get_logger(__name__)
         self.tool_registry = self._build_tool_registry()
         self.cache = cache
-        # Never None: an optional settings object is what makes every read
-        # defensive, and a defensive read is a place for a stale default to
-        # hide. Absent one, the declared defaults are the right answer.
-        self.settings = settings or Settings()
         self.tool_network_policy: ToolNetworkPolicy = build_tool_network_policy(
             allowlist=(settings.tool_network_allowlist if settings else []),
             proxy_url=settings.tool_network_proxy_url if settings else None,
@@ -2095,7 +2103,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 "the draft the cut removes is still in the accepted state"
             )
         registry = context.source_registry
-        if not self.CITATION_OFFERS_ENABLED or registry is None:
+        if not invocation.citation_offers_intact or registry is None:
             return None
         transcript = context.transcript
         if replace_terminal_answer:
@@ -2225,9 +2233,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
         A prompt that cannot afford its markers gives them up whole instead.
         """
         if (
-            not self.CITATION_OFFERS_ENABLED
-            or invocation is None
+            invocation is None
             or registry is None
+            or not invocation.citation_offers_intact
             or not invocation.citation_budget_intact
         ):
             return list(snippets), None
@@ -3292,6 +3300,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # into. An answer quoting such a handle is quoting one this turn can
         # no longer say the model was shown, and the two flags have to be read
         # together or the second is only a prompt-building preference.
+        #
+        # `citation_offers_intact` refuses it for a third reason, which is not
+        # about this turn at all: the operator withdrew citation authority
+        # while it was running. The handles committed before that are still in
+        # the namespace and the model may well quote one, but resolving it now
+        # would be granting authority after the deployment stopped granting
+        # it. The answer stands; it carries no citations.
         if (
             succeeded
             and (
@@ -3301,6 +3316,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             and not plan.get("stream_final")
             and context.citations_intact
             and invocation.citation_budget_intact
+            and invocation.citation_offers_intact
         ):
             citations = transfer_citations(
                 context.canonical_model_response,
@@ -3779,25 +3795,19 @@ class WorkflowEngine(WorkflowStreamingMixin):
     HISTORY_SEARCH_SCHEMA = agent_tools.HISTORY_SEARCH_SCHEMA
     NOTE_SEARCH_SCHEMA = agent_tools.NOTE_SEARCH_SCHEMA
 
-    #: Whether the model is shown citation markers at all.
+    #: Whether the model is shown citation markers at all is
+    #: `citation_offers_enabled`, a managed setting, read through
+    #: `Invocation.citation_offers_intact` - the execution's own snapshot of
+    #: it, taken when the execution opened and monotonic afterwards. It was a
+    #: class attribute here, which made the rollback a redeploy.
     #:
-    #: On. A turn that grounds on something offers the model a handle for it,
-    #: takes the namespace back out of everything that crosses to the worker
-    #: or the client, and keeps what the model wrote as the only thing a
-    #: citation is read from.
-    #:
-    #: Off, and the whole citation transformation is skipped rather than
-    #: performed and undone: no speculative table, no instruction, no labels,
-    #: no reconstruction standing in for the worker's messages, no handles
-    #: committed. What the model is sent is byte-for-byte what it was sent
-    #: before any of this existed, which is the rollback - a deploy-time one,
-    #: since this is a class attribute rather than a managed setting.
-    #:
-    #: A populated `CitationTable` is not this gate. Every turn mints a
-    #: namespace whether or not anything is offered, so reading one as
-    #: "offers are on" would turn the feature on for every turn that grounded
-    #: anything.
-    CITATION_OFFERS_ENABLED = True
+    #: Two things it does not decide. It is not containment: a namespace this
+    #: execution already showed the model is taken back out of everything that
+    #: crosses to the worker or the client whatever the setting says now, and
+    #: that decision reads `invocation.citations` alone. And a populated
+    #: `CitationTable` is not the gate either - every turn mints a namespace
+    #: whether or not anything is offered, so reading one as "offers are on"
+    #: would turn the feature on for every turn that grounded anything.
 
     MAX_AGENT_ROUNDS = 3
     # Leave headroom under the node timeout for the final model turn.

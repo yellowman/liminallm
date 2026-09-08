@@ -733,6 +733,18 @@ class Settings(BaseModel):
             "when off, notes routes and the note_search tool disappear."
         ),
     )
+    citation_offers_enabled: bool = managed_field(
+        True,
+        description=(
+            "Offer the model citation handles for what a turn retrieved. "
+            "Turning this off is a rollback: a turn already running loses "
+            "citation authority immediately and permanently, and answers "
+            "afterwards are ordinary uncited answers. It never stops a "
+            "namespace already shown to the model from being removed from "
+            "that turn's output, and it leaves citations already recorded "
+            "exactly where they are."
+        ),
+    )
     cluster_bus_backend: str = managed_field(
         "auto",
         description=(
@@ -1318,7 +1330,8 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
                    "rag_late_interaction", "rag_late_segments",
                    "history_budget_fraction", "history_recall_fraction")),
     ("Features", ("notes_enabled", "allow_signup", "enable_mfa",
-                  "web_tools_enabled", "extract_readers")),
+                  "web_tools_enabled", "extract_readers",
+                  "citation_offers_enabled")),
     ("Web tools", ("web_search_provider", "web_search_engine_id",
                    "web_search_api_key", "web_fetch_timeout",
                    "web_fetch_max_bytes", "tool_fetch_timeout",

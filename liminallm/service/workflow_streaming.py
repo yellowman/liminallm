@@ -937,13 +937,22 @@ class WorkflowStreamingMixin:
         # guessing at what was removed, which is the ambiguity the reader
         # exists to remove.
         #
-        # Built only for a turn that committed a handle, which is not the same
-        # question as whether the feature is on. A turn with nothing citable
-        # offers the model no namespace, so there is nothing of it in the
-        # answer to remove - and removing anything would be editing prose on
-        # the strength of a coincidence, the same rule the two capability
-        # bodies follow. It also keeps the quadratic scan and the length
-        # ceiling off every ordinary conversation once this is enabled.
+        # Built only for a turn that committed a handle, and on that alone.
+        #
+        # Not on whether offers are enabled *now*. That setting can be turned
+        # off while this turn is running, and the model has already been shown
+        # the handles: they may sit in an accepted provider continuation, the
+        # trusted transcript may describe the turn they were visible in, and
+        # the model may write one again. A rollback withdraws authority, which
+        # nothing here grants; it cannot withdraw the fact that a namespace
+        # was issued, so containment outlives it.
+        #
+        # And a turn with nothing citable still gets no filter: it offered the
+        # model no namespace, so there is nothing of it in the answer to
+        # remove, and removing anything would be editing prose on the strength
+        # of a coincidence - the same rule the two capability bodies follow.
+        # It also keeps the reader and the length ceiling off every ordinary
+        # conversation.
         streamed: Dict[str, ScrubbedTokenStream] = {}
 
         def produce():
@@ -955,7 +964,7 @@ class WorkflowStreamingMixin:
                 user_id=user_id,
                 **offer,
             )
-            if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
+            if not invocation.citations:
                 return raw
             filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
             streamed["stream"] = filtered
@@ -1030,6 +1039,13 @@ class WorkflowStreamingMixin:
             return []
         if not citations_intact or not invocation.citation_budget_intact:
             return []
+        if not invocation.citation_offers_intact:
+            # The deployment withdrew citation authority while this answer was
+            # being written. The scrub above still ran - it is keyed on the
+            # namespace, not on the policy - and this is the other half:
+            # resolving a handle now would grant authority the operator has
+            # already taken back.
+            return []
         return citation_payload(
             validate_citations(stream.reader.canonical, invocation.citations),
             stream.origins,
@@ -1059,7 +1075,7 @@ class WorkflowStreamingMixin:
         path reads it: out of the canonical copy of that same turn. This
         answer was never streamed, so there is no stream to read it out of,
         and the canonical copy is of exactly the turn that was delivered."""
-        if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
+        if not invocation.citation_offers_intact or not invocation.citations:
             return []
         if not context.citations_intact or not invocation.citation_budget_intact:
             return []
@@ -1403,7 +1419,11 @@ class WorkflowStreamingMixin:
                         messages, adapters, user_id=user_id,
                         **({"continuation": accepted} if native else {}),
                     )
-                    if not self.CITATION_OFFERS_ENABLED or not invocation.citations:
+                    # Issued handles, and nothing else. A rollback that lands
+                    # mid-turn takes this execution's authority to grant more;
+                    # it does not unshow the ones the model already has, so
+                    # the filter stays on. See the plain node above.
+                    if not invocation.citations:
                         return raw
                     filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
                     streamed["stream"] = filtered
