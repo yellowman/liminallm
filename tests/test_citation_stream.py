@@ -297,10 +297,17 @@ class TestTheStreamRefusesToBeUsedWrongly:
         reader.push(f"400 hours {MARKER}")
         reader.finish()
         assert reader.intact()
-        # Forcing the failure the check exists for: text released that the
-        # finished scrub does not begin with.
-        reader._released = "800 hours"
-        assert not reader.intact()
+
+        # Forcing the failure the check exists for: less released than the
+        # finished scrub says. Forced before `finish`, because that is where
+        # the comparison happens - the reader releases incrementally and asks
+        # the whole-string scrub once, at the end.
+        short = CanonicalCitationStream(NONCE)
+        short.push(f"400 hours {MARKER} exactly")
+        short._released_parts = ["400 hours"]
+        short._released_len = len("400 hours")
+        short.finish()
+        assert not short.intact()
 
 
 class TestTheGuardsOnStateThatShouldNotHappen:
@@ -312,12 +319,22 @@ class TestTheGuardsOnStateThatShouldNotHappen:
     """
 
     def test_released_text_that_the_scrub_later_removes_raises(self):
+        """The comparison is at completion, where the finished text exists.
+
+        The reader no longer scrubs the whole answer per chunk, so this is
+        where a released marker is caught: `finish` asks the whole-string
+        scrub what the answer is and refuses an answer that does not begin
+        with what already went out.
+        """
         reader = CanonicalCitationStream(NONCE)
         reader.push("400 hours ")
         # What a hold that was too short would have left behind.
-        reader._released = f"400 hours [cite:{NONCE}"
+        reader._released_parts = [f"400 hours [cite:{NONCE}"]
+        reader._released_len = len(reader._released_parts[0])
+        reader.push("-1] exactly")
         with pytest.raises(ValueError):
-            reader.push("-1] exactly")
+            reader.finish()
+        assert not reader.intact()
 
     def test_a_stream_that_has_not_finished_is_not_intact(self):
         """The gate this is about to sit in asks one question - may citations
@@ -338,9 +355,11 @@ class TestTheGuardsOnStateThatShouldNotHappen:
         with text missing from the front of it."""
         reader = CanonicalCitationStream(NONCE)
         reader.push(f"400 hours {MARKER}")
-        reader.finish()
-        reader._released = "hours"
+        reader._released_parts = ["hours"]
+        reader._released_len = len("hours")
         assert "hours" in scrub_positions(reader.canonical, NONCE)[0]
+        with pytest.raises(ValueError):
+            reader.finish()
         assert not reader.intact()
 
 
