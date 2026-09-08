@@ -113,10 +113,52 @@ def log_routing_trace(trace: list, logger: Optional[Any] = None) -> None:
     log.info("routing_trace", trace=trace)
 
 
+#: The statuses the workflow engine sets on a trace entry. A status arrives
+#: inside a node result, and a result is assembled from a handler's return
+#: value, so the value is bounded here rather than trusted: anything else is
+#: logged as "other".
+_TRACE_STATUSES = frozenset(
+    {"ok", "error", "end", "running", "parallel", "rolling_back", "rolled_back"}
+)
+
+
+def workflow_trace_summary(trace: list) -> Dict[str, Any]:
+    """What an execution log may say about a turn: which nodes ran, and how.
+
+    An allowlist, not a redaction pass. A trace entry nests node outputs, tool
+    arguments, tool results, failure text and context snippets - the same data
+    this build keeps out of message rows, chat responses and the stream (SPEC
+    §18) - and a log file is another retention system, with its own lifetime
+    and its own readers. So nothing is filtered out of an entry: two bounded
+    fields are copied out of it, and the entry itself is never handed to the
+    logger. A redaction pass would have to recognise every shape a handler can
+    return; this has to recognise two.
+    """
+    nodes: list = []
+    errors = 0
+    for entry in trace or []:
+        if not isinstance(entry, dict):
+            continue
+        status = entry.get("status")
+        status = status if status in _TRACE_STATUSES else "other"
+        if status == "error":
+            errors += 1
+        node = entry.get("node")
+        nodes.append(
+            {"node": node if isinstance(node, str) else None, "status": status}
+        )
+    return {"trace_length": len(nodes), "error_count": errors, "nodes": nodes}
+
+
 def log_workflow_trace(trace: list, logger: Optional[Any] = None) -> None:
-    """Log workflow trace per SPEC §15.2: nodes executed, errors."""
+    """Log workflow execution per SPEC §15.2: nodes executed, errors.
+
+    The summary, never the trace - see `workflow_trace_summary`. Sanitizing
+    here rather than at the call site so a caller cannot ask for the other
+    thing.
+    """
     log = logger or get_logger("workflow")
-    log.info("workflow_trace", trace=trace)
+    log.info("workflow_trace", **workflow_trace_summary(trace))
 
 
 # Issue 47.1-47.8: Content sanitization for API responses

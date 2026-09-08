@@ -2447,7 +2447,13 @@ metrics (per service):
 logs:
 
 - structured logs with correlation IDs for each chat request, including
-  the routing trace (rules fired, adapters activated) and workflow trace.
+  the routing trace (rules fired, adapters activated) and a summary of the
+  workflow trace: how many nodes ran, how many failed, and each node's id
+  and status. The trace itself is never logged. It nests node outputs, tool
+  arguments, tool results and failure text, and a log is a retention system
+  with its own lifetime - so the summary is assembled from an allowlist
+  rather than filtered out of the entry, and a status outside the engine's
+  own set is logged as `other`.
 - secrets never reach a log line: connection URLs are masked in both the
   userinfo and query spellings before logging.
 - redact PII where possible; configurable payload sampling.

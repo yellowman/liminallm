@@ -10,7 +10,11 @@ client-visible state nobody asked for.
 
 The lifetime this pins:
 
-    workflow executes -> transient trace -> logging, internal callers -> gone
+    workflow executes -> transient trace
+        -> sanitized diagnostic summary, internal callers -> gone
+
+A log is a retention system too, so the execution log gets a summary built
+from the trace rather than the trace itself.
 
 The boundary is `chat_turn.public()`. Above it the trace exists; below it -
 the message row, the chat response, the stream, the history API - it does not.
@@ -26,8 +30,10 @@ import json
 import uuid
 
 import pytest
+from structlog.testing import CapturingLogger
 
 from liminallm.api import chat_turn, routes, schemas
+from liminallm.logging import log_workflow_trace
 from liminallm.service.auth import AuthContext
 from liminallm.service.runtime import get_runtime
 from liminallm.service.workflow_streaming import WorkflowStreamingMixin
@@ -218,6 +224,94 @@ class TestNothingDurableCarriesTheTrace:
         """`Turn.orchestration` outlives the workflow and is read afterwards."""
         turn, _ = await _finished(store)
         assert "workflow_trace" not in turn.orchestration
+
+
+class TestTheExecutionLogIsASummaryNotTheTrace:
+    """A log is a retention system too.
+
+    The trace was handed to structlog whole. The redaction processor there
+    walks top-level event keys and rewrites string values under sensitive-
+    looking names, so `trace=[{outputs, tool_calls, ...}]` passed through it
+    untouched: the same node outputs and tool arguments this tranche keeps out
+    of rows and responses were being copied into a file that outlives the
+    request. What is logged now is an allowlist - which nodes ran and how they
+    ended - assembled from the trace rather than filtered out of it.
+    """
+
+    def _logged(self, trace):
+        capture = CapturingLogger()
+        log_workflow_trace(trace, logger=capture)
+        assert len(capture.calls) == 1, capture.calls
+        return capture.calls[0]
+
+    def test_no_nested_value_reaches_the_logger(self):
+        call = self._logged(TRACE_WITH_SECRETS)
+        assert SENTINEL not in json.dumps(
+            {"args": call.args, "kwargs": call.kwargs}, default=str
+        ), call
+
+    def test_an_ordinary_looking_key_is_dropped_too(self):
+        """`outputs.scratch` names nothing sensitive. It is dropped because it
+        was never on the list, which is the difference between an allowlist
+        and a redaction pass."""
+        call = self._logged(TRACE_WITH_SECRETS)
+        emitted = json.dumps(call.kwargs, default=str)
+        for absent in ("scratch", "outputs", "tool_calls", "args", "result",
+                       "error\":", "backend said", "web_fetch"):
+            assert absent not in emitted, f"{absent} survived: {emitted}"
+
+    def test_what_the_log_is_for_survives(self):
+        call = self._logged(TRACE_WITH_SECRETS)
+        assert call.args == ("workflow_trace",)
+        assert call.kwargs == {
+            "trace_length": 2,
+            "error_count": 1,
+            "nodes": [
+                {"node": "retrieve", "status": "ok"},
+                {"node": "answer", "status": "error"},
+            ],
+        }
+
+    def test_a_status_the_engine_never_sets_is_not_logged_verbatim(self):
+        """`status` arrives inside a node result, and a result is assembled
+        from a handler's return value - so the value is bounded here rather
+        than trusted."""
+        call = self._logged([{"node": "n", "status": f"ok {SENTINEL}"}])
+        assert call.kwargs["nodes"] == [{"node": "n", "status": "other"}]
+
+    def test_an_empty_trace_still_logs_a_shape(self):
+        call = self._logged([])
+        assert call.kwargs == {"trace_length": 0, "error_count": 0, "nodes": []}
+
+    def test_a_real_streamed_turn_logs_no_secret_anywhere(
+        self, client, auth_headers, tool_calling_backend
+    ):
+        """Not only this function: nothing the engine logs during a turn whose
+        trace nests a secret in a tool argument may carry it."""
+        engine = get_runtime().workflow
+        capture = CapturingLogger()
+        previous = engine.logger
+        engine.logger = capture
+        try:
+            with client.websocket_connect("/v1/chat/stream") as ws:
+                ws.send_json({
+                    "access_token": auth_headers["Authorization"].split()[1],
+                    "message": "how long does the kettle take",
+                    "stream": True,
+                })
+                for _ in range(200):
+                    if ws.receive_json().get("event") in ("message_done", "error"):
+                        break
+        finally:
+            engine.logger = previous
+        assert capture.calls, "the engine logged nothing; the witness is vacuous"
+        assert any(call.args[:1] == ("workflow_trace",) for call in capture.calls), (
+            f"the turn logged no workflow trace: {[c.args for c in capture.calls]}"
+        )
+        emitted = json.dumps(
+            [{"args": c.args, "kwargs": c.kwargs} for c in capture.calls], default=str
+        )
+        assert SENTINEL not in emitted, emitted
 
 
 class TestAFailedWorkflowParksNoTraceInTheCache:
