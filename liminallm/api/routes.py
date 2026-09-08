@@ -2041,7 +2041,7 @@ async def _responses_stream(
                             "logprobs": [],
                         },
                     )
-            elif kind == "trace":
+            elif kind == "tool_progress":
                 tool = data.get("tool") if isinstance(data, dict) else None
                 item_type = _RESPONSES_TOOL_ITEM_TYPES.get(tool)
                 if item_type and message_index is None:
@@ -2065,7 +2065,9 @@ async def _responses_stream(
                     next_output_index += 1
             elif kind == "message_done":
                 finished = True
-                orchestration = data if isinstance(data, dict) else {}
+                # The same boundary the socket applies: the dialect is built
+                # from the public projection of the engine's result.
+                orchestration = chat_turn.public(data)
             elif kind == "error":
                 message = data.get("message") if isinstance(data, dict) else None
                 yield ev(
@@ -5954,7 +5956,10 @@ async def websocket_chat(ws: WebSocket):
                             content_tokens.append(event_data)
                     elif event_type == "message_done":
                         message_done_received = True
-                        orchestration_dict = event_data if isinstance(event_data, dict) else {}
+                        # Where the engine's result crosses out of execution:
+                        # what this route stores, answers with and caches is
+                        # the public projection, never the engine's own.
+                        orchestration_dict = chat_turn.public(event_data)
                     elif event_type == "error":
                         # Error already sent, close connection
                         cancel_listener.cancel()
@@ -5995,7 +6000,8 @@ async def websocket_chat(ws: WebSocket):
             await idempotency.store("chat:ws", user_id, idempotency_key, envelope)
 
             # Send final event with message_id and conversation_id to client
-            # SPEC §18: Valid events are token, message_done, error, cancel_ack, trace
+            # SPEC §18: Valid events are token, tool_progress, message_done,
+            # error, cancel_ack
             await ws.send_json({
                 "event": "message_done",
                 "data": {
@@ -6010,7 +6016,12 @@ async def websocket_chat(ws: WebSocket):
                     "usage": orchestration_dict.get("usage", {}),
                     "context_snippets": orchestration_dict.get("context_snippets", []),
                     "routing_trace": orchestration_dict.get("routing_trace", []),
-                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                    # The kinds a scanner classified fetched content as, so the
+                    # client can warn that a page tried to hijack the turn.
+                    # Kinds only: no fetched text, no matched attack string.
+                    "injection_findings": orchestration_dict.get(
+                        "injection_findings", []
+                    ),
                 },
                 "request_id": request_id,
             })

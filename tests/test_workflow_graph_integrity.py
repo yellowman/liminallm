@@ -1401,12 +1401,15 @@ class TestAStreamedToolObeysTheSameControlPlane:
         return calls
 
     @staticmethod
-    def _nodes_run(events):
-        return [
-            e["data"]["workflow_trace"].get("node")
-            for e in events
-            if e.get("event") == "trace" and "workflow_trace" in (e.get("data") or {})
-        ]
+    def _nodes_run(trace):
+        """Which nodes ran, read from the engine's own transient trace.
+
+        These turns end in an error event and therefore reach no completion,
+        so the trace is collected live through `trace_sink`. It is not a
+        client-facing event: the execution trace stops at the API boundary
+        (see `tests/test_workflow_trace_lifetime.py`).
+        """
+        return [entry.get("node") for entry in trace]
 
     @pytest.mark.asyncio
     async def test_an_open_circuit_never_starts_the_stream(
@@ -1431,9 +1434,10 @@ class TestAStreamedToolObeysTheSameControlPlane:
     ):
         """The handoff half, for a failure the breaker produced."""
         self._stream(engine, monkeypatch, schema=self.BREAKER, opens_breaker=True)
-        events = [e async for e in engine.run_streaming(
-            "wf", None, "hi", None, user_id="u")]
-        ran = self._nodes_run(events)
+        trace: list = []
+        [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u", trace_sink=trace)]
+        ran = self._nodes_run(trace)
         assert "recover" in ran, f"the declared error edge was not taken: {ran}"
         assert "normal" not in ran, (
             f"a failed streamed node took the success edge: {ran}"
@@ -1450,9 +1454,10 @@ class TestAStreamedToolObeysTheSameControlPlane:
         this tranche does not answer it.
         """
         self._stream(engine, monkeypatch, schema=self.BREAKER, raises=True)
-        events = [e async for e in engine.run_streaming(
-            "wf", None, "hi", None, user_id="u")]
-        ran = self._nodes_run(events)
+        trace: list = []
+        [e async for e in engine.run_streaming(
+            "wf", None, "hi", None, user_id="u", trace_sink=trace)]
+        ran = self._nodes_run(trace)
         assert "recover" in ran, (
             f"a stream that failed before producing anything ended the turn "
             f"instead of taking its declared error edge: {ran}"
@@ -1466,9 +1471,10 @@ class TestAStreamedToolObeysTheSameControlPlane:
         """The control. Routing every streamed node to `on_error` would pass
         both witnesses above and break every successful turn."""
         calls = self._stream(engine, monkeypatch, schema=self.BREAKER)
+        trace: list = []
         events = [e async for e in engine.run_streaming(
-            "wf", None, "hi", None, user_id="u")]
-        ran = self._nodes_run(events)
+            "wf", None, "hi", None, user_id="u", trace_sink=trace)]
+        ran = self._nodes_run(trace)
         assert calls == ["generate_stream"], calls
         assert "normal" in ran, f"a successful stream took the error edge: {ran}"
         assert "recover" not in ran, ran
@@ -1525,14 +1531,15 @@ class TestAStreamedToolObeysTheSameControlPlane:
                             raising=False)
         monkeypatch.setattr(engine, "_load_workflow_for",
                             lambda *a, **k: _loaded(self.PARTIAL))
+        trace: list = []
         events = [e async for e in engine.run_streaming(
-            "wf", None, "hi", None, user_id="u")]
+            "wf", None, "hi", None, user_id="u", trace_sink=trace)]
 
         tokens = [e["data"] for e in events if e.get("event") == "token"]
         assert tokens == ["PARTIAL "], (
             f"a second answer was streamed into the same bubble: {tokens}"
         )
-        assert "recover" not in self._nodes_run(events), self._nodes_run(events)
+        assert "recover" not in self._nodes_run(trace), self._nodes_run(trace)
         assert len(calls) == 1, f"the model was called again after partial output: {calls}"
 
     @pytest.mark.asyncio
@@ -1550,7 +1557,8 @@ class TestAStreamedToolObeysTheSameControlPlane:
         schema = json.loads(json.dumps(self.BREAKER))
         del schema["nodes"][0]["on_error"]
         self._stream(engine, monkeypatch, schema=schema, raises=True)
+        trace: list = []
         events = [e async for e in engine.run_streaming(
-            "wf", None, "hi", None, user_id="u")]
+            "wf", None, "hi", None, user_id="u", trace_sink=trace)]
         assert any(e.get("event") == "error" for e in events), events
-        assert "normal" not in self._nodes_run(events), self._nodes_run(events)
+        assert "normal" not in self._nodes_run(trace), self._nodes_run(trace)

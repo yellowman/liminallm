@@ -462,8 +462,10 @@ class _FetchingBackend:
         return {"content": "It boils in 3 minutes.", "usage": {}}
 
 
-def test_injection_findings_reach_the_workflow_trace(monkeypatch):
-    """The UI warning is driven off the trace, so findings must land there."""
+def test_injection_findings_reach_the_completed_turn(monkeypatch):
+    """The UI warns that a page tried to hijack the turn, so the classified
+    kinds must reach the completion. The kinds alone: the page's text, and the
+    matched attack string, stay where they were found."""
     import asyncio
 
     from liminallm.service.runtime import get_runtime
@@ -517,14 +519,12 @@ def test_injection_findings_reach_the_workflow_trace(monkeypatch):
         server.server_close()
 
     done = next(e for e in reversed(events) if e["event"] == "message_done")
-    trace = done["data"]["workflow_trace"]
-    findings = [
-        kind
-        for entry in trace
-        for kind in (entry.get("injection_findings") or [])
-    ]
-    assert findings, f"no findings in trace: {trace}"
+    findings = done["data"].get("injection_findings") or []
+    assert findings, f"no findings on the completed turn: {done['data'].keys()}"
     assert "override-instructions" in findings or "persona-hijack" in findings
+    # Kinds, not evidence: every one is a classification the scanner names.
+    assert all(isinstance(kind, str) for kind in findings), findings
+    assert findings == list(dict.fromkeys(findings)), f"duplicated: {findings}"
 
 
 async def _collect_stream(engine, **kwargs):

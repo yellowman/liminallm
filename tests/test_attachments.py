@@ -371,14 +371,18 @@ def test_streaming_agent_emits_tool_traces_then_tokens(client, user, tool_callin
     )
     kinds = [e["event"] for e in events]
 
-    # Tool activity is announced before the answer streams.
+    # Tool activity is announced before the answer streams. The event carries
+    # the capability's name and its status and nothing else: it exists so the
+    # client can say what is happening, not to report execution state.
     tool_traces = [
-        e for e in events if e["event"] == "trace" and (e.get("data") or {}).get("tool")
+        e for e in events
+        if e["event"] == "tool_progress" and (e.get("data") or {}).get("tool")
     ]
     assert tool_traces, kinds
     assert {t["data"]["tool"] for t in tool_traces} <= {
         "file_search", "run_python", "web_search", "web_fetch",
     }
+    assert all(set(t["data"]) == {"tool", "status"} for t in tool_traces), tool_traces
 
     tokens = [e for e in events if e["event"] == "token"]
     assert len(tokens) > 1, f"expected a token stream, got {len(tokens)}"
@@ -386,7 +390,7 @@ def test_streaming_agent_emits_tool_traces_then_tokens(client, user, tool_callin
     first_token_at = kinds.index("token")
     first_trace_at = next(
         i for i, e in enumerate(events)
-        if e["event"] == "trace" and (e.get("data") or {}).get("tool")
+        if e["event"] == "tool_progress" and (e.get("data") or {}).get("tool")
     )
     assert first_trace_at < first_token_at, "tools must run before the answer streams"
 

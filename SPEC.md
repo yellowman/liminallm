@@ -2185,7 +2185,7 @@ request:
 response:
 
 - if `stream=true`: SSE (`event: token`) or WebSocket frames (§13.7)
-  until `event=done` with `{message_id, usage, adapters, workflow_trace}`.
+  until `event=done` with `{message_id, usage, adapters, injection_findings}`.
 - if `stream=false`: blocking JSON `{message_id, content, usage, adapters}`.
 - `POST /v1/chat/cancel { request_id }` cancels a running turn, across
   replicas via the cluster bus (§22).
@@ -2400,11 +2400,17 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
 - the initial frame also carries the request:
   `{ message, conversation_id?, context_id?, workflow_id?, stream?: bool,
   request_id?, idempotency_key? }`.
-- streaming events: `token`, `trace` (router/workflow snapshot),
-  `message_done`, `error`, `cancel_ack`, wrapped as
+- streaming events: `token`, `tool_progress`
+  (`{ tool, status }` - which capability is running, for a progress
+  indicator), `message_done`, `error`, `cancel_ack`, wrapped as
   `{ "event": "...", "data": ..., "request_id": "uuid" }`. SSE uses
   `event:` labels for the same set. `stream: false` yields a single
   envelope `{ status, data: ChatResponse }`.
+- the execution trace (`workflow_trace`) is internal. It is not an event,
+  not a field of any response, and not message metadata: it names nodes,
+  outputs, tool arguments and failure text, and its lifetime ends with the
+  request that produced it. What the client is told about untrusted content
+  is `injection_findings` on `message_done` - the classified kinds alone.
 
 ---
 
@@ -2441,7 +2447,13 @@ metrics (per service):
 logs:
 
 - structured logs with correlation IDs for each chat request, including
-  the routing trace (rules fired, adapters activated) and workflow trace.
+  the routing trace (rules fired, adapters activated) and a summary of the
+  workflow trace: how many nodes ran, how many failed, and each node's id
+  and status. The trace itself is never logged. It nests node outputs, tool
+  arguments, tool results and failure text, and a log is a retention system
+  with its own lifetime - so the summary is assembled from an allowlist
+  rather than filtered out of the entry, and a status outside the engine's
+  own set is logged as `other`.
 - secrets never reach a log line: connection URLs are masked in both the
   userinfo and query spellings before logging.
 - redact PII where possible; configurable payload sampling.
