@@ -297,14 +297,27 @@ class TestTheStreamRefusesToBeUsedWrongly:
         reader.push(f"400 hours {MARKER}")
         reader.finish()
         assert reader.intact()
-        # Forcing the failure the check exists for: text released that the
-        # finished scrub does not begin with.
-        reader._released = "800 hours"
-        assert not reader.intact()
+
+        # Forcing the failure the check exists for: less released than the
+        # finished scrub says. Forced before `finish`, because that is where
+        # the comparison happens - the reader releases incrementally and asks
+        # the whole-string scrub once, at the end.
+        #
+        # Releasing too little is not the lesser half of the contract. The
+        # completion is built out of what was released, so accepting a strict
+        # prefix produces a shorter answer carrying a success stamp - which is
+        # the same failure a truncating ceiling would have been.
+        short = CanonicalCitationStream(NONCE)
+        short.push(f"400 hours {MARKER} exactly")
+        short._released_parts = ["400 hours"]
+        short._released_len = len("400 hours")
+        with pytest.raises(ValueError):
+            short.finish()
+        assert not short.intact()
 
 
 class TestTheGuardsOnStateThatShouldNotHappen:
-    """Three checks that the mechanism above is meant to make unreachable.
+    """Four checks that the mechanism above is meant to make unreachable.
 
     Forced rather than provoked. Each one exists because the alternative to
     raising is streaming an answer whose public form is already wrong, and a
@@ -312,12 +325,42 @@ class TestTheGuardsOnStateThatShouldNotHappen:
     """
 
     def test_released_text_that_the_scrub_later_removes_raises(self):
+        """The comparison is at completion, where the finished text exists.
+
+        The reader no longer scrubs the whole answer per chunk, so this is
+        where a released marker is caught: `finish` asks the whole-string
+        scrub what the answer is and refuses anything but the same text.
+        """
         reader = CanonicalCitationStream(NONCE)
         reader.push("400 hours ")
         # What a hold that was too short would have left behind.
-        reader._released = f"400 hours [cite:{NONCE}"
+        reader._released_parts = [f"400 hours [cite:{NONCE}"]
+        reader._released_len = len(reader._released_parts[0])
+        reader.push("-1] exactly")
         with pytest.raises(ValueError):
-            reader.push("-1] exactly")
+            reader.finish()
+        assert not reader.intact()
+
+    def test_released_text_the_scrub_says_is_incomplete_raises(self):
+        """The other direction, which is not the milder one.
+
+        A reader that held text it should have released ends the answer short.
+        Nothing downstream can tell that apart from a model that stopped
+        there: `finish` returns the origin map, `_complete` builds
+        `message_done` out of the released text, and the turn is persisted as
+        a reply. So the check is equality, and the missing text is not
+        supplied here - an answer nobody streamed is not an answer this reader
+        may invent.
+        """
+        reader = CanonicalCitationStream(NONCE)
+        reader.push(f"400 hours {MARKER} exactly")
+        # What a hold that never let go would have left behind.
+        reader._released_parts = ["400 hours"]
+        reader._released_len = len("400 hours")
+        assert scrub_positions(reader.canonical, NONCE)[0].startswith("400 hours")
+        with pytest.raises(ValueError):
+            reader.finish()
+        assert not reader.intact()
 
     def test_a_stream_that_has_not_finished_is_not_intact(self):
         """The gate this is about to sit in asks one question - may citations
@@ -338,9 +381,11 @@ class TestTheGuardsOnStateThatShouldNotHappen:
         with text missing from the front of it."""
         reader = CanonicalCitationStream(NONCE)
         reader.push(f"400 hours {MARKER}")
-        reader.finish()
-        reader._released = "hours"
+        reader._released_parts = ["hours"]
+        reader._released_len = len("hours")
         assert "hours" in scrub_positions(reader.canonical, NONCE)[0]
+        with pytest.raises(ValueError):
+            reader.finish()
         assert not reader.intact()
 
 
@@ -520,6 +565,36 @@ class TestWhatTheFilterLetsThrough:
         events = list(stream)
         assert events[-1]["data"]["content"] == "400 hours exactly"
         assert stream.reader.intact()
+
+    def test_an_under_release_is_not_a_completion_either(self):
+        """The same rule as a contradiction, from the reader's side.
+
+        `_complete` builds `message_done` out of `reader.released`, so a
+        reader that released a strict prefix of the answer produces a
+        truncated reply with a success stamp on it - which the streamed node
+        would return and persist as the turn. The completion has to fail.
+        """
+        raw = ["400 hours ", MARKER, " exactly"]
+
+        def events():
+            for chunk in raw:
+                yield {"event": "token", "data": chunk}
+            # What a hold that never let go would have left behind, forced at
+            # the one moment it matters: the reader has streamed the whole
+            # answer and is about to be asked to complete it. `stream` is
+            # bound before anything pulls this generator.
+            stream.reader._released_parts = ["400 hours"]
+            stream.reader._released_len = len("400 hours")
+            yield {"event": "message_done", "data": {"content": "".join(raw)}}
+
+        stream = ScrubbedTokenStream(events(), NONCE)
+        seen = []
+        with pytest.raises(ValueError):
+            for event in stream:
+                seen.append(event)
+        assert [event["event"] for event in seen] == ["token", "token"]
+        assert not stream.reader.intact()
+        assert stream.origins == []
 
 
 class TestTheCeilingStopsRatherThanTruncates:
