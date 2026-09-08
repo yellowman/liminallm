@@ -22,11 +22,13 @@ released text is checked against it there.
 from __future__ import annotations
 
 import random
+import sys
 
 import pytest
 
 from liminallm.service import citation_stream
 from liminallm.service.citation_stream import (
+    MAX_CANONICAL_CHARS,
     CanonicalCitationStream,
     ScrubbedTokenStream,
 )
@@ -243,6 +245,102 @@ class TestAPassIsWhereASpliceIsReconsidered:
         for chunks in ([text], list(text), ["K7Q2K7Q2k7q2ab", "cdABCD"]):
             problem = _agrees(NONCE, text, chunks)
             assert problem is None, (chunks, problem)
+
+
+def _cascade(depth):
+    """A text needing exactly `depth` passes, which is the most per character.
+
+    Each pass removes the one occurrence at the junction of the two runs,
+    splices what is left into the next one, and hands down an answer eight
+    characters shorter. A removal is at least a whole nonce, so no text buys a
+    pass more cheaply than this.
+    """
+    return "K7Q2" * depth + "ABCD" * depth
+
+
+class TestTheChainCanBeDeeperThanTheInterpretersStack:
+    """How many passes an answer needs is the model's choice, not the code's.
+
+    Every removal adds the pass below it, so the depth of the chain is a
+    property of the text - and under the ceiling it reaches 2,048, which is
+    more stack than CPython gives a thread by default.
+
+    So neither driving nor closing the chain may recurse. Driving never did.
+    Closing did, and a text half the length of a legitimate answer raised
+    `RecursionError` out of the producer thread at completion, after the
+    client had already been shown most of the answer.
+    """
+
+    def test_closing_one_pass_never_closes_another(self, monkeypatch):
+        """The property itself, measured on a chain small enough to be cheap.
+
+        A pass closes its own queue and its own state. Walking the chain is
+        the reader's job, so at no moment is one `close` inside another - and
+        that, rather than any particular length, is what makes the depth of
+        the chain irrelevant to the stack.
+        """
+        inside = 0
+        deepest = 0
+        original = citation_stream._Pass.close
+
+        def counted(self):
+            nonlocal inside, deepest
+            inside += 1
+            deepest = max(deepest, inside)
+            try:
+                original(self)
+            finally:
+                inside -= 1
+
+        monkeypatch.setattr(citation_stream._Pass, "close", counted)
+        text = _cascade(200)
+        reader = CanonicalCitationStream(NONCE)
+        public = reader.push(text) + reader.finish()[0]
+        assert len(reader._passes) == 201
+        assert deepest == 1, f"a pass closed another, {deepest} deep"
+        assert public == scrub_positions(text, NONCE)[0]
+        assert reader.intact()
+
+    def test_a_removal_while_the_passes_below_hold_text_still_closes(self):
+        """Arriving one character at a time, every pass is part-way through
+        its own tail when the answer ends, so closing walks a chain that is
+        still handing text down as it goes."""
+        text = _cascade(200)
+        expected, expected_origins = scrub_positions(text, NONCE)
+        reader = CanonicalCitationStream(NONCE)
+        out = [reader.push(character) for character in text]
+        tail, origins = reader.finish()
+        out.append(tail)
+        assert "".join(out) == expected
+        assert origins == expected_origins
+        assert reader.intact()
+
+    @pytest.mark.slow
+    def test_a_chain_longer_than_the_stack_closes(self):
+        """The real thing, at a depth the interpreter cannot recurse to.
+
+        Deliberately the whole cascade rather than an instrument: the failure
+        this pins is an exception raised at completion, and nothing short of
+        a chain past the limit raises it. It costs seconds because the
+        cascade is quadratic for the oracle too - each pass rescans what
+        survives the one above - so it is marked rather than trimmed.
+        """
+        depth = sys.getrecursionlimit() + 64
+        text = _cascade(depth)
+        assert len(text) <= MAX_CANONICAL_CHARS, (
+            "the deepest chain the ceiling allows is shallower than this "
+            f"interpreter's recursion limit ({sys.getrecursionlimit()})"
+        )
+        expected, expected_origins = scrub_positions(text, NONCE)
+
+        reader = CanonicalCitationStream(NONCE)
+        public = reader.push(text)
+        tail, origins = reader.finish()
+
+        assert len(reader._passes) > sys.getrecursionlimit()
+        assert public + tail == expected
+        assert origins == expected_origins
+        assert reader.intact()
 
 
 # ---------------------------------------------------------------------------

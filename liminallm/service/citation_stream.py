@@ -230,9 +230,10 @@ class _Pass:
         self._states: List[_State] = []
         self._state = _CLEAN
         #: What this pass has been handed and not yet read. A deque because
-        #: it is read from the front and a whole chunk goes in at once. The
-        #: chain is driven a pass at a time rather than by recursion: a long
-        #: answer can need more passes than Python has stack.
+        #: it is read from the front and a whole chunk goes in at once. It is
+        #: also what lets the reader drive and close the chain a pass at a
+        #: time rather than by recursion: a pass hands text down by queueing
+        #: it, and a long answer can need more passes than Python has stack.
         self.queue: Deque[str] = deque()
 
     # -- reading ------------------------------------------------------------
@@ -263,11 +264,16 @@ class _Pass:
             self._hand_on()
 
     def close(self) -> None:
-        """No more input: the last handle goes, and the rest is handed on.
+        """No more input: this pass's last handle goes, and its tail with it.
 
         Its own queue first. A pass above hands text down by queueing it, so
         closing without reading that queue would drop everything the pass
         above settled on its way out.
+
+        This pass only. What it hands down lands in the successor's queue,
+        and the reader closes the chain in order - closing the successor from
+        here would be one Python frame per pass, and how many passes an
+        answer needs is the model's choice, not this module's.
         """
         while self.queue:
             self.step()
@@ -279,8 +285,6 @@ class _Pass:
                 self.step()
         if self._pending:
             self._hand_on()
-        if self._successor is not None:
-            self._successor.close()
 
     # -- the automaton ------------------------------------------------------
 
@@ -452,9 +456,9 @@ class CanonicalCitationStream:
 
     The public side is what has been released. `scrub_positions` remains the
     definition of what that is - `finish` produces the finished text and the
-    origin map with it, and checks that what went out is a prefix of it - and
-    the passes above are how the same answer is reached one character at a
-    time, without rescanning what is already settled.
+    origin map with it, and checks that what went out is exactly it - and the
+    passes above are how the same answer is reached one character at a time,
+    without rescanning what is already settled.
 
     Not a general filter. It removes exactly this turn's namespace, in the
     forms `scrub_positions` removes it, and leaves every other bracketed
@@ -579,28 +583,43 @@ class CanonicalCitationStream:
         `i` in the public text, the same map `scrub_positions` returns and
         `citation_payload` reads. Both come from the whole-string scrub, which
         stays the authority on the finished answer: this is where the two are
-        compared, and a reader that disagreed with it has released text nobody
-        can vouch for.
+        compared - as equality, in both directions - and a reader that
+        disagreed with it has no answer anyone can vouch for.
         """
         fresh: List[str] = []
         self._fresh = fresh
         try:
-            self._passes[0].close()
+            # Top down, over a list that grows while it is walked: closing a
+            # pass can settle a handle, which is a removal, which adds the
+            # pass below it. Indexed rather than iterated for exactly that.
+            index = 0
+            while index < len(self._passes):
+                self._passes[index].close()
+                index += 1
         finally:
             self._fresh = None
         tail = "".join(fresh)
         public, origins = scrub_positions(self.canonical, self.nonce)
         self._finished = True
         released = self.released
-        if not public.startswith(released):
-            # Released text the finished scrub does not begin with. There is
-            # no taking it back, so this is an error rather than a repair -
-            # the alternative is an answer whose public form is already wrong.
+        if released != public:
+            # Equality, in both directions, and neither is repairable here.
+            #
+            # Released text the scrub removes cannot be taken back: the client
+            # has seen it. Released text the scrub keeps cannot be supplied:
+            # the caller builds the completion out of what went out, so an
+            # answer that stops early is a truncated reply with a success
+            # stamp on it - and appending the difference would be this module
+            # writing an answer nobody streamed. Both are the same failure,
+            # which is that the reader and the oracle do not agree about what
+            # the answer is, and the honest response to that is to have no
+            # answer.
             self._verdict = False
             raise ValueError(
-                "citation stream released text the scrub later removed"
+                "citation stream released text the whole-string scrub "
+                "does not agree with"
             )
-        self._verdict = released == public
+        self._verdict = True
         return tail, origins
 
     def intact(self) -> bool:
@@ -760,6 +779,11 @@ class ScrubbedTokenStream:
         the client has already been shown stands, by the same partial-answer
         handling a backend failure gets, and the reader is left unfinished so
         nothing downstream reads authority out of it.
+
+        `finish` refuses the same completion for the same reason when the
+        reader and the whole-string scrub disagree about the answer, in
+        either direction: `content` below is the released text, so a reader
+        that stopped short would be completed here as a shorter reply.
 
         Otherwise the tail goes first. A consumer that replaces its
         accumulated tokens with the final content has to be given a final
