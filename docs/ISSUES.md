@@ -8625,7 +8625,36 @@ which it previously skipped entirely when no schema was declared - and
 what proceeds downstream is the sanitized object it returns, on both
 paths.
 
-### Recorded, not fixed: the context-window probe blocks the turn
+### Recorded, not fixed: the context-window probe blocks the turn [SUPERSEDED]
+
+> **Status: the premise below is no longer reachable, and verifying that
+> found a different defect, now fixed.**
+>
+> Measured rather than read: instrumenting `resolved_context_window` to
+> record the calling thread and whether the cache was cold, over both
+> streamed shapes, gives **zero cold resolutions on the event loop**. The
+> first resolution always happens on a `to_thread` worker, because planning
+> runs there and asks for `history_budget()` on its way through; every
+> resolution the loop performs is a cache hit. The static call chain the
+> entry describes is still present - `_stream_llm_node` reaches
+> `_apply_prompt_budget` with no `to_thread` between them - so it reads like
+> a defect, but nothing takes that path first. The 60.15s figure predates
+> both the timeouts now in `probe_context_window` and the move of
+> `_plan_invocation` off the loop.
+>
+> That ordering is incidental, so `tests/test_context_window_offloop.py`
+> pins the behaviour instead of the arrangement: a streamed turn may wait
+> for discovery and must not make the worker's other requests wait with it.
+>
+> What verifying it did find: discovery was not single-flight. Turns
+> starting together on a cold engine each resolved independently, and
+> discovery need not answer them alike - a probe that times out falls back to
+> the table while one that succeeds does not, so the prompt could be priced
+> against one window while the provider was told to compact at a threshold
+> from another. `resolved_context_window` now discovers under a lock, with
+> an unlocked fast path so a cached read never waits behind a probe.
+
+### Recorded, not fixed: the context-window probe blocks the turn (original)
 
 Found while writing the pre-headers witness. `context_window` is resolved
 lazily by probing the provider, and the prompt-budget path triggers it on

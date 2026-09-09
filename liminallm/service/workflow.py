@@ -8,6 +8,7 @@ import json
 import math
 import os
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import aclosing, asynccontextmanager
@@ -206,6 +207,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
         self.invocations = InvocationRegistry(
             citation_offers=self.settings.citation_offers_enabled
         )
+        #: Held only while the context window is being discovered, so several
+        #: turns starting at once resolve it between them rather than each
+        #: asking the provider. See `resolved_context_window`.
+        self._context_window_lock = threading.Lock()
         # A capability handler reaches its dependencies through the engine, so
         # the liveness check belongs on the engine's references to them rather
         # than at each call site - a handler cannot forget what it never had to
@@ -1839,26 +1844,57 @@ class WorkflowEngine(WorkflowStreamingMixin):
         change applies without a restart and a turn does not pay a settings
         read - and cached here, once, so the two derivations cannot turn
         over at different moments.
+
+        Discovery is single-flight for that same reason. Several turns
+        starting together on a cold engine would otherwise each probe, and
+        the answers need not agree: a probe that times out falls back to the
+        table while one that succeeds does not, so the prompt could be priced
+        against one window while the provider was told to compact at a
+        threshold derived from another.
         """
         now = time.monotonic()
         cached = getattr(self, "_budget_cache", None)
         if cached and now - cached[1] < self._BUDGET_CACHE_SECONDS:
             return cached[0]
-        # settings already carries what the admin saved; 0 means "discover".
-        window = self.settings.model_context_window
-        if window <= 0:
-            # Any llm-shaped object works here (tests inject doubles); an
-            # object without the accessor falls back to the default window.
-            getter = getattr(self.llm, "context_window", None)
-            try:
-                window = int(getter()) if callable(getter) else 0
-            except Exception as exc:  # noqa: BLE001 - never block a turn
-                self.logger.warning("context_window_failed", error=str(exc))
-                window = 0
-        if window <= 0:
-            window = DEFAULT_CONTEXT_WINDOW
-        self._budget_cache = (window, now)
-        return window
+        # Outside the lock, because a fresh cache is the overwhelmingly common
+        # case and a reader must never wait behind somebody else's probe. A
+        # tuple is published in one store, so a reader sees the whole of the
+        # previous answer or the whole of the next one.
+        with self._context_window_lock:
+            # One discovery, not one per caller. Cold-starting under load,
+            # several turns reach this together - and discovery can answer
+            # them differently, because a probe that times out falls back to
+            # the table while one that succeeds does not. Two turns holding
+            # two windows is exactly what the single fact below exists to
+            # prevent, so the first caller resolves and the rest read what it
+            # published.
+            now = time.monotonic()
+            cached = getattr(self, "_budget_cache", None)
+            if cached and now - cached[1] < self._BUDGET_CACHE_SECONDS:
+                return cached[0]
+            # settings already carries what the admin saved; 0 means "discover".
+            window = self.settings.model_context_window
+            if window <= 0:
+                # Any llm-shaped object works here (tests inject doubles); an
+                # object without the accessor falls back to the default window.
+                getter = getattr(self.llm, "context_window", None)
+                try:
+                    window = int(getter()) if callable(getter) else 0
+                except Exception as exc:  # noqa: BLE001 - never block a turn
+                    self.logger.warning("context_window_failed", error=str(exc))
+                    window = 0
+            if window <= 0:
+                window = DEFAULT_CONTEXT_WINDOW
+            # Timestamped when the answer exists, not when the search for it
+            # began. Discovery has no wall-clock bound - the probe's timeouts
+            # are per-operation, not for the request as a whole - so a slow
+            # one stamped at entry would publish a value already older than
+            # the cache lifetime. The next caller would discard it and probe
+            # again, which is the stampede this lock exists to prevent, and
+            # on the streamed path it would be a fresh synchronous probe
+            # reached from the event loop.
+            self._budget_cache = (window, time.monotonic())
+            return window
 
     def prompt_budget(self) -> int:
         """Tokens available for prompt+history+context with this deployment's
