@@ -986,6 +986,18 @@ class Settings(BaseModel):
         5.0, gt=0,
         description="Rate limits are multiplied by this for enterprise users",
     )
+    # Layered on top of the tier multiplier rather than replacing it, so a
+    # paid account that has not confirmed its address keeps its plan's shape.
+    # Positive for the same reason as the tier multipliers, and more sharply:
+    # a limit of 0 means unlimited here, so a zero modifier would make the
+    # unverified accounts the fastest ones on the instance.
+    unverified_rate_limit_multiplier: float = managed_field(
+        0.25, gt=0, le=1,
+        description=(
+            "Rate limits are multiplied by this again until the account's "
+            "email address is verified. 1 disables the reduction."
+        ),
+    )
     # Rate limits. 0 means unlimited, which is why these floor at 0 rather
     # than 1 - an operator turning one off is a legitimate choice.
     chat_rate_limit_per_minute: int = managed_field(

@@ -1417,9 +1417,11 @@ async def chat(
     runtime = get_runtime()
     user_id = principal.user_id
 
-    # Get user's plan tier for per-plan rate limits (SPEC §18)
+    # Get user's plan tier for per-plan rate limits (SPEC §18), and whether
+    # the address is verified, which scales them again (SPEC §12.1).
     user = runtime.store.get_user(user_id)
     plan_tier = user.plan_tier if user else "free"
+    verified = bool(user and user.email_verified)
     logger.info(
         "chat_request",
         user_id=user_id,
@@ -1444,6 +1446,7 @@ async def chat(
             runtime.settings.chat_rate_limit_per_minute,
             runtime.settings.chat_rate_limit_window_seconds,
             plan_tier,
+            verified=verified,
         )
 
         # SPEC §18: concurrency caps - limit decode pressure per user. The same
@@ -2245,6 +2248,7 @@ async def create_response(
             runtime.settings.chat_rate_limit_per_minute,
             runtime.settings.chat_rate_limit_window_seconds,
             plan_tier,
+            verified=bool(user and user.email_verified),
         )
 
         if body.get("stream") is True:
@@ -5847,6 +5851,7 @@ async def websocket_chat(ws: WebSocket):
             runtime.settings.chat_rate_limit_per_minute,
             runtime.settings.chat_rate_limit_window_seconds,
             plan_tier,
+            verified=bool(user and user.email_verified),
         )
 
         # SPEC §18: concurrency caps. CHAT_SLOTS is what a turn costs on either

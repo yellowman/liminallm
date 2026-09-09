@@ -62,14 +62,26 @@ def client_ip(request: Optional[Request]) -> str:
     return request.client.host
 
 
-def plan_rate_multiplier(runtime, plan_tier: str) -> float:
-    """Rate-limit multiplier for a plan tier (SPEC §18)."""
+def plan_rate_multiplier(runtime, plan_tier: str, *, verified: bool) -> float:
+    """Rate-limit multiplier for a plan tier (SPEC §18).
+
+    An account whose address is not yet verified is scaled down again on top
+    of its tier (SPEC §12.1). One modifier over the existing multiplier, not a
+    second limiter: the tier still decides the shape, and verifying restores
+    the ordinary rate on the next request.
+
+    `verified` has no default deliberately. A caller that forgets it fails
+    loudly rather than quietly granting the full rate.
+    """
     settings = runtime.settings
-    return {
+    plan = {
         "free": settings.rate_limit_multiplier_free,
         "paid": settings.rate_limit_multiplier_paid,
         "enterprise": settings.rate_limit_multiplier_enterprise,
     }.get(plan_tier, 1.0)
+    if verified:
+        return plan
+    return plan * settings.unverified_rate_limit_multiplier
 
 
 def plan_upload_limit(runtime, plan_tier: str) -> int:
@@ -147,8 +159,21 @@ async def enforce_per_plan(
     window_seconds: int,
     plan_tier: str,
     *,
+    verified: bool,
     response: Optional[Response] = None,
 ) -> RateLimitInfo:
-    """Enforce a limit scaled by the user's plan tier (SPEC §18)."""
-    adjusted = int(base_limit * plan_rate_multiplier(runtime, plan_tier))
+    """Enforce a limit scaled by the user's plan tier (SPEC §18).
+
+    `verified` says whether the account's email address has been confirmed;
+    an unverified one is scaled down again (SPEC §12.1).
+    """
+    multiplier = plan_rate_multiplier(runtime, plan_tier, verified=verified)
+    adjusted = int(base_limit * multiplier)
+    # Scaling must not manufacture "unlimited". `enforce` reads a limit of 0
+    # as disabled, so a small base times a multiplier below 1 - three requests
+    # a minute scaled by an unverified quarter - would round down to the one
+    # value that means no limit at all. 0 stays available as the operator's
+    # own choice; it is not something arithmetic arrives at.
+    if base_limit > 0:
+        adjusted = max(1, adjusted)
     return await enforce(runtime, key, adjusted, window_seconds, response=response)

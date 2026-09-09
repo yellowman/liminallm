@@ -50,8 +50,17 @@ is the only proof you fixed the cause and not the symptom. Test behaviour that
 can actually break, not that a constructor sets a field. If something is hard
 to test, that is information about the design, not permission to skip it.
 
-Four rules under it, each earned by a bug this project shipped and a review
+Six rules under it, each earned by a bug this project shipped and a review
 had to find.
+
+**Residuals are hypotheses.** Before implementing an `ISSUES.md` or inventory
+item, verify the current code and dynamically reproduce the claimed defect. A
+journal entry is not evidence that the defect still exists.
+
+**Static reachability is not dynamic reachability.** A valid call chain to a
+bad operation does not prove production can reach it in the required state.
+Check earlier invariants, ordering, caches, guards, and actual execution
+before treating the chain as a defect.
 
 **Execute before claiming.** Run the code on a real input before you say it
 works. Parsers, heuristics and anything with a threshold are the worst

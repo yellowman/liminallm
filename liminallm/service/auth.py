@@ -59,6 +59,24 @@ def _password_hasher() -> PasswordHasher:
 # to confuse with a JWT.
 API_KEY_PREFIX = "sk-liminal-"
 
+#: SPEC §12.1: "unverified accounts are limited to 24h and low rate limits
+#: until verified". The number is the SPEC's, so it is a constant rather than
+#: a setting - an operator who could raise it could undo the rule.
+UNVERIFIED_SESSION_MAX_MINUTES = 24 * 60
+
+
+def _cap_unverified(minutes: int, verified: bool) -> int:
+    """The configured lifetime, or a day, whichever is shorter.
+
+    A cap, not a replacement: an install whose ordinary sessions are already
+    shorter than a day keeps its own number, and verifying never shortens
+    anything.
+    """
+    if verified:
+        return minutes
+    return min(minutes, UNVERIFIED_SESSION_MAX_MINUTES)
+
+
 # OAuth provider configurations
 OAUTH_PROVIDERS = {
     "google": {
@@ -246,15 +264,19 @@ class AuthService:
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
 
-    def _get_session_ttl(self, device_type: str) -> int:
+    def _get_session_ttl(self, device_type: str, *, verified: bool) -> int:
         if (device_type or "web").lower() == "mobile":
-            return int(self.settings.session_ttl_minutes_mobile)
-        return int(self.settings.session_ttl_minutes_web)
+            configured = int(self.settings.session_ttl_minutes_mobile)
+        else:
+            configured = int(self.settings.session_ttl_minutes_web)
+        return _cap_unverified(configured, verified)
 
-    def _get_refresh_ttl(self, device_type: str) -> int:
+    def _get_refresh_ttl(self, device_type: str, *, verified: bool) -> int:
         if (device_type or "web").lower() == "mobile":
-            return int(self.settings.refresh_token_ttl_minutes_mobile)
-        return int(self.settings.refresh_token_ttl_minutes_web)
+            configured = int(self.settings.refresh_token_ttl_minutes_mobile)
+        else:
+            configured = int(self.settings.refresh_token_ttl_minutes_web)
+        return _cap_unverified(configured, verified)
 
     def _get_session_device(self, session: Session) -> str:
         meta = session.meta or {}
@@ -298,7 +320,9 @@ class AuthService:
         session = self.store.create_session(
             user.id,
             tenant_id=user.tenant_id,
-            ttl_minutes=self._get_session_ttl("web"),
+            ttl_minutes=self._get_session_ttl(
+                "web", verified=user.email_verified
+            ),
             meta={"device_type": "web"},
         )
         tokens = self._issue_tokens(user, session, device_type="web")
@@ -652,7 +676,9 @@ class AuthService:
         session = self.store.create_session(
             user.id,
             tenant_id=user.tenant_id,
-            ttl_minutes=self._get_session_ttl("web"),
+            ttl_minutes=self._get_session_ttl(
+                "web", verified=user.email_verified
+            ),
             meta={"device_type": "web"},
         )
         tokens = self._issue_tokens(user, session, device_type="web")
@@ -778,7 +804,7 @@ class AuthService:
         mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
         require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
         device = (device_type or "web").lower()
-        session_ttl = self._get_session_ttl(device)
+        session_ttl = self._get_session_ttl(device, verified=user.email_verified)
         session = self.store.create_session(
             user.id,
             mfa_required=require_mfa,
@@ -1023,7 +1049,9 @@ class AuthService:
                 tenant_id=sess.tenant_id,
                 user_agent=sess.user_agent,
                 ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
-                ttl_minutes=self._get_session_ttl(device_type),
+                ttl_minutes=self._get_session_ttl(
+                    device_type, verified=user.email_verified
+                ),
                 meta=new_meta,
             )
 
@@ -1571,7 +1599,7 @@ class AuthService:
             ).timestamp()
         )
         device = (device_type or self._get_session_device(session)).lower()
-        refresh_ttl = self._get_refresh_ttl(device)
+        refresh_ttl = self._get_refresh_ttl(device, verified=user.email_verified)
         refresh_exp = int((now + timedelta(minutes=refresh_ttl)).timestamp())
         # SPEC §12.1: Generate JTIs for both tokens to support denylist on logout
         access_jti = str(uuid.uuid4())
