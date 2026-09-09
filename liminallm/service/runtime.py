@@ -449,6 +449,26 @@ class Runtime:
             existing = getattr(self, service, None)
             if existing is not None and hasattr(existing, "settings"):
                 existing.settings = self.settings
+        # Citation offers are the one managed setting a live execution has to
+        # be *told* about rather than left to read. Everything else here is
+        # read per use off `settings`, so handing over the new object is the
+        # whole of it; this one is snapshotted when an execution opens, which
+        # is what makes a rollback one-way within a turn - so the transition
+        # has to reach the executions already running.
+        #
+        # Every route that changes settings passes through here: the admin
+        # write on this worker, the settings-version watcher on its peers, and
+        # `_build_model_services`, which calls this before it constructs the
+        # replacement engine. In that last case `self.workflow` is still the
+        # engine being retired, so its live executions lose authority on the
+        # way out and the new engine is built from the same stored value - a
+        # model rebuild is not a way around a rollback.
+        workflow = getattr(self, "workflow", None)
+        invocations = getattr(workflow, "invocations", None)
+        if invocations is not None:
+            invocations.configure_citation_offers(
+                self.settings.citation_offers_enabled
+            )
         # These capture their configuration rather than reading it, so they
         # have to be rebuilt for a change to reach them.
         if getattr(self, "email", None) is not None:

@@ -1415,8 +1415,8 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
     def _grounded_context(cls, engine, monkeypatch, *, offers, shown=ANSWER):
         """An invocation whose base prompt carries one of its two passages.
 
-        `offers` `None` leaves `CITATION_OFFERS_ENABLED` as the engine ships
-        it, which is the only way to witness the shipped default.
+        `offers` `None` leaves the rollout policy as the engine ships it,
+        which is the only way to witness the shipped default.
 
         `shown` is the evidence text the placed source is filed under. It is
         the passage in the prompt by default; give it anything else and the
@@ -1430,9 +1430,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
         what makes the restart's renumbering observable from out here.
         """
         if offers is not None:
-            monkeypatch.setattr(
-                type(engine), "CITATION_OFFERS_ENABLED", offers, raising=False
-            )
+            engine.invocations.configure_citation_offers(offers)
         registry = SourceRegistry()
         source = registry.register_source(
             kind="file", title="manual.md", locator="/files/manual.md"
@@ -1610,9 +1608,7 @@ class TestTheAgentPromptIsTheParentsWhenOffersAreOn:
         the parent's sent - and round two is the reduction honoured.
         """
         engine = get_runtime().workflow
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
-        )
+        engine.invocations.configure_citation_offers(True)
         monkeypatch.setattr(type(engine), "MAX_AGENT_ROUNDS", 2, raising=False)
         _tools_on(monkeypatch, engine)
         registry, _bindings = _registry()
@@ -1919,9 +1915,7 @@ class TestTheAutomaticRouteOffersItsOwnSnippets:
     def _retrieval(engine, monkeypatch, *, offers, contents):
         """A context retrieval that returns exactly these chunks."""
         if offers is not None:
-            monkeypatch.setattr(
-                type(engine), "CITATION_OFFERS_ENABLED", offers, raising=False
-            )
+            engine.invocations.configure_citation_offers(offers)
         chunks = [
             KnowledgeChunk(
                 context_id="ctx",
@@ -2375,9 +2369,7 @@ class TestGivingUpOnMaterializationGivesUpTheCitations:
         the transfer gate have to agree, or that answer becomes a citation.
         """
         engine = get_runtime().workflow
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
-        )
+        engine.invocations.configure_citation_offers(True)
         chunk = KnowledgeChunk(
             context_id="ctx",
             fs_path="/files/manual.md",
@@ -2472,9 +2464,7 @@ class TestTheStreamedFinalTurnRunsOnTheParentsConversation:
         under test is whether the parent consumes it.
         """
         if offers is not None:
-            monkeypatch.setattr(
-                type(engine), "CITATION_OFFERS_ENABLED", offers, raising=False
-            )
+            engine.invocations.configure_citation_offers(offers)
         _tools_on(monkeypatch, engine)
         if rounds_exhausted:
             # `stream_final` spends one fewer round than the limit, so two is
@@ -2772,9 +2762,7 @@ class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:
     @staticmethod
     def _streaming(engine, monkeypatch, store, *, offers, contents=(ANSWER,)):
         if offers is not None:
-            monkeypatch.setattr(
-                type(engine), "CITATION_OFFERS_ENABLED", offers, raising=False
-            )
+            engine.invocations.configure_citation_offers(offers)
         # No tools: the assembly falls through to the plain streamed node.
         monkeypatch.setattr(
             type(engine.llm.backend), "supports_tools", property(lambda _s: False)
@@ -2894,9 +2882,7 @@ class TestTheBackendSeesTheInstructionThePromptWasPricedWith:
             context_id="ctx", fs_path="/files/manual.md", content=ANSWER,
             embedding=[], chunk_index=0,
         )
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
-        )
+        engine.invocations.configure_citation_offers(True)
         monkeypatch.setattr(
             engine, "rag", SimpleNamespace(retrieve=lambda *a, **k: [chunk])
         )
@@ -3027,9 +3013,7 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         answer on the agent path and takes the same substitutions, so a
         witness can have the draft and the stream cite different sources.
         """
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
-        )
+        engine.invocations.configure_citation_offers(True)
         monkeypatch.setattr(
             type(engine.llm.backend), "supports_tools",
             property(lambda _s: agent),
@@ -3141,6 +3125,68 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
             if isinstance(data, dict) and data.get("validated_citations"):
                 return data["validated_citations"]
         return []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("agent", [False, True])
+    async def test_a_rollback_after_the_offer_does_not_take_the_filter_with_it(
+        self, store, monkeypatch, agent
+    ):
+        """Withdrawing citation authority mid-turn is not withdrawing
+        containment.
+
+        The handle is committed while the prompt is built. The operator
+        disables citation offers before a token exists, so the execution has
+        no authority left by the time the stream is created - and the model
+        has already been shown the namespace. The provider cannot be made to
+        unsee it, so the filter goes on anyway and the marker never reaches
+        the client. The answer completes as an ordinary uncited one.
+
+        Both call sites, because each decides this for itself and a mechanical
+        replacement of the old deploy-time gate gets both wrong the same way.
+        """
+        engine = get_runtime().workflow
+        user_id, opened = self._streamed(
+            engine, monkeypatch, store, agent=agent,
+            chunks=["400 hours ", "[cite:{H}]"],
+            draft="400 hours [cite:{H}]",
+        )
+        rolled_back: list = []
+        seam = "agent_prompt" if agent else "_offered_context"
+        real = getattr(engine, seam)
+
+        def _after_the_offer(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not rolled_back and any(inv.citations for inv in opened):
+                # The operator, after the offer was committed into the prompt
+                # and before the answer is generated.
+                engine.invocations.configure_citation_offers(False)
+                rolled_back.append(True)
+            return result
+
+        monkeypatch.setattr(engine, seam, _after_the_offer)
+        built: list = []
+        real_stream = workflow_module_streaming.ScrubbedTokenStream
+
+        def _counting(*args, **kwargs):
+            built.append(args)
+            return real_stream(*args, **kwargs)
+
+        monkeypatch.setattr(
+            workflow_module_streaming, "ScrubbedTokenStream", _counting
+        )
+
+        events = await self._run(engine, user_id)
+
+        assert rolled_back, "the offer never happened, so nothing was rolled back"
+        cited = [inv for inv in opened if inv.citations][-1]
+        assert cited.citation_offers_intact is False
+        assert built, "the filter was not built for an already-issued namespace"
+        assert cited.citations.nonce not in json.dumps(events)
+        assert "[cite:" not in json.dumps(events)
+        # The marker takes the space before it, which is the scrub's own
+        # rule and not something the rollback changed.
+        assert self._tokens(events) == "400 hours"
+        assert self._cited(events) == []
 
     @pytest.mark.asyncio
     async def test_a_marker_is_scrubbed_and_its_citation_points_into_what_was_shown(
@@ -3367,9 +3413,7 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         user_id, _opened = self._streamed(
             engine, monkeypatch, store, agent=agent, chunks=["plain ", "answer"],
         )
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", False, raising=False
-        )
+        engine.invocations.configure_citation_offers(False)
         built: list = []
         real = workflow_module_streaming.ScrubbedTokenStream
 
@@ -3467,9 +3511,7 @@ class TestOneAnswerCarriesOneSetOfCitations:
         committed, so the replacing answer can carry a real citation of its
         own or none at all.
         """
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
-        )
+        engine.invocations.configure_citation_offers(True)
         opened: list = []
         real_open = engine.invocations.open
 

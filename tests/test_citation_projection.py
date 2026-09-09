@@ -376,9 +376,7 @@ class TestTheTurnAndTheRowAgreeEndToEnd:
         from liminallm.storage.models import KnowledgeChunk
 
         engine = get_runtime().workflow
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
-        )
+        engine.invocations.configure_citation_offers(True)
         opened: list = []
         real_open = engine.invocations.open
 
@@ -680,9 +678,7 @@ class TestACitationNamesTheReadingItRestedOn:
     async def _cited_turn(store, monkeypatch, user, context):
         """One real turn over that context, whose answer cites what it read."""
         engine = get_runtime().workflow
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
-        )
+        engine.invocations.configure_citation_offers(True)
         opened: list = []
         real_open = engine.invocations.open
 
@@ -1137,9 +1133,7 @@ class TestTheResponsesSurfaceCarriesWhatTheTurnCited:
         from liminallm.storage.models import KnowledgeChunk
 
         engine = get_runtime().workflow
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", True, raising=False
-        )
+        engine.invocations.configure_citation_offers(True)
         opened: list = []
         real_open = engine.invocations.open
 
@@ -1213,7 +1207,7 @@ class TestTheResponsesSurfaceCarriesWhatTheTurnCited:
 class TestTheShippedDefaultCitesEndToEnd:
     """The gate as a deployment gets it, with nothing patching it.
 
-    Every other end-to-end witness sets `CITATION_OFFERS_ENABLED` itself,
+    Every other end-to-end witness sets the rollout policy itself,
     which was right while the feature was dormant and proves nothing about
     the default now that it is on. These take the engine as it ships and
     drive the surfaces a client actually uses.
@@ -1246,7 +1240,7 @@ class TestTheShippedDefaultCitesEndToEnd:
     def _citing_provider(monkeypatch):
         """A model that writes one marker, and the handles it was offered."""
         engine = get_runtime().workflow
-        assert engine.CITATION_OFFERS_ENABLED is True, (
+        assert engine.settings.citation_offers_enabled is True, (
             "this witness is about the shipped default"
         )
         opened: list = []

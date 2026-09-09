@@ -187,9 +187,7 @@ class TestARoundRunsOnlyTheCallsTheParentSaw:
         schemas, which is the legacy prompt shape. That must not become a way
         for a worker to declare its own authority: the names that count are
         the ones in the parent's set, whatever bytes were sent."""
-        monkeypatch.setattr(
-            type(engine), "CITATION_OFFERS_ENABLED", False, raising=False
-        )
+        engine.invocations.configure_citation_offers(False)
         context = _context(engine, tools=(NOTE_SEARCH,))
         invocation = _invocation()
         ran = _watch_round(engine, monkeypatch)

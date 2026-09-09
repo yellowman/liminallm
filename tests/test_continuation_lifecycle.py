@@ -64,14 +64,17 @@ def _declare(engine, monkeypatch, mode):
     monkeypatch.setattr(engine.llm.backend, "provider", PROVIDER_OF[mode], raising=False)
 
 
-def _turn(engine, monkeypatch, *, mode="openai"):
+def _turn(engine, monkeypatch, *, mode="openai", offers=True):
     """An agent turn on a backend declaring `mode`, as `_serve_invocation`
     would build it: the parent's base prompt remembered, a registry so offers
-    are live, and a broker told which body it serves."""
+    are live, and a broker told which body it serves.
+
+    `offers` is the deployment's citation-offer policy at the moment this
+    execution opens, which is where an execution takes its copy of it."""
     _web(engine, monkeypatch)
     _declare(engine, monkeypatch, mode)
     registry = SourceRegistry()
-    invocation = InvocationRegistry().open(
+    invocation = InvocationRegistry(citation_offers=offers).open(
         uuid.uuid4().hex, tool="agent.files_v1", user_id="u", tenant_id=None
     )
     context = InvocationContext(user_id="u", source_registry=registry)
@@ -357,8 +360,9 @@ class TestTheOpeningGoesWholeAndOnlyTheTailFollows:
         opening. What the provider is told since is the parent's record all
         the same: a list the worker composed is not what the provider holds."""
         engine = get_runtime().workflow
-        monkeypatch.setattr(type(engine), "CITATION_OFFERS_ENABLED", False, raising=False)
-        _registry, invocation, context, broker = _turn(engine, monkeypatch)
+        _registry, invocation, context, broker = _turn(
+            engine, monkeypatch, offers=False
+        )
         provider = _Provider(engine, monkeypatch, [
             native("looking", [SEARCH], tag="1"), native("done", tag="2"),
         ])
