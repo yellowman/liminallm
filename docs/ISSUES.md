@@ -678,7 +678,19 @@ So the manifest update takes a second lock on the manifest itself and re-reads
 under it. Always file lock then manifest lock, never the reverse - one order
 for two locks is what stops two uploads each holding what the other waits for.
 
-### Recorded, not fixed: re-ingestion leaves the old generation
+### Recorded, not fixed: re-ingestion leaves the old generation [RESOLVED 2E.1]
+
+> **Status: resolved by tranche 2E.1** (see "2E.1 closed: one generation, in
+> the index too", below). The text below is kept as it was written; what it
+> describes is no longer true. `RAGService._commit_generation` routes every
+> named-path exit through `store.replace_chunks_for_path`, including a
+> generation that produced no chunks, and the xfail is gone. The witnesses
+> are `test_the_old_generation_goes_immediately_and_the_work_is_recorded`
+> (`tests/test_file_replacement_coverage.py`), which pins that the previous
+> generation's chunks are gone *before* the queue re-reads the file, and
+> `test_a_deleted_file_is_described_by_no_context`
+> (`tests/test_generation_lifecycle.py`) for the `DELETE` half this entry
+> said would need the same answer.
 
 After two uploads of one name the index holds *both*. Nothing removes a path's
 previous chunks before writing its new ones, so a search over the context can
@@ -1894,7 +1906,16 @@ startup and the operator is told which script to run. The index is checked by
 shape rather than by name, so an index that merely carries the name does not
 satisfy it.
 
-## Recorded, not fixed: the migration mechanism does not match the SPEC
+## Recorded, not fixed: the migration mechanism does not match the SPEC [SUPERSEDED 2F.1]
+
+> **Status: superseded.** Tranche 2F.1 (see "2F.1: one thing builds the
+> schema", below) checked this entry's premise rather than acting on it and
+> found it dissolved - the repair block is unreachable on any database that
+> has applied the file once, so the single idempotent `sql/schema.sql`
+> stays. SPEC §13.6 now describes that arrangement directly ("no special
+> tooling and no migration history"; `scripts/migrate.sh` as the sole
+> application entry point), so the divergence this entry treats as a defect
+> no longer exists on either side. The text below is kept as it was written.
 
 Canonical SPEC describes ordered `sql/*.sql` files applied by
 `scripts/migrate.sh`, a checksum ledger, and a fail-fast on mismatch. The
@@ -2023,7 +2044,16 @@ passes it and rebuilds the original bug for anyone running at 64. The test
 compares the `migrate` and `app` values instead, so the two services cannot
 resolve the setting differently.
 
-## Recorded, not fixed: SPEC carries project status and contradicts itself
+## Recorded, not fixed: SPEC carries project status and contradicts itself [RESOLVED]
+
+> **Status: resolved by the SPEC canonicalization pass.** Both halves are
+> gone from the current SPEC, checked rather than assumed: there is no
+> "fails fast on checksum mismatch" bullet anywhere in it (the remaining
+> `checksum` occurrences are file dedupe, ingest jobs and adapter params),
+> and no "this project has never been deployed", "verified and fixed" or
+> "no upgrade path to get wrong" text. §13.6 states the single-file,
+> no-history arrangement on its own terms. The text below is kept as it was
+> written.
 
 SPEC is not a usable authority on how the schema is applied, for two separate
 reasons.
