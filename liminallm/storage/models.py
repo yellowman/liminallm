@@ -28,6 +28,17 @@ class User:
     plan_tier: str = "free"
     meta: Dict | None = None
 
+    @property
+    def email_verified(self) -> bool:
+        """Whether the address on this account has been proven.
+
+        It lives in `meta` rather than a column, and naming it here keeps the
+        key spelled once. Session lifetimes and rate limits both read it, and
+        a missing key reads as unverified - so a caller that misspelled it
+        would quietly restrict every account rather than fail.
+        """
+        return bool((self.meta or {}).get("email_verified"))
+
 
 @dataclass
 class Session:
