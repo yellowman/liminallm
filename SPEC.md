@@ -2307,6 +2307,14 @@ it).
   §2.5 hybrid pipeline, scoped to one owned context or across everything
   the user owns). ownership verdicts match the http surface - absent is
   absent, foreign is refused - as tool errors, not protocol errors.
+- **each answers twice**: the prose a model reads, and `structuredContent`
+  conforming to the tool's declared `outputSchema` - one result set
+  rendered two ways, never queried twice, carrying only fields this
+  principal can already read over http. a tool that declares a schema owes
+  every call a conforming object, so an empty search and a failed one
+  answer with the rows key and an empty list rather than with nothing.
+  retrieved text reaches it only as a json string value, so a document
+  that looks like protocol cannot become a field.
 - **read-only is the security posture, not a v1 shortcut**: these tools
   reach nothing outside the install, so an injected document has no
   egress here, and every result opens by naming its own text as document

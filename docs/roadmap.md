@@ -25,19 +25,39 @@ artifacts.
   `rag_late_interaction` covers new content only; existing corpora need
   re-ingesting until a backfill exists.
 
+**mcp client** (SPEC §13.1) - delivered
+
+The kernel consumes external mcp servers as ordinary tools:
+`liminallm/service/mcp_client.py` turns an admin-owned `mcp.server` artifact
+into namespaced kernel tools, classifies each server `egress` or `local_read`
+(unknown or malformed reads as `egress`, so a typo fails safe), runs every
+call inside `tool_network_guard`, bounds and scans the server's own
+discovery metadata, and treats what a server returns as untrusted
+third-party data. Witnesses: `tests/test_mcp_client.py`,
+`tests/test_mcp_turn.py`, `tests/test_mcp_reachability.py`.
+
 **mcp server** (SPEC §13.1)
 
-- resources: notes and chunks addressable by uri, subscriptions as a change
-  feed.
+Delivered: structured tool output. `note_search` and `knowledge_search`
+declare an `outputSchema` and answer with `structuredContent` beside the
+prose - the same result set rendered twice, never queried twice. See
+`tests/test_mcp_server.py`.
+
+Open, in the order worth doing them:
+
+- resources: notes and chunks addressable by uri. Straightforward and
+  immediately useful.
 - prompts: personas and prompt-mode skills offered as mcp prompts.
-- `tools/list_changed` notifications when artifacts change the tool set.
 - oauth 2.1 + protected-resource metadata (rfc 9728) so standard mcp clients
   onboard without pasting keys.
-- structured tool output (`structuredContent`) beside the text.
-- the consequential one: an mcp **client** in the kernel loop, consuming
-  external servers as tools under the taint discipline - each server
-  assigned a taint class, egress withdrawal extended to third-party tools,
-  so outside capability never outruns the injection defenses.
+- resource subscriptions as a change feed. Deliberately separate from
+  addressable resources rather than one bullet with them: subscriptions
+  change the transport and lifetime model, which is a much larger commitment
+  than an address is.
+- `tools/list_changed` notifications, once the tool set can actually change.
+  The server's `TOOLS` table is static today, so advertising
+  `listChanged: false` is true rather than lazy, and sending the
+  notification would be the change that makes it a lie.
 
 **auth / frontend**
 
