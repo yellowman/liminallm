@@ -9686,3 +9686,27 @@ with the round-five producer-gate mutant re-anchored onto the two-branch gate
 and re-run. The finding was a genuine regression the tranche shipped, caught
 by the PR's review bot and closed the same way as the rest of the campaign:
 red first, then the smallest branch that tells the two cases apart.
+
+## MCP transport: a client that disconnects mid-request becomes a 500
+
+[RECORDED, NOT FIXED - out of the protocol-version tranche's scope]
+
+`mcp_endpoint` reads the body with `await request.json()` under
+`except ValueError`, which covers a malformed body and nothing else. When the
+peer goes away before the body is read, Starlette raises `ClientDisconnect`,
+which is not a `ValueError`: it escapes, and an aborted request is logged as
+an unhandled ASGI exception and answered 500 instead of being dropped
+quietly.
+
+Found by accident, which is the useful part of the evidence. A bug in an
+audit harness raised inside the client's `async with`, tearing the connection
+down while a `notifications/initialized` POST was in flight; the server
+logged the 500. Fixing the harness made it disappear, so this is not
+something a contemporary client does on a healthy session - but a client that
+cancels or times out mid-request does exactly the same thing, so the path is
+reachable in production rather than only under a broken test.
+
+The shape is general: any route that reads a request body under a narrow
+`except` has it. Worth grepping for the sibling cases rather than patching
+the one sighting. The fix itself is small - a disconnected notification is a
+delivered notification, and there is nobody left to answer anyway.

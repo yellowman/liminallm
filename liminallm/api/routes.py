@@ -2379,6 +2379,15 @@ async def mcp_endpoint(
         body = await request.json()
     except ValueError:
         return JSONResponse(status_code=200, content=mcp.parse_error())
+    # The negotiated revision rides on the header for every message after the
+    # handshake. Checked here rather than in handle_message because the answer
+    # is a status code: a version this server cannot speak means there is no
+    # exchange to report a JSON-RPC result about.
+    refusal = mcp.version_header_refusal(
+        request.headers.get(mcp.PROTOCOL_VERSION_HEADER), body
+    )
+    if refusal:
+        raise http_error("bad_request", refusal, status_code=400)
     reply = mcp.handle_message(runtime, principal, body)
     if reply is None:
         # A notification: accepted, nothing to say (spec: 202, empty body).

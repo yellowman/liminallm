@@ -13,6 +13,7 @@ import uuid
 
 import jsonschema
 
+from liminallm.api import mcp as mcp_server
 from liminallm.service.runtime import get_runtime
 
 #: Comfortably above the retriever's `min_token_count` floor. Text that only
@@ -25,11 +26,23 @@ CABINET = (
 )
 
 
-def _rpc(client, headers, method, params=None, request_id=1):
+#: What a client carries on every message after the handshake. The helpers
+#: send it by default because a real client does; the tests that leave it out
+#: are the ones about leaving it out.
+VERSION = mcp_server.PROTOCOL_VERSION
+
+
+def _versioned(headers, version=VERSION):
+    if version is None:
+        return dict(headers)
+    return {**headers, mcp_server.PROTOCOL_VERSION_HEADER: version}
+
+
+def _rpc(client, headers, method, params=None, request_id=1, version=VERSION):
     body = {"jsonrpc": "2.0", "id": request_id, "method": method}
     if params is not None:
         body["params"] = params
-    return client.post("/v1/mcp", headers=headers, json=body)
+    return client.post("/v1/mcp", headers=_versioned(headers, version), json=body)
 
 
 def _tool_text(resp):
@@ -94,7 +107,7 @@ class TestMcpProtocol:
     def test_notification_is_202_with_no_body(self, client, auth_headers):
         resp = client.post(
             "/v1/mcp",
-            headers=auth_headers,
+            headers=_versioned(auth_headers),
             json={"jsonrpc": "2.0", "method": "notifications/initialized"},
         )
         assert resp.status_code == 202
@@ -121,7 +134,7 @@ class TestMcpProtocol:
     def test_batch_is_rejected_by_name(self, client, auth_headers):
         resp = client.post(
             "/v1/mcp",
-            headers=auth_headers,
+            headers=_versioned(auth_headers),
             json=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
         )
         error = resp.json()["error"]
@@ -131,13 +144,104 @@ class TestMcpProtocol:
     def test_malformed_json_is_parse_error(self, client, auth_headers):
         resp = client.post(
             "/v1/mcp",
-            headers={**auth_headers, "Content-Type": "application/json"},
+            headers=_versioned(
+                {**auth_headers, "Content-Type": "application/json"}
+            ),
             content=b"not json{",
         )
         assert resp.json()["error"]["code"] == -32700
 
     def test_get_is_405(self, client):
         assert client.get("/v1/mcp").status_code == 405
+
+
+class TestOneTruthfulRevision:
+    """A revision this server advertises has to be true at the wire.
+
+    `2025-03-26` was advertised and echoed while every JSON-RPC array was
+    refused - but that revision requires implementations to accept batches.
+    A client was told yes and refused on the next message. These pin the
+    removal from both ends: the older revision is not agreed to, and the
+    obligation that made agreeing wrong is still unmet, so restoring one
+    without the other fails here.
+    """
+
+    def test_only_one_revision_is_advertised(self):
+        assert mcp_server.SUPPORTED_PROTOCOL_VERSIONS == frozenset({"2025-06-18"}), (
+            "Adding a revision here adds its obligations too. 2025-03-26 "
+            "requires accepting JSON-RPC batches, which this server refuses."
+        )
+
+    def test_an_older_client_is_counter_offered_not_humoured(
+        self, client, auth_headers
+    ):
+        """The regression. This used to answer `2025-03-26` - agreeing to a
+        contract the next message would break."""
+        resp = _rpc(
+            client, auth_headers, "initialize",
+            {"protocolVersion": "2025-03-26", "capabilities": {}},
+            version=None,
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["result"]["protocolVersion"] == "2025-06-18"
+
+    def test_initialize_may_arrive_without_the_header(self, client, auth_headers):
+        """The handshake is what settles the version, so it cannot be asked
+        to carry it. The contemporary SDK omits it here."""
+        resp = _rpc(
+            client, auth_headers, "initialize",
+            {"protocolVersion": "2025-11-25", "capabilities": {}},
+            version=None,
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["result"]["protocolVersion"] == "2025-06-18"
+
+    def test_a_later_request_without_the_version_is_refused(
+        self, client, auth_headers
+    ):
+        """The one somebody will later be tempted to make permissive again.
+
+        Absent, the transport says to assume `2025-03-26`. This server does
+        not implement it, so serving the request as if it were `2025-06-18`
+        would restore the same untrue claim through a side door: the client
+        works until it tries something its own revision allows, such as a
+        batch.
+        """
+        resp = _rpc(client, auth_headers, "tools/list", version=None)
+
+        assert resp.status_code == 400, resp.text
+        assert "MCP-Protocol-Version" in resp.json()["error"]["message"]
+
+    def test_an_explicit_version_we_do_not_speak_is_refused(
+        self, client, auth_headers
+    ):
+        for claimed in ("2025-03-26", "1999-01-01", "nonsense", ""):
+            resp = _rpc(client, auth_headers, "tools/list", version=claimed)
+            assert resp.status_code == 400, f"{claimed!r} -> {resp.status_code}"
+
+    def test_an_explicit_version_we_do_speak_is_served(self, client, auth_headers):
+        resp = _rpc(client, auth_headers, "tools/list", version="2025-06-18")
+
+        assert resp.status_code == 200, resp.text
+        assert len(resp.json()["result"]["tools"]) == 2
+
+    def test_a_batch_is_refused_at_either_gate(self, client, auth_headers):
+        """Claiming the revision that permits batches does not get you one,
+        and neither does claiming the one that does not."""
+        batch = [{"jsonrpc": "2.0", "id": 1, "method": "ping"}]
+
+        speaking_ours = client.post(
+            "/v1/mcp", headers=_versioned(auth_headers), json=batch
+        )
+        assert speaking_ours.status_code == 200
+        assert speaking_ours.json()["error"]["code"] == -32600
+
+        claiming_batched = client.post(
+            "/v1/mcp", headers=_versioned(auth_headers, "2025-03-26"), json=batch
+        )
+        assert claiming_batched.status_code == 400, claiming_batched.text
 
 
 class TestMcpTools:

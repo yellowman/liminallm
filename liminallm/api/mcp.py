@@ -7,6 +7,13 @@ note_search and knowledge_search, backed by the exact services the internal
 agent loop uses, so an outside agent grounds itself in the same vault and
 knowledge contexts the kernel's own turns do.
 
+One revision, and only one. `2025-03-26` used to be accepted on initialize
+and echoed back, while every JSON-RPC array was refused - but that revision
+requires implementations to accept batches, so the server agreed to a
+contract it broke on the next message. A version this server advertises has
+to be true at the wire, so the older one is gone rather than half-kept: an
+older client is counter-offered `2025-06-18` and decides for itself.
+
 Deliberately not the whole spec: stateless (no Mcp-Session-Id), no
 server-initiated SSE stream (GET answers 405), no resources or prompts yet -
 SPEC §13.1 carries the roadmap. JSON-RPC batching was removed from the
@@ -36,7 +43,28 @@ from liminallm.service.auth import AuthContext
 logger = get_logger(__name__)
 
 PROTOCOL_VERSION = "2025-06-18"
-SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2025-03-26", "2025-06-18"})
+#: One revision, and it is completely true at the wire. This used to also list
+#: `2025-03-26` and echo it back on initialize, which was not a claim this
+#: server could keep: that revision requires implementations to accept
+#: JSON-RPC batches, and every array is rejected here by name. A client that
+#: asked for it was told yes and then refused on the next message.
+#:
+#: Dropping it costs nothing measurable. Measured against the SDK this
+#: project itself depends on, a client offers a newer revision, is
+#: counter-offered `2025-06-18`, accepts it, and completes initialize,
+#: `tools/list` and `tools/call`. Nothing asks for `2025-03-26`.
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({PROTOCOL_VERSION})
+
+#: Streamable HTTP carries the negotiated revision on every request after
+#: initialize. Validated at the route, where the status code lives - a
+#: version the server cannot speak is an HTTP problem, not a JSON-RPC result.
+PROTOCOL_VERSION_HEADER = "MCP-Protocol-Version"
+
+#: What the transport says a missing header means: no version state, assume
+#: this. The server does not implement it, so the assumption is what makes an
+#: absent header on a post-initialize request an error rather than a silent
+#: promotion to `2025-06-18` semantics.
+ASSUMED_VERSION_WHEN_ABSENT = "2025-03-26"
 
 SERVER_INFO = {"name": "liminallm", "title": "liminallm kernel", "version": "1"}
 
@@ -196,6 +224,48 @@ def _error(request_id: Any, code: int, message: str) -> dict:
 
 def parse_error() -> dict:
     return _error(None, -32700, "Parse error: body must be valid JSON.")
+
+
+def is_initialize(body: Any) -> bool:
+    """Whether this message is the handshake itself.
+
+    The one request that may arrive without the version header, because the
+    version is what it exists to settle. Everything after it has an answer to
+    carry.
+    """
+    return isinstance(body, dict) and body.get("method") == "initialize"
+
+
+def version_header_refusal(header: Optional[str], body: Any) -> Optional[str]:
+    """Why this request's protocol version is unacceptable, or None.
+
+    Two ways to be wrong, and neither is a JSON-RPC error - a version this
+    server cannot speak means the exchange never starts, so it is an HTTP
+    status.
+
+    A header that is present and is not the supported revision is refused
+    whatever it says. An absent header is refused on everything except
+    initialize: the transport says a server with no version state should
+    assume `2025-03-26`, and this server does not implement that revision.
+    Serving those requests as if they were `2025-06-18` would be the same
+    untrue claim removed from `SUPPORTED_PROTOCOL_VERSIONS`, made silently -
+    a client would work until it tried something its revision allows and
+    this one does not, such as a batch.
+    """
+    if header is not None:
+        if header in SUPPORTED_PROTOCOL_VERSIONS:
+            return None
+        return (
+            f"Unsupported MCP-Protocol-Version {header!r}. "
+            f"This server speaks {PROTOCOL_VERSION}."
+        )
+    if is_initialize(body):
+        return None
+    return (
+        f"Missing MCP-Protocol-Version. Absent, the transport assumes "
+        f"{ASSUMED_VERSION_WHEN_ABSENT}, which this server does not "
+        f"implement. Send {PROTOCOL_VERSION}."
+    )
 
 
 def _bounded_limit(arguments: Dict[str, Any], default: int) -> int:

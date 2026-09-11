@@ -2295,13 +2295,21 @@ envelope-free wire (json-rpc is the dialect; the §13.0 exception covers
 it).
 
 - **protocol subset, honestly drawn**: streamable http, one POST
-  endpoint, json responses only; protocol revision 2025-06-18 (2025-03-26
-  accepted on initialize). implemented: `initialize`, `ping`,
-  `tools/list`, `tools/call`; notifications answer 202 with no body. not
-  implemented: sessions (stateless - `Mcp-Session-Id` ignored),
-  server-initiated stream (GET answers 405), resources, prompts.
-  json-rpc batching was removed from the protocol in 2025-06-18 and is
-  rejected by name.
+  endpoint, json responses only; protocol revision 2025-06-18 and no
+  other. implemented: `initialize`, `ping`, `tools/list`, `tools/call`;
+  notifications answer 202 with no body. not implemented: sessions
+  (stateless - `Mcp-Session-Id` ignored), server-initiated stream (GET
+  answers 405), resources, prompts. json-rpc batching was removed from
+  the protocol in 2025-06-18 and is rejected by name.
+- **one revision, true at the wire**: a revision this server advertises
+  carries that revision's obligations, so `2025-03-26` is not offered -
+  it requires accepting batches, which this server refuses. a client
+  asking for any other revision is counter-offered 2025-06-18 and
+  decides for itself. every request after `initialize` must carry
+  `MCP-Protocol-Version: 2025-06-18`; any other value, **and an absent
+  one**, is HTTP 400. absent is refused rather than assumed because the
+  transport's compatibility rule assumes 2025-03-26, and serving those
+  requests as 2025-06-18 would restore the removed claim silently.
 - **two tools, both read-only, both the kernel's own**: `note_search`
   (the vault's bm25+semantic fusion) and `knowledge_search` (the full
   §2.5 hybrid pipeline, scoped to one owned context or across everything
