@@ -9689,7 +9689,7 @@ red first, then the smallest branch that tells the two cases apart.
 
 ## MCP transport: a client that disconnects mid-request becomes a 500
 
-[RECORDED, NOT FIXED - out of the protocol-version tranche's scope]
+[RESOLVED]
 
 `mcp_endpoint` reads the body with `await request.json()` under
 `except ValueError`, which covers a malformed body and nothing else. When the
@@ -9710,3 +9710,25 @@ The shape is general: any route that reads a request body under a narrow
 `except` has it. Worth grepping for the sibling cases rather than patching
 the one sighting. The fix itself is small - a disconnected notification is a
 delivered notification, and there is nobody left to answer anyway.
+
+Closed by a census and a measurement rather than by the grep. Two routes read
+their body by hand - `/v1/mcp` and `/v1/responses` - and they behaved
+differently despite the identical `except ValueError`: the MCP one let
+`ClientDisconnect` escape as an unhandled ASGI exception, while the Responses
+one had a deliberate catch-all below it and recorded the disconnect as
+`responses_turn_failed`, quieter and still untrue. Routes whose body FastAPI
+parses were measured and are unaffected, because the framework meets the
+disconnect before the endpoint runs.
+
+So two sites, not a class, and no body-reading helper invented for two
+callers: each catches `ClientDisconnect` and answers 499, which never reaches
+the closed socket and exists only to keep the access log honest.
+
+The witness that mattered was not the quiet one. Silencing the disconnect by
+widening the parse guard to `except Exception` also produces no traceback, so
+"nothing was printed" could not tell the fix from the mistake; the two are
+only distinguishable by what comes back, and a half-closed socket gets no
+response at all. The pair is pinned at the route function instead, over a real
+Starlette receive channel: a vanished peer answers 499, a body that arrived
+malformed still answers -32700. That mutant survived the first campaign and is
+why the seam test exists.

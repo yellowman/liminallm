@@ -34,7 +34,13 @@ dependencies = [
   # on are 2.x API, not a wire format the SDK would carry across a major.
   "mcp>=2,<3",
   "structlog>=24.4",
-  "jsonschema>=4.22"
+  "jsonschema>=4.22",
+  # FastAPI's own foundation, named here because one thing is used that
+  # FastAPI does not re-export: `ClientDisconnect`, which the two routes that
+  # read their request body by hand have to tell apart from a malformed one.
+  # A floor and no ceiling on purpose - FastAPI pins the range it works
+  # against, and a second ceiling here could only ever contradict it.
+  "starlette>=0.40"
 ]
 
 [build-system]

@@ -35,6 +35,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.requests import ClientDisconnect
 
 from liminallm.api import chat_turn, idempotency, mcp
 from liminallm.api.errors import http_error
@@ -2185,6 +2186,22 @@ async def _responses_stream(
             await admission.release(runtime, kind, principal.user_id)
 
 
+def _peer_gone() -> Response:
+    """The caller hung up while its body was still arriving.
+
+    Nothing was served and nothing failed: there is no request to act on and
+    nobody left to answer, which for an MCP notification is the normal end of
+    a cancelled one. So this is not an application error, and reporting it as
+    one puts a traceback in the log and a 500 in the metrics for an event the
+    server did not cause and cannot prevent.
+
+    499 is nginx's "client closed request". It never reaches the socket - the
+    peer is already gone - and exists only so the access log distinguishes an
+    abandoned request from a served one.
+    """
+    return Response(status_code=499)
+
+
 @router.post("/responses", tags=["responses"])
 async def create_response(
     request: Request,
@@ -2358,6 +2375,11 @@ async def create_response(
         # A provider or service failure mid-turn: without this, the app-wide
         # handler would answer in the Envelope and break the SDK parsing it.
         return _openai_error(exc.status_code, exc.message, code=exc.error_code)
+    except ClientDisconnect:
+        # Before the catch-all below, which would log this as a failed turn.
+        # It is not one, and calling it one costs a traceback and a 500 in
+        # the metrics every time a caller cancels mid-upload.
+        return _peer_gone()
     except Exception:  # noqa: BLE001 - the wire-shape rule outranks the global handler
         logger.exception("responses_turn_failed", user_id=user_id)
         return _openai_error(500, "internal server error", code="server_error")
@@ -2377,6 +2399,13 @@ async def mcp_endpoint(
     await rate_limit(runtime, "read", principal.user_id)
     try:
         body = await request.json()
+    except ClientDisconnect:
+        # Distinct from the parse error below, and deliberately not folded
+        # into it: a body that arrived and was malformed is the caller's
+        # mistake and gets told so, while a body that never finished arriving
+        # has nobody to tell. Widening the parse error to cover both would
+        # also swallow whatever else went wrong here.
+        return _peer_gone()
     except ValueError:
         return JSONResponse(status_code=200, content=mcp.parse_error())
     # The negotiated revision rides on the header for every message after the
