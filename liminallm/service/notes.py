@@ -511,6 +511,15 @@ def _note_ground(registry: SourceRegistry, note: Any) -> Optional[Binding]:
     return binding(source.source_id, evidence.evidence_id)
 
 
+def note_search_excerpt(content: str) -> str:
+    """The excerpt a note search shows.
+
+    Named once because a search now answers twice - prose for a model, fields
+    for a program - and the two must show the same words.
+    """
+    return _excerpt(content)[:NOTE_SEARCH_EXCERPT_CHARS]
+
+
 def format_note_results(
     results: List[Tuple[Any, float]],
     grounds: Optional[List[Optional[Binding]]] = None,
@@ -528,7 +537,7 @@ def format_note_results(
         body.add("\n")
         body.add(
             f"- [[{note.title}]] ({note.updated_at.date().isoformat()}): "
-            f"{_excerpt(note.content)[:NOTE_SEARCH_EXCERPT_CHARS]}",
+            f"{note_search_excerpt(note.content)}",
             grounds[index] if grounds and index < len(grounds) else None,
         )
     return body.render()
