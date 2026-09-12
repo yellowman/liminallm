@@ -2296,11 +2296,13 @@ it).
 
 - **protocol subset, honestly drawn**: streamable http, one POST
   endpoint, json responses only; protocol revision 2025-06-18 and no
-  other. implemented: `initialize`, `ping`, `tools/list`, `tools/call`;
+  other. implemented: `initialize`, `ping`, `tools/list`, `tools/call`,
+  `resources/list`, `resources/templates/list`, `resources/read`;
   notifications answer 202 with no body. not implemented: sessions
   (stateless - `Mcp-Session-Id` ignored), server-initiated stream (GET
-  answers 405), resources, prompts. json-rpc batching was removed from
-  the protocol in 2025-06-18 and is rejected by name.
+  answers 405), prompts, resource subscriptions and list-change
+  notifications. json-rpc batching was removed from the protocol in
+  2025-06-18 and is rejected by name.
 - **one revision, true at the wire**: a revision this server advertises
   carries that revision's obligations, so `2025-03-26` is not offered -
   it requires accepting batches, which this server refuses. a client
@@ -2323,10 +2325,33 @@ it).
   answer with the rows key and an empty list rather than with nothing.
   retrieved text reaches it only as a json string value, so a document
   that looks like protocol cannot become a field.
-- **read-only is the security posture, not a v1 shortcut**: these tools
-  reach nothing outside the install, so an injected document has no
-  egress here, and every result opens by naming its own text as document
-  content, never instructions.
+- **what has an address is what the owner has**: their notes, and the
+  documents of every knowledge context they own that is not a
+  conversation's implicit attachment index. an implicit index belongs to
+  the caller and still has no address, because it exists for one
+  conversation - so it is absent from the listing and indistinguishable
+  from absent on read. the same rule scopes `knowledge_search`, both
+  unscoped and when a context id is named.
+- **an address is `liminal://`**, one segment per variable, percent-encoded
+  by rfc 6570 simple expansion: `note/<id>`, `context/<id>/doc/~<path>`,
+  and that plus `/chunk/<n>`, which is the only template advertised. the
+  literal `~` prefixes a document path so a file named `..` cannot expand
+  into a dot-segment that generic uri normalisation is entitled to remove.
+  a segment is decoded exactly once, so the stored name `%2F` and a slash
+  remain different names. `resources/list` pages notes and then documents
+  behind one opaque cursor, and offers a continuation only when a further
+  row was seen. an unparseable, unknown or unaddressable uri is `-32602`;
+  the protocol's own `-32002` was retired in this revision.
+- **a document reads back as its passages**, one entry per chunk carrying
+  its own chunk uri, because ingestion overlaps consecutive chunks by 50
+  tokens (§2.5) and joining them would return a document nobody wrote.
+  every entry carries `_meta`
+  `{"liminallm.dev/content-role": "untrusted-data"}` and text the server
+  does not edit: the mark travels beside the passage, never inside it.
+- **read-only is the security posture, not a v1 shortcut**: tools and
+  resources both reach nothing outside the install, so an injected
+  document has no egress here, and every tool result opens by naming its
+  own text as document content, never instructions.
 - growth is a decision, not drift: the planned extensions live in
   docs/roadmap.md.
 

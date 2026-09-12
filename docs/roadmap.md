@@ -43,10 +43,16 @@ declare an `outputSchema` and answer with `structuredContent` beside the
 prose - the same result set rendered twice, never queried twice. See
 `tests/test_mcp_server.py`.
 
+Delivered: resources. Notes, documents and single passages are addressable
+under `liminal://`, listed behind one opaque cursor and read back as
+passages rather than as one joined string. Building it closed two shipped
+defects in the tool surface, which shared the authority check it needed: an
+unscoped `knowledge_search` reached a conversation's attachment index, and it
+stopped at the first hundred contexts a user owned. See
+`tests/test_mcp_resources.py` and `tests/test_mcp_real_client.py`.
+
 Open, in the order worth doing them:
 
-- resources: notes and chunks addressable by uri. Straightforward and
-  immediately useful.
 - prompts: personas and prompt-mode skills offered as mcp prompts.
 - oauth 2.1 + protected-resource metadata (rfc 9728) so standard mcp clients
   onboard without pasting keys.

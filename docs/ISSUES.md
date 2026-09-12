@@ -9732,3 +9732,50 @@ response at all. The pair is pinned at the route function instead, over a real
 Starlette receive channel: a vanished peer answers 499, a body that arrived
 malformed still answers -32700. That mutant survived the first campaign and is
 why the seam test exists.
+
+## Addressing the corpus found two leaks in the surface that already had it
+
+[RESOLVED]
+
+Adding `resources/*` needed one question answered that the tool surface had
+already answered wrongly: which of a user's knowledge contexts may a caller
+reach by name. Writing the resource authority made the tool authority
+readable next to it, and two defects fell out. Both were reproduced before
+being fixed, and both predate this tranche.
+
+**A conversation's attachment index was searchable.** Uploading a file to a
+chat creates an implicit `knowledge_context` carrying `conversation_id`. It
+is the user's own, so no ownership check rejects it - and `knowledge_search`
+reached it twice over. Unscoped, it was folded into "every context I own".
+Scoped, the implicit id was accepted like any ordinary context id. The
+verdict now is that an implicit index has no address at all: absent from the
+listing, `context not found` on a scoped call, and `-32602` from
+`resources/read`. Absent rather than refused, because the caller does own it
+and "another user's" would be untrue - and confirming it exists is the leak
+in a quieter form.
+
+**"Everything I own" meant "the first hundred".** The unscoped branch
+enumerated contexts through `list_contexts`, whose `page_size` defaults to
+100. A user with more than that silently lost the rest, and nothing in the
+answer said so. The fix is a store read that returns ids with no page and
+both exclusions in SQL: `list_ordinary_context_ids`. The regression witness
+builds the contexts through the store, because creating 130 over HTTP stops
+at the rate limiter around 61. Two reproductions were thrown away before one
+measured the bug: the first hit that limiter, and the second asserted on a
+marker written `harlequin-27`, which ingestion normalises into two tokens, so
+a passage the tool had in fact found read as missing.
+
+The general shape is worth keeping: a new surface over old data is a reason
+to re-derive the authority rule, not to import it. The resource surface would
+have inherited both defects by calling the same helper.
+
+The addressing itself has one decision that is not obvious. A document path
+is prefixed with a literal `~` inside its segment, so a file named `..`
+expands to `~..` rather than to a dot-segment that RFC 3986 §5.2.4
+normalisation is entitled to remove before the request ever arrives. An
+earlier attempt percent-encoded the dots instead, which worked and was still
+wrong: `%2E` is unreserved, so no conforming client expanding the advertised
+template would produce it, and the server's own address disagreed with the
+template it published. The witness that caught it expands the template with
+an RFC 6570 implementation written in the test file, which is the point -
+borrowing the server's encoder would have agreed with the server's mistake.
