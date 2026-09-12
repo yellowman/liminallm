@@ -34,7 +34,19 @@ dependencies = [
   # on are 2.x API, not a wire format the SDK would carry across a major.
   "mcp>=2,<3",
   "structlog>=24.4",
-  "jsonschema>=4.22"
+  "jsonschema>=4.22",
+  # FastAPI's own foundation, named here because one thing is used that
+  # FastAPI does not re-export: `ClientDisconnect`, which the two routes that
+  # read their request body by hand have to tell apart from a malformed one.
+  #
+  # The floor is the one the declared `fastapi>=0.110` already implies, not
+  # the one the currently installed FastAPI happens to want. FastAPI 0.110.0
+  # requires starlette <0.37, so a higher floor here would quietly make the
+  # advertised FastAPI minimum unresolvable - and nothing newer is needed:
+  # 0.36.3 already defines `ClientDisconnect` and already raises it from the
+  # body reader on `http.disconnect`. No ceiling, because FastAPI pins the
+  # range it works against and a second one here could only contradict it.
+  "starlette>=0.36.3"
 ]
 
 [build-system]
