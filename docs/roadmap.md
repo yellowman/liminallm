@@ -82,3 +82,14 @@ which is the browser lane's first witness.
 
 - OpenTelemetry traces across gateway → orchestrator → router → workflow →
   inference → training (SPEC §15.2 lists the intended spans).
+
+- A packaging gate that resolves the **declared floors** against each other.
+  Every lane installs a modern resolution, so CI proves that *some* compatible
+  set exists - not that the versions this project advertises supporting can be
+  installed together. #219 nearly shipped `starlette>=0.40` alongside
+  `fastapi>=0.110`, which cannot resolve, because FastAPI 0.110.0 requires
+  starlette below 0.37; every lane was green throughout. A real gate resolves
+  the minimum of each declared range in a clean environment and imports the
+  package, which needs a designed job rather than an assertion bolted onto the
+  existing dependency tests - those answer "is this import declared", a
+  different question from "is the declaration satisfiable".
