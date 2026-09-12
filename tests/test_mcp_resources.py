@@ -28,6 +28,17 @@ VERSION = mcp_server.PROTOCOL_VERSION
 #: `%` and a `..` that is not a traversal.
 HOSTILE_PATH = "notes/../odd name?v=1#frag 50%.md"
 
+#: Appears in exactly one document, and that document is attached to a
+#: conversation. Plain words only: ingestion normalizes a marker written as
+#: `zephyr-7` into two tokens, and a witness that then fails says nothing
+#: about what the server retrieved.
+CONVERSATION_ONLY_MARKER = "periwinkle mongoose flotilla"
+
+CONVERSATION_ONLY_TEXT = (
+    f"The {CONVERSATION_ONLY_MARKER} manifest lists the crates that left the "
+    "bonded warehouse before the audit, along with who signed for each one. "
+) * 20
+
 #: Long enough to cut into more than one chunk, so the overlap is observable.
 LONG_DOCUMENT = (
     "The launch code for the vermilion cabinet is kept by the night "
@@ -161,12 +172,56 @@ class TestWhoMayAddressWhat:
             answer = _rpc(client, headers, "resources/read", {"uri": uri})
             assert answer["error"]["code"] == -32602, answer
 
+    def test_a_conversation_index_is_not_searchable_either(self, client, store):
+        """The shipped defect this tranche closes, pinned at the tool surface.
+
+        Hiding an implicit index from `resources/read` closes nothing on its
+        own: `knowledge_search` reached the same rows first. Unscoped, the
+        index was folded into "every context I own". Scoped, its id was
+        accepted like any other context id. Both branches are asserted here,
+        because closing one and leaving the other open is not a fix.
+
+        The ordinary context is seeded too, so the unscoped call runs real
+        retrieval rather than passing because the caller owns nothing
+        searchable.
+        """
+        user_id, headers = _account(client)
+        ordinary = store.upsert_context(user_id, "ordinary", "d").id
+        _seed_document(store, ordinary, "public.md", LONG_DOCUMENT)
+        conversation = store.create_conversation(user_id)
+        implicit = ensure_conversation_context(
+            store, user_id=user_id, conversation_id=conversation.id
+        )
+        implicit_id = getattr(implicit, "id", implicit)
+        _seed_document(store, implicit_id, "attached.md", CONVERSATION_ONLY_TEXT)
+
+        unscoped = _ok(
+            client, headers, "tools/call",
+            {"name": "knowledge_search",
+             "arguments": {"query": CONVERSATION_ONLY_MARKER}},
+        )
+        scoped = _ok(
+            client, headers, "tools/call",
+            {"name": "knowledge_search",
+             "arguments": {"query": CONVERSATION_ONLY_MARKER,
+                           "context_id": implicit_id}},
+        )
+
+        assert unscoped["isError"] is False, unscoped
+        assert CONVERSATION_ONLY_MARKER not in unscoped["content"][0]["text"]
+        assert not [
+            passage
+            for passage in unscoped["structuredContent"]["passages"]
+            if passage["context_id"] == implicit_id
+        ], "an unscoped search reached a conversation's attachments"
+        assert scoped["isError"] is True, scoped
+        assert scoped["structuredContent"]["error"] == "context not found."
+
     def test_another_users_context_looks_exactly_the_same_as_absent(
         self, client, store
     ):
-        _owner, owner_headers = _account(client)
-        owner_id, _ = _owner, owner_headers
-        stranger_id, stranger_headers = _account(client)
+        _owner_id, owner_headers = _account(client)
+        stranger_id, _stranger_headers = _account(client)
         context_id = store.upsert_context(stranger_id, "theirs", "d").id
         _seed_document(store, context_id, "theirs.md", LONG_DOCUMENT)
 
