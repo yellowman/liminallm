@@ -461,16 +461,13 @@ def addressable_context(runtime, principal: AuthContext, context_id: Any):
 def addressable_context_ids(runtime, principal: AuthContext) -> list[str]:
     """Every context this principal may name, implicit indexes excluded.
 
-    `include_auto` defaults to True on the store, which is right for callers
-    that are working inside a conversation and wrong for every caller that is
-    not. Both agent surfaces here are the second kind.
+    Not `list_contexts`, twice over: its `include_auto` defaults to True,
+    which is right for a caller working inside a conversation and wrong for
+    both surfaces here, and its page defaults to 100, which silently turns
+    "everything I own" into "the first hundred". Both exclusions live in SQL
+    at the read that needs them.
     """
-    return [
-        context.id
-        for context in runtime.store.list_contexts(
-            owner_user_id=principal.user_id, include_auto=False
-        )
-    ]
+    return runtime.store.list_ordinary_context_ids(principal.user_id)
 
 
 def _tool_knowledge_search(
@@ -605,47 +602,34 @@ def _document_resource(context_id: str, fs_path: str) -> dict:
     }
 
 
-def _owned_context_ids(runtime, principal: AuthContext) -> list[str]:
-    """Sorted, because a page boundary lands between two of them."""
-    return sorted(addressable_context_ids(runtime, principal))
-
-
 def _list_documents(runtime, principal: AuthContext, parts: list[str]) -> dict:
-    """The document half of one page, resumed from (context_id, fs_path).
+    """One page of the document namespace, resumed from (context_id, fs_path).
 
-    Both halves of that key are immutable, so the cursor keeps meaning while
-    the client holds it - unlike a row count, which moves the moment anything
-    is ingested.
+    One keyset query over the whole namespace rather than a context list and
+    then a query each: a page boundary has to be able to fall anywhere in that
+    order, including inside a context, and materialising every context id to
+    get there would reintroduce the limit this just removed.
+
+    `limit + 1` rather than `limit`, so a continuation is only offered when a
+    further resource was actually seen. A cursor that promises a page which
+    turns out to be empty is a cursor that lied.
     """
-    context_ids = _owned_context_ids(runtime, principal)
-    from_context, from_path = (parts + [None, None])[:2]
-    resources: list[dict] = []
-    start = 0
-    if from_context:
-        # Resume at that context, or at the next one if it has since gone.
-        start = next(
-            (i for i, cid in enumerate(context_ids) if cid >= from_context),
-            len(context_ids),
-        )
-    for index in range(start, len(context_ids)):
-        context_id = context_ids[index]
-        after = from_path if context_id == from_context else None
-        while len(resources) < RESOURCE_PAGE_SIZE:
-            paths = runtime.store.list_context_document_paths(
-                context_id, after=after, limit=RESOURCE_PAGE_SIZE - len(resources)
-            )
-            if not paths:
-                break
-            resources.extend(
-                _document_resource(context_id, path) for path in paths
-            )
-            after = paths[-1]
-        if len(resources) >= RESOURCE_PAGE_SIZE:
-            return {
-                "resources": resources,
-                "nextCursor": _encode_cursor("doc", context_id, after),
-            }
-    return {"resources": resources}
+    after_context, after_path = (list(parts) + [None, None])[:2]
+    rows = runtime.store.list_owned_document_namespace(
+        principal.user_id,
+        after_context=after_context,
+        after_path=after_path,
+        limit=RESOURCE_PAGE_SIZE + 1,
+    )
+    page = rows[:RESOURCE_PAGE_SIZE]
+    listed = {
+        "resources": [
+            _document_resource(context_id, fs_path) for context_id, fs_path in page
+        ]
+    }
+    if len(rows) > RESOURCE_PAGE_SIZE:
+        listed["nextCursor"] = _encode_cursor("doc", page[-1][0], page[-1][1])
+    return listed
 
 
 def _list_resources(runtime, principal: AuthContext, params: Dict[str, Any]) -> dict:

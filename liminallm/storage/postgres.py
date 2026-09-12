@@ -4948,6 +4948,71 @@ class PostgresStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         return deleted_generation
 
+    def list_ordinary_context_ids(self, owner_user_id: str) -> List[str]:
+        """Every ordinary context this user owns. Ids only, and all of them.
+
+        `list_contexts` pages, and its default page is 100, which is right for
+        a listing and silently wrong for a caller that means "search
+        everything I own": the 101st context stops existing. Ids are small
+        enough to return whole, and the exclusion of a conversation's implicit
+        index is the SQL predicate rather than something a caller remembers.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM knowledge_context
+                WHERE owner_user_id = %s AND conversation_id IS NULL
+                ORDER BY id ASC
+                """,
+                (owner_user_id,),
+            ).fetchall()
+        return [str(row["id"]) for row in rows]
+
+    def list_owned_document_namespace(
+        self,
+        owner_user_id: str,
+        *,
+        after_context: Optional[str] = None,
+        after_path: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[tuple[str, str]]:
+        """(context_id, fs_path) for every document this user can address.
+
+        One keyset read over the whole namespace rather than a context list
+        followed by a query each: the resource surface pages documents across
+        contexts, so the page boundary has to fall anywhere in that order and
+        not at a context edge. Both halves of the key are immutable, so a
+        cursor built from them keeps its meaning.
+
+        The ownership and the implicit-index exclusion are both in the join,
+        where they cannot be forgotten by a caller assembling ids first.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT c.context_id, c.fs_path
+                FROM knowledge_chunk c
+                JOIN knowledge_context k ON k.id = c.context_id
+                WHERE k.owner_user_id = %s
+                  AND k.conversation_id IS NULL
+                  AND c.fs_path IS NOT NULL
+                  AND (
+                    %s::text IS NULL
+                    OR (c.context_id::text, c.fs_path) > (%s::text, %s::text)
+                  )
+                ORDER BY c.context_id ASC, c.fs_path ASC
+                LIMIT %s
+                """,
+                (
+                    owner_user_id,
+                    after_context,
+                    after_context,
+                    after_path,
+                    max(1, min(limit, 500)),
+                ),
+            ).fetchall()
+        return [(str(row["context_id"]), row["fs_path"]) for row in rows]
+
     def list_context_document_paths(
         self,
         context_id: str,
