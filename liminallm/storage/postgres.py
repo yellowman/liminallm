@@ -5013,37 +5013,6 @@ class PostgresStore:
             ).fetchall()
         return [(str(row["context_id"]), row["fs_path"]) for row in rows]
 
-    def list_context_document_paths(
-        self,
-        context_id: str,
-        *,
-        after: Optional[str] = None,
-        limit: int = 100,
-    ) -> List[str]:
-        """The distinct source paths this context holds, in a stable order.
-
-        A document is every chunk sharing an `fs_path`, and the MCP resource
-        surface addresses documents rather than only chunks, so it needs the
-        set of paths without reading a row per chunk - a large corpus has
-        millions of those and tens of paths.
-
-        Ordered by the path itself and paged by it with `after`, because the
-        caller pages across two kinds of resource and a cursor has to keep
-        meaning between requests: `fs_path` within a context does not change,
-        where a row count or a timestamp would.
-        """
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT DISTINCT fs_path FROM knowledge_chunk
-                WHERE context_id = %s AND fs_path IS NOT NULL
-                  AND (%s::text IS NULL OR fs_path > %s::text)
-                ORDER BY fs_path ASC LIMIT %s
-                """,
-                (context_id, after, after, max(1, min(limit, 500))),
-            ).fetchall()
-        return [row["fs_path"] for row in rows]
-
     def list_document_chunks(
         self, context_id: str, fs_path: str
     ) -> List[KnowledgeChunk]:
