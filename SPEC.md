@@ -2331,7 +2331,10 @@ it).
   the caller and still has no address, because it exists for one
   conversation - so it is absent from the listing and indistinguishable
   from absent on read. the same rule scopes `knowledge_search`, both
-  unscoped and when a context id is named.
+  unscoped and when a context id is named. a subsystem switched off takes
+  its surface with it: with `notes_enabled` off (§19.7) notes are neither
+  listed nor readable here, and `note_search` is neither offered nor
+  callable.
 - **an address is `liminal://`**, one segment per variable, percent-encoded
   by rfc 6570 simple expansion: `note/<id>`, `context/<id>/doc/~<path>`,
   and that plus `/chunk/<n>`, which is the only template advertised. the
@@ -3055,7 +3058,11 @@ previous run instead of re-judging unchanged pairs.
 overridable from the admin console (precedence: admin override → code
 default, §18.6). when off: all `/v1/notes/*` routes return 403
 `notes_disabled`, the `note_search` tool is never offered, and the
-front-end hides the notes tab on first contact.
+front-end hides the notes tab on first contact. the mcp server (§13.1)
+withdraws the same surface: `note_search` is absent from `tools/list` and
+not callable, notes are not enumerated by `resources/list`, and a note uri
+reads as absent. the flag is read per call, so turning it back on restores
+all of it without a restart.
 
 ---
 
