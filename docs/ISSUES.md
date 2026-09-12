@@ -9732,3 +9732,105 @@ response at all. The pair is pinned at the route function instead, over a real
 Starlette receive channel: a vanished peer answers 499, a body that arrived
 malformed still answers -32700. That mutant survived the first campaign and is
 why the seam test exists.
+
+## Addressing the corpus found two leaks in the surface that already had it
+
+[RESOLVED]
+
+Adding `resources/*` needed one question answered that the tool surface had
+already answered wrongly: which of a user's knowledge contexts may a caller
+reach by name. Writing the resource authority made the tool authority
+readable next to it, and two defects fell out. Both were reproduced before
+being fixed, and both predate this tranche.
+
+**A conversation's attachment index was searchable.** Uploading a file to a
+chat creates an implicit `knowledge_context` carrying `conversation_id`. It
+is the user's own, so no ownership check rejects it - and `knowledge_search`
+reached it twice over. Unscoped, it was folded into "every context I own".
+Scoped, the implicit id was accepted like any ordinary context id. The
+verdict now is that an implicit index has no address at all: absent from the
+listing, `context not found` on a scoped call, and `-32602` from
+`resources/read`. Absent rather than refused, because the caller does own it
+and "another user's" would be untrue - and confirming it exists is the leak
+in a quieter form.
+
+**"Everything I own" meant "the first hundred".** The unscoped branch
+enumerated contexts through `list_contexts`, whose `page_size` defaults to
+100. A user with more than that silently lost the rest, and nothing in the
+answer said so. The fix is a store read that returns ids with no page and
+both exclusions in SQL: `list_ordinary_context_ids`. The regression witness
+builds the contexts through the store, because creating 130 over HTTP stops
+at the rate limiter around 61. Two reproductions were thrown away before one
+measured the bug: the first hit that limiter, and the second asserted on a
+marker written `harlequin-27`, which ingestion normalises into two tokens, so
+a passage the tool had in fact found read as missing.
+
+The general shape is worth keeping: a new surface over old data is a reason
+to re-derive the authority rule, not to import it. The resource surface would
+have inherited both defects by calling the same helper.
+
+The addressing itself has one decision that is not obvious. A document path
+is prefixed with a literal `~` inside its segment, so a file named `..`
+expands to `~..` rather than to a dot-segment that RFC 3986 §5.2.4
+normalisation is entitled to remove before the request ever arrives. An
+earlier attempt percent-encoded the dots instead, which worked and was still
+wrong: `%2E` is unreserved, so no conforming client expanding the advertised
+template would produce it, and the server's own address disagreed with the
+template it published. The witness that caught it expands the template with
+an RFC 6570 implementation written in the test file, which is the point -
+borrowing the server's encoder would have agreed with the server's mistake.
+
+## The vault's off switch stopped at the HTTP boundary
+
+[RESOLVED]
+
+SPEC §19.7 says that with `notes_enabled` off, every `/v1/notes/*` route
+answers 403 and `note_search` is never offered. The first half held. The
+second did not, and the MCP server was where it failed.
+
+Reproduced on `main` at `bb79f4a` rather than inferred from the code: with the
+flag off in a live process, `GET /v1/notes` answered 403 while MCP
+`tools/list` still listed `note_search`, and calling it returned the note's
+title and an excerpt of its body. So an operator who switched the vault off
+had closed the browser's door and left the agent surface open.
+
+Adding addressable resources would have widened that from one tool to a whole
+namespace, which is why it is closed here rather than filed. The withdrawal
+now lives at four seams, because closing fewer would leave a way round:
+`tools/list` omits the tool, `tools/call` treats it as a name that does not
+exist, `resources/list` does not page notes, and a note uri reads as absent.
+Absent rather than refused, for the same reason the implicit-context decision
+went that way: a caller who is told "disabled" learns that the note exists.
+
+Two details worth keeping. The flag is read per call rather than captured at
+import, so an admin flipping it takes effect on the next request and turning
+it back on needs no restart. And a `note` cursor issued while the vault was on
+still resumes when it is off - it degrades into the document phase instead of
+failing, because the cursor was legitimately issued and the walk was heading
+there next anyway.
+
+## A full page of notes hid every document behind it
+
+[RESOLVED]
+
+`_list_resources` fetches one more note than it will emit, so a continuation
+means a further resource was actually seen. When more notes remain it emits a
+full page and a note cursor; when fewer remain it fills the rest of the page
+from the documents. The case it got wrong is the one exactly between: when the
+remaining notes are exactly the page size, the over-fetch sees no further note,
+so the code concluded the vault was exhausted, filled the page completely, and
+handed the document phase `room=0` - which returned nothing and no cursor. A
+full page with no continuation reads as "that was everything", so every
+document disappeared from the walk.
+
+The existing page-size-2 walk used three notes, which crosses the seam with a
+slot left over and steps straight over this. The witness that catches it uses
+exactly two notes and one document.
+
+The fix is to stop treating no room as nothing to do. `_list_documents` runs
+its query even at `room == 0`, where `limit=room + 1` is `limit=1`: if a row
+comes back it becomes a continuation rather than a resource, and if none does
+there is no cursor. That keeps the invariant in one expression instead of
+adding a second rule, and the sibling case - exactly two notes and no
+documents - still ends the walk with no cursor, which is the mutant that
+proves the probe is a probe and not an assumption.

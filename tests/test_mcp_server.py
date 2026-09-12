@@ -124,7 +124,10 @@ class TestMcpProtocol:
         assert _rpc(client, auth_headers, "ping").json()["result"] == {}
 
     def test_unknown_method_is_32601(self, client, auth_headers):
-        resp = _rpc(client, auth_headers, "resources/list")
+        """`resources/subscribe` rather than something invented: it is the
+        method this server deliberately does not implement, and the
+        capability it declares says so."""
+        resp = _rpc(client, auth_headers, "resources/subscribe")
         assert resp.json()["error"]["code"] == -32601
 
     def test_unknown_tool_is_32602(self, client, auth_headers):
