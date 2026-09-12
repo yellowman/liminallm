@@ -292,6 +292,50 @@ class TestPagingSaysWhatItMeans:
         assert len([u for u in seen if "/note/" in u]) == 3
         assert pages >= 3
 
+    def test_notes_that_exactly_fill_a_page_do_not_hide_the_documents(
+        self, client, store, monkeypatch
+    ):
+        """The exact-multiple seam, which the three-note walk steps over.
+
+        Two notes at page size two exhausts the vault *and* fills the page, so
+        the notes phase sees no further note and hands the documents phase no
+        room. Stopping there drops every document from the walk, and says so
+        in the worst possible way: a full page with no continuation reads as
+        "that was everything".
+        """
+        user_id, headers = _account(client)
+        for index in range(2):
+            store.create_note(user_id, f"note {index}", "body " * 40)
+        context_id = store.upsert_context(user_id, "ctx", "d").id
+        _seed_document(store, context_id, "only.md", LONG_DOCUMENT)
+
+        seen, pages, final = _walk(client, headers, 2, monkeypatch)
+
+        assert final is None
+        assert mcp_server.document_uri(context_id, "only.md") in seen, (
+            "the document namespace was never reached"
+        )
+        assert len([u for u in seen if "/note/" in u]) == 2
+        assert pages == 2
+
+    def test_notes_that_exactly_fill_the_only_page_end_the_walk(
+        self, client, store, monkeypatch
+    ):
+        """The sibling case, and the reason the fix probes rather than assumes.
+
+        The same full page of notes, with nothing after it. Offering a
+        continuation here would promise a page that does not exist.
+        """
+        user_id, headers = _account(client)
+        for index in range(2):
+            store.create_note(user_id, f"note {index}", "body " * 40)
+        monkeypatch.setattr(mcp_server, "RESOURCE_PAGE_SIZE", 2)
+
+        page = _ok(client, headers, "resources/list")
+
+        assert len(page["resources"]) == 2
+        assert "nextCursor" not in page
+
     def test_an_empty_account_is_not_promised_a_next_page(self, client):
         _user_id, headers = _account(client)
 
@@ -552,3 +596,95 @@ class TestTheCapabilityIsTrue:
         answer = _rpc(client, headers, "resources/subscribe", {"uri": "liminal://x"})
 
         assert answer["error"]["code"] == -32601
+
+
+class TestASwitchedOffVaultHasNoSurfaceHere:
+    """SPEC §19.7: with `notes_enabled` off, the notes routes are 403 and
+    `note_search` is never offered.
+
+    On `main` the HTTP half held and the MCP half did not: `tools/list` still
+    offered `note_search` and calling it returned the note's text. Adding
+    addressable notes would have widened that from a tool to a namespace, so
+    all four seams are pinned together - the list, the call, the enumeration
+    and the direct address.
+    """
+
+    @staticmethod
+    def _off(monkeypatch):
+        from liminallm.service.runtime import get_runtime
+
+        monkeypatch.setattr(get_runtime().settings, "notes_enabled", False)
+
+    def test_the_tool_is_not_offered(self, client, monkeypatch):
+        _user_id, headers = _account(client)
+        self._off(monkeypatch)
+
+        offered = [t["name"] for t in _ok(client, headers, "tools/list")["tools"]]
+
+        assert offered == ["knowledge_search"]
+
+    def test_calling_it_anyway_does_not_reach_the_vault(self, client, store, monkeypatch):
+        """A client holding a tool list from before the flag moved.
+
+        The withdrawal has to live at the call, not only in the listing, or it
+        is a hint rather than a rule.
+        """
+        user_id, headers = _account(client)
+        store.create_note(user_id, "Vermilion cabinet", "the launch code " * 30)
+        self._off(monkeypatch)
+
+        answer = _rpc(
+            client, headers, "tools/call",
+            {"name": "note_search", "arguments": {"query": "vermilion cabinet"}},
+        )
+
+        # Absent, not refused: the same -32602 an invented tool name gets.
+        assert answer["error"]["code"] == -32602, answer
+        assert "note_search" in answer["error"]["message"]
+        assert "vermilion" not in str(answer).lower()
+
+    def test_notes_are_not_enumerated_and_documents_still_are(
+        self, client, store, monkeypatch
+    ):
+        user_id, headers = _account(client)
+        store.create_note(user_id, "Vermilion cabinet", "the launch code " * 30)
+        context_id = store.upsert_context(user_id, "ctx", "d").id
+        _seed_document(store, context_id, "report.md", LONG_DOCUMENT)
+        self._off(monkeypatch)
+
+        listed = [r["uri"] for r in _ok(client, headers, "resources/list")["resources"]]
+
+        assert listed == [mcp_server.document_uri(context_id, "report.md")]
+
+    def test_a_note_uri_looks_exactly_like_one_that_is_absent(
+        self, client, store, monkeypatch
+    ):
+        user_id, headers = _account(client)
+        note = store.create_note(user_id, "Vermilion cabinet", "the launch code " * 30)
+        self._off(monkeypatch)
+
+        withdrawn = _rpc(
+            client, headers, "resources/read",
+            {"uri": mcp_server.note_uri(note.id)},
+        )
+        absent = _rpc(
+            client, headers, "resources/read",
+            {"uri": mcp_server.note_uri(str(uuid.uuid4()))},
+        )
+
+        assert withdrawn["error"] == absent["error"]
+        assert withdrawn["error"]["code"] == -32602
+
+    def test_turning_it_back_on_restores_both_halves(self, client, store, monkeypatch):
+        """The flag is read per call, so the withdrawal is not sticky."""
+        user_id, headers = _account(client)
+        note = store.create_note(user_id, "Vermilion cabinet", "the launch code " * 30)
+        self._off(monkeypatch)
+        _rpc(client, headers, "resources/list")
+        monkeypatch.undo()
+
+        offered = [t["name"] for t in _ok(client, headers, "tools/list")["tools"]]
+        listed = [r["uri"] for r in _ok(client, headers, "resources/list")["resources"]]
+
+        assert "note_search" in offered
+        assert mcp_server.note_uri(note.id) in listed

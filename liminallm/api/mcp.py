@@ -212,6 +212,26 @@ TOOLS = [
 
 _TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
 
+#: The one tool a feature flag can withdraw. SPEC §19.7 says that with
+#: `notes_enabled` off the vault's routes are 403 and `note_search` is never
+#: offered, so this surface withdraws it too - from the tool list, from
+#: `tools/call`, and from the resource namespace a note would otherwise have.
+NOTES_TOOL = "note_search"
+
+
+def _notes_enabled(runtime) -> bool:
+    """Read per call, because an admin can flip the setting mid-process."""
+    return bool(runtime.settings.notes_enabled)
+
+
+def _offered(runtime, name: str) -> bool:
+    return name != NOTES_TOOL or _notes_enabled(runtime)
+
+
+def _offered_tools(runtime) -> list:
+    """`TOOLS`, minus whatever a switched-off subsystem has withdrawn."""
+    return [tool for tool in TOOLS if _offered(runtime, tool["name"])]
+
 #: The key each tool's rows sit under, taken from the tool's own schema so the
 #: two cannot drift. A tool with an `outputSchema` owes every call a
 #: conforming object, so an empty search and a failed one answer with this key
@@ -610,7 +630,11 @@ def _call_tool(runtime, principal: AuthContext, params: Dict[str, Any]) -> dict:
     if not isinstance(arguments, dict):
         arguments = {}
     handler = _TOOL_HANDLERS.get(name)
-    if handler is None:
+    if handler is None or not _offered(runtime, name):
+        # A tool that is not offered is not callable either. The same KeyError
+        # a name that never existed gets, so a withdrawn tool reads as absent
+        # rather than as refused - and a client holding a stale tool list
+        # cannot call past the withdrawal.
         raise KeyError(name)
     try:
         text, structured = handler(runtime, principal, arguments)
@@ -715,9 +739,14 @@ def _list_documents(
     `room + 1` rather than `room`, so a continuation is offered only when a
     further resource was actually seen. A cursor promising a page that turns
     out to be empty is a cursor that lied.
+
+    `room == 0` is the exact-fill case: the notes ran out at exactly the page
+    size, so no document fits here and there is no document boundary yet to
+    encode. The query still runs, at `limit=1`, and what it finds becomes a
+    continuation instead of a resource - which is the same "a further row was
+    seen" rule, not an exception to it. Returning early on no room instead
+    would end the walk on a full page and hide every document behind it.
     """
-    if room <= 0:
-        return {"resources": []}
     after_context, after_path = (list(parts) + [None, None])[:2]
     rows = runtime.store.list_owned_document_namespace(
         principal.user_id,
@@ -732,7 +761,13 @@ def _list_documents(
         ]
     }
     if len(rows) > room:
-        listed["nextCursor"] = _encode_cursor("doc", page[-1][0], page[-1][1])
+        # No page means no boundary to resume from, so the cursor is the bare
+        # `doc` one: start of the document namespace, nothing emitted yet.
+        listed["nextCursor"] = (
+            _encode_cursor("doc", page[-1][0], page[-1][1])
+            if page
+            else _encode_cursor("doc")
+        )
     return listed
 
 
@@ -746,15 +781,25 @@ def _list_resources(runtime, principal: AuthContext, params: Dict[str, Any]) -> 
     documents rather than ending early with a bare transition cursor - an
     account with no notes at all would otherwise get an empty first page and
     a promise, and an account whose notes exactly fill a page would get a
-    continuation to a set that might be empty.
+    continuation to a set that might be empty. That last account is the one
+    edge the filling cannot serve, because a full page leaves no room to look
+    ahead with: `_list_documents` answers it by looking anyway and offering a
+    continuation only if it finds something.
     """
     kind, parts = _decode_cursor(params.get("cursor"))
     resources: list[dict] = []
 
     if kind == "note":
         after = parts[0] if parts else None
-        notes = runtime.store.list_notes_after(
-            principal.user_id, after=after, limit=RESOURCE_PAGE_SIZE + 1
+        # A switched-off vault is an empty phase rather than an error (SPEC
+        # §19.7), so a cursor issued while it was on still resumes - into the
+        # documents, which is where the walk was going next anyway.
+        notes = (
+            runtime.store.list_notes_after(
+                principal.user_id, after=after, limit=RESOURCE_PAGE_SIZE + 1
+            )
+            if _notes_enabled(runtime)
+            else []
         )
         if len(notes) > RESOURCE_PAGE_SIZE:
             page = notes[:RESOURCE_PAGE_SIZE]
@@ -838,6 +883,10 @@ def _read_resource(runtime, principal: AuthContext, params: Dict[str, Any]) -> d
         raise McpResourceError("unknown or malformed resource uri.")
 
     if ref.kind == "note":
+        # A switched-off vault has no addresses, and a note that is not
+        # addressable looks exactly like one that is not there (SPEC §19.7).
+        if not _notes_enabled(runtime):
+            raise McpResourceError("no such resource.")
         note = runtime.store.get_note(ref.note_id, principal.user_id)
         if not note:
             raise McpResourceError("no such resource.")
@@ -924,7 +973,7 @@ def handle_message(runtime, principal: AuthContext, body: Any) -> Optional[dict]
     if method == "ping":
         return _result(request_id, {})
     if method == "tools/list":
-        return _result(request_id, {"tools": TOOLS})
+        return _result(request_id, {"tools": _offered_tools(runtime)})
     if method == "resources/list":
         try:
             return _result(request_id, _list_resources(runtime, principal, params))
