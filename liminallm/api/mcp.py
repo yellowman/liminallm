@@ -436,6 +436,43 @@ def _tool_note_search(
     return text, {"notes": notes}
 
 
+def addressable_context(runtime, principal: AuthContext, context_id: Any):
+    """The context this principal may name, or None.
+
+    Owning a context is not enough. A conversation's implicit attachment index
+    is owned by the same user and is deliberately not an ordinary context: it
+    exists for one conversation, and naming it from outside would hand that
+    conversation's attachments to anything holding the id. `conversation_id`
+    is the authority on which kind it is - `meta.auto` says the same thing for
+    the UI, but only this is the foreign key every exclusion filter keys on.
+
+    Checked here rather than trusted from a previous listing, because a URI or
+    an argument is caller input and a resource that was never listed can still
+    be asked for by id.
+    """
+    context = runtime.store.get_context(str(context_id))
+    if not context or context.owner_user_id != principal.user_id:
+        return None
+    if context.conversation_id is not None:
+        return None
+    return context
+
+
+def addressable_context_ids(runtime, principal: AuthContext) -> list[str]:
+    """Every context this principal may name, implicit indexes excluded.
+
+    `include_auto` defaults to True on the store, which is right for callers
+    that are working inside a conversation and wrong for every caller that is
+    not. Both agent surfaces here are the second kind.
+    """
+    return [
+        context.id
+        for context in runtime.store.list_contexts(
+            owner_user_id=principal.user_id, include_auto=False
+        )
+    ]
+
+
 def _tool_knowledge_search(
     runtime, principal: AuthContext, arguments: Dict[str, Any]
 ) -> tuple[str, dict]:
@@ -443,18 +480,19 @@ def _tool_knowledge_search(
     context_id = arguments.get("context_id")
     if context_id:
         # The same verdicts the HTTP surface gives (_get_owned_context), as
-        # tool errors: absent is absent, foreign is refused.
-        ctx = runtime.store.get_context(str(context_id))
-        if not ctx:
+        # tool errors: absent is absent, foreign is refused. A conversation's
+        # implicit index reads as absent rather than refused - it is this
+        # user's own, so "another user" would be untrue, and it is not
+        # addressable, so saying it exists would be worse.
+        context = addressable_context(runtime, principal, context_id)
+        if not context:
+            existing = runtime.store.get_context(str(context_id))
+            if existing and existing.owner_user_id != principal.user_id:
+                raise McpToolError("context is owned by another user.")
             raise McpToolError("context not found.")
-        if ctx.owner_user_id != principal.user_id:
-            raise McpToolError("context is owned by another user.")
-        context_ids = [ctx.id]
+        context_ids = [context.id]
     else:
-        context_ids = [
-            ctx.id
-            for ctx in runtime.store.list_contexts(owner_user_id=principal.user_id)
-        ]
+        context_ids = addressable_context_ids(runtime, principal)
         if not context_ids:
             return "No knowledge contexts exist for this user yet.", {"passages": []}
     chunks = runtime.rag.retrieve(
@@ -569,10 +607,7 @@ def _document_resource(context_id: str, fs_path: str) -> dict:
 
 def _owned_context_ids(runtime, principal: AuthContext) -> list[str]:
     """Sorted, because a page boundary lands between two of them."""
-    return sorted(
-        ctx.id
-        for ctx in runtime.store.list_contexts(owner_user_id=principal.user_id)
-    )
+    return sorted(addressable_context_ids(runtime, principal))
 
 
 def _list_documents(runtime, principal: AuthContext, parts: list[str]) -> dict:
@@ -703,8 +738,10 @@ def _read_resource(runtime, principal: AuthContext, params: Dict[str, Any]) -> d
             raise McpResourceError("no such resource.")
         return {"contents": [_text_contents(note_uri(note.id), note.content)]}
 
-    context = runtime.store.get_context(ref.context_id)
-    if not context or context.owner_user_id != principal.user_id:
+    # Re-checked here, not inferred from having been listed: a URI is caller
+    # input, and an implicit index that `resources/list` never showed can
+    # still be asked for by id.
+    if addressable_context(runtime, principal, ref.context_id) is None:
         raise McpResourceError("no such resource.")
 
     if ref.kind == "chunk":
