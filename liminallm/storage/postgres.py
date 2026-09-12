@@ -4948,6 +4948,58 @@ class PostgresStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         return deleted_generation
 
+    def list_context_document_paths(
+        self,
+        context_id: str,
+        *,
+        after: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[str]:
+        """The distinct source paths this context holds, in a stable order.
+
+        A document is every chunk sharing an `fs_path`, and the MCP resource
+        surface addresses documents rather than only chunks, so it needs the
+        set of paths without reading a row per chunk - a large corpus has
+        millions of those and tens of paths.
+
+        Ordered by the path itself and paged by it with `after`, because the
+        caller pages across two kinds of resource and a cursor has to keep
+        meaning between requests: `fs_path` within a context does not change,
+        where a row count or a timestamp would.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT fs_path FROM knowledge_chunk
+                WHERE context_id = %s AND fs_path IS NOT NULL
+                  AND (%s::text IS NULL OR fs_path > %s::text)
+                ORDER BY fs_path ASC LIMIT %s
+                """,
+                (context_id, after, after, max(1, min(limit, 500))),
+            ).fetchall()
+        return [row["fs_path"] for row in rows]
+
+    def get_context_chunk(
+        self, context_id: str, fs_path: str, chunk_index: int
+    ) -> Optional[KnowledgeChunk]:
+        """One chunk, named exactly. Not "something like it".
+
+        The MCP resource surface resolves a URI to the passage that URI names,
+        so this matches all three parts or returns nothing - a near miss is a
+        different passage, and answering with it would make a citation point
+        somewhere its handle never did.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM knowledge_chunk
+                WHERE context_id = %s AND fs_path = %s AND chunk_index = %s
+                LIMIT 1
+                """,
+                (context_id, fs_path, chunk_index),
+            ).fetchone()
+        return self._row_to_knowledge_chunk(row) if row else None
+
     def prune_context_to_paths(self, context_id: str, keep_paths: Sequence[str]) -> int:
         """Drop everything this context says about anything not in `keep_paths`.
 

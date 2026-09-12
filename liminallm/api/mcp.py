@@ -34,7 +34,9 @@ instead, which serves those clients better than JSON would.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
+from urllib.parse import quote, unquote
 
 from liminallm.logging import get_logger
 from liminallm.service import notes as notes_service
@@ -208,6 +210,97 @@ _RESULT_KEY = {
     )
     for tool in TOOLS
 }
+
+
+URI_PREFIX = "liminal://"
+
+#: The chunk pattern, advertised through `resources/templates/list` because
+#: chunks are readable but not enumerable - a corpus has millions of them and
+#: a handful of documents. RFC 6570 level 1, so a client expands it by
+#: substitution; the encoding each variable needs is stated in the template's
+#: own description rather than left to be guessed.
+CHUNK_URI_TEMPLATE = (
+    URI_PREFIX + "context/{context_id}/doc/{fs_path}/chunk/{chunk_index}"
+)
+
+
+@dataclass(frozen=True)
+class ResourceRef:
+    """What a URI names, after parsing and before any lookup.
+
+    Parsing says what was asked for. It says nothing about whether it exists
+    or whether this caller may see it: that is decided afterwards, against the
+    authenticated principal, because a URI is caller input and names nothing
+    on its own.
+    """
+
+    kind: str  # "note" | "document" | "chunk"
+    note_id: Optional[str] = None
+    context_id: Optional[str] = None
+    fs_path: Optional[str] = None
+    chunk_index: Optional[int] = None
+
+
+def _segment(value: str) -> str:
+    """One URI path segment carrying an arbitrary value.
+
+    `safe=""` so nothing survives that could change the shape of the URI - a
+    path containing `/`, `?`, `#` or `%` becomes one segment rather than
+    several, and a name like `..` is a name rather than a traversal. Nothing
+    here reaches a filesystem; the decoded value is matched against a stored
+    `fs_path` exactly, so the danger to close is a URI that names a different
+    resource than it appears to, not an escape from a directory.
+    """
+    return quote(str(value), safe="")
+
+
+def note_uri(note_id: str) -> str:
+    return f"{URI_PREFIX}note/{_segment(note_id)}"
+
+
+def document_uri(context_id: str, fs_path: str) -> str:
+    return f"{URI_PREFIX}context/{_segment(context_id)}/doc/{_segment(fs_path)}"
+
+
+def chunk_uri(context_id: str, fs_path: str, chunk_index: int) -> str:
+    return f"{document_uri(context_id, fs_path)}/chunk/{_segment(chunk_index)}"
+
+
+def parse_resource_uri(uri: Any) -> Optional[ResourceRef]:
+    """A URI in, what it names out, or None if it names nothing here.
+
+    Strict on shape, and deliberately so. Each variable is one encoded
+    segment, so a caller that left `/` unencoded produces a different number
+    of segments and is refused rather than guessed at - the alternative is a
+    URI that resolves to a resource other than the one it spells. Decoded
+    exactly once: a value is never unquoted twice, which would make
+    `%252F` and `%2F` name the same thing.
+    """
+    if not isinstance(uri, str) or not uri.startswith(URI_PREFIX):
+        return None
+    parts = uri[len(URI_PREFIX):].split("/")
+    if not all(parts) or len(parts) < 2:
+        return None
+    decoded = [unquote(part) for part in parts]
+
+    if parts[0] == "note" and len(parts) == 2:
+        return ResourceRef(kind="note", note_id=decoded[1])
+    if parts[0] == "context" and parts[2:3] == ["doc"]:
+        if len(parts) == 4:
+            return ResourceRef(
+                kind="document", context_id=decoded[1], fs_path=decoded[3]
+            )
+        if len(parts) == 6 and parts[4] == "chunk":
+            index = decoded[5]
+            if not index.isdigit():
+                return None
+            return ResourceRef(
+                kind="chunk",
+                context_id=decoded[1],
+                fs_path=decoded[3],
+                chunk_index=int(index),
+            )
+    return None
 
 
 class McpToolError(Exception):
