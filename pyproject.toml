@@ -38,9 +38,15 @@ dependencies = [
   # FastAPI's own foundation, named here because one thing is used that
   # FastAPI does not re-export: `ClientDisconnect`, which the two routes that
   # read their request body by hand have to tell apart from a malformed one.
-  # A floor and no ceiling on purpose - FastAPI pins the range it works
-  # against, and a second ceiling here could only ever contradict it.
-  "starlette>=0.40"
+  #
+  # The floor is the one the declared `fastapi>=0.110` already implies, not
+  # the one the currently installed FastAPI happens to want. FastAPI 0.110.0
+  # requires starlette <0.37, so a higher floor here would quietly make the
+  # advertised FastAPI minimum unresolvable - and nothing newer is needed:
+  # 0.36.3 already defines `ClientDisconnect` and already raises it from the
+  # body reader on `http.disconnect`. No ceiling, because FastAPI pins the
+  # range it works against and a second one here could only contradict it.
+  "starlette>=0.36.3"
 ]
 
 [build-system]
