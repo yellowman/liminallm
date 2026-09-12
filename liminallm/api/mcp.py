@@ -233,7 +233,7 @@ URI_PREFIX = "liminal://"
 #: substitution; the encoding each variable needs is stated in the template's
 #: own description rather than left to be guessed.
 CHUNK_URI_TEMPLATE = (
-    URI_PREFIX + "context/{context_id}/doc/{fs_path}/chunk/{chunk_index}"
+    URI_PREFIX + "context/{context_id}/doc/~{fs_path}/chunk/{chunk_index}"
 )
 
 
@@ -268,18 +268,13 @@ def _segment(value: str) -> str:
     against a stored `fs_path` exactly, so the danger to close is a URI that
     names a different resource than it appears to.
 
-    `.` and `..` are the exception that has to be handled rather than
-    assumed away. They are unreserved, so `quote` leaves them alone, and a
-    lone `.` or `..` segment is a *dot-segment* with hierarchical meaning
-    that generic URI normalisation is entitled to remove (RFC 3986 §5.2.4) -
-    a document actually named `..` would otherwise get a URI that resolves
-    somewhere else. Encoding the dots keeps it an ordinary segment, and one
-    decode gives the name back.
+    This is exactly RFC 6570 simple expansion: everything but the unreserved
+    set is percent-encoded, so a client expanding the advertised template
+    produces the same bytes this produces. Nothing is added on top - a rule
+    only this server knows would make the two disagree, which is a resource
+    with two canonical addresses.
     """
-    encoded = quote(str(value), safe="")
-    if encoded in (".", ".."):
-        return encoded.replace(".", "%2E")
-    return encoded
+    return quote(str(value), safe="")
 
 
 def _decode_once(segment: str) -> Optional[str]:
@@ -308,8 +303,20 @@ def note_uri(note_id: str) -> str:
     return f"{URI_PREFIX}note/{_segment(note_id)}"
 
 
+#: A literal, and the reason `.` and `..` need no special handling. Both are
+#: unreserved, so neither RFC 6570 expansion nor `quote` escapes them, and a
+#: bare `..` segment would be a dot-segment that generic URI normalisation is
+#: entitled to remove (RFC 3986 §5.2.4) - a document named `..` would resolve
+#: somewhere else. With the prefix, no value of `fs_path` can make the whole
+#: segment `.` or `..`, and the template expands to the same bytes.
+PATH_SEGMENT_PREFIX = "~"
+
+
 def document_uri(context_id: str, fs_path: str) -> str:
-    return f"{URI_PREFIX}context/{_segment(context_id)}/doc/{_segment(fs_path)}"
+    return (
+        f"{URI_PREFIX}context/{_segment(context_id)}"
+        f"/doc/{PATH_SEGMENT_PREFIX}{_segment(fs_path)}"
+    )
 
 
 def chunk_uri(context_id: str, fs_path: str, chunk_index: int) -> str:
@@ -344,7 +351,15 @@ def parse_resource_uri(uri: Any) -> Optional[ResourceRef]:
 
     if split.netloc == "note" and len(raw) == 1:
         return ResourceRef(kind="note", note_id=decoded[0])
-    if split.netloc == "context" and len(raw) >= 2 and raw[1] == "doc":
+    if split.netloc == "context" and len(raw) >= 3 and raw[1] == "doc":
+        # One literal prefix, stripped before the single decode. A segment
+        # without it is not an address this server issues.
+        if not raw[2].startswith(PATH_SEGMENT_PREFIX):
+            return None
+        fs_path = _decode_once(raw[2][len(PATH_SEGMENT_PREFIX):])
+        if fs_path is None:
+            return None
+        decoded[2] = fs_path
         if len(raw) == 3:
             return ResourceRef(
                 kind="document", context_id=decoded[0], fs_path=decoded[2]
