@@ -24,9 +24,14 @@ def store():
     return get_runtime().store
 
 
+TENANT = "configops-tests"
+
+
 @pytest.fixture
 def artifact(store):
-    user = store.create_user(email=f"co_{uuid.uuid4().hex[:8]}@example.com")
+    user = store.create_user(
+        email=f"co_{uuid.uuid4().hex[:8]}@example.com", tenant_id=TENANT
+    )
     return store.create_artifact(
         type_="artifact",
         name=f"cfg-{uuid.uuid4().hex[:6]}",
@@ -53,22 +58,22 @@ def _propose(store, artifact, patch):
 def test_a_pending_patch_cannot_be_applied(ops, store, artifact):
     patch = _propose(store, artifact, {"ops": []})
     with pytest.raises(BadRequestError, match="approved"):
-        ops.apply_patch(patch.id)
+        ops.apply_patch(patch.id, tenant_id=TENANT)
 
 
 def test_a_rejected_patch_cannot_be_applied(ops, store, artifact):
     patch = _propose(store, artifact, {"ops": []})
-    ops.decide_patch(patch.id, "reject")
+    ops.decide_patch(patch.id, "reject", tenant_id=TENANT)
     with pytest.raises(BadRequestError, match="approved"):
-        ops.apply_patch(patch.id)
+        ops.apply_patch(patch.id, tenant_id=TENANT)
 
 
 def test_an_approved_patch_rewrites_the_schema(ops, store, artifact):
     patch = _propose(
         store, artifact, {"ops": [{"op": "replace", "path": "/meta/weight", "value": 7}]}
     )
-    ops.decide_patch(patch.id, "approve")
-    result = ops.apply_patch(patch.id)
+    ops.decide_patch(patch.id, "approve", tenant_id=TENANT)
+    result = ops.apply_patch(patch.id, tenant_id=TENANT)
 
     assert result["artifact"].schema["meta"]["weight"] == 7
     assert store.get_artifact(artifact.id).schema["meta"]["weight"] == 7
@@ -79,16 +84,16 @@ def test_applying_records_a_new_artifact_version(ops, store, artifact):
     patch = _propose(
         store, artifact, {"ops": [{"op": "add", "path": "/meta/note", "value": "x"}]}
     )
-    ops.decide_patch(patch.id, "approve")
-    ops.apply_patch(patch.id)
+    ops.decide_patch(patch.id, "approve", tenant_id=TENANT)
+    ops.apply_patch(patch.id, tenant_id=TENANT)
     assert store.get_artifact_current_version(artifact.id) > before
 
 
 def test_a_patch_is_decided_once(ops, store, artifact):
     patch = _propose(store, artifact, {"ops": []})
-    ops.decide_patch(patch.id, "approve")
+    ops.decide_patch(patch.id, "approve", tenant_id=TENANT)
     with pytest.raises(BadRequestError, match="pending"):
-        ops.decide_patch(patch.id, "reject")
+        ops.decide_patch(patch.id, "reject", tenant_id=TENANT)
 
 
 @pytest.mark.parametrize(
@@ -98,35 +103,37 @@ def test_a_patch_is_decided_once(ops, store, artifact):
 )
 def test_a_decision_word_normalizes(ops, store, artifact, word, expected):
     patch = _propose(store, artifact, {"ops": []})
-    assert ops.decide_patch(patch.id, word).status == expected
+    assert ops.decide_patch(patch.id, word, tenant_id=TENANT).status == expected
 
 
 @pytest.mark.parametrize("word", ["maybe", "", "approve-ish", "yes"])
 def test_an_unrecognised_decision_is_refused(ops, store, artifact, word):
     patch = _propose(store, artifact, {"ops": []})
     with pytest.raises(BadRequestError, match="decision"):
-        ops.decide_patch(patch.id, word)
+        ops.decide_patch(patch.id, word, tenant_id=TENANT)
 
 
 def test_deciding_an_unknown_patch_is_a_not_found(ops):
     with pytest.raises(NotFoundError):
-        ops.decide_patch(999_999_999, "approve")
+        ops.decide_patch(999_999_999, "approve", tenant_id=TENANT)
 
 
 def test_applying_an_unknown_patch_is_a_not_found(ops):
     with pytest.raises(NotFoundError):
-        ops.apply_patch(999_999_999)
+        ops.apply_patch(999_999_999, tenant_id=TENANT)
 
 
 def test_a_reason_is_kept_with_the_decision(ops, store, artifact):
     patch = _propose(store, artifact, {"ops": []})
-    decided = ops.decide_patch(patch.id, "reject", reason="changes the wrong knob")
+    decided = ops.decide_patch(
+        patch.id, "reject", reason="changes the wrong knob", tenant_id=TENANT
+    )
     assert (decided.meta or {}).get("reason") == "changes the wrong knob"
 
 
 def test_auto_generate_needs_a_real_artifact(ops):
     with pytest.raises(NotFoundError):
-        ops.auto_generate_patch(str(uuid.uuid4()), user_id=None)
+        ops.auto_generate_patch(str(uuid.uuid4()), user_id=None, tenant_id=TENANT)
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +435,9 @@ def test_a_malformed_routing_policy_is_refused(schema, why):
 
 @pytest.fixture
 def canonical_adapter(store):
-    user = store.create_user(email=f"ca_{uuid.uuid4().hex[:8]}@example.com")
+    user = store.create_user(
+        email=f"ca_{uuid.uuid4().hex[:8]}@example.com", tenant_id=TENANT
+    )
     return store.create_artifact(
         type_="adapter",
         name=f"ad-{uuid.uuid4().hex[:6]}",
@@ -485,9 +494,9 @@ class TestAnApprovedPatchCannotReopenARetiredFormat:
         before_versions = self._versions(store, canonical_adapter.id)
 
         patch = _propose(store, canonical_adapter, {"ops": patch_ops})
-        ops.decide_patch(patch.id, "approve")
+        ops.decide_patch(patch.id, "approve", tenant_id=TENANT)
         with pytest.raises(Exception) as caught:
-            ops.apply_patch(patch.id)
+            ops.apply_patch(patch.id, tenant_id=TENANT)
         assert "validation" in str(caught.value).lower(), (
             f"{label} failed for the wrong reason: {caught.value}"
         )
@@ -511,8 +520,8 @@ class TestAnApprovedPatchCannotReopenARetiredFormat:
             canonical_adapter,
             {"ops": [{"op": "replace", "path": "/prompt_instructions", "value": "be kind"}]},
         )
-        ops.decide_patch(patch.id, "approve")
-        ops.apply_patch(patch.id)
+        ops.decide_patch(patch.id, "approve", tenant_id=TENANT)
+        ops.apply_patch(patch.id, tenant_id=TENANT)
 
         schema = store.get_artifact(canonical_adapter.id).schema
         assert schema["prompt_instructions"] == "be kind"
@@ -555,9 +564,9 @@ class TestValidationIsAnchoredToTheArtifactsOwnType:
                 {"op": "add", "path": "/handler", "value": "x"},
             ]},
         )
-        ops.decide_patch(patch.id, "approve")
+        ops.decide_patch(patch.id, "approve", tenant_id=TENANT)
         with pytest.raises(Exception) as caught:
-            ops.apply_patch(patch.id)
+            ops.apply_patch(patch.id, tenant_id=TENANT)
         assert "validation" in str(caught.value).lower(), caught.value
 
         assert store.get_artifact(canonical_adapter.id).schema == before

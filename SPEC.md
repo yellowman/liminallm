@@ -1889,6 +1889,18 @@ execution guardrails:
 
 ### 10.1 api endpoints (canonical - nothing else defines these)
 
+Every endpoint below is scoped by the artifact its patch targets, derived as
+`patch.artifact_id -> artifact -> owner` and re-derived on each call. Being an
+admin of one tenant is not authority over another tenant's configuration.
+
+- `private` and `shared` targets: only an admin in the owner's tenant may
+  propose, list, decide or apply their patches.
+- `global` targets, and targets with no owner: any admin may.
+- Any other visibility: refuse.
+
+A target outside the caller's scope must read as absent, so an id says nothing
+about what exists elsewhere in the installation.
+
 - `POST /v1/config/propose_patch`
   - body: `{ artifact_id, patch, justification }`
   - auth: restricted (system-LLM, admins, or power users).

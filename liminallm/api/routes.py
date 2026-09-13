@@ -3592,6 +3592,16 @@ async def propose_patch(
     runtime = get_runtime()
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
+    # The target authorizes the proposal, not the fact that the caller is an
+    # admin of something. This route used to record whatever `artifact_id`
+    # was supplied - unchecked, not even for existence - and the rest of the
+    # flow trusted the stored row, so an admin in one tenant could propose,
+    # approve and apply a patch against another tenant's private artifact.
+    target = runtime.store.get_artifact(body.artifact_id)
+    if target is None or not runtime.store.artifact_is_administrable(
+        target, tenant_id=principal.tenant_id
+    ):
+        raise http_error("not_found", "artifact not found", status_code=404)
     proposer = "human_admin" if principal.role == "admin" else "user"
     audit = runtime.store.record_config_patch(
         artifact_id=body.artifact_id,
@@ -3610,7 +3620,9 @@ async def list_config_patches(
     runtime = get_runtime()
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
-    patches = runtime.store.list_config_patches(status)
+    patches = runtime.store.list_config_patches(
+        status, tenant_id=principal.tenant_id
+    )
     items = [
         ConfigPatchAuditResponse.model_validate(p)
         for p in patches
@@ -3627,7 +3639,9 @@ async def decide_config_patch(
     runtime = get_runtime()
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
-    decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
+    decision = runtime.config_ops.decide_patch(
+        patch_id, body.decision, body.reason, tenant_id=principal.tenant_id
+    )
     resp = ConfigPatchAuditResponse.model_validate(decision)
     return Envelope(status="ok", data=resp)
 
@@ -3641,7 +3655,9 @@ async def apply_config_patch(
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
     result = runtime.config_ops.apply_patch(
-        patch_id, approver_user_id=principal.user_id
+        patch_id,
+        approver_user_id=principal.user_id,
+        tenant_id=principal.tenant_id,
     )
     patch = result.get("patch")
     resp = ConfigPatchAuditResponse.model_validate(patch).model_copy(
@@ -3666,7 +3682,10 @@ async def auto_patch(
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
     audit = runtime.config_ops.auto_generate_patch(
-        body.artifact_id, principal.user_id, goal=body.goal
+        body.artifact_id,
+        principal.user_id,
+        goal=body.goal,
+        tenant_id=principal.tenant_id,
     )
     resp = ConfigPatchAuditResponse.model_validate(audit)
     return Envelope(status="ok", data=resp)

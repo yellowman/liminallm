@@ -3819,6 +3819,51 @@ class PostgresStore:
             return bool(owner and tenant_id and owner.tenant_id == tenant_id)
         return False
 
+    @staticmethod
+    def _administrable(
+        visibility: Optional[str],
+        owner_user_id: Optional[str],
+        owner_tenant_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> bool:
+        """The ConfigOps authority rule, stated once, over resolved columns.
+
+        `artifact_is_administrable` resolves the owner and asks this;
+        `list_config_patches` gets the same three values from its join and
+        asks this. Neither restates the rule.
+        """
+        if visibility not in {"private", "shared", "global"}:
+            return False
+        if visibility == "global" or not owner_user_id:
+            return True
+        return bool(tenant_id and owner_tenant_id and owner_tenant_id == tenant_id)
+
+    def artifact_is_administrable(self, artifact, *, tenant_id: Optional[str]) -> bool:
+        """Whether an admin in `tenant_id` may administer this artifact's
+        ConfigOps patches.
+
+        Not `artifact_is_reachable`: that is a user's read capability, and a
+        patch is a write, so the caller's own id does not enter into it. The
+        target decides. Private and shared both belong to their owner's
+        tenant, and only an admin of that tenant may patch them - being an
+        admin somewhere is not authority over an artifact somewhere else. A
+        global artifact is installation-wide, and an ownerless system
+        artifact has no tenant to belong to, so any admin administers those.
+        An unrecognized visibility is not a licence.
+
+        Measured before this existed: an admin in one tenant could approve
+        and apply a patch against another tenant's *private* artifact, by id,
+        and the owner's schema changed.
+        """
+        owner_id = getattr(artifact, "owner_user_id", None)
+        owner = self.get_user(owner_id) if owner_id else None
+        return self._administrable(
+            getattr(artifact, "visibility", "private"),
+            owner_id,
+            owner.tenant_id if owner else None,
+            tenant_id,
+        )
+
     def get_latest_workflow(
         self,
         workflow_id: str,
@@ -4051,17 +4096,58 @@ class PostgresStore:
         return self._config_patch_from_row(row) if row else None
 
     def list_config_patches(
-        self, status: Optional[str] = None
+        self, status: Optional[str] = None, *, tenant_id: Optional[str] = None
     ) -> List[ConfigPatchAudit]:
-        query = "SELECT * FROM config_patch"
-        params: tuple = ()
+        """Recorded patches, newest first.
+
+        `tenant_id` scopes the listing to patches an admin of that tenant may
+        administer, derived through each patch's target the way
+        `artifact_is_administrable` does - `config_patch` has no tenant
+        column and needs none. The join fetches the target's visibility and
+        its owner's tenant so the rule is asked once per row instead of the
+        target being re-read per row; it drops nothing, because
+        `config_patch.artifact_id` is a cascading foreign key and a patch
+        cannot outlive its target.
+
+        Omitting `tenant_id` lists every patch, which is what the training
+        loop's duplicate-proposal scan needs: it runs installation-wide with
+        no principal.
+        """
+        if tenant_id is None:
+            query = "SELECT * FROM config_patch"
+            params: tuple = ()
+            if status:
+                query += " WHERE status = %s"
+                params = (status,)
+            query += " ORDER BY created_at DESC"
+            with self._connect() as conn:
+                rows = conn.execute(query, params).fetchall()
+            return [self._config_patch_from_row(row) for row in rows]
+
+        query = (
+            "SELECT p.*, a.visibility AS target_visibility, "
+            "a.owner_user_id AS target_owner_id, u.tenant_id AS target_tenant_id "
+            "FROM config_patch p "
+            "JOIN artifact a ON a.id = p.artifact_id "
+            "LEFT JOIN app_user u ON u.id = a.owner_user_id"
+        )
+        params = ()
         if status:
-            query += " WHERE status = %s"
+            query += " WHERE p.status = %s"
             params = (status,)
-        query += " ORDER BY created_at DESC"
+        query += " ORDER BY p.created_at DESC"
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [self._config_patch_from_row(row) for row in rows]
+        return [
+            self._config_patch_from_row(row)
+            for row in rows
+            if self._administrable(
+                row.get("target_visibility"),
+                row.get("target_owner_id"),
+                row.get("target_tenant_id"),
+                tenant_id,
+            )
+        ]
 
     def update_config_patch_status(
         self,
