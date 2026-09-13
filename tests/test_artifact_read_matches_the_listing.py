@@ -153,6 +153,31 @@ class TestInvokingFollowsTheSameRule:
         assert spec.status_code == 200, spec.text
         assert invoked.status_code != 403, invoked.text
 
+    def test_a_shared_tool_is_invocable_inside_the_owners_tenant(
+        self, client, tenants
+    ):
+        """Shared is the middle tier, and the middle is where a rule breaks.
+
+        Global and private both have an answer that needs no tenant lookup,
+        so a helper can get them right and still get shared wrong in either
+        direction: refusing a colleague the listing already showed the tool
+        to, or serving it across the tenant edge.
+        """
+        _oid, owner = _account("acme", ACME, admin=True)
+        _cid, colleague = _account("acme", ACME)
+        _sid, outsider = _account("globex", GLOBEX)
+        tool = _artifact(client, owner, "shared", schema=TOOL_SCHEMA,
+                         type_="tool")
+
+        inside = client.post(f"/v1/tools/{tool}/invoke", headers=colleague,
+                             json={"inputs": {}})
+        outside = client.post(f"/v1/tools/{tool}/invoke", headers=outsider,
+                              json={"inputs": {}})
+
+        assert inside.status_code != 403, inside.text
+        assert outside.status_code == 403, outside.text
+        assert MARKER not in outside.text
+
     def test_a_private_tool_is_not_invocable_by_a_stranger(self, client, tenants):
         _oid, owner = _account("acme", ACME)
         _sid, stranger = _account("acme", ACME)
