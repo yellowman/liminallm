@@ -9919,3 +9919,23 @@ below always did, so this branch copies that join. Consequence, stated: an
 artifact owned in another tenant is in no tenant admin's inspection, and an
 owner-less one is in nobody's. Config patches stay install-wide on purpose -
 a patch has no owner and the settings it changes are the install's.
+
+## An admin could read any tenant's private artifact by id
+
+[RESOLVED]
+
+`_get_owned_artifact` is the read capability behind `GET /artifacts/{id}`, its
+versions, and a tool's spec and invocation. Its admin bypass carried no tenant
+condition while every sibling admin surface has one - the user listing,
+erasure and inspection all stop at the admin's own tenant - so an admin of one
+tenant could read any tenant's private artifact by id, schema and version
+history included. Measured by the release-qualification sweep.
+
+The same class as the inspection listing, reached by direct id. Closed the
+same way: an artifact's tenant is its owner's, so the bypass now requires the
+owner to be in the admin's tenant. An owner-less artifact has no tenant to
+compare and stays readable to any admin.
+
+Recorded as a fact: no surface changes an existing artifact's visibility.
+Publication happens only at creation and only by an admin; ConfigOps patches
+the schema document, never the visibility column.

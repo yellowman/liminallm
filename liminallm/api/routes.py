@@ -363,7 +363,18 @@ def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
     if not artifact:
         raise http_error("not_found", "artifact not found", status_code=404)
     if artifact.owner_user_id and artifact.owner_user_id != principal.user_id:
-        if principal.role != "admin":
+        # An admin reads another user's artifact - within their own tenant.
+        # The artifact's tenant is its owner's, the way list_artifacts and
+        # get_latest_workflow resolve it. Every other admin surface stops at
+        # the tenant edge (users, erasure, inspection); this bypass did not,
+        # so an admin of one tenant could read any tenant's private artifact,
+        # schema and version history included, by id.
+        owner = (
+            runtime.store.get_user(artifact.owner_user_id)
+            if principal.role == "admin"
+            else None
+        )
+        if owner is None or owner.tenant_id != principal.tenant_id:
             raise http_error(
                 "forbidden", "artifact is owned by another user", status_code=403
             )
