@@ -9970,12 +9970,28 @@ Measured through the real admin route: `enable_mfa: false` changed the setting,
 left `auth.mfa_enabled` true, and MFA challenges kept issuing until a restart
 the console never mentions.
 
-Both are now told, where the citation flag already is. Two more captured flags
-are recorded rather than changed, each needing a decision: `rag_late_interaction`,
-whose engine `refresh_settings` does not rebuild though its description reads
-as live, and `training_worker_enabled`, which no live change can start - the
-honest shapes are a loop that gates on the live flag, or a description that
-says restart.
+Both are now told, where the citation flag already is.
+
+Two further flags were recorded here as needing the same treatment. Measured
+afterwards, each answer was different from the record.
+
+`rag_late_interaction` and `rag_late_segments` were recorded as captured and
+never rebuilt. That read `refresh_settings` and stopped. Both are in
+`MODEL_AFFECTING_SETTINGS`, so the admin write rebuilds the model stack and
+the replacement `RAGService` is constructed from the stored value - and the
+peer workers' watcher compares a signature made of the same list, so they
+rebuild too. Measured through the real endpoint, on a runtime whose encoder
+reports itself semantic (the flag is stored as `enabled and semantic`, so a
+hash encoder pins it to False and would have made a passing test vacuous):
+both values reach the live `runtime.rag` immediately, in both directions. The
+concern was wrong; the code was already right. Witnessed so it stays that way.
+
+`training_worker_enabled` and `training_worker_poll_interval` really are
+read once, at startup. Starting or stopping a background loop from a settings
+write is real lifecycle machinery - a loop to cancel mid-job, a leader lock to
+release - so the honest shape chosen is the description: both now say "Takes
+effect on restart", and a test pins the behaviour and the wording together, so
+making either live fails the wording too rather than leaving a false promise.
 
 ## One artifact, three surfaces, three answers
 
