@@ -6150,8 +6150,23 @@ class PostgresStore:
                 ).fetchall()
                 sections["messages"] = [_serialize(row) for row in rows]
             if kind in (None, "artifacts"):
+                # Artifact has no tenant column; its tenant is its owner's,
+                # the way list_artifacts and get_latest_workflow resolve it and
+                # the way the contexts branch below always did. This was the
+                # one section that skipped the join, so a tenant admin's
+                # inspection listed every tenant's artifacts - owner,
+                # description, schema and path - beside a summary that counted
+                # only their own users.
                 rows = conn.execute(
-                    "SELECT * FROM artifact ORDER BY created_at DESC LIMIT %s", (limit,)
+                    """
+                    SELECT a.*
+                    FROM artifact a
+                    LEFT JOIN app_user u ON a.owner_user_id = u.id
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
+                    ORDER BY a.created_at DESC
+                    LIMIT %s
+                    """,
+                    (tenant_id, tenant_id, limit),
                 ).fetchall()
                 sections["artifacts"] = [_serialize(row) for row in rows]
             if kind in (None, "contexts"):

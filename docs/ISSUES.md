@@ -9899,3 +9899,23 @@ because the SPEC states the property and the surface did not have it. The
 route now resolves the message through the user-scoped conversation lookup
 before the turn begins, so unknown and not-yours raise the identical reject;
 `chat_turn.begin()` keeps its own check as the backstop.
+
+## A tenant admin's inspection listed every tenant's artifacts
+
+[RESOLVED]
+
+`GET /v1/admin/objects` hands `inspect_state` the admin's own tenant, and
+every section honoured it but one: users, sessions, conversations, messages,
+contexts, chunks and training jobs join through `app_user`; artifacts were
+`SELECT * FROM artifact`. So a tenant admin's inspection carried every other
+tenant's artifacts - owner, description, schema and path - beside a summary
+counting only their own users. Measured: a globex admin's inspection held an
+acme admin's private workflow and nothing else of acme's.
+
+Admin-only, and metadata plus schema rather than conversation content.
+`Artifact` has no tenant column; its tenant is its owner's, the way
+`list_artifacts` and `get_latest_workflow` resolve it and the contexts branch
+below always did, so this branch copies that join. Consequence, stated: an
+artifact owned in another tenant is in no tenant admin's inspection, and an
+owner-less one is in nobody's. Config patches stay install-wide on purpose -
+a patch has no owner and the settings it changes are the install's.
