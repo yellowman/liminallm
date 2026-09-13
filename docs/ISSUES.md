@@ -9881,3 +9881,26 @@ One thing observed and left alone: a `ServiceError` raised past the socket's
 close rather than as its own code. The preflight makes that path unreachable
 for this defect, and mapping service errors on the socket is a separate
 change.
+
+## Signup disabled closed one door and left the other open
+
+[RESOLVED]
+
+`allow_signup` is a managed flag; the password signup route refuses with 403
+`signup disabled` when it is off. The OAuth path did not consult it anywhere:
+not `oauth_start`, not `oauth_callback`, and not `complete_oauth`, whose
+`if not user:` branch created the account, linked the provider, opened a
+session and minted tokens. Measured by the release-qualification sweep with
+the flag off: password signup 403, then an OAuth round trip for an unknown
+email came back with a user, a session and a token, and the row existed.
+
+The `notes_enabled` lesson, generalised: a withdrawal that stops at the route
+that first introduced the capability is a hint, not a rule. Every door that
+can create an account has to ask the same question, and the answer has to be
+the same. Closed in `complete_oauth` at the point of creation, so the two
+routes above it need no knowledge of it: an unknown identity with signup off
+is refused with the password path's exact code and message, and no row is
+written. An identity that already has an account still signs in - signup off
+is not login off. The flag is read off the live settings object that
+`refresh_settings` hands the auth service, so turning it back on needs no
+restart. Reverting the gate is caught by the witness that asserts no row.

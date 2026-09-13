@@ -54,6 +54,12 @@ class NotFoundError(ServiceError):
     error_code = "not_found"
 
 
+class ForbiddenError(ServiceError):
+    """The caller is known and the action is refused (403)."""
+    status_code = 403
+    error_code = "forbidden"
+
+
 class ConflictError(ServiceError):
     """Resource conflict, e.g., duplicate creation (409)."""
     status_code = 409
