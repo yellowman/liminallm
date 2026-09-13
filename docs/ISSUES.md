@@ -9955,3 +9955,24 @@ that introduced the capability is a hint, not a rule. Closed at the point of
 creation rather than at a route, so no route above can forget it. An identity
 that already has an account still signs in - signup off is not login off - and
 the flag is read live, so turning it back on needs no restart.
+
+## Two managed flags stopped at the admin console
+
+[RESOLVED]
+
+SPEC §18.6: managed settings take effect without restart, and
+`refresh_settings` is how - it hands each service the new settings object,
+which is enough for anything that reads per use. Its comment claimed that was
+everything but citation offers. `AuthService.mfa_enabled` and
+`TrainingService.distillation_enabled` are bools captured at construction and
+never re-read, and the training service holds no settings object at all.
+Measured through the real admin route: `enable_mfa: false` changed the setting,
+left `auth.mfa_enabled` true, and MFA challenges kept issuing until a restart
+the console never mentions.
+
+Both are now told, where the citation flag already is. Two more captured flags
+are recorded rather than changed, each needing a decision: `rag_late_interaction`,
+whose engine `refresh_settings` does not rebuild though its description reads
+as live, and `training_worker_enabled`, which no live change can start - the
+honest shapes are a loop that gates on the live flag, or a description that
+says restart.
