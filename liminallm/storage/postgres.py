@@ -3793,6 +3793,32 @@ class PostgresStore:
             visibility=visibility,
         )
 
+    def artifact_is_reachable(
+        self, artifact, *, user_id: Optional[str], tenant_id: Optional[str]
+    ) -> bool:
+        """Whether this caller may reach an artifact at all, by visibility.
+
+        The one rule, so every surface that resolves an artifact for a caller
+        asks the same question: private is the owner's, shared is the owner's
+        tenant - `artifact` has no tenant column, so the tenant is read off
+        the owner the way `list_artifacts` does - and global is everyone's. An
+        unrecognized visibility is not a licence.
+
+        Ownerless is deliberate rather than incidental: a global artifact
+        whose publisher was erased is still global, and a private one nobody
+        owns cannot be shown to be this caller's.
+        """
+        visibility = getattr(artifact, "visibility", "private")
+        owner_id = getattr(artifact, "owner_user_id", None)
+        if visibility == "global":
+            return True
+        if visibility == "private":
+            return bool(owner_id) and owner_id == user_id
+        if visibility == "shared":
+            owner = self.get_user(owner_id) if owner_id else None
+            return bool(owner and tenant_id and owner.tenant_id == tenant_id)
+        return False
+
     def get_latest_workflow(
         self,
         workflow_id: str,
@@ -3818,25 +3844,9 @@ class PostgresStore:
             return None
         visibility = getattr(artifact, "visibility", "private")
         owner_id = getattr(artifact, "owner_user_id", None)
-        if visibility == "private":
-            # Ownerless too: an artifact nobody owns cannot be shown to be
-            # this caller's, and the previous form only refused when an owner
-            # was present, so a null owner served everyone.
-            if not owner_id or owner_id != user_id:
-                self._deny_workflow(workflow_id, user_id, owner_id, visibility)
-                return None
-        elif visibility == "shared":
-            # `shared` means within a tenant, and the tenant is the owner's -
-            # `Artifact` has no tenant column, so the previous
-            # `getattr(artifact, "tenant_id", None)` was always None and the
-            # `None in (...)` acceptance served shared workflows across
-            # tenants. Read it from the owner, the way list_artifacts does.
-            owner = self.get_user(owner_id) if owner_id else None
-            if not owner or not tenant_id or owner.tenant_id != tenant_id:
-                self._deny_workflow(workflow_id, user_id, owner_id, visibility)
-                return None
-        elif visibility != "global":
-            # An unrecognized visibility is not a licence.
+        if not self.artifact_is_reachable(
+            artifact, user_id=user_id, tenant_id=tenant_id
+        ):
             self._deny_workflow(workflow_id, user_id, owner_id, visibility)
             return None
         with self._connect() as conn:

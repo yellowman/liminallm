@@ -359,30 +359,41 @@ def _get_private_artifact(runtime, artifact_id: str, principal: AuthContext):
 
 
 def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
+    """An artifact this caller may read, or an error.
+
+    The rule is the store's `artifact_is_reachable` - the same one
+    `get_latest_workflow` runs before the engine executes a workflow, and the
+    same tiers `list_artifacts` pages. Reading by id used to be narrower than
+    either: a user whose listing showed them a global artifact *with its whole
+    schema*, and whose chat turn would run it, was refused when they asked for
+    it by id. One object, three surfaces, three answers - and the refusal hid
+    nothing, because the listing had already handed it over.
+
+    An admin additionally reads a private artifact owned inside their own
+    tenant - every other admin surface stops at that edge, and this one used
+    to not - and an ownerless artifact no tier can reach, because system
+    artifacts have no owner and somebody has to be able to inspect them.
+    """
     artifact = runtime.store.get_artifact(artifact_id)
     if not artifact:
         raise http_error("not_found", "artifact not found", status_code=404)
-    if artifact.owner_user_id and artifact.owner_user_id != principal.user_id:
-        # An admin reads another user's artifact - within their own tenant.
-        # The artifact's tenant is its owner's, the way list_artifacts and
-        # get_latest_workflow resolve it. Every other admin surface stops at
-        # the tenant edge (users, erasure, inspection); this bypass did not,
-        # so an admin of one tenant could read any tenant's private artifact,
-        # schema and version history included, by id.
-        owner = (
-            runtime.store.get_user(artifact.owner_user_id)
-            if principal.role == "admin"
-            else None
-        )
-        if owner is None or owner.tenant_id != principal.tenant_id:
-            raise http_error(
-                "forbidden", "artifact is owned by another user", status_code=403
-            )
-    if not artifact.owner_user_id and principal.role != "admin":
+    if runtime.store.artifact_is_reachable(
+        artifact, user_id=principal.user_id, tenant_id=principal.tenant_id
+    ):
+        return artifact
+    if principal.role == "admin":
+        if not artifact.owner_user_id:
+            return artifact
+        owner = runtime.store.get_user(artifact.owner_user_id)
+        if owner is not None and owner.tenant_id == principal.tenant_id:
+            return artifact
+    elif not artifact.owner_user_id:
         raise http_error(
             "forbidden", "artifact access requires admin privileges", status_code=403
         )
-    return artifact
+    raise http_error(
+        "forbidden", "artifact is owned by another user", status_code=403
+    )
 
 
 def _get_pagination_settings(runtime) -> dict:

@@ -9976,3 +9976,38 @@ whose engine `refresh_settings` does not rebuild though its description reads
 as live, and `training_worker_enabled`, which no live change can start - the
 honest shapes are a loop that gates on the live flag, or a description that
 says restart.
+
+## One artifact, three surfaces, three answers
+
+[RESOLVED]
+
+`list_artifacts` pages a caller's own private artifacts, every global one and
+shared ones inside the owner's tenant, returning the whole schema. The engine
+runs exactly those tiers, so a chat turn naming a global workflow ran it.
+Reading by id was narrower than both: `_get_owned_artifact` asked only who
+owned the row, so a user whose listing had already handed them a global
+artifact's schema, and who could run it, got 403 asking for it by id - and the
+same helper refused `invoke` on a globally published tool. The refusal
+protected nothing the listing had not already given away.
+
+Raised by the release-qualification sweep as a contract question rather than a
+defect, and decided on least surprise: the narrowest surface was the one out
+of step with the other two, not the two out of step with it.
+
+The tiers now live once, as `PostgresStore.artifact_is_reachable`, lifted out
+of `get_latest_workflow` - which had the only correct copy - so the engine and
+the read helper ask one rule. Mutation is untouched and stays narrower:
+`_get_private_artifact` still means private-and-yours, and published artifacts
+still change through config ops. The admin paths are unchanged too: a private
+artifact owned in the admin's own tenant, and an ownerless artifact no tier
+reaches, because system artifacts have no owner and somebody must be able to
+inspect them.
+
+Widening `invoke` is the deliberate part. Publishing globally already takes an
+admin and already means "for everyone" to the engine; the one surface that
+disagreed was direct invocation. A tool published to nobody in particular is
+still private, and still refused.
+
+One property the old code enforced in a comment and nothing witnessed: an
+unrecognized visibility is not a licence. It survived the first mutation
+campaign, and has a witness now.
