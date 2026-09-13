@@ -9881,3 +9881,44 @@ One thing observed and left alone: a `ServiceError` raised past the socket's
 close rather than as its own code. The preflight makes that path unreachable
 for this defect, and mapping service errors on the socket is a separate
 change.
+
+## Two managed flags stopped at the admin console
+
+[RESOLVED]
+
+SPEC §18.6: operational settings are database-managed, changed from the admin
+console, and take effect without restart. `refresh_settings` is how: every
+route that changes settings passes through it, and it hands the auth,
+workflow and training services the new settings object, which is enough for
+anything that reads per use. Its comment said that was everything but
+citation offers, which a live execution has to be told about. It was not
+everything.
+
+`AuthService.mfa_enabled` is a bool captured at construction from
+`enable_mfa`, and `TrainingService.distillation_enabled` is captured the same
+way from `training_distillation_enabled`; neither is read again, and the
+training service does not hold a settings object at all, so the hand-over
+skips it. Measured through the real admin route: `PUT /v1/admin/settings
+{"enable_mfa": false}` changed the setting, left `auth.mfa_enabled` true, and
+MFA challenges kept issuing. An operator switching MFA off - or on - in the
+console changed nothing until a restart, which the console does not say.
+
+Closed in `refresh_settings`, where the citation flag already is: both
+services are told, and the comment now names the three that need telling
+rather than claiming one. Reverting either line is caught by its own
+witness.
+
+Two more flags are captured at construction and recorded here rather than
+changed, because each needs a decision:
+
+- `rag_late_interaction` is passed to the RAG engine when the model stack is
+  built, and `refresh_settings` does not rebuild that stack. Its description
+  says it "only covers content ingested after it is turned on", which reads
+  as live. Whether a change should rebuild the engine, or the description
+  should say restart, is a choice; this runtime's test encoder is
+  non-semantic, so the flag is inert here whatever it is set to, and the
+  measurement is a code read, not a run.
+- `training_worker_enabled` is read once at startup to decide whether the
+  worker loop starts. A live change cannot start a loop that never began.
+  The honest shapes are a loop that always runs and gates its work on the
+  live flag, or a description that says restart. Neither is done here.

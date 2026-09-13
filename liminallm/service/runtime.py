@@ -449,10 +449,18 @@ class Runtime:
             existing = getattr(self, service, None)
             if existing is not None and hasattr(existing, "settings"):
                 existing.settings = self.settings
-        # Citation offers are the one managed setting a live execution has to
-        # be *told* about rather than left to read. Everything else here is
-        # read per use off `settings`, so handing over the new object is the
-        # whole of it; this one is snapshotted when an execution opens, which
+        # Three managed settings have to be *told* to a running service rather
+        # than left to read. Two are attributes captured at construction and
+        # never re-read - measured: an admin switching `enable_mfa` off in the
+        # console left MFA challenges issuing until a restart - so they are
+        # set here from the new settings.
+        if getattr(self, "auth", None) is not None:
+            self.auth.mfa_enabled = bool(self.settings.enable_mfa)
+        if getattr(self, "training", None) is not None:
+            self.training.distillation_enabled = bool(
+                self.settings.training_distillation_enabled
+            )
+        # The third is citation offers, snapshotted when an execution opens, which
         # is what makes a rollback one-way within a turn - so the transition
         # has to reach the executions already running.
         #
