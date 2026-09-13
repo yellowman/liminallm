@@ -9881,3 +9881,21 @@ One thing observed and left alone: a `ServiceError` raised past the socket's
 close rather than as its own code. The preflight makes that path unreachable
 for this defect, and mapping service errors on the socket is a separate
 change.
+
+## A Responses id you did not own said so
+
+[RESOLVED]
+
+SPEC §13.1 promises a foreign or unknown `previous_response_id` is "404 either
+way, so existence is not confirmed across users". The status held; the message
+did not. An unknown id was rejected at the lookup with `No response found`,
+while another user's resolved to its conversation and was refused further in
+with `conversation not found` - two sentences, so a caller holding a response
+id could learn whether it was somebody's. Found by the release-qualification
+sweep, for a same-tenant stranger and a cross-tenant outsider alike.
+
+Not an enumeration path at UUID entropy, and no content is exposed. Closed
+because the SPEC states the property and the surface did not have it. The
+route now resolves the message through the user-scoped conversation lookup
+before the turn begins, so unknown and not-yours raise the identical reject;
+`chat_turn.begin()` keeps its own check as the backstop.
