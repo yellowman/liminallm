@@ -926,7 +926,10 @@ class TestThePatchProducersEmitApplicablePatches:
 
         ops.llm.generate = _fails
         try:
-            audit = ops.auto_generate_patch(artifact, None, goal="probe")
+            audit = ops.auto_generate_patch(
+                artifact, None, goal="probe",
+                tenant_id=runtime.settings.default_tenant_id,
+            )
         finally:
             ops.llm.generate = original
 
@@ -1138,7 +1141,9 @@ class TestApplyIsOneReadModifyWrite:
             assert at_delete.wait(timeout=60), "the delete never took the artifact lock"
 
             a = threading.Thread(target=run, daemon=True, args=(
-                "apply", lambda: runtime.config_ops.apply_patch(patch_id),
+                "apply", lambda: runtime.config_ops.apply_patch(
+                    patch_id, tenant_id=store.get_user(owner).tenant_id,
+                ),
             ))
             a.start()
             assert _wait_until_a_backend_blocks(store), "the apply never reached a lock"
