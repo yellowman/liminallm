@@ -9881,3 +9881,42 @@ One thing observed and left alone: a `ServiceError` raised past the socket's
 close rather than as its own code. The preflight makes that path unreachable
 for this defect, and mapping service errors on the socket is a separate
 change.
+
+## A tenant admin's inspection listed every tenant's artifacts
+
+[RESOLVED]
+
+`GET /v1/admin/objects` is scoped to the admin's own tenant: the route hands
+`inspect_state` `principal.tenant_id`, and the sibling listing of users
+refuses a `tenant_id` parameter naming any other. Inside `inspect_state`,
+users, sessions, conversations, messages, contexts, chunks and training jobs
+all honour it, each joining through `app_user` to the tenant. Artifacts did
+not. That branch was `SELECT * FROM artifact ORDER BY created_at DESC`, so an
+admin of one tenant inspecting their install got every other tenant's
+artifacts in `details.artifacts` - owner id, description, the schema itself
+and the path on disk - while the summary beside it, which is just the length
+of each section, counted twelve artifacts for a tenant that owned none.
+
+Measured by the release-qualification sweep, and pinned to the section rather
+than inferred: a globex admin's inspection carried an acme admin's private
+workflow with its marker, and nothing else of acme's - the user and
+conversation sections stayed clean.
+
+Admin-only, and metadata plus schema rather than conversation content, so
+narrower than a user-facing leak. Still cross-tenant, and still the one
+branch that contradicts the route's own contract.
+
+`Artifact` has no tenant column. Its tenant is its owner's, which is how
+`list_artifacts` and `get_latest_workflow` already resolve it, and how the
+contexts branch two lines below resolved it all along. The fix copies that
+join. One consequence, stated rather than hidden: an artifact whose owner is
+in another tenant is not in this tenant admin's inspection whatever its
+visibility, and an owner-less artifact is in nobody's. Inspection audits
+what a tenant's users own; the artifact surfaces that decide what a user
+may *use* are unchanged.
+
+Config patches remain install-wide in the same inspection, on purpose: a
+patch has no owner and no tenant because the settings it changes are the
+install's, and a tenant admin can already see and decide any patch through
+`/v1/config/patches`. Whether config administration should be a tenant role
+at all is a design question the sweep recorded and did not answer.
