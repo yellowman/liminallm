@@ -9939,3 +9939,19 @@ compare and stays readable to any admin.
 Recorded as a fact: no surface changes an existing artifact's visibility.
 Publication happens only at creation and only by an admin; ConfigOps patches
 the schema document, never the visibility column.
+
+## Signup disabled closed one door and left the other open
+
+[RESOLVED]
+
+`allow_signup` off made the password route answer 403 `signup disabled`. The
+OAuth path consulted it nowhere - not the routes, not `complete_oauth`, whose
+`if not user:` branch created the account, opened a session and minted tokens.
+Measured with the flag off: password 403, then an OAuth round trip for an
+unknown email returned a user, a session and a token, and the row existed.
+
+The `notes_enabled` lesson generalised: a withdrawal that stops at the route
+that introduced the capability is a hint, not a rule. Closed at the point of
+creation rather than at a route, so no route above can forget it. An identity
+that already has an account still signs in - signup off is not login off - and
+the flag is read live, so turning it back on needs no restart.
