@@ -9881,3 +9881,41 @@ One thing observed and left alone: a `ServiceError` raised past the socket's
 close rather than as its own code. The preflight makes that path unreachable
 for this defect, and mapping service errors on the socket is a separate
 change.
+
+## An admin could read any tenant's private artifact by id
+
+[RESOLVED]
+
+`_get_owned_artifact` is the read capability behind `GET /artifacts/{id}`, its
+version history, and a tool's spec and invocation. It lets an admin through to
+another user's artifact, which is right for viewing within an install - and it
+carried no tenant condition. Every sibling admin surface does: the user
+listing refuses a `tenant_id` naming another tenant, erasure refuses another
+tenant's user, and inspection is scoped to the admin's own. So an admin of one
+tenant could read any tenant's private artifact by id, schema and version
+history included. Measured by the release-qualification sweep: a globex admin
+read an acme user's private workflow with its marker, and the version listing
+with it.
+
+The same class as the inspection listing, reached by direct id instead of by
+enumeration, and admin-only in the same way. Closed the same way too: an
+artifact's tenant is its owner's, so the bypass now requires the owner to be in
+the admin's tenant. An ownerless artifact - a published one whose publisher was
+erased - has no tenant to compare and stays readable to any admin, which is
+witnessed as the unchanged half. Reverting the tenant condition is caught by
+the cross-tenant witness.
+
+Recorded beside it, not changed: published artifacts are refused on direct
+`GET`, version history, spec and invocation to every non-owner - a same-tenant
+user gets 403 on a global workflow it is listed and can run - while the
+listing already returns the full schema to that same user. The refusal hides
+nothing the listing hands out, and it contradicts "global is everyone's" at the
+one surface a user would go to inspect what they are about to run. Whether the
+read capability should honour visibility the way the listing and the engine
+do, and whether direct invocation of a global tool belongs to everyone, are
+contract decisions the sweep put to the owner rather than made.
+
+Recorded as a fact: no surface changes an existing artifact's visibility.
+Publication happens only at creation and only by an admin; ConfigOps patches
+the schema document and never the visibility column. "Private to shared or
+global" is not a transition this API has.
