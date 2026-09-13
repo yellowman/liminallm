@@ -9834,3 +9834,50 @@ there is no cursor. That keeps the invariant in one expression instead of
 adding a second rule, and the sibling case - exactly two notes and no
 documents - still ends the walk with no cursor, which is the mutant that
 proves the probe is a probe and not an assumption.
+
+## An explicit workflow_id was accepted whatever it named
+
+[RESOLVED]
+
+`workflow_id` on a chat turn is documented as an optional artifact-id override,
+which gives it two meanings: omitted means "choose the default", given means
+"this one". `WorkflowEngine.run()` collapsed them. It asked the store for the
+named workflow with the caller's user and tenant - the right question, and the
+store answered it correctly, refusing another user's private workflow and
+another tenant's - and then, on `None`, fell through to the same default
+selection the omitted case uses. The turn ran on the default, and
+`chat_turn.response()` reported `turn.workflow_id`, which was the caller's
+requested value. So the reply said a workflow had run that had not.
+
+Found by the release-qualification isolation sweep, and worth being precise
+about what it was and was not. It was not an authorization hole: asked at the
+rule site, `get_latest_workflow` returned the owner's workflow with its marker
+and `None` for a same-tenant stranger and a cross-tenant outsider, so no
+foreign workflow ever loaded. It was not an existence oracle either: an id
+that never existed was echoed back identically. It was a control-contract
+defect - an explicit instruction silently replaced, and the replacement
+misreported - which is the same shape as the earlier tool-agent routing that
+erased an explicitly selected knowledge context.
+
+Reproduced on both transports before the fix: `POST /v1/chat` and the
+`/chat/stream` socket each answered `ok` and echoed the requested id, for a
+foreign private workflow and for a ghost.
+
+Closed at two seams, because one is not enough. The transports resolve the
+override first - before the conversation is created and before the user's
+message is appended - through a route helper that asks the store's own
+reachability rule rather than restating it, and answer 404 `workflow not
+found` for absent, foreign and cross-tenant alike. The engine refuses too,
+raising rather than defaulting when an explicit id does not resolve, for a
+workflow that disappears between the transport check and execution. Each was
+reverted on its own in the mutation campaign and each revert was caught by a
+different witness: without the engine rule, a direct call to `run()` with an
+unreachable id ran the default; without the preflight, the engine still
+refused but the refused turn had already persisted a user message that no
+reply would ever answer.
+
+One thing observed and left alone: a `ServiceError` raised past the socket's
+`except HTTPException` surfaces there as a generic `server_error` and a 1011
+close rather than as its own code. The preflight makes that path unreachable
+for this defect, and mapping service errors on the socket is a separate
+change.

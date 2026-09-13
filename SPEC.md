@@ -2189,6 +2189,14 @@ response:
 - if `stream=false`: blocking JSON `{message_id, content, usage, adapters}`.
 - `POST /v1/chat/cancel { request_id }` cancels a running turn, across
   replicas via the cluster bus (§22).
+- `workflow_id` is an override, and the two spellings mean two things:
+  omitted chooses the default workflow; given runs that workflow or fails
+  404 `workflow not found`. absent, another user's private and another
+  tenant's all answer the same, so the id is not an existence oracle. the
+  check runs before the conversation is created or the message persisted,
+  so a refused turn leaves nothing behind, and the engine refuses again
+  rather than substituting if the workflow vanishes in between. the same
+  contract on the `/chat/stream` socket.
 
 #### served responses api (`POST /v1/responses`)
 
