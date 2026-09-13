@@ -2260,7 +2260,19 @@ async def create_response(
             conversation_id = runtime.store.get_message_conversation(
                 previous_response_id[len(_RESPONSES_ID_PREFIX):]
             )
-            if not conversation_id:
+            # Unknown and not-yours answer alike, and here, before the turn
+            # begins. `begin()` refuses a foreign thread too, but with the
+            # owned-conversation message, and that difference told a caller
+            # whether the id was somebody's - which §13.1 promises it does
+            # not. The status was already the same; the words were not. The
+            # store scopes the lookup to this user, so a thread that is not
+            # theirs comes back as no thread at all.
+            owned = (
+                runtime.store.get_conversation(conversation_id, user_id=user_id)
+                if conversation_id
+                else None
+            )
+            if owned is None:
                 raise _ResponsesReject(
                     f"No response found with id {previous_response_id!r}.",
                     param="previous_response_id",

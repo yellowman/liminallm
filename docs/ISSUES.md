@@ -9881,3 +9881,30 @@ One thing observed and left alone: a `ServiceError` raised past the socket's
 close rather than as its own code. The preflight makes that path unreachable
 for this defect, and mapping service errors on the socket is a separate
 change.
+
+## A Responses id you did not own said so
+
+[RESOLVED]
+
+SPEC §13.1 promises that a foreign or unknown `previous_response_id` is "404
+either way, so existence is not confirmed across users". The status held. The
+message did not. An unknown id was rejected at the lookup with `No response
+found with id ...`, while an id belonging to another user resolved to its
+conversation and went on into `chat_turn.begin()`, whose owned-conversation
+check refused it with `conversation not found`. Two different sentences for
+the two cases, so a caller holding a response id could learn whether it was
+somebody's. Measured by the release-qualification sweep for a same-tenant
+stranger and a cross-tenant outsider alike.
+
+At UUID entropy this is not an enumeration path, and it exposes no content.
+It is recorded and closed because the SPEC states the property and the
+surface did not have it, and because every other absent-or-unreachable
+surface here - contexts, workflows, MCP resources - reads the same both ways
+on purpose.
+
+Closed at the lookup: the route resolves the message to its conversation and
+checks the caller owns it before the turn begins, and unknown and not-yours
+raise the identical reject. `begin()` keeps its own check as the backstop,
+the same two-seam shape as the explicit-workflow fix. Reverting the
+route-level ownership half brings the second sentence back through the
+backstop, which is what the witness catches.
