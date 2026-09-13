@@ -45,11 +45,13 @@ prose - the same result set rendered twice, never queried twice. See
 
 Delivered: resources. Notes, documents and single passages are addressable
 under `liminal://`, listed behind one opaque cursor and read back as
-passages rather than as one joined string. Building it closed two shipped
-defects in the tool surface, which shared the authority check it needed: an
-unscoped `knowledge_search` reached a conversation's attachment index, and it
-stopped at the first hundred contexts a user owned. See
-`tests/test_mcp_resources.py` and `tests/test_mcp_real_client.py`.
+passages rather than as one joined string. Building it closed three shipped
+defects in the tool surface, each one a rule the new surface needed and the
+old one had got wrong: an unscoped `knowledge_search` reached a conversation's
+attachment index, it stopped at the first hundred contexts a user owned, and
+`note_search` stayed offered and callable with `notes_enabled` switched off,
+which SPEC §19.7 forbids. See `tests/test_mcp_resources.py` and
+`tests/test_mcp_real_client.py`.
 
 Open, in the order worth doing them:
 
