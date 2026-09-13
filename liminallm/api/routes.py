@@ -274,6 +274,24 @@ def _stringify_adapters(adapters: Any) -> list[str]:
     return adapter_list
 
 
+def _get_owned_workflow(runtime, workflow_id: str, principal: AuthContext) -> None:
+    """A workflow this caller may run, or 404.
+
+    The reachability rule is the store's - `get_latest_workflow`: private is
+    the owner's, shared is the owner's tenant, global is everyone's - and it
+    is asked here rather than restated, before the turn persists anything.
+    Absent and unreachable read the same, so the id is not an existence
+    oracle. An explicit `workflow_id` used to be accepted whatever it named:
+    the default workflow ran instead, and the reply reported the requested id
+    as though it had.
+    """
+    reachable = runtime.store.get_latest_workflow(
+        workflow_id, user_id=principal.user_id, tenant_id=principal.tenant_id
+    )
+    if reachable is None:
+        raise http_error("not_found", "workflow not found", status_code=404)
+
+
 def _get_owned_context(
     runtime, context_id: str, principal: AuthContext
 ) -> KnowledgeContext:
@@ -1464,6 +1482,7 @@ async def chat(
                 mode=body.message.mode,
                 owned_conversation=_get_owned_conversation,
                 owned_context=_get_owned_context,
+                owned_workflow=_get_owned_workflow,
             )
             orchestration = await runtime.workflow.run(
                 body.workflow_id,
@@ -2290,6 +2309,7 @@ async def create_response(
                     conversation_meta={"source": "responses"},
                     owned_conversation=_get_owned_conversation,
                     owned_context=_get_owned_context,
+                    owned_workflow=_get_owned_workflow,
                 )
             except BaseException:
                 for kind in reversed(held_slots):
@@ -2323,6 +2343,7 @@ async def create_response(
                 conversation_meta={"source": "responses"},
                 owned_conversation=_get_owned_conversation,
                 owned_context=_get_owned_context,
+                owned_workflow=_get_owned_workflow,
             )
             orchestration = await runtime.workflow.run(
                 None,
@@ -5920,6 +5941,7 @@ async def websocket_chat(ws: WebSocket):
             content_struct=init.get("content_struct"),
             owned_conversation=_get_owned_conversation,
             owned_context=_get_owned_context,
+            owned_workflow=_get_owned_workflow,
         )
         convo_id = turn.conversation_id
         context_id = turn.context_id

@@ -88,12 +88,21 @@ async def begin(
     conversation_meta: Optional[dict] = None,
     owned_conversation,
     owned_context,
+    owned_workflow,
 ) -> Turn:
     """Resolve the conversation and context, then persist the user's message.
 
     The ownership checks are passed in so this module need not import the
     route helpers that call it.
     """
+    if workflow_id:
+        # An explicit override is resolved before anything durable exists -
+        # before the conversation is created and before the message is
+        # appended - so a refusal leaves nothing behind. The engine refuses
+        # too (WorkflowEngine.run); without this, its refusal would arrive
+        # after the user's message had already been persisted.
+        owned_workflow(runtime, workflow_id, principal)
+
     requested_conversation_id = conversation_id
     validated_context_id: Optional[str] = None
 

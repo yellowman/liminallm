@@ -66,7 +66,7 @@ from liminallm.service.embeddings import (
     ensure_embedding_dim,
     validated_embedding,
 )
-from liminallm.service.errors import BadRequestError
+from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.invocation import (
     Invocation,
     InvocationRegistry,
@@ -722,6 +722,18 @@ class WorkflowEngine(WorkflowStreamingMixin):
             loaded = self._load_workflow_for(
                 workflow_id, user_id=user_id, tenant_id=tenant_id
             )
+            if loaded is None:
+                # An explicit workflow_id is an override, not a suggestion: it
+                # names one workflow, and a name this caller cannot reach -
+                # absent, another user's private, another tenant's - is
+                # refused rather than quietly replaced by the default. The
+                # substitute used to run, and the reply reported the requested
+                # id as though it had. The transports ask this same question
+                # before persisting anything; this is the rule at the engine,
+                # for a workflow that vanishes between that check and here.
+                raise NotFoundError(
+                    "workflow not found", detail={"workflow_id": workflow_id}
+                )
         if loaded is None:
             # The tool agent handles anything needing tools. It degrades to a
             # plain reply when it has no tools to offer, so the cost of a false
