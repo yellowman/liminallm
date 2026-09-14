@@ -33,11 +33,39 @@ class ConfigOpsService:
         self.router = router
         self.training = training
 
-    def auto_generate_patch(
-        self, artifact_id: str, user_id: Optional[str], goal: Optional[str] = None
-    ) -> ConfigPatchAudit:
+    def _administrable_target(
+        self, artifact_id: str, tenant_id: Optional[str]
+    ) -> Optional[Artifact]:
+        """The artifact a patch targets, if this tenant may administer it.
+
+        Every ConfigOps entry point resolves its target through here, so the
+        authority is derived from the target on each call - at proposal, at
+        decision and at application alike - rather than carried over from
+        whatever an earlier call decided. A patch that was listed an hour ago
+        is not thereby still administrable: its target may have been
+        published, unpublished, or transferred since.
+
+        Absent and unadministrable both return None, and each caller reports
+        the resource it was asked for as not found. An id therefore tells an
+        admin nothing about what exists elsewhere in the installation.
+        """
         artifact = self.store.get_artifact(artifact_id)
-        if not artifact:
+        if not artifact or not self.store.artifact_is_administrable(
+            artifact, tenant_id=tenant_id
+        ):
+            return None
+        return artifact
+
+    def auto_generate_patch(
+        self,
+        artifact_id: str,
+        user_id: Optional[str],
+        goal: Optional[str] = None,
+        *,
+        tenant_id: Optional[str],
+    ) -> ConfigPatchAudit:
+        artifact = self._administrable_target(artifact_id, tenant_id)
+        if artifact is None:
             raise NotFoundError(
                 "artifact not found", detail={"artifact_id": artifact_id}
             )
@@ -52,11 +80,18 @@ class ConfigOpsService:
         )
 
     def decide_patch(
-        self, patch_id: int, decision: str, reason: Optional[str] = None
+        self,
+        patch_id: int,
+        decision: str,
+        reason: Optional[str] = None,
+        *,
+        tenant_id: Optional[str],
     ) -> ConfigPatchAudit:
         # Validate patch exists and is in pending status
         patch = self.store.get_config_patch(patch_id)
         if not patch:
+            raise NotFoundError("patch not found", detail={"patch_id": patch_id})
+        if self._administrable_target(patch.artifact_id, tenant_id) is None:
             raise NotFoundError("patch not found", detail={"patch_id": patch_id})
         if patch.status != "pending":
             raise BadRequestError(
@@ -82,7 +117,11 @@ class ConfigOpsService:
         return updated
 
     def apply_patch(
-        self, patch_id: int, approver_user_id: Optional[str] = None
+        self,
+        patch_id: int,
+        approver_user_id: Optional[str] = None,
+        *,
+        tenant_id: Optional[str],
     ) -> dict:
         """Apply an approved patch to its target artifact.
 
@@ -90,20 +129,22 @@ class ConfigOpsService:
         one transaction in the store, and the store validates the result
         before writing any of them - so there is no partial state to report
         and no invalid schema to persist. A failure here changed nothing.
+
+        Authority is re-derived from the target here and not inherited from
+        the approval: approving is one act and applying is another, and the
+        second is the one that writes.
         """
         patch = self.store.get_config_patch(patch_id)
         if not patch:
+            raise NotFoundError("patch not found", detail={"patch_id": patch_id})
+        artifact = self._administrable_target(patch.artifact_id, tenant_id)
+        if artifact is None:
             raise NotFoundError("patch not found", detail={"patch_id": patch_id})
         # Security: Only apply approved patches
         if patch.status != "approved":
             raise BadRequestError(
                 "patch must be approved before applying",
                 detail={"patch_id": patch_id, "current_status": patch.status},
-            )
-        artifact = self.store.get_artifact(patch.artifact_id)
-        if not artifact:
-            raise NotFoundError(
-                "artifact missing", detail={"artifact_id": patch.artifact_id}
             )
 
         # The patch is applied inside the store's transaction, against the

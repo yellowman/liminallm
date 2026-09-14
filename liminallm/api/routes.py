@@ -359,19 +359,41 @@ def _get_private_artifact(runtime, artifact_id: str, principal: AuthContext):
 
 
 def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
+    """An artifact this caller may read, or an error.
+
+    The rule is the store's `artifact_is_reachable` - the same one
+    `get_latest_workflow` runs before the engine executes a workflow, and the
+    same tiers `list_artifacts` pages. Reading by id used to be narrower than
+    either: a user whose listing showed them a global artifact *with its whole
+    schema*, and whose chat turn would run it, was refused when they asked for
+    it by id. One object, three surfaces, three answers - and the refusal hid
+    nothing, because the listing had already handed it over.
+
+    An admin additionally reads a private artifact owned inside their own
+    tenant - every other admin surface stops at that edge, and this one used
+    to not - and an ownerless artifact no tier can reach, because system
+    artifacts have no owner and somebody has to be able to inspect them.
+    """
     artifact = runtime.store.get_artifact(artifact_id)
     if not artifact:
         raise http_error("not_found", "artifact not found", status_code=404)
-    if artifact.owner_user_id and artifact.owner_user_id != principal.user_id:
-        if principal.role != "admin":
-            raise http_error(
-                "forbidden", "artifact is owned by another user", status_code=403
-            )
-    if not artifact.owner_user_id and principal.role != "admin":
+    if runtime.store.artifact_is_reachable(
+        artifact, user_id=principal.user_id, tenant_id=principal.tenant_id
+    ):
+        return artifact
+    if principal.role == "admin":
+        if not artifact.owner_user_id:
+            return artifact
+        owner = runtime.store.get_user(artifact.owner_user_id)
+        if owner is not None and owner.tenant_id == principal.tenant_id:
+            return artifact
+    elif not artifact.owner_user_id:
         raise http_error(
             "forbidden", "artifact access requires admin privileges", status_code=403
         )
-    return artifact
+    raise http_error(
+        "forbidden", "artifact is owned by another user", status_code=403
+    )
 
 
 def _get_pagination_settings(runtime) -> dict:
@@ -2260,7 +2282,19 @@ async def create_response(
             conversation_id = runtime.store.get_message_conversation(
                 previous_response_id[len(_RESPONSES_ID_PREFIX):]
             )
-            if not conversation_id:
+            # Unknown and not-yours answer alike, and here, before the turn
+            # begins. `begin()` refuses a foreign thread too, but with the
+            # owned-conversation message, and that difference told a caller
+            # whether the id was somebody's - which §13.1 promises it does
+            # not. The status was already the same; the words were not. The
+            # store scopes the lookup to this user, so a thread that is not
+            # theirs comes back as no thread at all.
+            owned = (
+                runtime.store.get_conversation(conversation_id, user_id=user_id)
+                if conversation_id
+                else None
+            )
+            if owned is None:
                 raise _ResponsesReject(
                     f"No response found with id {previous_response_id!r}.",
                     param="previous_response_id",
@@ -3558,6 +3592,16 @@ async def propose_patch(
     runtime = get_runtime()
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
+    # The target authorizes the proposal, not the fact that the caller is an
+    # admin of something. This route used to record whatever `artifact_id`
+    # was supplied - unchecked, not even for existence - and the rest of the
+    # flow trusted the stored row, so an admin in one tenant could propose,
+    # approve and apply a patch against another tenant's private artifact.
+    target = runtime.store.get_artifact(body.artifact_id)
+    if target is None or not runtime.store.artifact_is_administrable(
+        target, tenant_id=principal.tenant_id
+    ):
+        raise http_error("not_found", "artifact not found", status_code=404)
     proposer = "human_admin" if principal.role == "admin" else "user"
     audit = runtime.store.record_config_patch(
         artifact_id=body.artifact_id,
@@ -3576,7 +3620,9 @@ async def list_config_patches(
     runtime = get_runtime()
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
-    patches = runtime.store.list_config_patches(status)
+    patches = runtime.store.list_config_patches(
+        status, tenant_id=principal.tenant_id
+    )
     items = [
         ConfigPatchAuditResponse.model_validate(p)
         for p in patches
@@ -3593,7 +3639,9 @@ async def decide_config_patch(
     runtime = get_runtime()
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
-    decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
+    decision = runtime.config_ops.decide_patch(
+        patch_id, body.decision, body.reason, tenant_id=principal.tenant_id
+    )
     resp = ConfigPatchAuditResponse.model_validate(decision)
     return Envelope(status="ok", data=resp)
 
@@ -3607,7 +3655,9 @@ async def apply_config_patch(
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
     result = runtime.config_ops.apply_patch(
-        patch_id, approver_user_id=principal.user_id
+        patch_id,
+        approver_user_id=principal.user_id,
+        tenant_id=principal.tenant_id,
     )
     patch = result.get("patch")
     resp = ConfigPatchAuditResponse.model_validate(patch).model_copy(
@@ -3632,7 +3682,10 @@ async def auto_patch(
     # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
     audit = runtime.config_ops.auto_generate_patch(
-        body.artifact_id, principal.user_id, goal=body.goal
+        body.artifact_id,
+        principal.user_id,
+        goal=body.goal,
+        tenant_id=principal.tenant_id,
     )
     resp = ConfigPatchAuditResponse.model_validate(audit)
     return Envelope(status="ok", data=resp)

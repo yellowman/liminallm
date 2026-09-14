@@ -20,6 +20,7 @@ from argon2.exceptions import InvalidHash, VerifyMismatchError
 
 from liminallm.config import Settings
 from liminallm.logging import get_logger
+from liminallm.service.errors import ForbiddenError
 from liminallm.service.tenancy import user_belongs_to_site
 from liminallm.storage.models import ApiKey, Session, User
 from liminallm.storage.redis_cache import RedisCache
@@ -660,6 +661,15 @@ class AuthService:
             )
             return None, None, {}
         if not user:
+            if not self.settings.allow_signup:
+                # The password route refuses here with 403 `signup disabled`.
+                # This is the other door that creates an account, and it was
+                # open whatever the flag said. Refused at creation rather than
+                # at a route, so no route above can forget it - and an
+                # identity that already has an account still signs in, because
+                # signup off is not login off.
+                self.logger.warning("oauth_signup_disabled", provider=provider)
+                raise ForbiddenError("signup disabled")
             user_email = identity.get("email") or f"{provider_uid}@{provider}.oauth"
             handle = identity.get("handle") or provider_uid
             user = self.store.create_user(

@@ -1889,6 +1889,18 @@ execution guardrails:
 
 ### 10.1 api endpoints (canonical - nothing else defines these)
 
+Every endpoint below is scoped by the artifact its patch targets, derived as
+`patch.artifact_id -> artifact -> owner` and re-derived on each call. Being an
+admin of one tenant is not authority over another tenant's configuration.
+
+- `private` and `shared` targets: only an admin in the owner's tenant may
+  propose, list, decide or apply their patches.
+- `global` targets, and targets with no owner: any admin may.
+- Any other visibility: refuse.
+
+A target outside the caller's scope must read as absent, so an id says nothing
+about what exists elsewhere in the installation.
+
 - `POST /v1/config/propose_patch`
   - body: `{ artifact_id, patch, justification }`
   - auth: restricted (system-LLM, admins, or power users).
@@ -2320,6 +2332,15 @@ it).
   one**, is HTTP 400. absent is refused rather than assumed because the
   transport's compatibility rule assumes 2025-03-26, and serving those
   requests as 2025-06-18 would restore the removed claim silently.
+- **one visibility rule, asked by every surface**: private is the owner's,
+  shared is the owner's tenant, global is everyone's, and an unrecognized
+  tier reaches nobody. `list_artifacts` pages those tiers, the engine runs
+  them, and reading an artifact by id - its schema, its versions, a tool's
+  spec and its invocation - resolves the same way, so one object gives one
+  answer at every surface. an admin additionally reads a private artifact
+  owned inside their own tenant, and an ownerless one no tier reaches.
+  mutating stays narrower: user CRUD is private artifacts only (§12.3), and
+  published ones change through config ops.
 - **two tools, both read-only, both the kernel's own**: `note_search`
   (the vault's bm25+semantic fusion) and `knowledge_search` (the full
   §2.5 hybrid pipeline, scoped to one owned context or across everything

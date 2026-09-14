@@ -897,13 +897,24 @@ class Settings(BaseModel):
     # - default_tenant_id, jwt_issuer, jwt_audience
 
     # Training worker settings (env vars are fallbacks - prefer admin UI)
+    # Both are read once, at startup: the lifespan decides whether to start
+    # the worker at all, and the interval is captured when it is constructed.
+    # The worker is built in Runtime.__init__ rather than in
+    # _build_model_services, so neither refresh_settings nor a model-stack
+    # rebuild reaches it. Starting or stopping a background loop from a
+    # settings write is real lifecycle machinery - a loop to cancel mid-job, a
+    # leader lock to release - so the console says restart instead.
     training_worker_enabled: bool = managed_field(
         True,
-        description="Enable background training job worker",
+        description=(
+            "Enable background training job worker. Takes effect on restart"
+        ),
     )
     training_worker_poll_interval: int = managed_field(
         60,
-        description="Training worker poll interval in seconds",
+        description=(
+            "Training worker poll interval in seconds. Takes effect on restart"
+        ),
     )
     settings_watch_interval_seconds: int = managed_field(
         10,

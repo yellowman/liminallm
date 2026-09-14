@@ -576,7 +576,9 @@ class TestEveryAdmissionPathAsksTheQuestion:
 
         svc = ConfigOpsService(store, rt.llm, rt.router, rt.training)
         with pytest.raises(Exception):
-            svc.apply_patch(patch.id, approver_user_id=alice.id)
+            svc.apply_patch(
+                patch.id, approver_user_id=alice.id, tenant_id=alice.tenant_id
+            )
 
         after = store.get_artifact(wf.id)
         assert after.schema["nodes"][0]["tool"] == "llm.generic", (

@@ -9881,3 +9881,149 @@ One thing observed and left alone: a `ServiceError` raised past the socket's
 close rather than as its own code. The preflight makes that path unreachable
 for this defect, and mapping service errors on the socket is a separate
 change.
+
+## A Responses id you did not own said so
+
+[RESOLVED]
+
+SPEC §13.1 promises a foreign or unknown `previous_response_id` is "404 either
+way, so existence is not confirmed across users". The status held; the message
+did not. An unknown id was rejected at the lookup with `No response found`,
+while another user's resolved to its conversation and was refused further in
+with `conversation not found` - two sentences, so a caller holding a response
+id could learn whether it was somebody's. Found by the release-qualification
+sweep, for a same-tenant stranger and a cross-tenant outsider alike.
+
+Not an enumeration path at UUID entropy, and no content is exposed. Closed
+because the SPEC states the property and the surface did not have it. The
+route now resolves the message through the user-scoped conversation lookup
+before the turn begins, so unknown and not-yours raise the identical reject;
+`chat_turn.begin()` keeps its own check as the backstop.
+
+## A tenant admin's inspection listed every tenant's artifacts
+
+[RESOLVED]
+
+`GET /v1/admin/objects` hands `inspect_state` the admin's own tenant, and
+every section honoured it but one: users, sessions, conversations, messages,
+contexts, chunks and training jobs join through `app_user`; artifacts were
+`SELECT * FROM artifact`. So a tenant admin's inspection carried every other
+tenant's artifacts - owner, description, schema and path - beside a summary
+counting only their own users. Measured: a globex admin's inspection held an
+acme admin's private workflow and nothing else of acme's.
+
+Admin-only, and metadata plus schema rather than conversation content.
+`Artifact` has no tenant column; its tenant is its owner's, the way
+`list_artifacts` and `get_latest_workflow` resolve it and the contexts branch
+below always did, so this branch copies that join. Consequence, stated: an
+artifact owned in another tenant is in no tenant admin's inspection, and an
+owner-less one is in nobody's. Config patches stay install-wide on purpose -
+a patch has no owner and the settings it changes are the install's.
+
+## An admin could read any tenant's private artifact by id
+
+[RESOLVED]
+
+`_get_owned_artifact` is the read capability behind `GET /artifacts/{id}`, its
+versions, and a tool's spec and invocation. Its admin bypass carried no tenant
+condition while every sibling admin surface has one - the user listing,
+erasure and inspection all stop at the admin's own tenant - so an admin of one
+tenant could read any tenant's private artifact by id, schema and version
+history included. Measured by the release-qualification sweep.
+
+The same class as the inspection listing, reached by direct id. Closed the
+same way: an artifact's tenant is its owner's, so the bypass now requires the
+owner to be in the admin's tenant. An owner-less artifact has no tenant to
+compare and stays readable to any admin.
+
+Recorded as a fact: no surface changes an existing artifact's visibility.
+Publication happens only at creation and only by an admin; ConfigOps patches
+the schema document, never the visibility column.
+
+## Signup disabled closed one door and left the other open
+
+[RESOLVED]
+
+`allow_signup` off made the password route answer 403 `signup disabled`. The
+OAuth path consulted it nowhere - not the routes, not `complete_oauth`, whose
+`if not user:` branch created the account, opened a session and minted tokens.
+Measured with the flag off: password 403, then an OAuth round trip for an
+unknown email returned a user, a session and a token, and the row existed.
+
+The `notes_enabled` lesson generalised: a withdrawal that stops at the route
+that introduced the capability is a hint, not a rule. Closed at the point of
+creation rather than at a route, so no route above can forget it. An identity
+that already has an account still signs in - signup off is not login off - and
+the flag is read live, so turning it back on needs no restart.
+
+## Two managed flags stopped at the admin console
+
+[RESOLVED]
+
+SPEC §18.6: managed settings take effect without restart, and
+`refresh_settings` is how - it hands each service the new settings object,
+which is enough for anything that reads per use. Its comment claimed that was
+everything but citation offers. `AuthService.mfa_enabled` and
+`TrainingService.distillation_enabled` are bools captured at construction and
+never re-read, and the training service holds no settings object at all.
+Measured through the real admin route: `enable_mfa: false` changed the setting,
+left `auth.mfa_enabled` true, and MFA challenges kept issuing until a restart
+the console never mentions.
+
+Both are now told, where the citation flag already is.
+
+Two further flags were recorded here as needing the same treatment. Measured
+afterwards, each answer was different from the record.
+
+`rag_late_interaction` and `rag_late_segments` were recorded as captured and
+never rebuilt. That read `refresh_settings` and stopped. Both are in
+`MODEL_AFFECTING_SETTINGS`, so the admin write rebuilds the model stack and
+the replacement `RAGService` is constructed from the stored value - and the
+peer workers' watcher compares a signature made of the same list, so they
+rebuild too. Measured through the real endpoint, on a runtime whose encoder
+reports itself semantic (the flag is stored as `enabled and semantic`, so a
+hash encoder pins it to False and would have made a passing test vacuous):
+both values reach the live `runtime.rag` immediately, in both directions. The
+concern was wrong; the code was already right. Witnessed so it stays that way.
+
+`training_worker_enabled` and `training_worker_poll_interval` really are
+read once, at startup. Starting or stopping a background loop from a settings
+write is real lifecycle machinery - a loop to cancel mid-job, a leader lock to
+release - so the honest shape chosen is the description: both now say "Takes
+effect on restart", and a test pins the behaviour and the wording together, so
+making either live fails the wording too rather than leaving a false promise.
+
+## One artifact, three surfaces, three answers
+
+[RESOLVED]
+
+`list_artifacts` pages a caller's own private artifacts, every global one and
+shared ones inside the owner's tenant, returning the whole schema. The engine
+runs exactly those tiers, so a chat turn naming a global workflow ran it.
+Reading by id was narrower than both: `_get_owned_artifact` asked only who
+owned the row, so a user whose listing had already handed them a global
+artifact's schema, and who could run it, got 403 asking for it by id - and the
+same helper refused `invoke` on a globally published tool. The refusal
+protected nothing the listing had not already given away.
+
+Raised by the release-qualification sweep as a contract question rather than a
+defect, and decided on least surprise: the narrowest surface was the one out
+of step with the other two, not the two out of step with it.
+
+The tiers now live once, as `PostgresStore.artifact_is_reachable`, lifted out
+of `get_latest_workflow` - which had the only correct copy - so the engine and
+the read helper ask one rule. Mutation is untouched and stays narrower:
+`_get_private_artifact` still means private-and-yours, and published artifacts
+still change through config ops. The admin paths are unchanged too: a private
+artifact owned in the admin's own tenant, and an ownerless artifact no tier
+reaches, because system artifacts have no owner and somebody must be able to
+inspect them.
+
+Widening `invoke` is the deliberate part. Publishing globally already takes an
+admin and already means "for everyone" to the engine; the one surface that
+disagreed was direct invocation. A tool published to nobody in particular is
+still private, and still refused.
+
+One property the old code enforced in a comment and nothing witnessed: an
+unrecognized visibility is not a licence. It survived the first mutation
+campaign, and has a witness now.
