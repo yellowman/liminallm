@@ -503,7 +503,7 @@ def test_web_search_when_the_deployment_has_it_disabled():
     from liminallm.service import agent_tools
 
     settings = get_settings().model_copy(update={"web_tools_enabled": False})
-    text, findings = agent_tools.run_web_search(
+    _ran, text, findings = agent_tools.run_web_search(
         "anything", 5, settings=settings, logger=get_logger("test")
     )
     assert "disabled" in text
@@ -521,7 +521,7 @@ def test_web_search_provider_failure_is_an_answer_not_an_exception(monkeypatch):
 
     monkeypatch.setattr(web, "search_web", explode)
     settings = get_settings().model_copy(update={"web_tools_enabled": True})
-    text, findings = agent_tools.run_web_search(
+    _ran, text, findings = agent_tools.run_web_search(
         "anything", 5, settings=settings, logger=get_logger("test")
     )
     assert "Search failed" in text
@@ -685,7 +685,7 @@ def test_web_search_results_come_back_wrapped_and_counted(monkeypatch):
         ],
     )
     settings = get_settings().model_copy(update={"web_tools_enabled": True})
-    text, findings = agent_tools.run_web_search(
+    _ran, text, findings = agent_tools.run_web_search(
         "query", 5, settings=settings, logger=get_logger("test")
     )
     assert "T1" in text and "T2" in text

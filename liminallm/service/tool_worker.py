@@ -319,6 +319,10 @@ def _body_web_search(
     query = inputs.get("query") or inputs.get("message") or plan.get("message") or ""
     out = broker.call("web.search", {"query": query, "limit": inputs.get("limit") or 5})
     return {
+        # `ran` is the broker's, not this body's judgement: a search that was
+        # withdrawn or that failed is an error, and without saying so a tool
+        # node could never take its `on_error` branch.
+        "status": "ok" if out.get("ran") else "error",
         "content": out.get("text") or "",
         "usage": {},
         "injection_findings": out.get("findings") or [],
@@ -334,6 +338,7 @@ def _body_web_fetch(
         return {"status": "error", "content": "no url supplied", "usage": {}}
     out = broker.call("web.fetch", {"url": str(url)})
     return {
+        "status": "ok" if out.get("ran") else "error",
         "content": out.get("text") or "",
         "usage": {},
         "injection_findings": out.get("findings") or [],

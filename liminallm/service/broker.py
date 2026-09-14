@@ -760,13 +760,14 @@ class CapabilityBroker:
         invocation.check_live()
         grounds = self._sink()
         spans = self._spans()
-        text, findings = self._engine._run_web_search(
+        ran, text, findings = self._engine._run_web_search(
             str(payload.get("query") or ""), int(payload.get("limit") or 5),
             source_registry=self._ctx.source_registry, bindings_sink=grounds,
             spans_sink=spans,
         )
         return self._grounded(
-            self._with_findings(invocation, text, findings), grounds, spans
+            {**self._with_findings(invocation, text, findings), "ran": ran},
+            grounds, spans,
         )
 
     def _web_fetch(
@@ -775,13 +776,14 @@ class CapabilityBroker:
         invocation.check_live()
         grounds = self._sink()
         spans = self._spans()
-        text, findings = self._engine._run_web_fetch(
+        ran, text, findings = self._engine._run_web_fetch(
             str(payload.get("url") or ""),
             source_registry=self._ctx.source_registry, bindings_sink=grounds,
             spans_sink=spans,
         )
         return self._grounded(
-            self._with_findings(invocation, text, findings), grounds, spans
+            {**self._with_findings(invocation, text, findings), "ran": ran},
+            grounds, spans,
         )
 
     def _sink(self) -> Optional[List[Dict[str, Optional[str]]]]:

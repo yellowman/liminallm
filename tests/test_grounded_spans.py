@@ -453,7 +453,7 @@ class TestTheEnvelopeSaysWhereItPutTheBody:
             registry = SourceRegistry()
             bindings: list = []
             spans: list = []
-            text, _findings = agent_tools.run_web_fetch(
+            _ran, text, _findings = agent_tools.run_web_fetch(
                 url, settings=_Settings(), logger=_Logger(),
                 source_registry=registry, bindings_sink=bindings,
                 spans_sink=spans,

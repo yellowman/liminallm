@@ -72,8 +72,16 @@ def run_web_search(
     source_registry: Optional[SourceRegistry] = None,
     bindings_sink: Optional[List[Binding]] = None,
     spans_sink: Optional[List[GroundedSpan]] = None,
-) -> Tuple[str, List[dict]]:
-    """Search the web. Returns (wrapped_results, injection_findings).
+) -> Tuple[bool, str, List[dict]]:
+    """Search the web. Returns (ran, wrapped_results, injection_findings).
+
+    `ran` is False when the deployment has withdrawn web access and when the
+    provider failed. Both used to be an ordinary string like any result, so a
+    caller could not tell a page from a refusal, and the direct tool endpoint
+    reported `status: "ok"` for a search that never happened. The model is the
+    one caller that wants the sentence rather than the flag - it has to have
+    something to reason about - so the text is unchanged and it simply
+    ignores `ran`.
 
     Grounding is recorded through the sinks rather than returned, because
     nothing else here needs the structured results: the caller decides whether
@@ -87,7 +95,7 @@ def run_web_search(
     """
     cfg = web_settings(settings)
     if not cfg["enabled"]:
-        return ("Web access is disabled on this deployment.", [])
+        return (False, "Web access is disabled on this deployment.", [])
     try:
         results = web.search_web(
             query,
@@ -99,7 +107,7 @@ def run_web_search(
             proxy=cfg["proxy"],
         )
     except web.WebFetchError as exc:
-        return (f"Search failed: {exc}", [])
+        return (False, f"Search failed: {exc}", [])
     grounds = None
     if source_registry is not None and bindings_sink is not None:
         # Aligned with `results`, so the renderer can say which result each
@@ -114,7 +122,7 @@ def run_web_search(
         results=len(results),
         injection_findings=len(findings),
     )
-    return (text, findings)
+    return (True, text, findings)
 
 
 def run_web_fetch(
@@ -125,11 +133,15 @@ def run_web_fetch(
     source_registry: Optional[SourceRegistry] = None,
     bindings_sink: Optional[List[Binding]] = None,
     spans_sink: Optional[List[GroundedSpan]] = None,
-) -> Tuple[str, List[dict]]:
-    """Fetch a page as untrusted data. Returns (wrapped_text, findings)."""
+) -> Tuple[bool, str, List[dict]]:
+    """Fetch a page as untrusted data. Returns (ran, wrapped_text, findings).
+
+    `ran` is False for a withdrawn deployment and for a page that could not
+    be read; see `run_web_search` for why the sentence stays.
+    """
     cfg = web_settings(settings)
     if not cfg["enabled"]:
-        return ("Web access is disabled on this deployment.", [])
+        return (False, "Web access is disabled on this deployment.", [])
     try:
         page = web.fetch_url(
             url,
@@ -139,7 +151,7 @@ def run_web_fetch(
             proxy=cfg["proxy"],
         )
     except web.WebFetchError as exc:
-        return (f"Could not read that page: {exc}", [])
+        return (False, f"Could not read that page: {exc}", [])
     grounds: List[Binding] = []
     if source_registry is not None and bindings_sink is not None:
         grounds = web.register_fetched_page(source_registry, page)
@@ -161,7 +173,7 @@ def run_web_fetch(
     text, spans = body.render(prefix, suffix)
     if spans_sink is not None:
         spans_sink.extend(spans)
-    return (text, findings)
+    return (True, text, findings)
 
 
 def _chunk_path(chunk: Any) -> Optional[str]:

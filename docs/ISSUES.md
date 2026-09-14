@@ -10027,3 +10027,39 @@ still private, and still refused.
 One property the old code enforced in a comment and nothing witnessed: an
 unrecognized visibility is not a licence. It survived the first mutation
 campaign, and has a witness now.
+
+## A web tool that did not run reported success
+
+[RESOLVED]
+
+`run_web_search` and `run_web_fetch` returned `(text, findings)` for three
+different outcomes: the page, a fetch that failed, and a deployment with web
+access withdrawn. Nothing downstream could tell them apart. The worker body
+set no `status`, and the direct endpoint's `result.get("status", "ok")` read
+that absence as success.
+
+Measured, with `web_tools_enabled` off: both web tools answered
+`status: None` - coerced to `"ok"` - with "Web access is disabled on this
+deployment." as their content, while the same tool called with no url
+answered `status: "error"`. One tool, two refusals, two shapes, which is how
+the absence stayed invisible.
+
+Not cosmetic. `status == "error"` is what records a failed node, what selects
+a node's `on_error` branch, and what keeps a failed child's retrieval out of
+the grounding merge. A web node whose fetch failed could therefore never take
+its error branch: the workflow carried "Could not read that page: ..."
+forward as that node's answer and the recovery node it was written with never
+ran.
+
+Closed by widening both runners to `(ran, text, findings)`, one shape for
+every caller. The broker carries `ran` across the pipe and the worker bodies
+turn it into a status. The model still reads the sentence: it is the one
+caller that should, because the agent loop needs something to reason about
+rather than an exception.
+
+Found by the release-qualification sweep's flag census. The same census found
+nothing on `trust_forwarded_host` (`X-Forwarded-Host` is ignored when the flag
+is off, and `tenant_of` really is the only entry point), nothing on
+`web_fetch_allow_private` (eleven vectors refused, decimal and octal IP
+spellings included), and nothing on the model-facing half of
+`web_tools_enabled`, which is all that flag's description promises.
