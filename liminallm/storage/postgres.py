@@ -103,6 +103,16 @@ def _configure_connection(conn) -> None:
     conn.commit()
 
 
+#: Who authored a version whose author has since been erased.
+#:
+#: `artifact_version.created_by` is TEXT, and it already holds authors that
+#: are not account ids - `system_llm` writes the seeded versions, and a config
+#: patch records `human_admin` or `user` when no approver id is known. So a
+#: reader already handles a name that is not a UUID, and the erasure needs no
+#: schema change and introduces no shape nothing understands.
+ERASED_AUTHOR = "deleted_user"
+
+
 def _is_uuid(value: Any) -> bool:
     """Every id in this schema is a UUID.
 
@@ -1837,6 +1847,37 @@ class PostgresStore:
             conn.execute(
                 "UPDATE artifact SET owner_user_id = NULL WHERE owner_user_id = %s",
                 (user_id,),
+            )
+            # And the same detachment on the history those artifacts keep.
+            # `artifact_version.created_by` is TEXT with no foreign key, so
+            # nothing above reaches it: measured, an erased account's raw UUID
+            # stayed on every surviving version and `GET
+            # /v1/artifacts/{id}/versions` handed it to any caller who could
+            # read the artifact - for a global one, everybody.
+            #
+            # Replaced rather than deleted. The published history is what has
+            # to survive; the identity is what must not.
+            #
+            # Not scoped to `artifact_ids`, and not to the account's own
+            # artifacts either: `apply_config_patch` writes `created_by` from
+            # `approver_user_id`, so this id is on versions of artifacts other
+            # people own - and those are the ones most likely to survive.
+            conn.execute(
+                "UPDATE artifact_version SET created_by = %s WHERE created_by = %s",
+                (ERASED_AUTHOR, user_id),
+            )
+            # `apply_config_patch` writes the approver twice - once as the
+            # version's author, once here - and the patch row cascades from
+            # the artifact, so it survives exactly when the artifact does.
+            # `meta` is a field of the patch listing's response, so this is
+            # the same identifier reaching the same kind of reader by a second
+            # route. Found by scanning every text and jsonb column for the
+            # erased id rather than by reasoning about which ones mattered.
+            conn.execute(
+                "UPDATE config_patch "
+                "SET meta = jsonb_set(meta, '{applied_by}', to_jsonb(%s::text)) "
+                "WHERE meta->>'applied_by' = %s",
+                (ERASED_AUTHOR, user_id),
             )
 
             # 10. Delete preference events

@@ -10063,3 +10063,45 @@ is off, and `tenant_of` really is the only entry point), nothing on
 `web_fetch_allow_private` (eleven vectors refused, decimal and octal IP
 spellings included), and nothing on the model-facing half of
 `web_tools_enabled`, which is all that flag's description promises.
+
+## An erased account's id stayed on the history it published
+
+[RESOLVED]
+
+A published artifact outlives its owner on purpose (SPEC §12.3), so
+`delete_user` detaches `artifact.owner_user_id` rather than deleting the row.
+It did not detach the history that artifact keeps.
+`artifact_version.created_by` is `TEXT NOT NULL` with no foreign key, so no
+cascade reached it, and `GET /v1/artifacts/{id}/versions` returns the value
+verbatim - for a global artifact, to everybody.
+
+Measured: account A published a global artifact, A was erased, the artifact
+survived with `owner_user_id = NULL`, and an unrelated account B read A's raw
+UUID back from the versions endpoint. The row was still there in the database
+too, so redacting at the API would have left the identifier stored.
+
+Not content exposure and not an authority bypass. It is durable attribution to
+an account that asked to be erased, reachable through an ordinary API.
+
+Closed in the same transaction as the detach, by replacing the author rather
+than deleting the version: the published history is what has to survive, and
+the identity is what must not. The column already carries non-identifying
+authors (`system_llm`, `human_admin`), so the sentinel needs no schema change
+and no shape a reader does not already handle. The scrub is not scoped to the
+account's own artifacts: `apply_config_patch` writes `created_by` from
+`approver_user_id`, so the id sits on versions of artifacts other people own -
+and those are the ones most likely to survive.
+
+Scanning every text, varchar, uuid and jsonb column in the schema for the
+erased id then found a second copy of the same shape:
+`config_patch.meta["applied_by"]`, written by the same call, surviving by the
+same cascade, and returned by the patch listing. Reasoning about which columns
+mattered had missed it, exactly as it had missed `created_by` twice - once
+when the erasure was written, once when this sweep first reported account
+deletion clean. That scan is now a test, so the next column to start holding
+an account id fails rather than waits to be reasoned about.
+
+The one id that still outlives its account is
+`user_namespace_retirement.user_id`, which is what reclaims the filesystem
+namespace and is defined by outliving it. It reaches no API and
+`clear_user_namespace_retirement` removes it once the namespace is collected.
