@@ -23,6 +23,7 @@ sees no conversation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 import uuid
@@ -84,26 +85,31 @@ def seeded_chat(client, auth):
     return conversation_id
 
 
-def _delete_mid_turn(client, headers, conversation_id):
-    """Delete the chat from inside the model call of the next turn.
+def _end_it_mid_turn(client, headers, conversation_id, end_it):
+    """Run `end_it` from inside the model call of the next turn.
 
-    A real interleaving driven by real code: the delete lands after the turn
+    A real interleaving driven by real code: the ending lands after the turn
     has begun and before `chat_turn.finish()` is reached, which is where
     production's own window is. Nothing holds a lock open.
+
+    The hook does one thing and records one value. It used to read the cache
+    here too, as a second statement after recording the delete's status - and
+    a node retry (CI refuses `::1` for tool egress, so the first attempt fails
+    and the node backs off and respawns) meant this ran twice, while an
+    exception in the second statement left the first recorded and the retry
+    skipped by the guard. The test then died on the missing key rather than on
+    anything it was about. Whatever this observes, it observes after the turn.
     """
     runtime = get_runtime()
     real_generate = runtime.llm.generate
-    state = {}
+    state: dict = {}
 
-    def _delete_then_answer(*args, **kwargs):
-        if "status" not in state:
-            state["status"] = client.delete(
-                f"/v1/conversations/{conversation_id}", headers=headers
-            ).status_code
-            state["retired"] = not _cached_contents(conversation_id)
+    def _end_then_answer(*args, **kwargs):
+        if "ended" not in state:
+            state["ended"] = end_it()
         return real_generate(*args, **kwargs)
 
-    runtime.llm.generate = _delete_then_answer
+    runtime.llm.generate = _end_then_answer
     try:
         state["turn"] = _turn(
             client, headers, conversation_id, "the doomed question"
@@ -113,16 +119,67 @@ def _delete_mid_turn(client, headers, conversation_id):
     return state
 
 
+def _delete_mid_turn(client, headers, conversation_id):
+    return _end_it_mid_turn(
+        client, headers, conversation_id,
+        lambda: client.delete(
+            f"/v1/conversations/{conversation_id}", headers=headers
+        ).status_code,
+    )
+
+
+@contextlib.contextmanager
+def _summary_writes(conversation_id):
+    """Collect every `chat:summary` write for this chat while open.
+
+    Used where the property is "the in-flight turn did not write", which is
+    exactly what the guard decides. Reading the cache afterwards answers a
+    different question: what is left there also depends on whether the purge
+    that follows an erasure succeeded, and `purge_user_state` is best effort
+    by design - Postgres is canonical, and a cache that cannot be reached must
+    not stop an account being erased. Measured on CI, every purge family came
+    back `-1`, and a test that read the cache blamed this guard for a Redis
+    outage.
+    """
+    runtime = get_runtime()
+    real_set = runtime.cache.set_conversation_summary
+    written: list = []
+
+    async def _spy(target_id, payload, *args, **kwargs):
+        if target_id == conversation_id:
+            written.append(payload)
+        return await real_set(target_id, payload, *args, **kwargs)
+
+    runtime.cache.set_conversation_summary = _spy
+    try:
+        yield written
+    finally:
+        runtime.cache.set_conversation_summary = real_set
+
+
 class TestTheChatDoesNotComeBack:
+    def test_deleting_a_chat_retires_its_cached_summary(
+        self, client, auth, seeded_chat
+    ):
+        """The precondition, on its own and with no turn in flight.
+
+        It used to be observed from inside the mid-turn hook, which put a
+        cache read on a code path a node retry runs twice.
+        """
+        assert client.delete(
+            f"/v1/conversations/{seeded_chat}", headers=auth["headers"]
+        ).status_code == 200
+        assert _cached_contents(seeded_chat) == []
+
     def test_an_in_flight_turn_does_not_recache_a_deleted_chat(
         self, client, auth, seeded_chat
     ):
-        state = _delete_mid_turn(client, auth["headers"], seeded_chat)
+        with _summary_writes(seeded_chat) as written:
+            state = _delete_mid_turn(client, auth["headers"], seeded_chat)
 
-        assert state["status"] == 200, "the delete itself failed"
-        assert state["retired"], "the delete route never retired the summary"
-        assert _cached_contents(seeded_chat) == [], (
-            "the deleted chat's messages are cached again"
+        assert state["ended"] == 200, "the delete itself failed"
+        assert written == [], (
+            f"the turn wrote the deleted chat back: {written}"
         )
 
     def test_the_turn_still_fails_and_writes_nothing(
@@ -172,13 +229,16 @@ class TestTheAccountHalfStillHolds:
 
         runtime.llm.generate = _erase_then_answer
         try:
-            _turn(client, auth["headers"], seeded_chat, "the doomed question")
+            with _summary_writes(seeded_chat) as written:
+                _turn(
+                    client, auth["headers"], seeded_chat, "the doomed question"
+                )
         finally:
             runtime.llm.generate = real_generate
 
         assert erased.get("done"), "the account was not erased"
-        assert _cached_contents(seeded_chat) == [], (
-            "an erased account's chat is cached again"
+        assert written == [], (
+            f"the turn wrote an erased account's chat back: {written}"
         )
 
     def test_the_hold_refuses_a_chat_whose_owner_is_erased(
