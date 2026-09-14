@@ -87,7 +87,7 @@ def test_web_fetch_findings_set_the_taint(monkeypatch):
     monkeypatch.setattr(
         engine, "_run_web_fetch",
         lambda url, **kw: (
-            "wrapped page text", [{"type": "persona-hijack", "match": "x"}]
+            True, "wrapped page text", [{"type": "persona-hijack", "match": "x"}]
         ),
     )
     session = {}

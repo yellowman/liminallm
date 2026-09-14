@@ -75,14 +75,14 @@ class TestWebSettings:
 
 class TestWebToolsDisabled:
     def test_search_says_so_rather_than_failing(self):
-        text, findings = agent_tools.run_web_search(
+        _ran, text, findings = agent_tools.run_web_search(
             "anything", 5, settings=_settings(), logger=_Log()
         )
         assert "disabled" in text
         assert findings == []
 
     def test_fetch_says_so_rather_than_failing(self):
-        text, findings = agent_tools.run_web_fetch(
+        _ran, text, findings = agent_tools.run_web_fetch(
             "https://example.com", settings=_settings(), logger=_Log()
         )
         assert "disabled" in text

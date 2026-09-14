@@ -358,7 +358,7 @@ class TestTheEvidenceIsTheTextTheModelWasGiven:
         try:
             registry = SourceRegistry()
             sink: list = []
-            shown, _findings = agent_tools.run_web_fetch(
+            _ran, shown, _findings = agent_tools.run_web_fetch(
                 f"http://127.0.0.1:{server.server_port}/page",
                 settings=_web_enabled_settings(),
                 logger=get_runtime().workflow.logger,

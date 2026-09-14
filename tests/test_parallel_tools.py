@@ -122,7 +122,7 @@ class TestParallelRounds:
         monkeypatch.setattr(
             engine,
             "_run_web_fetch",
-            lambda url, **kw: ("page text", [{"type": "override_attempt"}]),
+            lambda url, **kw: (True, "page text", [{"type": "override_attempt"}]),
         )
         monkeypatch.setattr(
             engine,

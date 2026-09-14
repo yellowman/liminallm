@@ -4065,7 +4065,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
         spans_sink: Optional[List[GroundedSpan]] = None,
-    ) -> Tuple[str, List[dict]]:
+    ) -> Tuple[bool, str, List[dict]]:
         return agent_tools.run_web_search(
             query, limit, settings=self.settings, logger=self.logger,
             source_registry=source_registry, bindings_sink=bindings_sink,
@@ -4079,7 +4079,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         source_registry: Optional[SourceRegistry] = None,
         bindings_sink: Optional[List[Binding]] = None,
         spans_sink: Optional[List[GroundedSpan]] = None,
-    ) -> Tuple[str, List[dict]]:
+    ) -> Tuple[bool, str, List[dict]]:
         return agent_tools.run_web_fetch(
             url, settings=self.settings, logger=self.logger,
             source_registry=source_registry, bindings_sink=bindings_sink,
@@ -4421,7 +4421,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # behaves exactly as it did before provenance existed.
         _grounds = bindings_sink if source_registry is not None else None
         if name == "web_search":
-            text, found = self._run_web_search(
+            # `_ran` deliberately dropped: a refusal is what the model needs
+            # to read, not an outcome it needs to branch on.
+            _ran, text, found = self._run_web_search(
                 str(args.get("query") or fallback_query), int(args.get("limit") or 5),
                 source_registry=source_registry, bindings_sink=_grounds,
                 spans_sink=spans_sink,
@@ -4429,7 +4431,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             taint.record_findings(session, found)
             return text
         if name == "web_fetch":
-            text, found = self._run_web_fetch(
+            _ran, text, found = self._run_web_fetch(
                 str(args.get("url") or ""),
                 source_registry=source_registry, bindings_sink=_grounds,
                 spans_sink=spans_sink,
