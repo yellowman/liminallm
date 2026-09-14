@@ -215,9 +215,43 @@ class TestTheDeleteWaitsForTheWrite:
     it.
     """
 
-    @staticmethod
-    def _blocks_while_held(hold, delete):
-        """True if `delete` cannot finish while `hold` is open."""
+    #: How long to keep asking Postgres whether the deleter is waiting. This
+    #: is a liveness bound, not the measurement: the assertion is "a waiter
+    #: appeared on this lock", which either happens or does not. An earlier
+    #: version asserted `thread.is_alive()` after a 1.5s sleep, which is a
+    #: statement about how fast the runner is - and on a CI box whose
+    #: Postgres checkpoints took over two minutes, that is not a statement
+    #: about the lock at all.
+    WAIT_BUDGET_SECONDS = 60.0
+
+    @classmethod
+    def _waiting_on_lock(cls, classid: int, objid: str) -> bool:
+        """Is some backend blocked on this advisory lock right now?
+
+        Asked of `pg_locks`, so the answer names the lock rather than being
+        inferred from a thread that has not finished yet. `hashtext` is what
+        the lock helpers key with, so the same expression resolves the id
+        here.
+        """
+        store = get_runtime().store
+        deadline = time.monotonic() + cls.WAIT_BUDGET_SECONDS
+        while time.monotonic() < deadline:
+            with store._connect() as conn:
+                waiting = conn.execute(
+                    "SELECT count(*) c FROM pg_locks "
+                    "WHERE locktype = 'advisory' AND NOT granted "
+                    "  AND classid = %s AND objid = hashtext(%s)::bigint "
+                    "      & 4294967295",
+                    (classid, str(objid)),
+                ).fetchone()["c"]
+            if waiting:
+                return True
+            time.sleep(0.05)
+        return False
+
+    @classmethod
+    def _blocks_while_held(cls, hold, delete, *, classid, objid):
+        """True if `delete` ends up waiting on the lock `hold` is holding."""
         inside, release = threading.Event(), threading.Event()
         outcome: dict = {}
 
@@ -225,24 +259,24 @@ class TestTheDeleteWaitsForTheWrite:
             with hold() as live:
                 outcome["live"] = live
                 inside.set()
-                release.wait(timeout=30)
+                release.wait(timeout=cls.WAIT_BUDGET_SECONDS * 2)
 
         def _deleter():
             outcome["deleted"] = delete()
-            outcome["finished_at"] = time.monotonic()
 
         holder = threading.Thread(target=_holder, daemon=True)
         holder.start()
-        assert inside.wait(timeout=30), "the hold never opened"
+        assert inside.wait(timeout=cls.WAIT_BUDGET_SECONDS), (
+            "the hold never opened"
+        )
 
         deleter = threading.Thread(target=_deleter, daemon=True)
         deleter.start()
-        deleter.join(timeout=1.5)
-        blocked = deleter.is_alive()
+        blocked = cls._waiting_on_lock(classid, objid)
 
         release.set()
-        deleter.join(timeout=30)
-        holder.join(timeout=30)
+        deleter.join(timeout=cls.WAIT_BUDGET_SECONDS * 2)
+        holder.join(timeout=cls.WAIT_BUDGET_SECONDS * 2)
         assert not deleter.is_alive(), "the delete never completed"
         return blocked, outcome
 
@@ -256,6 +290,7 @@ class TestTheDeleteWaitsForTheWrite:
         blocked, outcome = self._blocks_while_held(
             lambda: store.hold_live_conversation(seeded_chat, user_id=user_id),
             lambda: store.delete_conversation(seeded_chat, user_id=user_id),
+            classid=store._CONVERSATION_LIFETIME_LOCK, objid=seeded_chat,
         )
 
         assert outcome["live"] is True, "the hold did not see a live chat"
@@ -279,6 +314,7 @@ class TestTheDeleteWaitsForTheWrite:
                 seeded_chat, user_id=user_id
             ),
             lambda: asyncio.run(runtime.auth.delete_user(user_id)),
+            classid=runtime.store._USER_LIFETIME_LOCK, objid=user_id,
         )
 
         assert outcome["live"] is True
