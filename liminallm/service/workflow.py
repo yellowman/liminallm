@@ -2453,12 +2453,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
         history: List[Message],
         user_id: Optional[str],
     ) -> None:
-        """Cache the trimmed history, unless the account has been erased.
+        """Cache the trimmed history, unless what it belongs to is gone.
 
         This writes the conversation's own messages into `chat:summary`, so a
-        turn that loaded them from Postgres and wrote them back after the
-        account was deleted restored the erased content for another hour. The
-        owner is held for the write; see `PostgresStore.hold_live_user`.
+        turn that loaded them from Postgres and wrote them back after they
+        were deleted restores the content for another hour.
+
+        Two lifetimes, because there are two ways to lose the thing this
+        caches. The account's was held first and answers only the erasure:
+        deleting one chat leaves its owner in place, so that hold returned
+        True and the write went through. Measured: the delete committed, the
+        route retired the cached summary, and the in-flight turn put the
+        messages straight back. `hold_live_conversation` now holds both in one
+        transaction, across the decision and the write, so whichever deleter
+        is racing either waits for this write and then retires what it wrote,
+        or wins and this sees no conversation.
 
         `user_id` has no default. It may be None - a caller without one is not
         a principal's turn, and there is no account lifetime to hold - but it
@@ -2472,10 +2481,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "recent_messages": serialized,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        if user_id is None:
-            await self.cache.set_conversation_summary(conversation_id, payload)
-            return
-        with self.store.hold_live_user(user_id) as live:
+        with self.store.hold_live_conversation(
+            conversation_id, user_id=user_id
+        ) as live:
             if not live:
                 return
             await self.cache.set_conversation_summary(conversation_id, payload)

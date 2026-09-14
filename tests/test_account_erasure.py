@@ -1069,6 +1069,18 @@ class TestAnInFlightRequestCannotUndoTheErasure:
 
     @pytest.mark.asyncio
     async def test_an_in_flight_conversation_summary_does_not_resurrect(self, client):
+        """The pause goes on `hold_live_conversation`, which is the hold this
+        write takes.
+
+        It used to take `hold_live_user` directly, and this test installed its
+        pause there. The chat's own lifetime had to be held too - deleting one
+        chat leaves its owner in place, so the account hold answered a
+        question nobody had asked - and both locks now live in one
+        transaction. The property under test is unchanged; only the name of
+        the hold it happens inside moved.
+        """
+        import threading
+
         runtime = get_runtime()
         if runtime.cache is None:
             pytest.skip("no Redis in this environment")
@@ -1079,6 +1091,22 @@ class TestAnInFlightRequestCannotUndoTheErasure:
         ).json()["data"]["id"]
         history = runtime.store.list_messages(conversation, user_id=user_id)
 
+        reached, release = threading.Event(), threading.Event()
+        real_hold = runtime.store.hold_live_conversation
+
+        @contextlib.contextmanager
+        def pause_inside(target_conversation_id, *, user_id=None):
+            with real_hold(target_conversation_id, user_id=user_id) as live:
+                if target_conversation_id == conversation:
+                    reached.set()
+                    assert release.wait(timeout=30), "the writer was not released"
+                yield live
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            runtime.store, "hold_live_conversation", pause_inside
+        )
+
         async def write():
             await runtime.workflow.cache_conversation_state(
                 conversation, history, user_id
@@ -1087,9 +1115,13 @@ class TestAnInFlightRequestCannotUndoTheErasure:
         async def key_exists():
             return await runtime.cache.get_conversation_summary(conversation)
 
-        await self._forced_schedule(
-            client, user_id, admin_headers, write, key_exists
-        )
+        try:
+            await self._forced_schedule(
+                client, user_id, admin_headers, write, key_exists,
+                reached=reached, release=release,
+            )
+        finally:
+            monkeypatch.undo()
 
     @pytest.mark.asyncio
     async def test_an_in_flight_idempotency_claim_does_not_resurrect(self, client):
