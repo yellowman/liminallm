@@ -2588,6 +2588,11 @@ class PostgresStore:
             return False
 
         with self._connect() as conn, conn.transaction():
+            # First, and before the delete: this is what an in-flight turn's
+            # cache write waits on. See `hold_live_conversation` - without it
+            # the turn decides "still there", the delete commits and retires
+            # the cached summary, and the write lands afterwards.
+            self._lock_conversation_lifetime(conn, conversation_id)
             params: list[Any] = [conversation_id]
             where_clause = "id = %s"
             if user_id:
@@ -3413,6 +3418,63 @@ class PostgresStore:
             self._lock_user_lifetime(conn, user_id)
             row = conn.execute(
                 "SELECT 1 FROM app_user WHERE id = %s", (user_id,)
+            ).fetchone()
+            yield row is not None
+
+    _CONVERSATION_LIFETIME_LOCK = 0x6C696663  # "lifc"
+
+    def _lock_conversation_lifetime(self, conn, conversation_id: str) -> None:
+        """Hold this chat's lifetime for the rest of the transaction."""
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (self._CONVERSATION_LIFETIME_LOCK, str(conversation_id)),
+        )
+
+    @contextlib.contextmanager
+    def hold_live_conversation(
+        self, conversation_id: str, *, user_id: Optional[str] = None
+    ):
+        """Hold one chat's lifetime, and say whether it still exists.
+
+        `hold_live_user` one lifetime down, and needed for the same reason.
+        A turn loads a chat's history, runs for as long as a model takes, and
+        writes that history back into `chat:summary` when it finishes. The
+        owner may delete the chat in between - and the account is still there,
+        so holding *its* lifetime answers a question nobody asked. Measured:
+        the delete committed, the route retired the cached summary, and the
+        in-flight turn put the messages back for the rest of the hour.
+
+        Hold it across both the decision and the write. `delete_conversation`
+        takes the same lock at the start of its transaction, so only two
+        histories remain: the write goes first and the retire that follows the
+        delete removes what it wrote, or the delete goes first and the write
+        sees no conversation.
+
+        `user_id` holds the owner's lifetime too, in the same transaction.
+        Both are needed and one check answers both: `delete_user` deletes the
+        conversation without taking the chat lock, so only the account lock
+        stops it committing under a write that has already decided - and
+        `conversation.user_id` cascades, so a chat that is still there proves
+        an account that is still there. Taking them in one connection rather
+        than nesting two holds is deliberate: a hold inside a hold takes a
+        second pooled connection while keeping the first, and enough
+        concurrent writes would wait on a connection the pool has already
+        lent to them. The account lock is taken first, so two holders order
+        their locks the same way and cannot form a cycle.
+
+        A name that is not a UUID yields True, as it does for an account: such
+        a name can never have been a row, so it has nothing to resurrect, and
+        refusing it would only break a caller the deletion has no claim on.
+        """
+        if not _is_uuid(conversation_id):
+            yield True
+            return
+        with self._connect() as conn, conn.transaction():
+            if user_id and _is_uuid(user_id):
+                self._lock_user_lifetime(conn, user_id)
+            self._lock_conversation_lifetime(conn, conversation_id)
+            row = conn.execute(
+                "SELECT 1 FROM conversation WHERE id = %s", (conversation_id,)
             ).fetchone()
             yield row is not None
 

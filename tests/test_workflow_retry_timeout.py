@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from typing import Optional
 from unittest.mock import patch
@@ -49,6 +50,18 @@ class MockStore:
 
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         return None
+
+    @contextlib.contextmanager
+    def hold_live_conversation(self, conversation_id, *, user_id=None):
+        """Everything this double holds is live, because nothing deletes it.
+
+        Mirrors `PostgresStore.hold_live_conversation`, which the engine takes
+        around every `chat:summary` write. This double used never to be asked:
+        the guard was the account's alone and was skipped entirely when no
+        `user_id` was passed, which is the case these tests run. Closing that
+        gap is what brought the call here.
+        """
+        yield True
 
     def list_artifacts(self, type_filter: Optional[str] = None, **kwargs) -> list:
         return []

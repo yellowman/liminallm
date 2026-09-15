@@ -10105,3 +10105,55 @@ The one id that still outlives its account is
 `user_namespace_retirement.user_id`, which is what reclaims the filesystem
 namespace and is defined by outliving it. It reaches no API and
 `clear_user_namespace_retirement` removes it once the namespace is collected.
+
+## An in-flight turn put a deleted chat back in the cache
+
+[RESOLVED]
+
+`cache_conversation_state` writes a conversation's own messages into
+`chat:summary`, and it held one lifetime: the account's. A conversation
+deletion is not an account deletion - the owner is still there - so the guard
+returned True and the write went through.
+
+Measured on `main`, with the delete driven from inside the model call so it
+lands after the turn has begun and before `chat_turn.finish()` is reached:
+
+```
+delete at T1     -> chat:summary retired      (verified absent)
+workflow.py:1073 -> cache_conversation_state  (after the delete)
+chat:summary now -> 2 messages, the deleted chat's own content
+```
+
+The other two halves were already right, and are now witnessed rather than
+assumed. The caller gets 409 `conversation not found` - it is not told the
+turn succeeded - and no conversation-owned row survives, because the
+assistant message cannot be appended to a conversation that is gone. Only the
+cache came back, for the rest of the hour-long TTL.
+
+Closed with `hold_live_conversation`, `hold_live_user` one lifetime down.
+`delete_conversation` takes the chat's advisory lock at the start of its
+transaction, and the cache write holds it across both the decision and the
+write, so only two histories remain: the write goes first and the retire that
+follows the delete removes what it wrote, or the delete goes first and the
+write sees no conversation.
+
+Both locks are taken in one transaction rather than by nesting two holds. A
+hold inside a hold takes a second pooled connection while keeping the first,
+and enough concurrent writes would wait on a connection the pool had already
+lent to them. One check answers both, because `conversation.user_id` cascades:
+a chat that is still there proves an account that is still there. Both locks
+are still needed - `delete_user` removes the conversation without taking the
+chat lock, so only the account lock stops it committing under a write that has
+already decided.
+
+Two campaign mutants survived the first pass, and both were honest: removing
+either advisory lock left every assertion passing, because a sequential test
+cannot tell a lock from a check. The witness grew two threaded cases - the
+delete must block while a write holds the lifetime - and those hold the guard
+open from the test, so they are evidence that the lock is taken and honoured
+rather than that production reaches that instant. The measured defect is what
+shows production reaches the window.
+
+One gap closed on the way: the guard used to be skipped entirely when no
+`user_id` was passed, so a caller without a principal could recache a deleted
+chat unguarded. The hold now runs either way.
