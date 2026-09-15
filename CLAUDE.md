@@ -144,6 +144,11 @@ language, one idea per sentence, and consistent terminology.
 When describing the project, name the language choices and the components
 implemented in each language or framework.
 
+### Commit and pull request attribution
+
+Do not add `Co-Authored-By`, `Claude-Session`, or generated-by-Claude and
+session-link footers to commit messages or pull request bodies.
+
 ### Prompt budget
 
 Model-facing prompt text is paid on every call - keep the wording tight. But
