@@ -23,6 +23,7 @@ Two rules, and everything here is one of them:
 
 from __future__ import annotations
 
+import threading
 import uuid
 
 import pytest
@@ -31,6 +32,9 @@ from liminallm.service.runtime import get_runtime
 
 SEEDED = "the question asked before the socket was cut"
 TERMINAL = ("message_done", "error", "cancel_ack")
+#: Long enough for a slow runner, short enough that a stuck socket fails this
+#: test rather than the job.
+DRAIN_BUDGET_SECONDS = 90.0
 
 
 @pytest.fixture
@@ -59,24 +63,46 @@ def seeded_chat(client, auth):
 
 
 def _drain(ws, limit: int = 300) -> list[dict]:
-    """Read until the socket says its last word.
+    """Read until the socket says its last word, under a watchdog.
 
-    Stops on a terminal frame rather than waiting for the close, because a
-    socket that never sends one would otherwise hang the test instead of
-    failing it.
+    Two bounds, because they answer different failures. Stopping on a terminal
+    frame handles a socket that keeps talking. The watchdog handles a socket
+    that says nothing at all: `TestClient.receive_json` has no timeout, so a
+    server that neither sends nor closes blocks this thread for as long as the
+    job lives.
+
+    That is not hypothetical. An earlier version of this helper carried a
+    docstring saying it could not hang, which was true only once a frame
+    arrived - the blocking read itself was unbounded. A CI job then sat on a
+    stuck worker until the six-hour ceiling cancelled it. A test that hangs
+    costs a whole job; a test that fails costs a line.
     """
     frames: list[dict] = []
-    for _ in range(limit):
+    finished = threading.Event()
+
+    def _read() -> None:
         try:
-            frame = ws.receive_json()
-        except Exception:  # noqa: BLE001 - the close is an outcome, not an error
-            frames.append({"__closed__": True})
-            break
-        frames.append(frame)
-        if frame.get("event") in TERMINAL:
-            break
-        if "event" not in frame and "status" in frame:
-            break
+            for _ in range(limit):
+                try:
+                    frame = ws.receive_json()
+                except Exception:  # noqa: BLE001 - the close is an outcome
+                    frames.append({"__closed__": True})
+                    return
+                frames.append(frame)
+                if frame.get("event") in TERMINAL:
+                    return
+                if "event" not in frame and "status" in frame:
+                    return
+        finally:
+            finished.set()
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    if not finished.wait(timeout=DRAIN_BUDGET_SECONDS):
+        raise AssertionError(
+            f"the socket sent no terminal frame within {DRAIN_BUDGET_SECONDS}s; "
+            f"read so far: {[f.get('event') for f in frames]}"
+        )
     return frames
 
 
