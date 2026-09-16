@@ -10215,3 +10215,57 @@ guards that stop it writing erased state back are the ones that were measured
 holding.
 
 Eight mutants, none surviving.
+
+## Release qualification: conversation deletion sweep closeout
+
+The sweep that produced the two entries above is finished. This records what
+else was tested and came back clean, so the next reader can tell a path that
+was measured from one that was never looked at.
+
+**Defects found and fixed.** An in-flight turn put a deleted chat back in the
+cache (#232). A streaming socket ended in the non-streaming shape and called a
+deliberate deletion an internal fault (#233).
+
+**Measured clean.**
+
+* *Held WebSocket, both endings.* Conversation deletion and account erasure
+  driven from inside `llm.generate_stream`: zero `conversation` rows, zero
+  `message` rows, zero `chat:summary` writes on each. The guard added in #232
+  covers this path because `chat_turn.finish` is shared.
+* *Attachment publication mid-flight.* The upload already answers
+  `409 conflict` with the purpose-written message "conversation deleted during
+  upload", leaving no orphan `knowledge_context` and no orphan
+  `knowledge_chunk`. The uploaded file is retained on purpose: files are
+  user-scoped, and deleting a chat must not delete the user's file.
+* *Scheduled and background turn effects.* Labels, title and digest write only
+  id-keyed UPDATEs on rows that cascade with the conversation, so a late effect
+  no-ops rather than resurrecting anything. `turn_effects` performs no INSERT
+  and touches no cache.
+* *Share links.* The public read returns the conversation before deletion and
+  404 after, with no content in the body, and the public directory drops it.
+  `get_conversation` reads Postgres directly, so no cached copy outlives the
+  row.
+* *`previous_response_id`.* The response id is the message id, resolved through
+  `get_message_conversation` and re-scoped by owner. After deletion the owner
+  gets the same 404, with the same text, that a stranger already got, so
+  deletion does not become an existence oracle. The provider-side continuation
+  is not a durable handle at all: it lives in the per-invocation ledger, with
+  no column, no meta key and no store write.
+* *Deletion during a Responses continuation.* `409 conflict`,
+  "conversation not found", in that surface's own OpenAI error shape, with zero
+  durable rows. All three transports now give the same account of the same
+  cause.
+
+**One case explicitly not exercised.** The digest effect's write branch.
+`compaction.needs_digest` requires history beyond the model's verbatim window,
+so an ordinary fixture returns before the write. The branch was read and
+reasoned about - `merge_conversation_meta` is an id-keyed UPDATE like the rest
+- but it was not run. Anyone revisiting this should build a conversation long
+enough to trip the budget rather than assume it was covered.
+
+**The distinction that did the work.** For each object, separate "the bytes or
+the worker may legitimately outlive the delete" from "the object is still
+reachable, or can be written back, after the delete". The first is by design in
+several places here. The second is the defect. Holding the two apart is what
+stopped `workflow:state` becoming a false finding and what exposed both
+`chat:summary` defects.
