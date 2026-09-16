@@ -10157,3 +10157,61 @@ shows production reaches the window.
 One gap closed on the way: the guard used to be skipped entirely when no
 `user_id` was passed, so a caller without a principal could recache a deleted
 chat unguarded. The hold now runs either way.
+
+## A streaming socket ended in the non-streaming shape
+
+SPEC §13.7 gives `/v1/chat/stream` one vocabulary - `{event, data,
+request_id}`, with `error` among the five events - and reserves the bare
+`{status, data}` envelope for the client that asked for `stream: false`. The
+route kept two, split by where the failure arose. Failures the workflow
+yielded became `error` events. Failures raised around it were sent as
+envelopes by the three outer handlers, and a completed turn replayed by
+idempotency key was sent as an envelope too.
+
+Measured: deleting a chat from inside its own streaming turn ended the socket
+with `{"status": "error", "error": {"code": "server_error", "message": "An
+internal error occurred"}}` after thirty-three token events. Two things are
+wrong in one frame. The shape is the one reserved for a client that asked not
+to stream, and the classification is an internal fault for a condition the
+caller caused deliberately - the same platform answers 409 `conflict` for it
+over HTTP, and the upload route already names it "conversation deleted during
+upload".
+
+The deletion itself was correct and stayed correct: zero conversation rows,
+zero message rows, zero `chat:summary` writes, on both conversation deletion
+and account erasure. This was only the transport's account of the failure.
+
+Two rules now. The shape follows the mode the client asked for, never where
+the failure arose: `stream_enabled` is read immediately after `init` parses
+and defaults to True before it, so even a malformed first frame answers in
+this route's default vocabulary. And a `ConstraintViolation` is caught before
+the generic handler and classified `conflict`, mirroring
+`register_exception_handlers`.
+
+The idempotent replay was a static suspicion when the fix began, and the probe
+reproduced it: a second socket with the same key and `stream: true` answered
+with the stored envelope, ending a live stream in the non-streaming shape. It
+now replays as `message_done`, or as an `error` event for a stored failure.
+
+Carrying a raised message onto the wire brought the scrubbing with it.
+`_error_response` calls itself the one place an error leaves the process, and
+the socket never went through it - the old `HTTPException` branch put
+`str(exc.detail)` on the wire untouched. The socket's error body is built once
+and sanitized there, and the same body is what gets stored for replay, so a
+replay cannot be the one path that escapes it.
+
+The client's half is visible, which is why the fix has a browser witness. Its
+`case 'error'` branch finalizes the partial bubble with "Error occurred" and
+surfaces the server's message; the legacy `msg.status` branch cleans up and
+rejects without finalizing anything. So a streamed reply that failed used to
+leave a half-written bubble still marked `streaming`, under an error banner
+blaming the server. With the mutation applied the browser test times out
+waiting for a bubble that is never finished, which is what makes it a witness
+rather than a screenshot.
+
+Not changed: an already-authorized turn still runs to completion after its
+account is erased. The established lifetime semantics allow that, and the
+guards that stop it writing erased state back are the ones that were measured
+holding.
+
+Eight mutants, none surviving.

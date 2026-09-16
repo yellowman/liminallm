@@ -128,7 +128,11 @@ from liminallm.config import (
     secret_setting_names,
     validate_managed_settings,
 )
-from liminallm.logging import get_logger
+from liminallm.logging import (
+    get_logger,
+    sanitize_error_message,
+    sanitize_response_data,
+)
 from liminallm.service import (
     admission,
     cancellation,
@@ -5879,6 +5883,96 @@ async def synthesize_voice(
     return Envelope(status="ok", data=VoiceSynthesisResponse(**audio))
 
 
+def _ws_error_body(code: str, message: str, details: Any = None) -> dict:
+    """One error object for the socket, sanitized where it leaves the process.
+
+    Sanitized here rather than on the way to the wire because the same body is
+    also stored for idempotent replay, and a replay must not be the one path
+    that escapes the scrubbing `_error_response` does for every HTTP error.
+    Field for field this matches `Workflow._error_event`, so a client cannot
+    tell a failure raised inside the workflow from one raised around it.
+    """
+    return {
+        "code": code,
+        "message": sanitize_error_message(message),
+        "details": sanitize_response_data(details) if details else {},
+    }
+
+
+async def _ws_send(ws: WebSocket, payload: dict) -> None:
+    """Send, tolerating a peer that has already gone."""
+    try:
+        await ws.send_json(payload)
+    except Exception as send_exc:
+        logger.debug("websocket_error_send_failed", error=str(send_exc))
+
+
+async def _ws_fail(
+    ws: WebSocket,
+    *,
+    streaming: bool,
+    body: dict,
+    request_id: str,
+    close_code: int,
+) -> None:
+    """Send a socket's last word in the shape its transport mode promised.
+
+    SPEC §13.7 gives a streaming socket one vocabulary - `{event, data,
+    request_id}`, with `error` among the five events - and reserves the bare
+    `{status, data}` envelope for `stream: false`. So the shape follows the
+    mode the client asked for, never where the failure happened to arise: the
+    workflow's own failures already reach the client as `error` events, and a
+    failure raised around it is the same failure to whoever is reading.
+    """
+    if streaming:
+        payload = {"event": "error", "data": body, "request_id": request_id}
+    else:
+        payload = Envelope(
+            status="error", error=body, request_id=request_id
+        ).model_dump()
+    await _ws_send(ws, payload)
+    await ws.close(code=close_code)
+
+
+async def _ws_replay(
+    ws: WebSocket, cached: Envelope, *, streaming: bool, request_id: str
+) -> None:
+    """Replay a stored response, in the shape this socket speaks.
+
+    The same rule as `_ws_fail`, for the one exit that answers without running
+    the turn. A streaming socket that replays a stored envelope verbatim ends
+    a stream with the `stream: false` shape, which is the case §13.7 reserves
+    for a client that asked not to stream.
+    """
+    stored = cached.model_dump()
+    if not streaming:
+        await _ws_send(ws, stored)
+        return
+    if stored.get("status") == "ok":
+        await _ws_send(
+            ws,
+            {
+                "event": "message_done",
+                "data": stored.get("data"),
+                "request_id": request_id,
+            },
+        )
+        return
+    error = stored.get("error") or {}
+    await _ws_send(
+        ws,
+        {
+            "event": "error",
+            "data": {
+                "code": error.get("code") or "server_error",
+                "message": error.get("message") or "An internal error occurred",
+                "details": error.get("details") or {},
+            },
+            "request_id": request_id,
+        },
+    )
+
+
 @router.websocket("/chat/stream")
 async def websocket_chat(ws: WebSocket):
     """Handle WebSocket chat connections for streaming responses."""
@@ -5899,9 +5993,16 @@ async def websocket_chat(ws: WebSocket):
     request_id: str = str(uuid4())
     convo_id: Optional[str] = None
     held_slots: list[str] = []
+    # The vocabulary this socket speaks. True until the client's own `stream`
+    # is read, because a failure before that point - malformed JSON - still
+    # has to answer in some shape, and streaming is this route's default.
+    stream_enabled: bool = True
     try:
         init = await ws.receive_json()
         idempotency_key = init.get("idempotency_key")
+        # Read before anything can fail or replay below, so every exit from
+        # here on knows which shape it owes the client.
+        stream_enabled = bool(init.get("stream", True))
         # Use client-provided request_id if available, otherwise keep generated one
         request_id = init.get("request_id") or request_id
         session_id = init.get("session_id")
@@ -5953,7 +6054,9 @@ async def websocket_chat(ws: WebSocket):
             "chat:ws", user_id, idempotency_key, require=False, request_id=request_id
         )
         if cached:
-            await ws.send_json(cached.model_dump())
+            await _ws_replay(
+                ws, cached, streaming=stream_enabled, request_id=request_id
+            )
             return
 
         # SPEC §18: Per-plan adjustable rate limits
@@ -5998,9 +6101,6 @@ async def websocket_chat(ws: WebSocket):
         )
         convo_id = turn.conversation_id
         context_id = turn.context_id
-
-        # SPEC §18: Check if streaming is requested (default True for WebSocket)
-        stream_enabled = init.get("stream", True)
 
         if stream_enabled:
             # Streaming mode: emit token, trace, message_done, error events
@@ -6173,16 +6273,27 @@ async def websocket_chat(ws: WebSocket):
             if detail and "error" in detail
             else {"code": "server_error", "message": str(exc.detail)}
         )
-        error_env = Envelope(
-            status="error", error=error_payload, request_id=request_id
+        status_code = getattr(exc, "status_code", 500)
+        body = _ws_error_body(
+            error_payload.get("code") or "server_error",
+            error_payload.get("message") or str(exc.detail),
+            error_payload.get("details"),
         )
         if user_id:
             await idempotency.store(
-                "chat:ws", user_id, idempotency_key, error_env, status="failed"
+                "chat:ws",
+                user_id,
+                idempotency_key,
+                Envelope(status="error", error=body, request_id=request_id),
+                status="failed",
             )
-        await ws.send_json(error_env.model_dump())
-        status_code = getattr(exc, "status_code", 500)
-        await ws.close(code=4429 if status_code == 429 else 1011)
+        await _ws_fail(
+            ws,
+            streaming=stream_enabled,
+            body=body,
+            request_id=request_id,
+            close_code=4429 if status_code == 429 else 1011,
+        )
     except WebSocketDisconnect:
         return
     except json.JSONDecodeError:
@@ -6191,16 +6302,42 @@ async def websocket_chat(ws: WebSocket):
             "websocket_invalid_json",
             request_id=request_id,
         )
-        error_env = Envelope(
-            status="error",
-            error={"code": "validation_error", "message": "Invalid JSON in request"},
+        await _ws_fail(
+            ws,
+            streaming=stream_enabled,
+            body=_ws_error_body("validation_error", "Invalid JSON in request"),
             request_id=request_id,
+            close_code=1003,
         )
-        try:
-            await ws.send_json(error_env.model_dump())
-        except Exception as send_exc:
-            logger.debug("websocket_error_send_failed", error=str(send_exc))
-        await ws.close(code=1003)
+    except ConstraintViolation as exc:
+        # The condition the platform already answers 409 `conflict` over HTTP
+        # (`register_exception_handlers`). A chat deleted while its own turn
+        # was running is the measured case: the caller asked for this, so
+        # calling it `server_error` because it crossed a socket tells the
+        # wrong story. 4409 follows this route's own 4000+status convention.
+        logger.warning(
+            "websocket_constraint_violation",
+            user_id=user_id,
+            conversation_id=convo_id,
+            request_id=request_id,
+            message=exc.message,
+        )
+        body = _ws_error_body("conflict", exc.message, exc.detail)
+        if user_id:
+            await idempotency.store(
+                "chat:ws",
+                user_id,
+                idempotency_key,
+                Envelope(status="error", error=body, request_id=request_id),
+                status="failed",
+            )
+        await _ws_fail(
+            ws,
+            streaming=stream_enabled,
+            body=body,
+            request_id=request_id,
+            close_code=4409,
+        )
     except Exception as exc:
         # SECURITY: Use logger.error instead of logger.exception to avoid
         # exposing full stack traces that may reveal implementation details
@@ -6211,22 +6348,22 @@ async def websocket_chat(ws: WebSocket):
             request_id=request_id,
             error_type=type(exc).__name__,
         )
-        error_env = Envelope(
-            status="error",
-            error={"code": "server_error", "message": "An internal error occurred"},
-            request_id=request_id,
-        )
+        body = _ws_error_body("server_error", "An internal error occurred")
         if user_id:
             await idempotency.store(
-                "chat:ws", user_id, idempotency_key, error_env, status="failed"
+                "chat:ws",
+                user_id,
+                idempotency_key,
+                Envelope(status="error", error=body, request_id=request_id),
+                status="failed",
             )
-        # Send error envelope to client before closing
-        try:
-            await ws.send_json(error_env.model_dump())
-        except Exception as send_exc:
-            # Connection may already be closed
-            logger.debug("websocket_error_send_failed", error=str(send_exc))
-        await ws.close(code=1011)
+        await _ws_fail(
+            ws,
+            streaming=stream_enabled,
+            body=body,
+            request_id=request_id,
+            close_code=1011,
+        )
     finally:
         # Always release slots, even on error
         for kind in reversed(held_slots):
