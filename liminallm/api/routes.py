@@ -149,7 +149,6 @@ from liminallm.service.archive import (
     is_archive_filename,
 )
 from liminallm.service.attachments import (
-    GENERATION_KEY_PREFIX,
     authorized_generation_keys,
     classify_attachment,
     ensure_conversation_context,
@@ -4804,7 +4803,6 @@ async def delete_file(
                 principal.user_id,
                 filename,
                 paths_for=authorized_generation_keys,
-                generation_prefix=GENERATION_KEY_PREFIX,
             )
 
             # Every context this user owns, not one named context: the same

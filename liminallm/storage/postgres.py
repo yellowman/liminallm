@@ -2544,7 +2544,6 @@ class PostgresStore:
         filename: str,
         *,
         paths_for: Any,
-        generation_prefix: Optional[str] = None,
     ) -> int:
         """Revoke every attachment record backed by a file being deleted.
 
@@ -2605,6 +2604,11 @@ class PostgresStore:
                     continue
                 remaining = [a for a in current if not _names_this_file(a)]
                 meta["attachments"] = remaining
+                # `updated_at` is deliberately left alone. The upsert bumps it
+                # because an upload happens *in* the conversation; a file
+                # deleted from the file list happens elsewhere, and bumping it
+                # would lift every chat that ever took that file to the top of
+                # the user's list.
                 conn.execute(
                     "UPDATE conversation SET meta = %s::jsonb WHERE id = %s",
                     (json.dumps(meta), row["id"]),
