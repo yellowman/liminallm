@@ -76,7 +76,19 @@ class TestAFailedStreamFinishesItsMessage:
         page = context.new_page()
         runtime = get_runtime()
         real_stream = runtime.llm.generate_stream
+        real_needs_tools = runtime.workflow._turn_needs_tools
         state: dict = {}
+
+        # Take the plain-chat workflow, not the tool-agent one. This test is
+        # about the socket's terminal frame, not about tool routing, and the
+        # attachment agent's `files` node reaches the network: on a runner that
+        # refuses that egress it exhausts its retries and the turn ends with
+        # the workflow's own error event, before `chat_turn.finish` is ever
+        # reached. That error is already event-shaped, so the bubble would be
+        # finalized by the very path this test exists to prove is not taken -
+        # the witness would pass with the defect present. Measured on CI:
+        # `workflow_node_retries_exhausted` on `files`, then a 30s timeout here.
+        runtime.workflow._turn_needs_tools = lambda *a, **k: False
 
         try:
             page.goto(f"{server.base_url}/", wait_until="domcontentloaded")
@@ -159,4 +171,5 @@ class TestAFailedStreamFinishesItsMessage:
             )
         finally:
             runtime.llm.generate_stream = real_stream
+            runtime.workflow._turn_needs_tools = real_needs_tools
             context.close()
