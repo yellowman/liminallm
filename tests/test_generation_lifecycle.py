@@ -1600,7 +1600,24 @@ class TestAnAttachmentIsAnImmutableGeneration:
         )
         assert "A LATER UNRELATED BRIEF" not in served
 
-    def test_the_attachment_survives_the_pathname_being_deleted(self, client):
+    def test_deleting_the_pathname_revokes_the_attachment(self, client):
+        """Deletion is not replacement, and they differ in what the user asked.
+
+        The test above is about the pathname *moving*: a later upload of the
+        same name is a new generation, and the chat that attached the earlier
+        one never asked to lose it, so it keeps it. That is the payoff of
+        keeping the bytes in a write-once store.
+
+        Deleting the file is the opposite intent. The owner asked for it to be
+        gone, and a record is not a label - it resolves a checksum to the
+        generation object, so a surviving record goes on inlining the deleted
+        bytes, resolving them for staging and retrieving them through
+        `file_search`. This used to assert the record survived, which is the
+        defect `retire_file_attachments` closes.
+
+        The other half of the original test matters more now, not less: a name
+        recreated after a deletion must not rebind anything.
+        """
         runtime = get_runtime()
         user_id, headers = _account(client)
         conversation_id = self._conversation(client, headers)
@@ -1616,8 +1633,8 @@ class TestAnAttachmentIsAnImmutableGeneration:
             item["content"] for item in self._inline(runtime, conversation_id, user_id)
         )
         assert "WRITTEN LATER" not in served, "a recreated name rebound the attachment"
-        assert "THE FIGURES" in served, (
-            "deleting the global pathname took the chat's attachment with it"
+        assert "THE FIGURES" not in served, (
+            "the deleted file's bytes are still being inlined into this chat"
         )
 
     def test_a_record_from_before_generations_fails_closed(self, client):
