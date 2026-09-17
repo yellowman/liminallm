@@ -149,6 +149,7 @@ from liminallm.service.archive import (
     is_archive_filename,
 )
 from liminallm.service.attachments import (
+    authorized_generation_keys,
     classify_attachment,
     ensure_conversation_context,
     find_conversation_context_id,
@@ -4790,6 +4791,19 @@ async def delete_file(
             # answer about a moment that has passed.
             if not file_path.exists() or file_path == files_dir.resolve():
                 raise http_error("not_found", "file not found", status_code=404)
+
+            # The record is the authority, so it goes first. It resolves a
+            # checksum to an object in the write-once generation store, which
+            # the pathname's removal does not touch - a surviving record keeps
+            # inline injection, interpreter staging and file_search all
+            # reaching the deleted bytes. Pruning the index is the consequence
+            # of revoking it, and is computed from the records that remain, so
+            # a second name holding identical bytes keeps its own reading.
+            runtime.store.retire_file_attachments(
+                principal.user_id,
+                filename,
+                paths_for=authorized_generation_keys,
+            )
 
             # Every context this user owns, not one named context: the same
             # file uploaded to a second context is ingested again, and an

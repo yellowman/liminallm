@@ -2538,6 +2538,100 @@ class PostgresStore:
                     )
         return attachments
 
+    def retire_file_attachments(
+        self,
+        user_id: str,
+        filename: str,
+        *,
+        paths_for: Any,
+    ) -> int:
+        """Revoke every attachment record backed by a file being deleted.
+
+        A record is not a label. It resolves a checksum to an object in the
+        write-once generation store, so it keeps three capabilities alive at
+        once - inline injection, interpreter staging, and `file_search` - and
+        it reaches the bytes through the generation rather than through the
+        pathname. Deleting the pathname therefore revokes nothing on its own:
+        measured, a deleted file's text was still inlined into later turns,
+        still resolved for staging, and still retrievable.
+
+        So the record is the authority, and this removes it first. Pruning the
+        index is the consequence, not the fix.
+
+        The prune is context-local and computed from what *remains*, exactly
+        as `upsert_conversation_attachment` does: `generation_key` is a
+        checksum and a format, so two names holding identical bytes share one
+        reading. Deleting the key outright would take a surviving record's
+        chunks with it - `foo.md` and `bar.md` with the same bytes authorize
+        the same key, and so does another conversation that still names it.
+        Only keys no remaining record in that context authorizes are retired.
+
+        Names match on a path boundary, never on a raw prefix, so deleting
+        `bundle` revokes `bundle/report.md` and leaves `bundle2.md` alone.
+
+        One transaction, each conversation row taken `FOR UPDATE`, because the
+        attachment list is a single JSON value and a concurrent upload is
+        editing the same one.
+
+        Returns the number of records revoked.
+        """
+        if not _is_uuid(user_id):
+            return 0
+        boundary = filename.rstrip("/") + "/"
+        revoked = 0
+        with self._connect() as conn, conn.transaction():
+            rows = conn.execute(
+                "SELECT id, meta FROM conversation WHERE user_id = %s "
+                "AND EXISTS ("
+                "  SELECT 1 FROM jsonb_array_elements("
+                "    coalesce(meta->'attachments', '[]'::jsonb)) a"
+                "  WHERE a->>'name' = %s OR left(a->>'name', %s) = %s"
+                ") FOR UPDATE",
+                (user_id, filename, len(boundary), boundary),
+            ).fetchall()
+            for row in rows:
+                meta = dict(row["meta"] or {})
+                current = [
+                    a for a in (meta.get("attachments") or []) if isinstance(a, dict)
+                ]
+
+                def _names_this_file(record: dict) -> bool:
+                    name = str(record.get("name") or "")
+                    return name == filename or name.startswith(boundary)
+
+                removed = [a for a in current if _names_this_file(a)]
+                if not removed:
+                    continue
+                remaining = [a for a in current if not _names_this_file(a)]
+                meta["attachments"] = remaining
+                # `updated_at` is deliberately left alone. The upsert bumps it
+                # because an upload happens *in* the conversation; a file
+                # deleted from the file list happens elsewhere, and bumping it
+                # would lift every chat that ever took that file to the top of
+                # the user's list.
+                conn.execute(
+                    "UPDATE conversation SET meta = %s::jsonb WHERE id = %s",
+                    (json.dumps(meta), row["id"]),
+                )
+                revoked += len(removed)
+
+                context_row = conn.execute(
+                    "SELECT id FROM knowledge_context "
+                    "WHERE owner_user_id = %s AND conversation_id = %s",
+                    (user_id, str(row["id"])),
+                ).fetchone()
+                if not context_row:
+                    continue
+                keep = set(paths_for(remaining))
+                retired = sorted(set(paths_for(removed)) - keep)
+                if retired:
+                    conn.execute(
+                        "DELETE FROM knowledge_chunk WHERE context_id = %s "
+                        "AND fs_path = ANY(%s)",
+                        (context_row["id"], retired),
+                    )
+        return revoked
+
     def set_conversation_public(
         self, conversation_id: str, *, user_id: str, public: bool
     ) -> Optional[Conversation]:

@@ -10269,3 +10269,63 @@ reachable, or can be written back, after the delete". The first is by design in
 several places here. The second is the defect. Holding the two apart is what
 stopped `workflow:state` becoming a false finding and what exposed both
 `chat:summary` defects.
+
+## Deleting a file did not revoke the attachments backed by it
+
+An attachment record is not a label on a filename. It carries a checksum, and
+`resolve_attachment` turns that checksum into an object in the write-once
+generation store - a different place from `/users/{u}/files/{name}`, and one
+the pathname's removal does not touch. The record is therefore what holds a
+conversation's capabilities open, and it holds all three at once:
+`read_inline_contents` reads the generation, `resolved_sources` resolves it
+for staging, and `file_search` retrieves chunks indexed under its generation
+key.
+
+Measured on `main`: delete the file, get 200, watch the bytes leave the disk -
+and the same conversation still inlined the deleted file's text into later
+turns, still resolved it for staging, and still returned its contents from the
+workflow's own `_run_file_search`, rendered under the original filename. The
+retained chunks were the symptom that surfaced first; inline and analyzable
+are the same cause with no chunks involved at all.
+
+`delete_chunks_under_path` was doing its job. Attachment chunks are indexed
+under `attachment-generation:<sha256>:<ext>` rather than a pathname - that is
+deliberate, because the object store dedupes by digest and keying the index by
+digest alone made a second reading of the same bytes delete the first's
+chunks. A path-shaped sweep and a checksum-shaped key never intersect, so it
+matched nothing.
+
+Closed by revoking the record first, in `retire_file_attachments`, with the
+prune as its consequence rather than as the fix. The prune is context-local
+and computed from the records that *remain*, reusing the rule
+`upsert_conversation_attachment` already applies when a re-upload displaces
+one: `generation_key` is a checksum and a format, so two names holding
+identical bytes share one reading, and deleting that key outright would take a
+surviving record's chunks. Only keys no remaining record authorizes are
+retired.
+
+Names match on a path boundary rather than a raw prefix. One transaction, each
+conversation row `FOR UPDATE`, inside the existing filesystem publication lock
+so upload-versus-delete still serialises in the order it already had. The
+route's durable-first failure policy is unchanged: a failed revocation leaves
+the pathname in place, which is a state the user can act on.
+
+The generation object itself deliberately survives, and is left to the
+existing sweep. It is write-once and shared, and an execution that resolved it
+before the delete may still be reading it. What must not survive is a way to
+reach it, and with no record naming it there is none.
+
+One existing test asserted the old behaviour and was repaired rather than
+weakened. `test_the_attachment_survives_the_pathname_being_deleted` conflated
+two operations. Its sibling covers the pathname being *replaced*, where a
+later upload is a new generation and the chat that attached the earlier one
+never asked to lose it - that half is the payoff of the write-once store and
+still holds. Deletion is the opposite intent: the owner asked for the file to
+be gone. It now asserts the attachment is revoked, and keeps the half that
+matters more than before - a name recreated afterwards must rebind nothing.
+
+Eleven witnesses, eight mutants, none surviving. One mutant survived the first
+campaign - the raw-prefix match - because the witness paired `planX.txt` with
+`planX2.txt`, which the two rules answer identically. `planX.txtmore.txt` is a
+name the uploader's sanitizer really produces and does begin with the whole
+deleted name, and it kills the mutant.
