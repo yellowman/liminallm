@@ -2730,6 +2730,17 @@ async def update_note(
         raise http_error(
             "conflict", "a note with this title already exists", status_code=409
         )
+    if note is None:
+        # Deleted between the ownership check above and this write, so the
+        # UPDATE matched no row. The same answer the caller gets when the note
+        # was already gone before the request - the alternative was
+        # `_save_note_graph` dereferencing None and answering a deliberate
+        # deletion with a 500.
+        #
+        # Only this ordering is a lie to report as success. A delete landing
+        # *after* the write returns a real note, and "the update committed,
+        # then the note was deleted" is a truthful account of that history.
+        raise http_error("not_found", "note not found", status_code=404)
     _save_note_graph(runtime, principal, note)
     if title and title.lower() != old_title.lower():
         # [[Old Title]] in other notes no longer resolves here; rebuild their

@@ -10329,3 +10329,46 @@ campaign - the raw-prefix match - because the witness paired `planX.txt` with
 `planX2.txt`, which the two rules answer identically. `planX.txtmore.txt` is a
 name the uploader's sanitizer really produces and does begin with the whole
 deleted name, and it kills the mutant.
+
+## A note deleted mid-PATCH answered 500, and the archive answers nothing
+
+Two results from the same sweep, pulling in opposite directions.
+
+**The defect.** `PATCH /v1/notes/{id}` checks ownership, then writes. A delete
+landing between those two makes `update_note` match no row and return None,
+and the route handed that None to `_save_note_graph`, which dereferenced
+`note.id`. Measured: `AttributeError: 'NoneType' object has no attribute
+'id'`, so a deliberate deletion was answered as an internal fault. The same
+request a moment later - the note already gone before it arrived - answered a
+clean 404. Now both do.
+
+Only that ordering is a lie. The neighbouring seam was probed rather than
+assumed: a delete landing *after* the write returns a real note, and the route
+answers 200 with zero note rows and zero link rows left behind. That is a
+truthful account of a valid history - the update committed, then the note was
+deleted - and it is the same rule the artifact tranche pinned, where patch
+first and delete second removes the result. It is left alone.
+
+**The non-defect.** A deleted note's id, the title it had, and the judgment the
+witness made from its excerpt all survive in `sweep_report.report`, readable
+through `GET /v1/notes/sweeps`. `sweep_report` has a foreign key to `app_user`
+and none to `note`, so nothing cascades.
+
+That is intentional, and SPEC 19.6 is what settles it: a report is a
+self-contained snapshot, and the archive exists to replay a past sweep without
+spending the model calls again. Redacting a report when a note is deleted
+would make it describe a sweep that never happened. So the rule is now written
+down rather than left to be re-derived: deleting a note removes it from the
+live vault, the graph, search and every future witness run, and does not
+rewrite reports already persisted; erasing the account removes the archive
+with everything else. "Forget every historical derivative of this note" is a
+different operation and would need its own semantic.
+
+No sentinel here. Replacing the title with a `deleted_note` marker is the
+right shape for an attribution field whose purpose is current identity, which
+is what #231 did to `artifact_version.created_by`. It is the wrong shape for
+an archive whose purpose is to preserve what the report said at the time.
+
+Six witnesses, six mutants, none surviving - including a schema mutant that
+drops the archive's cascade, so the erasure half is pinned to the foreign key
+rather than to a passing assertion.
