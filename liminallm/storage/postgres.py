@@ -3953,51 +3953,6 @@ class PostgresStore:
             result[str(row["artifact_id"])] = row["max_version"]
         return result
 
-    def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
-        with self._connect() as conn, conn.transaction():
-            artifact_row = conn.execute(
-                "SELECT id, schema, base_model FROM artifact WHERE id = %s FOR UPDATE",
-                (artifact_id,),
-            ).fetchone()
-            if not artifact_row:
-                raise ConstraintViolation(
-                    "artifact missing", {"artifact_id": artifact_id}
-                )
-            version_row = conn.execute(
-                "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s FOR UPDATE",
-                (artifact_id,),
-            ).fetchone()
-            next_version = (version_row["v"] or 0) + 1
-            fs_path = self._persist_payload(artifact_id, next_version, schema)
-
-            base_model = schema.get("base_model")
-            existing_schema = artifact_row.get("schema")
-            if not base_model and existing_schema:
-                if isinstance(existing_schema, str):
-                    try:
-                        existing_schema = json.loads(existing_schema)
-                    except Exception:
-                        existing_schema = {}
-                base_model = (existing_schema or {}).get("base_model")
-
-            conn.execute(
-                "UPDATE artifact SET schema = %s, fs_path = %s, base_model = %s, updated_at = now() WHERE id = %s",
-                (json.dumps(schema), fs_path, base_model, artifact_id),
-            )
-            conn.execute(
-                "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, base_model, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (
-                    artifact_id,
-                    next_version,
-                    json.dumps(schema),
-                    fs_path,
-                    base_model,
-                    "system_llm",
-                    None,
-                ),
-            )
-        return fs_path
-
     def _deny_workflow(self, workflow_id, user_id, owner_user_id, visibility) -> None:
         self.logger.warning(
             "workflow_access_denied",
