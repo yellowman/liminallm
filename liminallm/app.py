@@ -36,6 +36,36 @@ _cleanup_task: asyncio.Task | None = None
 _settings_watch_task: asyncio.Task | None = None
 
 
+async def _in_thread(func) -> None:
+    """Run background work on a thread, and wait for it even when cancelled.
+
+    `asyncio.to_thread` makes only the *await* cancellable. Cancelling it
+    returns at once and leaves the thread running, so `task.cancel()` followed
+    by `await task` - which is exactly what the lifespan below does to both of
+    its loops - completed while a thread was still deleting directories,
+    rebuilding the model stack and writing logs. A worker that reported itself
+    stopped kept mutating the filesystem, and whatever kills the process next
+    interrupts a deletion the process already reported finishing.
+
+    Measured, because a straggler is only a defect once something observes it.
+    A sweep outliving its server crashed a test worker with `Fatal Python
+    error: Segmentation fault`: it was logging through structlog while another
+    thread closed the stream underneath it, and a concurrent write and close
+    on a buffered file object is a segfault in CPython rather than an
+    exception. Reproduced at 4 runs in 12 before this, in its benign form.
+
+    Cancellation still stops the caller's loop. It stops it after the thread
+    has finished rather than before.
+    """
+    running = asyncio.ensure_future(asyncio.to_thread(func))
+    try:
+        await asyncio.shield(running)
+    except asyncio.CancelledError:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await running
+        raise
+
+
 async def _run_settings_watcher(runtime, interval_seconds: int) -> None:
     """Per-worker loop that reloads model services when admin settings change.
 
@@ -49,7 +79,7 @@ async def _run_settings_watcher(runtime, interval_seconds: int) -> None:
         while True:
             await asyncio.sleep(interval)
             try:
-                await asyncio.to_thread(runtime.maybe_reload_model_services)
+                await _in_thread(runtime.maybe_reload_model_services)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # best-effort; keep the worker serving
@@ -825,8 +855,8 @@ async def _run_cleanup_pass(runtime, shared_root: Path, max_age_hours: int) -> N
     # First, so a namespace this pass enrols is already excluded from the
     # sweeps below rather than chewed on once more on the way out.
     try:
-        await asyncio.to_thread(
-            sweep_user_namespaces, runtime.store, str(shared_root)
+        await _in_thread(
+            functools.partial(sweep_user_namespaces, runtime.store, str(shared_root))
         )
     except asyncio.CancelledError:
         raise
@@ -862,7 +892,7 @@ async def _run_cleanup_pass(runtime, shared_root: Path, max_age_hours: int) -> N
     )
     for event, sweep in sweeps:
         try:
-            await asyncio.to_thread(sweep)
+            await _in_thread(sweep)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - best-effort cleanup
