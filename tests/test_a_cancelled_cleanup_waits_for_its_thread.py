@@ -172,6 +172,34 @@ async def test_cancelling_the_settings_watcher_waits_too(monkeypatch, blocking):
 
 
 @pytest.mark.asyncio
+async def test_the_namespace_sweep_still_gets_its_arguments(monkeypatch):
+    """`_in_thread` takes one callable, so this sweep is bound by a partial.
+
+    A wrong binding raises `TypeError` on the thread, and the pass catches it
+    and logs a warning - so the pass still succeeds and every other witness in
+    this file still passes. Pin the call rather than the outcome.
+    """
+    from liminallm.app import _run_cleanup_pass
+    from liminallm.service import users as users_module
+
+    seen: list[tuple] = []
+
+    def recorder(*args, **kwargs) -> int:
+        seen.append((args, kwargs))
+        return 0
+
+    monkeypatch.setattr(users_module, "sweep_user_namespaces", recorder)
+
+    runtime = get_runtime()
+    root = Path(runtime.settings.shared_fs_root)
+    await _run_cleanup_pass(runtime, root, 24)
+
+    assert seen == [((runtime.store, str(root)), {})], (
+        f"the namespace sweep was not called the way it used to be: {seen}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_an_uncancelled_pass_still_finishes(sweep):
     """The other direction: waiting must not become never returning."""
     from liminallm.app import _run_cleanup_pass
