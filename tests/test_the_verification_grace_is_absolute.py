@@ -36,10 +36,12 @@ everyone else.
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 
 import psycopg
 import pytest
 
+from liminallm.service.auth import VERIFICATION_GRACE_FLOOR
 from liminallm.service.errors import ServiceError
 from liminallm.service.runtime import get_runtime
 
@@ -65,14 +67,22 @@ def _age_floor(store, hours):
     when this test started.
     """
     runtime = get_runtime()
-    runtime.auth._grace_floor()  # ensure the row exists before moving it
+    current = runtime.auth._grace_floor()  # also ensures the row exists
+    # Aged in Python and written back as Python writes it. Doing the
+    # arithmetic in SQL and storing `::text` renders Postgres's own format,
+    # whose two-digit offset (`+00`) `datetime.fromisoformat` rejects on
+    # Python 3.10 - it wants `+00:00`, and only 3.11 relaxed that. The parse
+    # then failed, the floor was re-established at now, nothing was expired,
+    # and every assertion below failed on one interpreter and passed on the
+    # other two. Production never sees that format: the only writer stores
+    # `now.isoformat()`.
+    aged = (current - timedelta(hours=hours)).isoformat()
     with psycopg.connect(store.dsn, autocommit=True) as conn:
         conn.execute(
-            "UPDATE instance_config SET config = jsonb_set("
-            "config, '{recorded_at}', to_jsonb((("
-            "config ->> 'recorded_at')::timestamptz "
-            "- make_interval(hours => %s))::text)) WHERE name = %s",
-            (hours, "verification_grace_floor"),
+            "UPDATE instance_config SET config = "
+            "jsonb_set(config, '{recorded_at}', to_jsonb(%s::text)) "
+            "WHERE name = %s",
+            (aged, VERIFICATION_GRACE_FLOOR),
         )
     runtime.auth._grace_floor_cache = None
 
