@@ -1718,11 +1718,13 @@ const sendMessage = async (event) => {
     updateStreamingUI(true);
 
     const data = await chatViaWebSocketStreaming().catch(async (err) => {
-      // Only a failed transport is retried here. A server `error` event, a
-      // legacy `status != ok` envelope and a frame that would not parse all
-      // reach the caller instead, so the outer handler can name the cause.
+      // Only a failure before the request was handed to the socket is
+      // retryable. Once the turn has been sent, any failure propagates
+      // rather than replaying it over REST - including a transport one, such
+      // as a socket error or a close mid-stream, because the server may
+      // already have run the turn.
       if (!err?.retryableTransport) throw err;
-      // Fallback to REST API if the WebSocket transport fails
+      // The socket never carried the request, so ask for the turn over HTTP.
       const envelope = await requestEnvelope(
         `${apiBase}/chat`,
         { method: 'POST', headers: headers(idempotencyKey), body: JSON.stringify({ ...payload, stream: false }) },
