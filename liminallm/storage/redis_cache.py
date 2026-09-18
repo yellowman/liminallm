@@ -936,6 +936,16 @@ return {1, tokens, 0}
         Returns:
             Tuple of (circuit_tripped: bool, failure_count: int)
         """
+        # Correctness currently relies on cooldown_seconds >= window_seconds:
+        # failures completing while the circuit is open are intentionally not
+        # recorded because they cannot remain in the failure window when the
+        # cooldown expires. If shorter cooldowns are supported, open-period
+        # failures must be retained.
+        #
+        # Measured, not assumed. At 60/60 - the only call site, on these
+        # defaults - recording those failures instead changes nothing: five are
+        # still needed to re-trip after the cooldown. At cooldown 1 / window 10
+        # it takes four, which is the accounting bug this invariant avoids.
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         open_key = f"circuit:{tenant_prefix}{tool_id}:open"
         failures_key = f"circuit:{tenant_prefix}{tool_id}:{self._FAILURES_SUFFIX}"

@@ -4655,6 +4655,11 @@ class PostgresStore:
         """Merged settings including secrets. For the runtime, not the API."""
         return {**SYSTEM_SETTINGS_DEFAULTS, **self._get_stored_system_settings()}
 
+    #: The withdrawal counter for citation authority. Its own row rather than
+    #: a key inside `system_settings`, which is filtered to declared settings
+    #: and would prune anything else.
+    CITATION_ROLLBACK_GENERATION = "citation_rollback_generation"
+
     def get_system_settings_overrides(self) -> dict:
         """Explicitly stored admin settings only, no defaults merged in.
 
@@ -4662,6 +4667,37 @@ class PostgresStore:
         settings the admin never actually overrode.
         """
         return dict(self._get_stored_system_settings())
+
+    def get_system_settings_state(self) -> tuple[dict, int]:
+        """The stored overrides and the citation rollback generation, together.
+
+        One transaction, because a worker decides two things from this pair and
+        they have to describe the same moment: whether a withdrawal happened
+        that it did not see, and what the value is now. Reading them separately
+        allows a write to land in between, so a peer could take the generation
+        from before a rollback and the boolean from after it - and conclude
+        nothing was withdrawn.
+        """
+        with self._connect() as conn, conn.transaction():
+            settings_row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s",
+                ("system_settings",),
+            ).fetchone()
+            generation_row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s",
+                (self.CITATION_ROLLBACK_GENERATION,),
+            ).fetchone()
+        overrides = {
+            key: value
+            for key, value in self._coerce_stored_settings(settings_row).items()
+            if key in SYSTEM_SETTINGS_DEFAULTS
+        }
+        raw = self._coerce_stored_settings(generation_row).get("generation")
+        try:
+            generation = int(raw)
+        except (TypeError, ValueError):
+            generation = 0
+        return overrides, generation
 
     def get_system_settings_version(self) -> Optional[str]:
         """Return a token that changes whenever system settings are written.
@@ -4788,6 +4824,38 @@ class PostgresStore:
                 """,
                 ("system_settings", json.dumps(merged)),
             )
+            # Count the withdrawal, in this transaction, so a worker can learn
+            # that authority was taken away even if it never saw the value
+            # while it was gone. The settings version says only that something
+            # changed; a peer polling after an off-and-on pair reads `True` and
+            # would otherwise conclude nothing had happened.
+            #
+            # A transition of the canonical value, not of the stored override:
+            # the effective policy is defaults-under-overrides, so clearing an
+            # override is a withdrawal whenever the default it falls back to is
+            # `False`. Writing `False` over `False` is not.
+            was_on = bool(
+                {**SYSTEM_SETTINGS_DEFAULTS, **stored}.get("citation_offers_enabled")
+            )
+            now_on = bool(
+                {**SYSTEM_SETTINGS_DEFAULTS, **merged}.get("citation_offers_enabled")
+            )
+            if was_on and not now_on:
+                conn.execute(
+                    """
+                    INSERT INTO instance_config (name, config, created_at, updated_at)
+                    VALUES (%s, '{"generation": 1}'::jsonb, now(), now())
+                    ON CONFLICT (name) DO UPDATE SET
+                        config = jsonb_build_object(
+                            'generation',
+                            COALESCE(
+                                (instance_config.config ->> 'generation')::bigint, 0
+                            ) + 1
+                        ),
+                        updated_at = now()
+                    """,
+                    (self.CITATION_ROLLBACK_GENERATION,),
+                )
         return {**SYSTEM_SETTINGS_DEFAULTS, **merged}
 
     # knowledge

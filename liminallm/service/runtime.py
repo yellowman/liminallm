@@ -171,6 +171,10 @@ class Runtime:
         # the first reader of both.
         self._last_settings_overrides: dict = {}
         self._settings_overrides_stale = False
+        # The last citation withdrawal this worker has accounted for. A worker
+        # starting now adopts whatever the store says, because it holds no
+        # execution that predates it and so has nothing to withdraw.
+        self._citation_rollback_generation: Optional[int] = None
         self._seed_settings_from_env()
         self._ensure_signing_key()
         self.refresh_settings()
@@ -348,13 +352,15 @@ class Runtime:
         is no policy to keep and the defaults are the honest answer.
         """
         try:
-            overrides = dict(self.store.get_system_settings_overrides() or {})
+            overrides, generation = self.store.get_system_settings_state()
+            overrides = dict(overrides or {})
         except Exception as exc:
             logger.warning("settings_overrides_read_failed", error=str(exc))
             self._settings_overrides_stale = True
             return dict(self._last_settings_overrides)
         self._settings_overrides_stale = False
         self._last_settings_overrides = overrides
+        self._pending_citation_rollback_generation = generation
         return dict(overrides)
 
     #: Written by the instance itself, not chosen by anyone.
@@ -490,12 +496,41 @@ class Runtime:
         # engine being retired, so its live executions lose authority on the
         # way out and the new engine is built from the same stored value - a
         # model rebuild is not a way around a rollback.
+        #
+        # A withdrawal this worker never observed is applied first. The
+        # settings version says only that something changed, so an operator
+        # turning offers off and back on between two polls would otherwise
+        # reach a peer as no change at all, leaving the executions that were
+        # live throughout with authority that was withdrawn from them. The
+        # persisted generation counts withdrawals, so the peer can see that one
+        # happened even though the value is back where it started.
+        #
+        # Order matters: withdraw from what is live, then apply the current
+        # value prospectively. `configure_citation_offers(True)` is prospective
+        # by design and leaves a caught execution caught, which is exactly what
+        # makes those two calls compose.
+        generation = getattr(self, "_pending_citation_rollback_generation", None)
+        observed = self._citation_rollback_generation
         workflow = getattr(self, "workflow", None)
         invocations = getattr(workflow, "invocations", None)
         if invocations is not None:
+            if (
+                generation is not None
+                and observed is not None
+                and generation > observed
+            ):
+                invocations.configure_citation_offers(False)
             invocations.configure_citation_offers(
                 self.settings.citation_offers_enabled
             )
+        # Recorded after the steps above, so a failure between them is retried
+        # rather than remembered as done - and recorded even on the boot
+        # refresh, which runs before `self.workflow` exists. That refresh is
+        # where a starting worker adopts its baseline; leaving it unset there
+        # would make the first poll adopt the generation instead, which is
+        # after the rollback it was supposed to notice.
+        if generation is not None:
+            self._citation_rollback_generation = generation
         # These capture their configuration rather than reading it, so they
         # have to be rebuilt for a change to reach them.
         if getattr(self, "email", None) is not None:
