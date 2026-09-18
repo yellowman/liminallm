@@ -166,6 +166,11 @@ class Runtime:
         # settings before building anything that depends on them.
         # Order matters: the seed only applies to an unconfigured instance, and
         # the generated signing key would otherwise make it look configured.
+        # The last overrides this worker actually read, and whether the most
+        # recent attempt failed. Set before the first refresh below, which is
+        # the first reader of both.
+        self._last_settings_overrides: dict = {}
+        self._settings_overrides_stale = False
         self._seed_settings_from_env()
         self._ensure_signing_key()
         self.refresh_settings()
@@ -331,12 +336,26 @@ class Runtime:
         get_system_settings() merges the shipped defaults over the stored
         values; overlaying that would make a default indistinguishable from a
         choice. This returns the choices.
+
+        A read failure returns the last choices this worker read, not `{}`.
+        Empty is not "no answer" to the caller - it is "the admin chose
+        nothing", which applies every shipped default. That turned one
+        transient error into a policy rollback, and for `citation_offers_enabled`
+        (default `True`) into a fail-open: authority handed back to executions
+        an operator had withdrawn it from.
+
+        A worker that has never read anything keeps `{}`, because at boot there
+        is no policy to keep and the defaults are the honest answer.
         """
         try:
-            return self.store.get_system_settings_overrides() or {}
+            overrides = dict(self.store.get_system_settings_overrides() or {})
         except Exception as exc:
             logger.warning("settings_overrides_read_failed", error=str(exc))
-            return {}
+            self._settings_overrides_stale = True
+            return dict(self._last_settings_overrides)
+        self._settings_overrides_stale = False
+        self._last_settings_overrides = overrides
+        return dict(overrides)
 
     #: Written by the instance itself, not chosen by anyone.
     GENERATED_SETTINGS = frozenset({"jwt_secret"})
@@ -615,8 +634,13 @@ class Runtime:
         # now what request handlers read.
         self.refresh_settings()
         # Record the version even when nothing model-relevant changed, so an
-        # unrelated settings write isn't rechecked.
-        self._applied_settings_version = version
+        # unrelated settings write isn't rechecked - but only when the refresh
+        # actually read the stored settings. Recording a version this worker
+        # never managed to apply made every later poll return early, so one
+        # failed read left the worker on its previous policy until the next
+        # settings write or a restart rather than until the next poll.
+        if not self._settings_overrides_stale:
+            self._applied_settings_version = version
         if target != self._model_settings_signature:
             self.reload_model_services()
             return True
@@ -669,8 +693,12 @@ class Runtime:
                     error=str(exc),
                 )
                 raise
-            # Mark this version applied so the watcher doesn't reload again.
-            self._applied_settings_version = version
+            # Mark this version applied so the watcher doesn't reload again -
+            # unless the settings read inside the rebuild failed, in which case
+            # the stack was built from the policy this worker already had and
+            # the version has not been applied at all.
+            if not self._settings_overrides_stale:
+                self._applied_settings_version = version
             if getattr(self, "training_worker", None):
                 # Every rebuilt service the worker holds, or it keeps running
                 # the old stack: a re-embed sweep on the previous encoder, or

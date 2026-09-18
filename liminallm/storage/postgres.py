@@ -3729,6 +3729,49 @@ class PostgresStore:
             require_private=True,
         )
 
+    def _enforce_adapter_role(
+        self, artifact_type: str, previous: dict, schema: dict, artifact_id: str
+    ) -> None:
+        """Refuse a write that changes or removes an adapter's role.
+
+        An adapter's role decides whether training may select live events or
+        must be authorized by a pinned job, so an edit that removed or flipped
+        it would hand a skill the persona path (SPEC §5.5.3).
+
+        Shared by the two writers that build a new schema from a locked row:
+        `update_artifact` and `apply_config_patch`. It used to live inline in
+        the first, under a comment saying every writer arrived through it.
+        Config ops did not - it is its own read-modify-write, in its own
+        transaction - so the one path whose content is model-authored was the
+        one path the rule did not reach.
+
+        Call it after `validate_artifact`, which is what guarantees `schema`
+        is an object here; the one value this method writes is itself a legal
+        role.
+        """
+        if artifact_type != "adapter":
+            return
+        previous_role = previous.get("adapter_role")
+        if previous_role is None and previous.get("cluster_id"):
+            # A skill written before the role existed. Canonicalize it here
+            # rather than waiting for the ladder to revisit it: until the role
+            # is on the row, this same edit could drop `cluster_id` and leave
+            # nothing to say the adapter had ever been a skill. The binding may
+            # still change or go - reclustering is ordinary - but what the
+            # write leaves behind is a skill without a cluster, never a
+            # persona.
+            previous_role = "skill"
+            schema.setdefault("adapter_role", "skill")
+        if previous_role and schema.get("adapter_role") != previous_role:
+            raise ConstraintViolation(
+                "adapter_role is immutable",
+                {
+                    "artifact_id": artifact_id,
+                    "adapter_role": previous_role,
+                    "requested": schema.get("adapter_role"),
+                },
+            )
+
     def update_artifact(
         self,
         artifact_id: str,
@@ -3787,37 +3830,11 @@ class PostgresStore:
             except ArtifactValidationError as exc:
                 self.logger.warning("artifact_validation_failed", errors=exc.errors)
                 raise
-            # An adapter's role decides whether training may select live
-            # events or must be authorized by a pinned job, so an edit that
-            # removed or flipped it would hand a skill the persona path
-            # (SPEC §5.5.3). Enforced here rather than in the route because
-            # every writer - the route, config ops, the training service -
-            # arrives through this one method, and the previous value is
-            # only knowable from the locked row. After validation, which is
-            # what guarantees `schema` is an object here; the one value this
-            # block writes is itself a legal role.
-            if row["type"] == "adapter":
-                previous_role = previous.get("adapter_role")
-                if previous_role is None and previous.get("cluster_id"):
-                    # A skill written before the role existed. Canonicalize
-                    # it here rather than waiting for the ladder to revisit
-                    # it: until the role is on the row, this same edit could
-                    # drop `cluster_id` and leave nothing to say the adapter
-                    # had ever been a skill. The binding may still change or
-                    # go - reclustering is ordinary - but what the write
-                    # leaves behind is a skill without a cluster, never a
-                    # persona.
-                    previous_role = "skill"
-                    schema.setdefault("adapter_role", "skill")
-                if previous_role and schema.get("adapter_role") != previous_role:
-                    raise ConstraintViolation(
-                        "adapter_role is immutable",
-                        {
-                            "artifact_id": artifact_id,
-                            "adapter_role": previous_role,
-                            "requested": schema.get("adapter_role"),
-                        },
-                    )
+            # Enforced in the store rather than in the route because the
+            # previous value is only knowable from the locked row.
+            self._enforce_adapter_role(
+                row["type"], previous, schema, artifact_id  # type: ignore[arg-type]
+            )
             # The row's own audience, taken from the locked row rather than
             # from the caller: a private workflow may name its owner's private
             # tool, and the same edit on a shared one may not.
@@ -4480,6 +4497,17 @@ class PostgresStore:
             # Inside the transaction and before `_persist_payload`, so a
             # refusal leaves no row, no version and no payload behind.
             validate_artifact(artifact_row["type"], new_schema)  # type: ignore[arg-type]
+            # Same door, second entrance: the role rule reaches the patch path
+            # too. An approved patch is model-authored text, so this is the
+            # writer that most needs it - without it a proposal could recast a
+            # skill as a persona and move it onto the training path that may
+            # select live preference events.
+            self._enforce_adapter_role(
+                artifact_row["type"],  # type: ignore[arg-type]
+                current_schema if isinstance(current_schema, dict) else {},
+                new_schema,
+                str(patch.artifact_id),
+            )
             # Same door, third entrance. Without this an approved patch could
             # swap a published workflow onto a tool its audience cannot reach,
             # write a version, and mark itself `applied` - an audit record
