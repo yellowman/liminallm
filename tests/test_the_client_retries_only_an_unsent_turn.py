@@ -318,15 +318,37 @@ class TestAFailureBeforeTheRequestStillFallsBack:
         the feature they bound was gone. It is also the positive control for
         the REST counter: an empty `rest_calls` is evidence only once the same
         counter has been shown to record something.
+
+        It waits for the request itself, not for a DOM state that follows it.
+        An earlier version waited for `.message.assistant:not(.streaming)`,
+        which `showTypingIndicator` satisfies the moment the turn is sent -
+        `typingEl.className = 'message assistant typing'` (chat.js:1335),
+        appended before the socket has even failed. The wait therefore
+        returned before the fallback could happen and the assertion sampled an
+        empty counter. It passed locally on timing luck and failed in CI,
+        which is the same thing as not testing anything.
         """
         turn = signed_in(fails_to_open=True)
 
-        turn.send()
+        # The *response*, not the request. The `request` event fires before
+        # the route handler appends to `rest_calls`, so waiting on it left the
+        # counter assertion below racing - measured, 2 failures in 4 runs. A
+        # response cannot exist unless the handler already ran, because the
+        # handler appends and only then calls `route.continue_()`.
+        with turn.page.expect_response(
+            lambda response: (
+                response.request.method == "POST"
+                and bool(REST_CHAT.search(response.url))
+            ),
+            timeout=30000,
+        ) as fallback:
+            turn.send()
 
-        turn.page.wait_for_selector(
-            ".message.assistant:not(.streaming)", timeout=60000
-        )
-        assert turn.rest_calls, (
+        assert fallback.value.request.method == "POST", (
             "a socket that never opened did not fall back to REST, so the "
             "fix withdrew the one retry that is still safe"
+        )
+        assert turn.rest_calls, (
+            "the fallback request was made but the counter did not record "
+            "it, so every `rest_calls == []` above proves nothing"
         )
