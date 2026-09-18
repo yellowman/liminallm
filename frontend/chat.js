@@ -1402,6 +1402,37 @@ const cleanupWebSocket = () => {
 
 window.addEventListener('beforeunload', cleanupWebSocket);
 
+// A chat turn falls back to REST only if the request never reached the
+// server, and this is what says so. Fallback is opt-in: `sendMessage` retries
+// an error only if it carries this tag, so anything untagged propagates to
+// the caller and reaches the error banner.
+//
+// The boundary is not "did a terminal frame arrive" but "was the request
+// handed to the socket". Once it has been, the outcome is ambiguous and the
+// turn must not be replayed, because the two transports do not share an
+// idempotency slot: the socket claims `chat:ws` and the REST route claims
+// `chat`, and the socket stores its result only after the stream finishes.
+// A disconnect mid-turn therefore leaves the user's message already appended
+// by `chat_turn.begin`, the socket's slot merely in progress, and no
+// completed response for a retry to replay - so the REST attempt appends the
+// message a second time and runs the workflow again. Duplicated tool effects,
+// not just duplicated inference.
+//
+// That is why this tag lives only inside `openChatSocket`, which returns
+// before the request exists. The boundary is enforced by where the function
+// can be called rather than by a flag each new reject site must remember to
+// get right.
+//
+// The same reasoning covers an answer the server did send. An application
+// error, and bytes the client cannot parse, both mean the turn has already
+// happened; replaying it hides a real fault and repeats work of unknown
+// extent, which an idempotency key narrows but does not make safe to assume.
+const transportError = (message) => {
+  const err = new Error(message);
+  err.retryableTransport = true;
+  return err;
+};
+
 // Open a fresh socket for one chat exchange; resolves once it is usable.
 const openChatSocket = () =>
   new Promise((resolve, reject) => {
@@ -1409,7 +1440,7 @@ const openChatSocket = () =>
     const socket = new WebSocket(`${protocol}://${window.location.host}${apiBase}/chat/stream`);
     const timeout = setTimeout(() => {
       socket.close();
-      reject(new Error('WebSocket connection timeout'));
+      reject(transportError('WebSocket connection timeout'));
     }, 5000);
     socket.addEventListener('open', () => {
       clearTimeout(timeout);
@@ -1418,7 +1449,7 @@ const openChatSocket = () =>
     });
     socket.addEventListener('error', () => {
       clearTimeout(timeout);
-      reject(new Error('WebSocket connection failed'));
+      reject(transportError('WebSocket connection failed'));
     });
   });
 
@@ -1686,8 +1717,14 @@ const sendMessage = async (event) => {
     showTypingIndicator();
     updateStreamingUI(true);
 
-    const data = await chatViaWebSocketStreaming().catch(async () => {
-      // Fallback to REST API if WebSocket fails
+    const data = await chatViaWebSocketStreaming().catch(async (err) => {
+      // Only a failure before the request was handed to the socket is
+      // retryable. Once the turn has been sent, any failure propagates
+      // rather than replaying it over REST - including a transport one, such
+      // as a socket error or a close mid-stream, because the server may
+      // already have run the turn.
+      if (!err?.retryableTransport) throw err;
+      // The socket never carried the request, so ask for the turn over HTTP.
       const envelope = await requestEnvelope(
         `${apiBase}/chat`,
         { method: 'POST', headers: headers(idempotencyKey), body: JSON.stringify({ ...payload, stream: false }) },
