@@ -319,14 +319,15 @@ class TestAFailureBeforeTheRequestStillFallsBack:
         the REST counter: an empty `rest_calls` is evidence only once the same
         counter has been shown to record something.
 
-        It waits for the request itself, not for a DOM state that follows it.
-        An earlier version waited for `.message.assistant:not(.streaming)`,
-        which `showTypingIndicator` satisfies the moment the turn is sent -
-        `typingEl.className = 'message assistant typing'` (chat.js:1335),
-        appended before the socket has even failed. The wait therefore
-        returned before the fallback could happen and the assertion sampled an
-        empty counter. It passed locally on timing luck and failed in CI,
-        which is the same thing as not testing anything.
+        It waits for the fallback response itself, not for a DOM state that
+        follows it. An earlier version waited for
+        `.message.assistant:not(.streaming)`, which `showTypingIndicator`
+        satisfies the moment the turn is sent - `typingEl.className = 'message
+        assistant typing'` (chat.js:1335), appended before the socket has even
+        failed. The wait therefore returned before the fallback could happen
+        and the assertion sampled an empty counter. It passed locally on
+        timing luck and failed in CI, which is the same thing as not testing
+        anything.
         """
         turn = signed_in(fails_to_open=True)
 
