@@ -4626,22 +4626,30 @@ class PostgresStore:
     def get_system_settings_state(self) -> tuple[dict, int]:
         """The stored overrides and the citation rollback generation, together.
 
-        One transaction, because a worker decides two things from this pair and
+        One statement, because a worker decides two things from this pair and
         they have to describe the same moment: whether a withdrawal happened
-        that it did not see, and what the value is now. Reading them separately
-        allows a write to land in between, so a peer could take the generation
-        from before a rollback and the boolean from after it - and conclude
-        nothing was withdrawn.
+        that it did not see, and what the value is now.
+
+        A transaction is not enough. The default isolation is READ COMMITTED,
+        where every statement takes its own snapshot, so two SELECTs inside one
+        transaction still straddle a write that commits between them. Measured:
+        with a disable committing in that gap, the pair came back as the
+        boolean from before it and the generation from after. `refresh_settings`
+        then withdrew authority from the live executions, correctly, and
+        immediately applied the stale `True` prospectively - so executions
+        opened afterwards were born with the authority the operator had just
+        removed, until the next poll.
+
+        One statement takes one snapshot, so the pair cannot straddle anything.
         """
-        with self._connect() as conn, conn.transaction():
-            settings_row = conn.execute(
-                "SELECT config FROM instance_config WHERE name = %s",
-                ("system_settings",),
-            ).fetchone()
-            generation_row = conn.execute(
-                "SELECT config FROM instance_config WHERE name = %s",
-                (self.CITATION_ROLLBACK_GENERATION,),
-            ).fetchone()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT name, config FROM instance_config WHERE name = ANY(%s)",
+                (["system_settings", self.CITATION_ROLLBACK_GENERATION],),
+            ).fetchall()
+        by_name = {row["name"]: row for row in rows}
+        settings_row = by_name.get("system_settings")
+        generation_row = by_name.get(self.CITATION_ROLLBACK_GENERATION)
         overrides = {
             key: value
             for key, value in self._coerce_stored_settings(settings_row).items()
@@ -4707,6 +4715,30 @@ class PostgresStore:
                 return {}
         return raw_config if isinstance(raw_config, dict) else {}
 
+    def read_instance_config(self, name: str) -> Optional[dict]:
+        """The stored blob, or None when no row exists at all.
+
+        `get_instance_config` answers `{}` for an absent row and for a present
+        one holding nothing usable. That is right for a caller treating
+        configuration as optional, and wrong for one deciding whether a piece
+        of authority state was ever established: "never written" and "written
+        and now unreadable" call for opposite actions, and collapsing them
+        makes a corrupt row look like a fresh install.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s", (name,)
+            ).fetchone()
+        if not row:
+            return None
+        config = row.get("config")
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except Exception:  # noqa: BLE001
+                return {}
+        return config if isinstance(config, dict) else {}
+
     def get_instance_config(self, name: str) -> dict:
         """Read a named JSONB blob from instance_config ({} when absent)."""
         with self._connect() as conn:
@@ -4723,25 +4755,31 @@ class PostgresStore:
                 return {}
         return config if isinstance(config, dict) else {}
 
-    def record_instance_config_default(self, name: str, patch: dict) -> dict:
-        """Fill in keys the blob does not have yet, and return the result.
+    def establish_instance_config(self, name: str, config: dict) -> dict:
+        """Write this blob only if the row does not exist, and return the row.
 
-        The opposite precedence to `merge_instance_config`: what is stored
-        wins. For a value that must be written once and then never move - a
-        recorded instant, say - a merge is the wrong primitive, because two
-        workers arriving together would each overwrite the other's.
+        For a value established once and then never moved. A row that already
+        exists is returned exactly as it stands - not merged into, not repaired,
+        not even key by key.
 
-        One statement, and the conflict resolution is what makes it safe.
-        Reading first and writing after does not work here: `FOR UPDATE` locks
-        nothing when the row does not exist, so concurrent callers all find it
-        absent, all write, and the last one wins - each having returned the
-        value it computed rather than the one that was committed. Measured with
-        four workers establishing a value together: three different answers.
+        One statement, and the conflict arm is what makes it safe. Reading
+        first and writing after does not work here: `FOR UPDATE` locks nothing
+        when the row does not exist, so concurrent callers all find it absent,
+        all write, and the last one wins - each having returned the value it
+        computed rather than the one committed. Measured with four workers
+        establishing a value together: three different answers.
 
-        `EXCLUDED.config || instance_config.config` concatenates with the
-        stored side on the right, so it wins key by key, and `RETURNING` hands
-        back what the row actually holds. `updated_at` is carried over rather
-        than bumped, because a call that changed nothing is not a write.
+        The conflict arm is a no-op on `config`, which exists so `RETURNING`
+        can hand back the row the winner wrote. Filling in absent keys instead
+        - `EXCLUDED.config || instance_config.config` - was the earlier shape,
+        and it repairs. A caller that read absence, lost a race to a writer
+        that committed something unusable, and then arrived here had its own
+        value merged into that row and accepted back: for the verification
+        floor that meant a corrupt row silently became a fresh 24 hours for
+        every expired account, and the row was modified on the way. Measured.
+
+        `updated_at` is carried over rather than bumped, because a call that
+        changed nothing is not a write.
         """
         with self._connect() as conn, conn.transaction():
             row = conn.execute(
@@ -4749,11 +4787,11 @@ class PostgresStore:
                 INSERT INTO instance_config (name, config, created_at, updated_at)
                 VALUES (%s, %s, now(), now())
                 ON CONFLICT (name) DO UPDATE
-                SET config = EXCLUDED.config || instance_config.config,
+                SET config = instance_config.config,
                     updated_at = instance_config.updated_at
                 RETURNING config
                 """,
-                (name, json.dumps(patch)),
+                (name, json.dumps(config)),
             ).fetchone()
         return self._coerce_stored_settings(row)
 

@@ -452,7 +452,7 @@ class TestTheMigrationFloorIsEstablishedOnce:
         assert later._grace_floor() == first
 
         # Even asking directly, with a value of its own.
-        written = store.record_instance_config_default(
+        written = store.establish_instance_config(
             VERIFICATION_GRACE_FLOOR, {"recorded_at": "2099-01-01T00:00:00+00:00"}
         )
         assert written["recorded_at"] == first.isoformat(), (
@@ -628,3 +628,151 @@ class TestACorruptFloorFailsClosed:
 
         assert runtime.auth._grace_floor() is None
         assert _login(client, account["email"]).status_code == 403
+
+
+class TestAPresentButUnusableFloorIsCorruption:
+    """`{}` is not "never established" - it is a row that lost its value.
+
+    `get_instance_config` answered `{}` for an absent row and for a present
+    one holding nothing, so a restored or half-written row took the establish
+    path and wrote a fresh floor. That is the same fail-open the malformed
+    string case was fixed for: every expired account gets another day, and the
+    row an operator would need to diagnose is overwritten on the way.
+    """
+
+    def _break_floor(self, store, payload):
+        runtime = get_runtime()
+        runtime.auth._grace_floor()  # establish it first
+        with psycopg.connect(store.dsn, autocommit=True) as conn:
+            conn.execute(
+                "UPDATE instance_config SET config = %s::jsonb WHERE name = %s",
+                (payload, VERIFICATION_GRACE_FLOOR),
+            )
+        runtime.auth._grace_floor_cache = None
+        runtime.auth._grace_floor_resolved = False
+
+    @pytest.mark.parametrize(
+        "payload", ['{}', '{"foo": 1}'], ids=["empty", "wrong-keys"]
+    )
+    def test_an_old_account_is_expired_and_the_row_survives(
+        self, client, store, account, payload
+    ):
+        _age_account(store, account["user_id"], 500)
+        self._break_floor(store, payload)
+        before = _raw_floor(store)
+
+        assert get_runtime().auth._grace_floor() is None, (
+            "a present row with no usable floor was read as 'never established'"
+        )
+        resp = _login(client, account["email"])
+        assert resp.status_code == 403, (
+            "a 500-hour-old unverified account was granted a fresh grace "
+            f"period by a corrupt floor row: {resp.text}"
+        )
+        assert resp.json()["error"]["code"] == "verification_required"
+        assert _raw_floor(store) == before, (
+            "the corrupt row was overwritten with a fresh floor"
+        )
+
+    def test_a_new_account_still_keeps_its_own_day(self, client, store, account):
+        """Corruption must not lock out an account created minutes ago."""
+        self._break_floor(store, '{}')
+
+        assert _login(client, account["email"]).status_code == 200
+
+    def test_an_absent_row_still_establishes(self, store):
+        """The one case that may write: no row at all."""
+        runtime = get_runtime()
+        runtime.auth._grace_floor()
+        with psycopg.connect(store.dsn, autocommit=True) as conn:
+            conn.execute(
+                "DELETE FROM instance_config WHERE name = %s",
+                (VERIFICATION_GRACE_FLOOR,),
+            )
+        runtime.auth._grace_floor_cache = None
+        runtime.auth._grace_floor_resolved = False
+
+        assert runtime.auth._grace_floor() is not None, (
+            "an absent row must still establish a floor, or a fresh install "
+            "expires every account it creates"
+        )
+
+
+class TestACorruptRowAppearingMidEstablish:
+    """The read can lose a race, and losing it must not repair anything.
+
+    `_grace_floor` reads, sees no row, and only then establishes. A restore, a
+    manual repair or a future writer can commit an unusable row in that gap.
+    The establish then conflicts, and the question is what the conflict arm
+    does with what it found.
+
+    Filling in the missing key - the earlier shape - merged a fresh
+    `recorded_at` into the corrupt row and accepted it back, so a corrupt row
+    silently became another 24 hours for every expired account and was
+    modified on the way. An existing row now wins whole.
+    """
+
+    def _read_loses_the_race(self, store, payload):
+        """The row already holds `payload`; the read reports absence."""
+        runtime = get_runtime()
+        runtime.auth._grace_floor()  # make the row exist
+        with psycopg.connect(store.dsn, autocommit=True) as conn:
+            conn.execute(
+                "UPDATE instance_config SET config = %s::jsonb WHERE name = %s",
+                (payload, VERIFICATION_GRACE_FLOOR),
+            )
+        real = store.read_instance_config
+
+        def _sees_nothing(name, _real=real):
+            return None if name == VERIFICATION_GRACE_FLOOR else _real(name)
+
+        store.read_instance_config = _sees_nothing
+        runtime.auth._grace_floor_cache = None
+        runtime.auth._grace_floor_resolved = False
+        return real
+
+    @pytest.mark.parametrize(
+        "payload", ['{}', '{"foo": 1}'], ids=["empty", "wrong-keys"]
+    )
+    def test_establish_does_not_repair_a_row_that_appeared(
+        self, client, store, account, payload
+    ):
+        _age_account(store, account["user_id"], 500)
+        real = self._read_loses_the_race(store, payload)
+        before = _raw_floor(store)
+        try:
+            floor = get_runtime().auth._grace_floor()
+        finally:
+            store.read_instance_config = real
+
+        assert floor is None, (
+            "the establish merged its fresh timestamp into a corrupt row that "
+            "appeared after the read, turning corruption into a new grace"
+        )
+        assert _raw_floor(store) == before, (
+            "the corrupt row was modified by an establish that lost the race"
+        )
+        resp = _login(client, account["email"])
+        assert resp.status_code == 403, (
+            f"a 500-hour-old unverified account authenticated: {resp.text}"
+        )
+
+    def test_a_real_floor_that_appeared_is_adopted_whole(self, store):
+        """The other side: a valid row that wins the race is used as-is."""
+        runtime = get_runtime()
+        established = runtime.auth._grace_floor()
+        real = store.read_instance_config
+
+        def _sees_nothing(name, _real=real):
+            return None if name == VERIFICATION_GRACE_FLOOR else _real(name)
+
+        store.read_instance_config = _sees_nothing
+        runtime.auth._grace_floor_cache = None
+        runtime.auth._grace_floor_resolved = False
+        try:
+            assert runtime.auth._grace_floor() == established, (
+                "a worker that lost the race wrote its own floor instead of "
+                "adopting the one already committed"
+            )
+        finally:
+            store.read_instance_config = real
