@@ -50,7 +50,7 @@ is the only proof you fixed the cause and not the symptom. Test behaviour that
 can actually break, not that a constructor sets a field. If something is hard
 to test, that is information about the design, not permission to skip it.
 
-Six rules under it, each earned by a bug this project shipped and a review
+Seven rules under it, each earned by a bug this project shipped and a review
 had to find.
 
 **Residuals are hypotheses.** Before implementing an `ISSUES.md` or inventory
@@ -67,6 +67,11 @@ works. Parsers, heuristics and anything with a threshold are the worst
 offenders: reading them confirms what you meant, running them shows what they
 do. `"mini"` is a substring of `"gemini"`, and no amount of re-reading the
 line said so.
+
+**Adversarial measurements need a positive control.** A negative result is
+evidence only when the same probe first demonstrates that it can reach and
+observe the state being tested. A mutation campaign must also verify that every
+mutation actually applied before interpreting its result.
 
 **Build test doubles from the real object.** A stub you construct from your own
 belief about an interface encodes that belief, so the test passes and the code
