@@ -3081,6 +3081,17 @@ of the last sweep and a "what moved this year" ledger. a future scheduled
 sweep (leader-locked like other periodic work) could diff against the
 previous run instead of re-judging unchanged pairs.
 
+a saved report is an immutable historical snapshot. deleting a note removes
+it from the live vault, the graph, search, and every future witness run; it
+does not rewrite reports already persisted, which keep the note's id, the
+title it had, and the judgment the witness made from its excerpt at that
+time. that is what makes a report self-contained and its replay honest -
+redacting it later would make the archive describe a sweep that never
+happened. erasing the account removes the archive with everything else.
+"forget every historical derivative of this note" is a different operation
+from deleting the note, and would need its own semantic rather than a
+quiet change to what `DELETE /v1/notes/{id}` means.
+
 ### 19.7 activation
 
 `notes_enabled` - a database-managed feature flag, code default on,
