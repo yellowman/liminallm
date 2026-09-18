@@ -1402,22 +1402,31 @@ const cleanupWebSocket = () => {
 
 window.addEventListener('beforeunload', cleanupWebSocket);
 
-// A chat turn falls back to REST only when the socket itself failed, and this
-// is what says so. Fallback is opt-in: `sendMessage` retries an error only if
-// it carries this tag, so anything untagged propagates to the caller and
-// reaches the error banner.
+// A chat turn falls back to REST only if the request never reached the
+// server, and this is what says so. Fallback is opt-in: `sendMessage` retries
+// an error only if it carries this tag, so anything untagged propagates to
+// the caller and reaches the error banner.
 //
-// The direction matters. A `.catch()` that cannot tell a dead socket from a
-// server that answered "conversation not found" retries the turn over REST,
-// the retry succeeds against a different conversation, and the outer handler
-// that would have shown the real cause never runs. The user sees a reply to a
-// chat they deleted instead of the reason it failed.
+// The boundary is not "did a terminal frame arrive" but "was the request
+// handed to the socket". Once it has been, the outcome is ambiguous and the
+// turn must not be replayed, because the two transports do not share an
+// idempotency slot: the socket claims `chat:ws` and the REST route claims
+// `chat`, and the socket stores its result only after the stream finishes.
+// A disconnect mid-turn therefore leaves the user's message already appended
+// by `chat_turn.begin`, the socket's slot merely in progress, and no
+// completed response for a retry to replay - so the REST attempt appends the
+// message a second time and runs the workflow again. Duplicated tool effects,
+// not just duplicated inference.
 //
-// Only a transport that failed to carry the exchange is tagged. A server that
-// answered with an application error, and a server whose bytes the client
-// cannot parse, have both already done whatever they did to the turn -
-// replaying it hides a real fault and re-runs work of unknown extent, which
-// an idempotency key narrows but does not make safe to assume.
+// That is why this tag lives only inside `openChatSocket`, which returns
+// before the request exists. The boundary is enforced by where the function
+// can be called rather than by a flag each new reject site must remember to
+// get right.
+//
+// The same reasoning covers an answer the server did send. An application
+// error, and bytes the client cannot parse, both mean the turn has already
+// happened; replaying it hides a real fault and repeats work of unknown
+// extent, which an idempotency key narrows but does not make safe to assume.
 const transportError = (message) => {
   const err = new Error(message);
   err.retryableTransport = true;
@@ -1534,7 +1543,7 @@ const sendMessage = async (event) => {
           settled = true;
           cleanup();
           if (streamingMsg) streamingMsg.finalize('Timed out');
-          reject(transportError('Streaming timed out'));
+          reject(new Error('Streaming timed out'));
         }, 120000);
       };
       armIdleTimer();
@@ -1660,7 +1669,7 @@ const sendMessage = async (event) => {
           settled = true;
           cleanup();
           if (streamingMsg) streamingMsg.finalize('Connection error');
-          reject(transportError('WebSocket failed'));
+          reject(new Error('WebSocket failed'));
         }
       };
 
@@ -1675,7 +1684,7 @@ const sendMessage = async (event) => {
             resolve(messageDoneData);
           } else {
             if (streamingMsg) streamingMsg.finalize('Connection closed');
-            reject(transportError('Connection closed'));
+            reject(new Error('Connection closed'));
           }
         }
       };

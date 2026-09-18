@@ -2599,14 +2599,20 @@ live in docs/ui.md; this section is the behavioral contract.
 - **surfaces**: conversations, notes (when enabled), knowledge contexts,
   files, artifacts, tools, insights, settings - each backed only by the
   §13 APIs.
-- **streaming**: WebSocket primary (§13.7) with HTTP fallback. The fallback
-  is for a transport that failed to carry the exchange - a socket that would
-  not open, errored, closed before a terminal event, or went idle. An answer
-  the server delivered is never replayed over it: an `error` event, a legacy
-  `status != ok` envelope, and a frame that will not parse each surface to
-  the user instead, because the turn has already happened. Tokens accumulate
-  into the message; cancel is a connection close or `POST /v1/chat/cancel`;
-  the UI renders the trace events it receives and invents nothing.
+- **streaming**: WebSocket primary (§13.7) with HTTP fallback, and the
+  fallback is only for a request that never reached the server - the socket
+  would not open, or failed before the turn was sent. Once the request is on
+  the socket the turn is never replayed over HTTP, whatever goes wrong next:
+  a socket error, a close before a terminal event, an idle timeout, a frame
+  that will not parse, an `error` event and a legacy `status != ok` envelope
+  all surface to the user instead. The two transports do not share an
+  idempotency slot (`chat:ws` against `chat`) and the socket stores its
+  result only after the stream finishes, so a mid-turn disconnect leaves the
+  user's message appended and no completed response to replay; retrying it
+  over HTTP appends that message again and re-runs the workflow. Tokens
+  accumulate into the message; cancel is a connection close or
+  `POST /v1/chat/cancel`; the UI renders the trace events it receives and
+  invents nothing.
 - **tenant**: the tenant is the site the user visited. The login form has
   no tenant field, no request carries one, and the client never stores
   one as authority (§12.2).
