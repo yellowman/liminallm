@@ -4768,6 +4768,36 @@ class PostgresStore:
                 return {}
         return config if isinstance(config, dict) else {}
 
+    def record_instance_config_default(self, name: str, patch: dict) -> dict:
+        """Fill in keys the blob does not have yet, and return the result.
+
+        The opposite precedence to `merge_instance_config`: what is stored
+        wins. For a value that must be written once and then never move - a
+        recorded instant, say - a merge is the wrong primitive, because two
+        workers arriving together would each overwrite the other's.
+
+        Under the row lock, so the first writer's value is what every later
+        caller reads back.
+        """
+        with self._connect() as conn, conn.transaction():
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s FOR UPDATE",
+                (name,),
+            ).fetchone()
+            current = self._coerce_stored_settings(row)
+            merged = {**patch, **current}
+            if merged != current or not row:
+                conn.execute(
+                    """
+                    INSERT INTO instance_config (name, config, created_at, updated_at)
+                    VALUES (%s, %s, now(), now())
+                    ON CONFLICT (name) DO UPDATE
+                    SET config = EXCLUDED.config, updated_at = now()
+                    """,
+                    (name, json.dumps(merged)),
+                )
+        return merged
+
     def merge_instance_config(self, name: str, patch: dict) -> dict:
         """Merge keys into a named blob atomically; returns the merged dict."""
         with self._connect() as conn, conn.transaction():

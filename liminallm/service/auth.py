@@ -20,7 +20,7 @@ from argon2.exceptions import InvalidHash, VerifyMismatchError
 
 from liminallm.config import Settings
 from liminallm.logging import get_logger
-from liminallm.service.errors import ForbiddenError
+from liminallm.service.errors import ForbiddenError, VerificationRequiredError
 from liminallm.service.tenancy import user_belongs_to_site
 from liminallm.storage.models import ApiKey, Session, User
 from liminallm.storage.redis_cache import RedisCache
@@ -61,21 +61,21 @@ def _password_hasher() -> PasswordHasher:
 API_KEY_PREFIX = "sk-liminal-"
 
 #: SPEC §12.1: "unverified accounts are limited to 24h and low rate limits
-#: until verified". The number is the SPEC's, so it is a constant rather than
-#: a setting - an operator who could raise it could undo the rule.
-UNVERIFIED_SESSION_MAX_MINUTES = 24 * 60
+#: until verified or the grace period expires". The number is the SPEC's, so it
+#: is a constant rather than a setting - an operator who could raise it could
+#: undo the rule.
+#:
+#: It is the account's grace period, not each session's lifetime. Capping every
+#: session at a day instead handed each login another full day, so an account
+#: could stay unverified indefinitely in 24-hour increments and "the grace
+#: period expires" described nothing that happened.
+UNVERIFIED_GRACE_MINUTES = 24 * 60
 
-
-def _cap_unverified(minutes: int, verified: bool) -> int:
-    """The configured lifetime, or a day, whichever is shorter.
-
-    A cap, not a replacement: an install whose ordinary sessions are already
-    shorter than a day keeps its own number, and verifying never shortens
-    anything.
-    """
-    if verified:
-        return minutes
-    return min(minutes, UNVERIFIED_SESSION_MAX_MINUTES)
+#: Where the deadline is measured from for accounts that predate this rule.
+#: Deriving it from `created_at` alone would expire every existing unverified
+#: account the moment this ships - and every OAuth account is unverified,
+#: because nothing ever marked one. Recorded once, on first boot.
+VERIFICATION_GRACE_FLOOR = "verification_grace_floor"
 
 
 # OAuth provider configurations
@@ -162,6 +162,105 @@ class AuthService:
         """Timezone-aware UTC helper to avoid naive datetime usage."""
 
         return datetime.now(timezone.utc)
+
+    def _grace_floor(self) -> datetime:
+        """When this instance started measuring verification grace.
+
+        Written once and never moved. Accounts created before it are measured
+        from it instead of from their own birthday, so deploying this rule does
+        not retroactively expire a database of accounts that had no way to
+        become verified - which is every OAuth account, since `complete_oauth`
+        never marked one.
+        """
+        stored = self.store.get_instance_config(VERIFICATION_GRACE_FLOOR)
+        recorded = stored.get("recorded_at") if isinstance(stored, dict) else None
+        if isinstance(recorded, str):
+            try:
+                return datetime.fromisoformat(recorded)
+            except ValueError:
+                self.logger.warning("verification_floor_unparsable", value=recorded)
+        now = self._now()
+        # Written once and never moved: what is stored wins, under the row
+        # lock, so two workers racing on first boot agree on one floor rather
+        # than each overwriting the other - and a floor that moved later would
+        # hand a fresh day to every account that had already expired.
+        written = self.store.record_instance_config_default(
+            VERIFICATION_GRACE_FLOOR, {"recorded_at": now.isoformat()}
+        )
+        recorded = (written or {}).get("recorded_at")
+        if isinstance(recorded, str):
+            try:
+                return datetime.fromisoformat(recorded)
+            except ValueError:
+                pass
+        return now
+
+    def _verification_deadline(self, user: User) -> datetime:
+        """When an unverified account stops authenticating.
+
+        The later of its own birthday and the floor, plus the grace period.
+        """
+        created = user.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return max(created, self._grace_floor()) + timedelta(
+            minutes=UNVERIFIED_GRACE_MINUTES
+        )
+
+    def _grace_expired(self, user: User) -> bool:
+        """Whether this account's grace period has run out.
+
+        Verified accounts have no deadline; the grace period is what covers the
+        interval before the address is proven, and proving it ends the
+        question for good.
+        """
+        if user.email_verified:
+            return False
+        return self._now() >= self._verification_deadline(user)
+
+    async def _require_verification_grace(self, user: User) -> None:
+        """Refuse an expired unverified account, and send it a way back.
+
+        Called only after a credential has been proven, so the refusal is
+        addressed to someone who controls the account rather than to a stranger
+        probing addresses.
+
+        Expiry is dormancy, not a lockout. The message carries a verification
+        token, and `POST /v1/auth/verify_email` takes that token alone - no
+        session - so proving the password or the provider identity is enough to
+        get the mail that restores ordinary authority. Nothing here issues a
+        session, not even a restricted one: the mailbox is the capability.
+        """
+        if not self._grace_expired(user):
+            return
+        try:
+            await self.request_email_verification(user)
+        except Exception as exc:
+            # The refusal stands either way. A mail failure must not turn into
+            # a login, and it must not turn into a 500 that hides the reason.
+            self.logger.warning(
+                "verification_resend_failed", user_id=user.id, error=str(exc)
+            )
+        self.logger.info("verification_grace_expired", user_id=user.id)
+        raise VerificationRequiredError(
+            "verify your email address to continue",
+            detail={"verification_required": True},
+        )
+
+    def _cap_to_deadline(self, minutes: int, user: User) -> int:
+        """The configured lifetime, or what is left of the grace, whichever is
+        shorter.
+
+        A cap, not a replacement: an install whose ordinary sessions are
+        already shorter keeps its own number, and verifying never shortens
+        anything. Measured against the deadline rather than trimmed to a flat
+        day, so a credential minted with an hour of grace left expires with the
+        grace rather than a day after it.
+        """
+        if user.email_verified:
+            return minutes
+        remaining = self._verification_deadline(user) - self._now()
+        return max(0, min(minutes, int(remaining.total_seconds() // 60)))
 
     @contextlib.contextmanager
     def _with_state_lock(self):
@@ -265,19 +364,19 @@ class AuthService:
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
 
-    def _get_session_ttl(self, device_type: str, *, verified: bool) -> int:
+    def _get_session_ttl(self, device_type: str, *, user: User) -> int:
         if (device_type or "web").lower() == "mobile":
             configured = int(self.settings.session_ttl_minutes_mobile)
         else:
             configured = int(self.settings.session_ttl_minutes_web)
-        return _cap_unverified(configured, verified)
+        return self._cap_to_deadline(configured, user)
 
-    def _get_refresh_ttl(self, device_type: str, *, verified: bool) -> int:
+    def _get_refresh_ttl(self, device_type: str, *, user: User) -> int:
         if (device_type or "web").lower() == "mobile":
             configured = int(self.settings.refresh_token_ttl_minutes_mobile)
         else:
             configured = int(self.settings.refresh_token_ttl_minutes_web)
-        return _cap_unverified(configured, verified)
+        return self._cap_to_deadline(configured, user)
 
     def _get_session_device(self, session: Session) -> str:
         meta = session.meta or {}
@@ -321,9 +420,7 @@ class AuthService:
         session = self.store.create_session(
             user.id,
             tenant_id=user.tenant_id,
-            ttl_minutes=self._get_session_ttl(
-                "web", verified=user.email_verified
-            ),
+            ttl_minutes=self._get_session_ttl("web", user=user),
             meta={"device_type": "web"},
         )
         tokens = self._issue_tokens(user, session, device_type="web")
@@ -530,20 +627,27 @@ class AuthService:
                     self.logger.error("oauth_identity_missing_uid", provider=provider)
                     return None
 
-                # For GitHub, we may need to fetch email separately
-                if provider == "github" and not identity.get("email"):
+                # GitHub's verification status lives in `/user/emails`, never
+                # in `/user`. This used to be consulted only when the profile
+                # had no public address, so the common case took the public
+                # one - which says nothing about verification - and this flow
+                # had no way to tell a proven address from a typed one. Asked
+                # every time now, and the answer is what makes the account
+                # verified.
+                if provider == "github":
                     emails_response = await client.get(
                         "https://api.github.com/user/emails",
                         headers=userinfo_headers,
                     )
                     if emails_response.status_code == 200:
-                        emails = emails_response.json()
-                        primary_email = next(
-                            (e["email"] for e in emails if e.get("primary") and e.get("verified")),
-                            None,
+                        identity = self._apply_github_emails(
+                            identity, emails_response.json()
                         )
-                        if primary_email:
-                            identity["email"] = primary_email
+                    else:
+                        self.logger.warning(
+                            "github_emails_unavailable",
+                            status_code=emails_response.status_code,
+                        )
 
                 if not identity.get("email"):
                     self.logger.error("oauth_identity_missing_email", provider=provider)
@@ -569,11 +673,21 @@ class AuthService:
             return None
 
     def _parse_oauth_userinfo(self, provider: str, userinfo: dict) -> dict:
-        """Parse user info from OAuth provider into standardized format."""
+        """Parse user info from OAuth provider into standardized format.
+
+        Signing in with a provider proves the identity, not the address.
+        `email_verified` is set only where the provider attests to that exact
+        address, and is `False` everywhere else - including for every provider
+        this method does not know.
+        """
         if provider == "google":
             return {
                 "provider_uid": userinfo.get("id"),
                 "email": userinfo.get("email"),
+                # `/oauth2/v2/userinfo` returns `verified_email` for the
+                # address it returned. `is True` rather than truthiness: the
+                # string "false" is truthy, and a provider answer is data.
+                "email_verified": userinfo.get("verified_email") is True,
                 "handle": userinfo.get("name") or userinfo.get("email", "").split("@")[0],
                 "name": userinfo.get("name"),
                 "picture": userinfo.get("picture"),
@@ -581,7 +695,12 @@ class AuthService:
         elif provider == "github":
             return {
                 "provider_uid": str(userinfo.get("id")),
+                # `/user.email` is the public profile address and carries no
+                # verification status at all. `_exchange_oauth_code` resolves
+                # the verified one through `/user/emails`; until then this is
+                # an address candidate.
                 "email": userinfo.get("email"),
+                "email_verified": False,
                 "handle": userinfo.get("login"),
                 "name": userinfo.get("name"),
                 "picture": userinfo.get("avatar_url"),
@@ -589,12 +708,66 @@ class AuthService:
         elif provider == "microsoft":
             return {
                 "provider_uid": userinfo.get("id"),
+                # Graph `/me` has no verified-address claim, and Microsoft
+                # documents the email value as mutable and not guaranteed to
+                # be correct. So it is an address candidate, and these accounts
+                # prove the mailbox the ordinary way.
                 "email": userinfo.get("mail") or userinfo.get("userPrincipalName"),
+                "email_verified": False,
                 "handle": userinfo.get("displayName") or userinfo.get("userPrincipalName", "").split("@")[0],
                 "name": userinfo.get("displayName"),
                 "picture": None,  # Microsoft requires a separate Graph API call for photos
             }
-        return {"provider_uid": userinfo.get("id") or userinfo.get("sub")}
+        return {
+            "provider_uid": userinfo.get("id") or userinfo.get("sub"),
+            "email_verified": False,
+        }
+
+    def _apply_github_emails(self, identity: dict, payload: Any) -> dict:
+        """Resolve GitHub's attested address from `/user/emails`.
+
+        The attested address becomes this identity's address, and the
+        attestation travels with it. Keeping the public profile address while
+        setting the flag would attach a claim about one mailbox to a different
+        one.
+
+        `payload` is a provider response, so it is data: anything that is not a
+        list of objects carrying a primary, verified entry leaves the identity
+        exactly as unproven as it arrived.
+        """
+        if not isinstance(payload, list):
+            return identity
+        primary = next(
+            (
+                entry["email"]
+                for entry in payload
+                if isinstance(entry, dict)
+                and entry.get("primary")
+                and entry.get("verified") is True
+                and isinstance(entry.get("email"), str)
+            ),
+            None,
+        )
+        if primary:
+            identity["email"] = primary
+            identity["email_verified"] = True
+        return identity
+
+    def _should_mark_verified(self, user: User, identity: dict) -> bool:
+        """Whether a provider's claim proves this account's own address.
+
+        Three things have to line up: the account is not already verified, the
+        provider explicitly attested, and the address it attested to is the one
+        this account has. An account resolved by `provider_uid` may carry a
+        different address, and a claim about one mailbox says nothing about
+        another.
+        """
+        if user.email_verified or identity.get("email_verified") is not True:
+            return False
+        claimed = identity.get("email")
+        return bool(
+            claimed and user.email and claimed.lower() == user.email.lower()
+        )
 
     async def complete_oauth(
         self, provider: str, code: str, state: str
@@ -683,12 +856,31 @@ class AuthService:
         except Exception as exc:
             self.logger.error("link_oauth_provider_failed", error=str(exc))
             raise
+        # The provider attested to a specific address. It marks this account
+        # verified only when that is the address this account actually has -
+        # an attestation about one mailbox says nothing about another, and an
+        # account resolved by `provider_uid` may carry a different one.
+        #
+        # This is also the only writer of verification outside the mailbox
+        # flow, which is why it is narrow: before it, nothing marked an OAuth
+        # account verified at all, so every one of them was permanently
+        # unverified through an omission rather than a decision.
+        if self._should_mark_verified(user, identity):
+            updated = self.store.mark_email_verified(user.id)
+            if updated is not None:
+                user = updated
+            self.logger.info(
+                "oauth_email_verified", provider=provider, user_id=user.id
+            )
+        # After the provider proof, for the same reason the password path
+        # checks after the password: the answer names the account's
+        # verification state, and only a caller who has proven the identity
+        # may be told it.
+        await self._require_verification_grace(user)
         session = self.store.create_session(
             user.id,
             tenant_id=user.tenant_id,
-            ttl_minutes=self._get_session_ttl(
-                "web", verified=user.email_verified
-            ),
+            ttl_minutes=self._get_session_ttl("web", user=user),
             meta={"device_type": "web"},
         )
         tokens = self._issue_tokens(user, session, device_type="web")
@@ -800,6 +992,20 @@ class AuthService:
             return None, None, {}
         if not self._site_matches(user, tenant_id):
             return None, None, {}
+        # Only now, with the password proven, and against a freshly read row.
+        #
+        # Freshly read because the snapshot above was taken before the password
+        # check, and a verification committing during that check would
+        # otherwise be judged from a stale `email_verified=False` - issuing
+        # credentials calculated from a state that no longer exists, or
+        # refusing an account that had just become verified.
+        #
+        # After the credential check because the answer names the account's
+        # verification state. Before it, the same answer would tell anyone
+        # which addresses have unverified accounts. A wrong password on an
+        # expired account is still an ordinary failure.
+        user = self.store.get_user(user.id) or user
+        await self._require_verification_grace(user)
 
         # SPEC §18: Single-session mode - invalidate prior sessions if enabled
         user_meta = user.meta or {}
@@ -814,7 +1020,7 @@ class AuthService:
         mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
         require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
         device = (device_type or "web").lower()
-        session_ttl = self._get_session_ttl(device, verified=user.email_verified)
+        session_ttl = self._get_session_ttl(device, user=user)
         session = self.store.create_session(
             user.id,
             mfa_required=require_mfa,
@@ -862,6 +1068,12 @@ class AuthService:
         if not self._site_matches(user, tenant_hint):
             return None, None, {}
         if not self._refresh_token_matches(session, jti):
+            return None, None, {}
+        if self._grace_expired(user):
+            # Silent here rather than `verification_required`: a refresh token
+            # is a bearer credential, and this path already answers every other
+            # refusal the same way. The session it names is capped at the same
+            # deadline, so this is a backstop for one that outlived it.
             return None, None, {}
         device = self._get_session_device(session)
         tokens = self._issue_tokens(user, session, device_type=device)
@@ -1059,9 +1271,7 @@ class AuthService:
                 tenant_id=sess.tenant_id,
                 user_agent=sess.user_agent,
                 ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
-                ttl_minutes=self._get_session_ttl(
-                    device_type, verified=user.email_verified
-                ),
+                ttl_minutes=self._get_session_ttl(device_type, user=user),
                 meta=new_meta,
             )
 
@@ -1143,7 +1353,19 @@ class AuthService:
 
         The stored form is a SHA-256; a random 256-bit key needs no slow hash,
         that cost model belongs to low-entropy passwords.
+
+        Refused for an unverified account, during the grace period as well as
+        after it. A key is a long-lived credential that skips the session
+        machinery, and minting one while the address is still unproven creates
+        exactly the authority the grace period is meant to be lending
+        temporarily.
         """
+        user = self.store.get_user(user_id)
+        if user is not None and not user.email_verified:
+            raise VerificationRequiredError(
+                "verify your email address before creating an API key",
+                detail={"verification_required": True},
+            )
         secret = secrets.token_urlsafe(32)
         plaintext = f"{API_KEY_PREFIX}{secret}"
         record = self.store.create_api_key(
@@ -1177,6 +1399,12 @@ class AuthService:
         if not user or not user.is_active:
             return None
         if not self._site_matches(user, tenant_hint):
+            return None
+        if self._grace_expired(user):
+            # Dormant, not destroyed. The key is a durable credential and the
+            # grace period is a temporary state, so verifying the address wakes
+            # it again. Destroying it stays what revocation and account
+            # deletion are for.
             return None
         self.store.touch_api_key(record.id)
         return AuthContext(
@@ -1609,7 +1837,7 @@ class AuthService:
             ).timestamp()
         )
         device = (device_type or self._get_session_device(session)).lower()
-        refresh_ttl = self._get_refresh_ttl(device, verified=user.email_verified)
+        refresh_ttl = self._get_refresh_ttl(device, user=user)
         refresh_exp = int((now + timedelta(minutes=refresh_ttl)).timestamp())
         # SPEC §12.1: Generate JTIs for both tokens to support denylist on logout
         access_jti = str(uuid.uuid4())

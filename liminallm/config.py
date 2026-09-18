@@ -1002,11 +1002,17 @@ class Settings(BaseModel):
     # Positive for the same reason as the tier multipliers, and more sharply:
     # a limit of 0 means unlimited here, so a zero modifier would make the
     # unverified accounts the fastest ones on the instance.
+    # Strictly below 1: SPEC §12.1 makes low rate limits a property of being
+    # unverified, so how much lower is the operator's choice and whether to
+    # reduce at all is not. `1` was an escape hatch from a rule the SPEC states
+    # as a fact; a stored `1` now fails validation and falls back to this
+    # default, which is the fail-closed direction.
     unverified_rate_limit_multiplier: float = managed_field(
-        0.25, gt=0, le=1,
+        0.25, gt=0, lt=1,
         description=(
             "Rate limits are multiplied by this again until the account's "
-            "email address is verified. 1 disables the reduction."
+            "email address is verified. Must be below 1: the reduction is "
+            "required, and this setting is how much."
         ),
     )
     # Rate limits. 0 means unlimited, which is why these floor at 0 rather
