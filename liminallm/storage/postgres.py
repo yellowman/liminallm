@@ -4755,25 +4755,31 @@ class PostgresStore:
                 return {}
         return config if isinstance(config, dict) else {}
 
-    def record_instance_config_default(self, name: str, patch: dict) -> dict:
-        """Fill in keys the blob does not have yet, and return the result.
+    def establish_instance_config(self, name: str, config: dict) -> dict:
+        """Write this blob only if the row does not exist, and return the row.
 
-        The opposite precedence to `merge_instance_config`: what is stored
-        wins. For a value that must be written once and then never move - a
-        recorded instant, say - a merge is the wrong primitive, because two
-        workers arriving together would each overwrite the other's.
+        For a value established once and then never moved. A row that already
+        exists is returned exactly as it stands - not merged into, not repaired,
+        not even key by key.
 
-        One statement, and the conflict resolution is what makes it safe.
-        Reading first and writing after does not work here: `FOR UPDATE` locks
-        nothing when the row does not exist, so concurrent callers all find it
-        absent, all write, and the last one wins - each having returned the
-        value it computed rather than the one that was committed. Measured with
-        four workers establishing a value together: three different answers.
+        One statement, and the conflict arm is what makes it safe. Reading
+        first and writing after does not work here: `FOR UPDATE` locks nothing
+        when the row does not exist, so concurrent callers all find it absent,
+        all write, and the last one wins - each having returned the value it
+        computed rather than the one committed. Measured with four workers
+        establishing a value together: three different answers.
 
-        `EXCLUDED.config || instance_config.config` concatenates with the
-        stored side on the right, so it wins key by key, and `RETURNING` hands
-        back what the row actually holds. `updated_at` is carried over rather
-        than bumped, because a call that changed nothing is not a write.
+        The conflict arm is a no-op on `config`, which exists so `RETURNING`
+        can hand back the row the winner wrote. Filling in absent keys instead
+        - `EXCLUDED.config || instance_config.config` - was the earlier shape,
+        and it repairs. A caller that read absence, lost a race to a writer
+        that committed something unusable, and then arrived here had its own
+        value merged into that row and accepted back: for the verification
+        floor that meant a corrupt row silently became a fresh 24 hours for
+        every expired account, and the row was modified on the way. Measured.
+
+        `updated_at` is carried over rather than bumped, because a call that
+        changed nothing is not a write.
         """
         with self._connect() as conn, conn.transaction():
             row = conn.execute(
@@ -4781,11 +4787,11 @@ class PostgresStore:
                 INSERT INTO instance_config (name, config, created_at, updated_at)
                 VALUES (%s, %s, now(), now())
                 ON CONFLICT (name) DO UPDATE
-                SET config = EXCLUDED.config || instance_config.config,
+                SET config = instance_config.config,
                     updated_at = instance_config.updated_at
                 RETURNING config
                 """,
-                (name, json.dumps(patch)),
+                (name, json.dumps(config)),
             ).fetchone()
         return self._coerce_stored_settings(row)
 

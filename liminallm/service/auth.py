@@ -244,12 +244,19 @@ class AuthService:
     def _establish_grace_floor(self) -> Optional[datetime]:
         """Record this instance's floor, once.
 
-        What is stored wins, under the row lock, so workers racing on first
-        boot agree on one value rather than each overwriting the other. The
-        write is read back rather than assumed: another worker may have won,
-        and what it wrote is what every later reader will see.
+        An existing row wins whole, so workers racing on first boot agree on
+        one value rather than each overwriting the other. The write is read
+        back rather than assumed: another worker may have won, and what it
+        wrote is what every later reader will see.
+
+        Whole, not key by key, because the caller reached here after reading
+        absence and that read can lose a race. If a row appeared in between,
+        it is returned exactly as it stands - including when it holds nothing
+        usable, which then fails closed like any other corruption. Merging the
+        fresh timestamp into it instead would repair a corrupt row into a new
+        24 hours for every expired account, and modify the evidence.
         """
-        written = self.store.record_instance_config_default(
+        written = self.store.establish_instance_config(
             VERIFICATION_GRACE_FLOOR, {"recorded_at": self._now().isoformat()}
         )
         recorded = (written or {}).get("recorded_at")
@@ -260,6 +267,11 @@ class AuthService:
                 self.logger.error(
                     "verification_floor_invalid", value=recorded[:64]
                 )
+                return None
+        self.logger.error(
+            "verification_floor_invalid",
+            value="row appeared without recorded_at",
+        )
         return None
 
     def _verification_deadline(self, user: User) -> datetime:
