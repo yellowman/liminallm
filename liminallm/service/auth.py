@@ -157,6 +157,8 @@ class AuthService:
         self._last_cleanup = datetime.now(timezone.utc)
         # Allowance for small clock skew across nodes (Issue 76.1/76.2)
         self._clock_skew_leeway = timedelta(seconds=120)
+        #: Resolved once; the floor never moves. See `_grace_floor`.
+        self._grace_floor_cache: Optional[datetime] = None
 
     def _now(self) -> datetime:
         """Timezone-aware UTC helper to avoid naive datetime usage."""
@@ -171,12 +173,21 @@ class AuthService:
         not retroactively expire a database of accounts that had no way to
         become verified - which is every OAuth account, since `complete_oauth`
         never marked one.
+
+        Held in memory after the first read. The deadline is consulted on every
+        login, every refresh and every API-key authentication - including
+        `/v1/responses`, which is the hottest one - and a value that never
+        moves has no reason to cost a query each time. An operator who deletes
+        the row to reset the grace needs a restart for it to take effect.
         """
+        if self._grace_floor_cache is not None:
+            return self._grace_floor_cache
         stored = self.store.get_instance_config(VERIFICATION_GRACE_FLOOR)
         recorded = stored.get("recorded_at") if isinstance(stored, dict) else None
         if isinstance(recorded, str):
             try:
-                return datetime.fromisoformat(recorded)
+                self._grace_floor_cache = datetime.fromisoformat(recorded)
+                return self._grace_floor_cache
             except ValueError:
                 self.logger.warning("verification_floor_unparsable", value=recorded)
         now = self._now()
@@ -190,9 +201,11 @@ class AuthService:
         recorded = (written or {}).get("recorded_at")
         if isinstance(recorded, str):
             try:
-                return datetime.fromisoformat(recorded)
+                self._grace_floor_cache = datetime.fromisoformat(recorded)
+                return self._grace_floor_cache
             except ValueError:
                 pass
+        self._grace_floor_cache = now
         return now
 
     def _verification_deadline(self, user: User) -> datetime:

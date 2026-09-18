@@ -7,9 +7,24 @@ anything.
 """
 
 from liminallm.service.auth import API_KEY_PREFIX
+from liminallm.service.runtime import get_runtime
+
+
+def _verify(client, headers):
+    """Minting needs a proven address (SPEC 12.1).
+
+    A key outlives the verification grace period, so it is not issued during
+    one. The shared signup fixture leaves the address unproven, which is what
+    a real new account looks like; these tests are about what a key does once
+    it exists, so they start from an account entitled to hold one.
+    """
+    user_id = client.get("/v1/me", headers=headers).json()["data"]["id"]
+    get_runtime().store.mark_email_verified(user_id)
+    return user_id
 
 
 def _mint(client, headers, name="test key"):
+    _verify(client, headers)
     resp = client.post("/v1/auth/api-keys", headers=headers, json={"name": name})
     assert resp.status_code == 201, resp.text
     return resp.json()["data"]
@@ -147,6 +162,7 @@ class TestApiKeyLifecycle:
         user_id = signup.json()["data"]["user_id"]
 
         runtime = get_runtime()
+        runtime.store.mark_email_verified(user_id)
         # Seed to the cap through the service, not the route: an HTTP loop
         # would trip the write rate limit first and test the wrong thing.
         while runtime.store.count_active_api_keys(user_id) < MAX_ACTIVE_API_KEYS:

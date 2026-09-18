@@ -520,6 +520,13 @@ class TestStructuredOutput:
 
 class TestMcpAuth:
     def test_api_key_authenticates_mcp(self, client, auth_headers):
+        # Minting needs a proven address (SPEC 12.1); this test is about what
+        # the key reaches once it exists.
+        from liminallm.service.runtime import get_runtime  # noqa: PLC0415
+
+        get_runtime().store.mark_email_verified(
+            client.get("/v1/me", headers=auth_headers).json()["data"]["id"]
+        )
         key = client.post(
             "/v1/auth/api-keys", headers=auth_headers, json={"name": "mcp agent"}
         ).json()["data"]["api_key"]

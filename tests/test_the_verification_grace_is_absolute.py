@@ -57,7 +57,15 @@ def _age_account(store, user_id, hours):
 
 
 def _age_floor(store, hours):
-    """Age the migration floor too, or it holds every deadline open."""
+    """Age the migration floor too, or it holds every deadline open.
+
+    The floor is resolved once and kept in memory, so the stored row is moved
+    and the resolved copy dropped - otherwise this writes a value nothing
+    reads, and every assertion below would be measuring the floor recorded
+    when this test started.
+    """
+    runtime = get_runtime()
+    runtime.auth._grace_floor()  # ensure the row exists before moving it
     with psycopg.connect(store.dsn, autocommit=True) as conn:
         conn.execute(
             "UPDATE instance_config SET config = jsonb_set("
@@ -66,6 +74,7 @@ def _age_floor(store, hours):
             "- make_interval(hours => %s))::text)) WHERE name = %s",
             (hours, "verification_grace_floor"),
         )
+    runtime.auth._grace_floor_cache = None
 
 
 def _expire(store, user_id, hours=25):
