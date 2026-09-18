@@ -232,6 +232,40 @@ def client():
     return TestClient(app_module.app)
 
 
+@pytest.fixture
+def quiet_background_loops(monkeypatch):
+    """Silence the lifespan's periodic loops for a test that runs the real app.
+
+    `capfd` replaces the process's stdout and stderr file descriptors, and a
+    test that runs a real in-process server does that while the server is up.
+    Both lifespan loops hand work to threads that log - the cleanup pass runs
+    immediately at startup, and the settings watcher every ten seconds - so a
+    write can land in the middle of that replacement. CPython answers a
+    concurrent write and close on a buffered file object with a segmentation
+    fault rather than an exception.
+
+    Measured, not inferred. A `make test-xdist` worker died with `Fatal Python
+    error: Segmentation fault`; the faulting thread was inside
+    `sweep_artifact_payloads` logging through structlog, and the main thread
+    was in `CaptureManager.activate_fixture`, which starts `capfd`'s temporary
+    file. The worker's death then deadlocked the whole run - master idle in
+    `futex_do_wait`, the dead worker unreaped - which is the CI job that
+    produces no output and no failure. The benign form of the same write reads
+    `I/O operation on closed file` and reproduced in 4 runs of 12.
+
+    Neither loop has anything to do with what these tests measure. The
+    lifespan still creates and cancels both tasks; they simply have nothing to
+    say while it does.
+    """
+    from liminallm import app as app_module
+
+    async def _idle(*args, **kwargs) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(app_module, "_run_tmp_cleanup", _idle)
+    monkeypatch.setattr(app_module, "_run_settings_watcher", _idle)
+
+
 def _signup(client, prefix, *, admin=False):
     import uuid
 
