@@ -157,15 +157,19 @@ class AuthService:
         self._last_cleanup = datetime.now(timezone.utc)
         # Allowance for small clock skew across nodes (Issue 76.1/76.2)
         self._clock_skew_leeway = timedelta(seconds=120)
-        #: Resolved once; the floor never moves. See `_grace_floor`.
+        #: Resolved once; the floor never moves. See `_grace_floor`. The flag
+        #: is separate because `None` is a real answer - a corrupt floor - and
+        #: caching it is the point: re-reading would not repair the row, and
+        #: this row is authority state, so a manual repair means a restart.
         self._grace_floor_cache: Optional[datetime] = None
+        self._grace_floor_resolved = False
 
     def _now(self) -> datetime:
         """Timezone-aware UTC helper to avoid naive datetime usage."""
 
         return datetime.now(timezone.utc)
 
-    def _grace_floor(self) -> datetime:
+    def _grace_floor(self) -> Optional[datetime]:
         """When this instance started measuring verification grace.
 
         Written once and never moved. Accounts created before it are measured
@@ -184,46 +188,81 @@ class AuthService:
         part of authority semantics rather than configuration, so removing it
         by hand is database surgery, and a process that has already read it
         will not notice.
+
+        Three cases, and only the first may write:
+
+            absent            -> not established yet; establish it
+            present, valid    -> use exactly what is stored
+            present, invalid  -> authority state is corrupt; return None
+
+        `None` means "migration grandfathering is unavailable", never "make a
+        replacement". Treating an unreadable floor as `now` would turn
+        corruption into extra authorization time - the one direction this must
+        not fail in - and would overwrite the evidence an operator needs to
+        diagnose it. Production cannot currently write an unreadable value, but
+        a restore, a manual repair, a later writer or a parser change could.
         """
-        if self._grace_floor_cache is not None:
+        if self._grace_floor_resolved:
             return self._grace_floor_cache
         stored = self.store.get_instance_config(VERIFICATION_GRACE_FLOOR)
         recorded = stored.get("recorded_at") if isinstance(stored, dict) else None
-        if isinstance(recorded, str):
+        if recorded is None:
+            # Absent, or a row carrying nothing: `get_instance_config` answers
+            # `{}` for both and they call for the same thing.
+            floor = self._establish_grace_floor()
+        elif isinstance(recorded, str):
             try:
-                self._grace_floor_cache = datetime.fromisoformat(recorded)
-                return self._grace_floor_cache
+                floor = datetime.fromisoformat(recorded)
             except ValueError:
-                self.logger.warning("verification_floor_unparsable", value=recorded)
-        now = self._now()
-        # Written once and never moved: what is stored wins, under the row
-        # lock, so two workers racing on first boot agree on one floor rather
-        # than each overwriting the other - and a floor that moved later would
-        # hand a fresh day to every account that had already expired.
+                self.logger.error(
+                    "verification_floor_invalid", value=recorded[:64]
+                )
+                floor = None
+        else:
+            self.logger.error(
+                "verification_floor_invalid", value=type(recorded).__name__
+            )
+            floor = None
+        self._grace_floor_cache = floor
+        self._grace_floor_resolved = True
+        return floor
+
+    def _establish_grace_floor(self) -> Optional[datetime]:
+        """Record this instance's floor, once.
+
+        What is stored wins, under the row lock, so workers racing on first
+        boot agree on one value rather than each overwriting the other. The
+        write is read back rather than assumed: another worker may have won,
+        and what it wrote is what every later reader will see.
+        """
         written = self.store.record_instance_config_default(
-            VERIFICATION_GRACE_FLOOR, {"recorded_at": now.isoformat()}
+            VERIFICATION_GRACE_FLOOR, {"recorded_at": self._now().isoformat()}
         )
         recorded = (written or {}).get("recorded_at")
         if isinstance(recorded, str):
             try:
-                self._grace_floor_cache = datetime.fromisoformat(recorded)
-                return self._grace_floor_cache
+                return datetime.fromisoformat(recorded)
             except ValueError:
-                pass
-        self._grace_floor_cache = now
-        return now
+                self.logger.error(
+                    "verification_floor_invalid", value=recorded[:64]
+                )
+        return None
 
     def _verification_deadline(self, user: User) -> datetime:
         """When an unverified account stops authenticating.
 
-        The later of its own birthday and the floor, plus the grace period.
+        The later of its own birthday and the floor, plus the grace period -
+        or its birthday alone when no floor is available, which is the
+        conservative reading: an account older than the grace is expired
+        rather than granted another day, and a new one still gets the
+        remainder of its own.
         """
         created = user.created_at
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
-        return max(created, self._grace_floor()) + timedelta(
-            minutes=UNVERIFIED_GRACE_MINUTES
-        )
+        floor = self._grace_floor()
+        origin = max(created, floor) if floor is not None else created
+        return origin + timedelta(minutes=UNVERIFIED_GRACE_MINUTES)
 
     def _grace_expired(self, user: User) -> bool:
         """Whether this account's grace period has run out.

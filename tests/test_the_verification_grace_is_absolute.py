@@ -41,7 +41,10 @@ from datetime import timedelta
 import psycopg
 import pytest
 
-from liminallm.service.auth import VERIFICATION_GRACE_FLOOR
+from liminallm.service.auth import (
+    UNVERIFIED_GRACE_MINUTES,
+    VERIFICATION_GRACE_FLOOR,
+)
 from liminallm.service.errors import ServiceError
 from liminallm.service.runtime import get_runtime
 
@@ -85,6 +88,7 @@ def _age_floor(store, hours):
             (aged, VERIFICATION_GRACE_FLOOR),
         )
     runtime.auth._grace_floor_cache = None
+    runtime.auth._grace_floor_resolved = False
 
 
 def _expire(store, user_id, hours=25):
@@ -527,3 +531,100 @@ class TestOAuthRefusesWithoutProof:
         assert asyncio.run(
             auth.complete_oauth("google", "code", _uuid.uuid4().hex)
         ) == (None, None, {})
+
+
+def _corrupt_floor(store, value):
+    """Put something unreadable where the floor belongs, and force a re-read.
+
+    A restore, a manual repair, a later writer or a parser change could all
+    produce this. Production's own writer cannot, which is exactly why the
+    behaviour needs pinning rather than assuming.
+    """
+    runtime = get_runtime()
+    runtime.auth._grace_floor()  # ensure the row exists
+    with psycopg.connect(store.dsn, autocommit=True) as conn:
+        conn.execute(
+            "UPDATE instance_config SET config = "
+            "jsonb_set(config, '{recorded_at}', to_jsonb(%s::text)) "
+            "WHERE name = %s",
+            (value, VERIFICATION_GRACE_FLOOR),
+        )
+    runtime.auth._grace_floor_cache = None
+    runtime.auth._grace_floor_resolved = False
+
+
+def _raw_floor(store):
+    with psycopg.connect(store.dsn, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT config::text FROM instance_config WHERE name = %s",
+            (VERIFICATION_GRACE_FLOOR,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+class TestACorruptFloorFailsClosed:
+    """An unreadable floor must not become extra authorization time.
+
+    The dangerous reading is "cannot parse it, so use now": that grants every
+    expired account another full day, and overwrites the evidence. The floor
+    exists only to grandfather accounts that predate the rule, so losing it
+    means no grandfathering - not a new grace period.
+    """
+
+    def test_an_old_account_is_expired_and_the_row_is_left_alone(
+        self, client, store, account
+    ):
+        _age_account(store, account["user_id"], 500)
+        _corrupt_floor(store, "not a timestamp")
+        before = _raw_floor(store)
+
+        resp = _login(client, account["email"])
+
+        assert resp.status_code == 403, (
+            "a corrupt floor granted a 500-hour-old unverified account a "
+            f"fresh grace period: {resp.text}"
+        )
+        assert resp.json()["error"]["code"] == "verification_required"
+        assert _raw_floor(store) == before, (
+            "the corrupt floor was overwritten, destroying what an operator "
+            "would need to diagnose it"
+        )
+
+    def test_a_new_account_keeps_the_remainder_of_its_own_day(
+        self, client, store, account
+    ):
+        """Corruption must not lock out an account created minutes ago."""
+        _corrupt_floor(store, "not a timestamp")
+
+        resp = _login(client, account["email"])
+        assert resp.status_code == 200, (
+            f"a corrupt floor locked out a brand-new account: {resp.text}"
+        )
+
+        runtime = get_runtime()
+        user = store.get_user(account["user_id"])
+        deadline = runtime.auth._verification_deadline(user)
+        expected = user.created_at + timedelta(minutes=UNVERIFIED_GRACE_MINUTES)
+        assert abs((deadline - expected).total_seconds()) < 1, (
+            "the deadline is not measured from the account's own creation"
+        )
+        session = store.get_session(resp.json()["data"]["session_id"])
+        assert session.expires_at <= deadline
+
+    def test_a_floor_of_the_wrong_type_is_also_refused(self, client, store, account):
+        """Not every corruption is a bad string."""
+        _age_account(store, account["user_id"], 500)
+        runtime = get_runtime()
+        runtime.auth._grace_floor()
+        with psycopg.connect(store.dsn, autocommit=True) as conn:
+            conn.execute(
+                "UPDATE instance_config SET config = "
+                "jsonb_set(config, '{recorded_at}', '12345'::jsonb) "
+                "WHERE name = %s",
+                (VERIFICATION_GRACE_FLOOR,),
+            )
+        runtime.auth._grace_floor_cache = None
+        runtime.auth._grace_floor_resolved = False
+
+        assert runtime.auth._grace_floor() is None
+        assert _login(client, account["email"]).status_code == 403
