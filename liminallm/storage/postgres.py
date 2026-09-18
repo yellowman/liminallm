@@ -4626,22 +4626,30 @@ class PostgresStore:
     def get_system_settings_state(self) -> tuple[dict, int]:
         """The stored overrides and the citation rollback generation, together.
 
-        One transaction, because a worker decides two things from this pair and
+        One statement, because a worker decides two things from this pair and
         they have to describe the same moment: whether a withdrawal happened
-        that it did not see, and what the value is now. Reading them separately
-        allows a write to land in between, so a peer could take the generation
-        from before a rollback and the boolean from after it - and conclude
-        nothing was withdrawn.
+        that it did not see, and what the value is now.
+
+        A transaction is not enough. The default isolation is READ COMMITTED,
+        where every statement takes its own snapshot, so two SELECTs inside one
+        transaction still straddle a write that commits between them. Measured:
+        with a disable committing in that gap, the pair came back as the
+        boolean from before it and the generation from after. `refresh_settings`
+        then withdrew authority from the live executions, correctly, and
+        immediately applied the stale `True` prospectively - so executions
+        opened afterwards were born with the authority the operator had just
+        removed, until the next poll.
+
+        One statement takes one snapshot, so the pair cannot straddle anything.
         """
-        with self._connect() as conn, conn.transaction():
-            settings_row = conn.execute(
-                "SELECT config FROM instance_config WHERE name = %s",
-                ("system_settings",),
-            ).fetchone()
-            generation_row = conn.execute(
-                "SELECT config FROM instance_config WHERE name = %s",
-                (self.CITATION_ROLLBACK_GENERATION,),
-            ).fetchone()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT name, config FROM instance_config WHERE name = ANY(%s)",
+                (["system_settings", self.CITATION_ROLLBACK_GENERATION],),
+            ).fetchall()
+        by_name = {row["name"]: row for row in rows}
+        settings_row = by_name.get("system_settings")
+        generation_row = by_name.get(self.CITATION_ROLLBACK_GENERATION)
         overrides = {
             key: value
             for key, value in self._coerce_stored_settings(settings_row).items()
@@ -4706,6 +4714,30 @@ class PostgresStore:
             except Exception:
                 return {}
         return raw_config if isinstance(raw_config, dict) else {}
+
+    def read_instance_config(self, name: str) -> Optional[dict]:
+        """The stored blob, or None when no row exists at all.
+
+        `get_instance_config` answers `{}` for an absent row and for a present
+        one holding nothing usable. That is right for a caller treating
+        configuration as optional, and wrong for one deciding whether a piece
+        of authority state was ever established: "never written" and "written
+        and now unreadable" call for opposite actions, and collapsing them
+        makes a corrupt row look like a fresh install.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s", (name,)
+            ).fetchone()
+        if not row:
+            return None
+        config = row.get("config")
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except Exception:  # noqa: BLE001
+                return {}
+        return config if isinstance(config, dict) else {}
 
     def get_instance_config(self, name: str) -> dict:
         """Read a named JSONB blob from instance_config ({} when absent)."""

@@ -204,25 +204,39 @@ class AuthService:
         """
         if self._grace_floor_resolved:
             return self._grace_floor_cache
-        stored = self.store.get_instance_config(VERIFICATION_GRACE_FLOOR)
-        recorded = stored.get("recorded_at") if isinstance(stored, dict) else None
-        if recorded is None:
-            # Absent, or a row carrying nothing: `get_instance_config` answers
-            # `{}` for both and they call for the same thing.
+        stored = self.store.read_instance_config(VERIFICATION_GRACE_FLOOR)
+        if stored is None:
+            # No row at all: never established, so establish it.
             floor = self._establish_grace_floor()
-        elif isinstance(recorded, str):
-            try:
-                floor = datetime.fromisoformat(recorded)
-            except ValueError:
+        else:
+            # A row exists, so the floor was established once. Anything
+            # unusable in it is corruption, not absence. Reading it as absence
+            # and writing a fresh floor is the fail-open this policy exists to
+            # prevent: it hands every expired account another day and
+            # overwrites the evidence. A row holding `{}` or the wrong keys is
+            # the same corruption as a malformed timestamp.
+            recorded = (
+                stored.get("recorded_at") if isinstance(stored, dict) else None
+            )
+            if recorded is None:
                 self.logger.error(
-                    "verification_floor_invalid", value=recorded[:64]
+                    "verification_floor_invalid",
+                    value="row present without recorded_at",
                 )
                 floor = None
-        else:
-            self.logger.error(
-                "verification_floor_invalid", value=type(recorded).__name__
-            )
-            floor = None
+            elif isinstance(recorded, str):
+                try:
+                    floor = datetime.fromisoformat(recorded)
+                except ValueError:
+                    self.logger.error(
+                        "verification_floor_invalid", value=recorded[:64]
+                    )
+                    floor = None
+            else:
+                self.logger.error(
+                    "verification_floor_invalid", value=type(recorded).__name__
+                )
+                floor = None
         self._grace_floor_cache = floor
         self._grace_floor_resolved = True
         return floor
