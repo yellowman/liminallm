@@ -383,3 +383,137 @@ class TestGithubEmailResolution:
                 payload,
             )
             assert identity["email_verified"] is False, payload
+
+
+class TestTheMigrationFloorIsEstablishedOnce:
+    """The floor decides when every unverified account expires, so two
+    workers establishing it must not each get their own."""
+
+    def test_racing_workers_converge_on_one_floor(self, store):
+        """Both boot together, each with its own idea of `now`.
+
+        The danger is not that one is wrong - it is that they disagree, which
+        would give the same account two different deadlines depending on which
+        worker answered the request.
+        """
+        import threading
+
+        from liminallm.service.auth import VERIFICATION_GRACE_FLOOR
+        from liminallm.service.runtime import Runtime
+
+        workers = [Runtime().auth for _ in range(4)]
+        seen: list = []
+        barrier = threading.Barrier(len(workers))
+
+        def _establish(auth):
+            barrier.wait()
+            seen.append(auth._grace_floor())
+
+        threads = [
+            threading.Thread(target=_establish, args=(auth,)) for auth in workers
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(seen) == len(workers), "a worker never established a floor"
+        assert len(set(seen)) == 1, (
+            f"workers disagreed about the verification floor: {sorted(set(seen))}"
+        )
+        stored = store.get_instance_config(VERIFICATION_GRACE_FLOOR)
+        assert stored.get("recorded_at") == seen[0].isoformat(), (
+            "the value the workers agreed on is not the one that was committed"
+        )
+
+    def test_a_later_worker_cannot_move_it(self, store):
+        """Arriving afterwards reads the first commit, and writing does not
+        replace it."""
+        from liminallm.service.auth import VERIFICATION_GRACE_FLOOR
+        from liminallm.service.runtime import Runtime
+
+        first = Runtime().auth._grace_floor()
+
+        later = Runtime().auth
+        assert later._grace_floor() == first
+
+        # Even asking directly, with a value of its own.
+        written = store.record_instance_config_default(
+            VERIFICATION_GRACE_FLOOR, {"recorded_at": "2099-01-01T00:00:00+00:00"}
+        )
+        assert written["recorded_at"] == first.isoformat(), (
+            "a later write moved a floor that is supposed to be immutable"
+        )
+
+
+def test_the_refresh_credential_never_outlives_the_deadline(client, store, account):
+    """The session cap alone would leave the longer credential beside it."""
+    _age_account(store, account["user_id"], 23)
+    resp = _login(client, account["email"])
+    assert resp.status_code == 200, resp.text
+
+    runtime = get_runtime()
+    user = store.get_user(account["user_id"])
+    deadline = runtime.auth._verification_deadline(user)
+    payload = runtime.auth._decode_jwt(resp.json()["data"]["refresh_token"])
+    assert payload is not None
+    assert payload["exp"] <= deadline.timestamp() + 60, (
+        "the refresh token outlives the verification deadline, so the cap on "
+        "the session is one request from being undone"
+    )
+
+
+class TestOAuthRefusesWithoutProof:
+    def test_a_failed_exchange_says_nothing(self, store, account):
+        """No provider proof, so no verification state is disclosed.
+
+        The expired account exists and is unverified. A caller who cannot
+        complete the exchange must not learn either fact.
+        """
+        import asyncio
+
+        runtime = get_runtime()
+        auth = runtime.auth
+        _expire(store, account["user_id"])
+        settings = runtime.settings
+        before = (
+            settings.oauth_google_client_id,
+            settings.oauth_google_client_secret,
+            settings.oauth_redirect_uri,
+        )
+        settings.oauth_google_client_id = "test-client-id"
+        settings.oauth_google_client_secret = "test-client-secret"
+        settings.oauth_redirect_uri = "https://example.com/callback"
+        try:
+            start = asyncio.run(auth.start_oauth("google"))
+
+            async def _fails(_provider, _code):
+                return None
+
+            real = auth._exchange_oauth_code
+            auth._exchange_oauth_code = _fails
+            try:
+                user, session, tokens = asyncio.run(
+                    auth.complete_oauth("google", "code", start["state"])
+                )
+            finally:
+                auth._exchange_oauth_code = real
+        finally:
+            (
+                settings.oauth_google_client_id,
+                settings.oauth_google_client_secret,
+                settings.oauth_redirect_uri,
+            ) = before
+
+        assert (user, session, tokens) == (None, None, {}), (
+            "a failed exchange produced something other than the generic refusal"
+        )
+
+    def test_an_unknown_state_says_nothing(self):
+        import asyncio
+        import uuid as _uuid
+
+        auth = get_runtime().auth
+        assert asyncio.run(
+            auth.complete_oauth("google", "code", _uuid.uuid4().hex)
+        ) == (None, None, {})

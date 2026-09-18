@@ -177,8 +177,13 @@ class AuthService:
         Held in memory after the first read. The deadline is consulted on every
         login, every refresh and every API-key authentication - including
         `/v1/responses`, which is the hottest one - and a value that never
-        moves has no reason to cost a query each time. An operator who deletes
-        the row to reset the grace needs a restart for it to take effect.
+        moves has no reason to cost a query each time.
+
+        Caching it for the service's lifetime is safe precisely because the
+        floor is immutable. There is no supported way to reset it: the row is
+        part of authority semantics rather than configuration, so removing it
+        by hand is database surgery, and a process that has already read it
+        will not notice.
         """
         if self._grace_floor_cache is not None:
             return self._grace_floor_cache

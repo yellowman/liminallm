@@ -4776,27 +4776,31 @@ class PostgresStore:
         recorded instant, say - a merge is the wrong primitive, because two
         workers arriving together would each overwrite the other's.
 
-        Under the row lock, so the first writer's value is what every later
-        caller reads back.
+        One statement, and the conflict resolution is what makes it safe.
+        Reading first and writing after does not work here: `FOR UPDATE` locks
+        nothing when the row does not exist, so concurrent callers all find it
+        absent, all write, and the last one wins - each having returned the
+        value it computed rather than the one that was committed. Measured with
+        four workers establishing a value together: three different answers.
+
+        `EXCLUDED.config || instance_config.config` concatenates with the
+        stored side on the right, so it wins key by key, and `RETURNING` hands
+        back what the row actually holds. `updated_at` is carried over rather
+        than bumped, because a call that changed nothing is not a write.
         """
         with self._connect() as conn, conn.transaction():
             row = conn.execute(
-                "SELECT config FROM instance_config WHERE name = %s FOR UPDATE",
-                (name,),
+                """
+                INSERT INTO instance_config (name, config, created_at, updated_at)
+                VALUES (%s, %s, now(), now())
+                ON CONFLICT (name) DO UPDATE
+                SET config = EXCLUDED.config || instance_config.config,
+                    updated_at = instance_config.updated_at
+                RETURNING config
+                """,
+                (name, json.dumps(patch)),
             ).fetchone()
-            current = self._coerce_stored_settings(row)
-            merged = {**patch, **current}
-            if merged != current or not row:
-                conn.execute(
-                    """
-                    INSERT INTO instance_config (name, config, created_at, updated_at)
-                    VALUES (%s, %s, now(), now())
-                    ON CONFLICT (name) DO UPDATE
-                    SET config = EXCLUDED.config, updated_at = now()
-                    """,
-                    (name, json.dumps(merged)),
-                )
-        return merged
+        return self._coerce_stored_settings(row)
 
     def merge_instance_config(self, name: str, patch: dict) -> dict:
         """Merge keys into a named blob atomically; returns the merged dict."""
