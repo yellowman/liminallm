@@ -19,6 +19,15 @@ the next settings write or a restart - not until the next poll.
 
 Scope: the policy a worker already holds. A worker that has never read anything
 has no policy to keep, so a failure during boot still yields the defaults.
+
+The patched method is `get_system_settings_state`, which is what
+`_system_settings_overrides` calls. These tests used to patch
+`get_system_settings_overrides`, and when the citation rollback generation
+moved the read onto the combined method they kept passing while exercising
+nothing: the patched method was no longer called, so no read ever failed and
+every assertion was satisfied by the stored value. Measured - restoring the
+original defect left all six green. A test that names a collaborator is only a
+test while that collaborator is the one being used.
 """
 
 from __future__ import annotations
@@ -59,7 +68,7 @@ def test_the_stored_policy_reaches_a_worker(store):
 
 
 def test_a_failed_read_does_not_restore_the_default(worker, monkeypatch):
-    monkeypatch.setattr(worker.store, "get_system_settings_overrides", _boom)
+    monkeypatch.setattr(worker.store, "get_system_settings_state", _boom)
 
     worker.refresh_settings()
 
@@ -78,7 +87,7 @@ def test_a_failed_read_does_not_re_grant_authority_to_live_executions(
     live = worker.workflow.invocations.open(uuid.uuid4().hex, tool="t")
     assert live.citation_offers_intact is False
 
-    monkeypatch.setattr(worker.store, "get_system_settings_overrides", _boom)
+    monkeypatch.setattr(worker.store, "get_system_settings_state", _boom)
     worker.refresh_settings()
 
     assert worker.workflow.invocations.citation_offers is False
@@ -101,7 +110,7 @@ def test_a_failed_read_is_retried_on_the_next_poll(worker, store, monkeypatch):
         "citation_offers_enabled": False, "default_page_size": 120
     })
 
-    monkeypatch.setattr(worker.store, "get_system_settings_overrides", _boom)
+    monkeypatch.setattr(worker.store, "get_system_settings_state", _boom)
     worker.maybe_reload_model_services()
     assert worker.settings.citation_offers_enabled is False
 
@@ -117,7 +126,7 @@ def test_a_failed_read_is_retried_on_the_next_poll(worker, store, monkeypatch):
 
 def test_a_recovered_read_replaces_the_kept_policy(worker, store, monkeypatch):
     """Keeping the last policy must not become ignoring the current one."""
-    monkeypatch.setattr(worker.store, "get_system_settings_overrides", _boom)
+    monkeypatch.setattr(worker.store, "get_system_settings_state", _boom)
     worker.refresh_settings()
     monkeypatch.undo()
 
@@ -140,7 +149,7 @@ def test_a_model_rebuild_with_a_failed_read_is_retried_too(
         "citation_offers_enabled": False, "default_page_size": 140
     })
 
-    monkeypatch.setattr(worker.store, "get_system_settings_overrides", _boom)
+    monkeypatch.setattr(worker.store, "get_system_settings_state", _boom)
     worker.reload_model_services()
     assert worker.settings.citation_offers_enabled is False
 
