@@ -12,9 +12,13 @@ Two consequences, and both are deliberately small. A session minted for an
 unverified account is capped at twenty-four hours - the number is the SPEC's,
 so it is a constant rather than a setting. And its rate limits are the
 ordinary per-plan ones times one modifier, which *is* a setting, because "low"
-is a number the SPEC does not give and an operator has to choose. The clause
-about a grace period is not covered: what expiring is meant to do to an
-account is not stated anywhere, and guessing would mean inventing a lockout.
+is a number the SPEC does not give and an operator has to choose.
+
+The grace clause is covered now, in `test_the_verification_grace_is_absolute`:
+the deadline is absolute, measured from the account rather than from each
+session, and expiring closes ordinary authority while leaving the mailbox as
+the way back. What this file still pins is the other half - that credentials
+minted before the deadline are short, and that the rate is lower throughout.
 
 The cap is applied where the lifetime is decided rather than at each caller.
 Four seams mint a session - signup, OAuth, login, and the rotation a long-
@@ -31,6 +35,7 @@ would simply send the same turns over the Responses API or the socket.
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from datetime import timedelta
@@ -40,7 +45,7 @@ from fastapi import HTTPException
 
 from liminallm.api import routes
 from liminallm.api.limits import enforce_per_plan, plan_rate_multiplier
-from liminallm.service.auth import UNVERIFIED_SESSION_MAX_MINUTES
+from liminallm.service.auth import UNVERIFIED_GRACE_MINUTES
 from liminallm.service.runtime import get_runtime
 
 PASSWORD = "Str0ng!passw0rd"
@@ -180,12 +185,13 @@ class TestTheSessionIsCappedAtADay:
     ):
         """The third seam, and the one that carries the consequence.
 
-        Nothing records what the provider asserted about the address - the
-        identity parser drops Google's `verified_email`, and Microsoft returns
-        no equivalent - so an account created this way is unverified by this
-        definition and is held to the day. That is the fail-closed reading and
-        it is deliberate, but it is the half of this tranche a reader should
-        see stated rather than discover.
+        The identity here carries no `email_verified`, which is what a
+        provider that does not attest looks like - Microsoft Graph, or a
+        Google response without `verified_email`. Such an account is
+        unverified and held to the deadline.
+
+        The opposite case, where a provider does attest to this exact address,
+        is pinned in `test_the_verification_grace_is_absolute`.
         """
         runtime = get_runtime()
         auth = runtime.auth
@@ -226,7 +232,7 @@ class TestTheSessionIsCappedAtADay:
         assert user.email_verified is False
         assert _minutes(store.get_session(session.id)) <= DAY_MINUTES
 
-    def test_the_two_lifetime_helpers_carry_the_cap(self):
+    def test_the_two_lifetime_helpers_carry_the_cap(self, store):
         """Where the rule lives, stated directly: a seam that has not been
         written yet gets this for free by asking either helper.
 
@@ -236,27 +242,43 @@ class TestTheSessionIsCappedAtADay:
         """
         auth = get_runtime().auth
 
+        fresh = store.get_user(
+            asyncio.run(auth.signup(_email(), PASSWORD))[0].id
+        )
         for device in ("web", "mobile"):
-            assert auth._get_session_ttl(device, verified=False) == DAY_MINUTES
-            assert auth._get_refresh_ttl(device, verified=False) == DAY_MINUTES
-        assert UNVERIFIED_SESSION_MAX_MINUTES == DAY_MINUTES
+            # Within a minute of a day: the cap is now measured to the
+            # account's deadline, so a brand-new account has all but the
+            # moment this test took.
+            assert DAY_MINUTES - 1 <= auth._get_session_ttl(
+                device, user=fresh
+            ) <= DAY_MINUTES
+            assert DAY_MINUTES - 1 <= auth._get_refresh_ttl(
+                device, user=fresh
+            ) <= DAY_MINUTES
+        assert UNVERIFIED_GRACE_MINUTES == DAY_MINUTES
 
 
 class TestAVerifiedAccountIsUnchanged:
     """The other half. This tranche shortens one thing and must not shorten
     anything else."""
 
-    def test_the_ordinary_lifetimes_are_untouched(self):
+    def test_the_ordinary_lifetimes_are_untouched(self, store):
         auth = get_runtime().auth
         settings = get_runtime().settings
 
-        assert auth._get_session_ttl("web", verified=True) == (
+        user = store.get_user(
+            asyncio.run(auth.signup(_email(), PASSWORD))[0].id
+        )
+        store.mark_email_verified(user.id)
+        verified = store.get_user(user.id)
+
+        assert auth._get_session_ttl("web", user=verified) == (
             settings.session_ttl_minutes_web
         )
-        assert auth._get_session_ttl("mobile", verified=True) == (
+        assert auth._get_session_ttl("mobile", user=verified) == (
             settings.session_ttl_minutes_mobile
         )
-        assert auth._get_refresh_ttl("web", verified=True) == (
+        assert auth._get_refresh_ttl("web", user=verified) == (
             settings.refresh_token_ttl_minutes_web
         )
 

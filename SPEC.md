@@ -2025,7 +2025,25 @@ about what exists elsewhere in the installation.
   - completing a password reset rotates credentials and revokes sessions
     and refresh tokens.
   - unverified accounts are limited to 24h and low rate limits until
-    verified or the grace period expires.
+    verified or the grace period expires. the 24h is the account's, not
+    each session's: the deadline is fixed when the account is created, and
+    no credential it holds - session, refresh token or API key - may
+    outlast it. an account that predates this rule is measured from a
+    one-time floor recorded at first boot instead, so introducing the
+    deadline does not expire a database of accounts retroactively.
+  - after the deadline, a caller who **proves** a credential (the
+    password, or an OAuth identity) is answered `verification_required`
+    (403) and sent a fresh verification message; `POST
+    /v1/auth/verify_email` takes that token alone, so the mailbox is the
+    way back and no session is issued to enable recovery. an API key stops
+    authenticating and is *not* revoked - verifying restores it. clients
+    branch on this code: it is the one refusal that names its own remedy,
+    and it is distinct from `unauthorized`, which is what an unproven
+    credential gets whatever the account's state. minting a new API key is
+    refused for any unverified account, during the grace as well as after.
+  - signing in with a provider proves the identity, not the address. an
+    account becomes verified from a provider only on an explicit claim
+    about the address that account already has.
 - **MFA (TOTP)**: enable issues secret + QR; verify gates login/refresh
   once enabled; 5 failed codes locks MFA for 5 minutes. The parameters
   are **HMAC-SHA-1, 6 digits, 30s, 160-bit secret** (RFC 6238 / RFC 4226)

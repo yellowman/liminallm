@@ -107,6 +107,11 @@ _VALID_ERROR_CODES = frozenset({
     "busy",
     "ingest_failed",
     "not_implemented",
+    # A 403 that names the one action resolving it: the account's verification
+    # grace period has expired (SPEC §12.1). `forbidden` would be true and
+    # useless - a client cannot tell from it that checking the mailbox is what
+    # restores the account.
+    "verification_required",
 })
 
 

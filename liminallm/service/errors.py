@@ -66,10 +66,24 @@ class ConflictError(ServiceError):
     error_code = "conflict"
 
 
+class VerificationRequiredError(ServiceError):
+    """The account's verification grace period has expired (403).
+
+    Distinct from `forbidden` because it names the one action that resolves
+    it. Raised only after the caller has proven a credential - the password or
+    the provider identity - so it tells an authenticated caller what to do
+    next rather than telling a stranger which addresses have accounts.
+    """
+    status_code = 403
+    error_code = "verification_required"
+
+
 __all__ = [
     "ServiceError",
     "ValidationError",
     "BadRequestError",
     "NotFoundError",
+    "ForbiddenError",
     "ConflictError",
+    "VerificationRequiredError",
 ]
