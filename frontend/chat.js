@@ -1402,6 +1402,28 @@ const cleanupWebSocket = () => {
 
 window.addEventListener('beforeunload', cleanupWebSocket);
 
+// A chat turn falls back to REST only when the socket itself failed, and this
+// is what says so. Fallback is opt-in: `sendMessage` retries an error only if
+// it carries this tag, so anything untagged propagates to the caller and
+// reaches the error banner.
+//
+// The direction matters. A `.catch()` that cannot tell a dead socket from a
+// server that answered "conversation not found" retries the turn over REST,
+// the retry succeeds against a different conversation, and the outer handler
+// that would have shown the real cause never runs. The user sees a reply to a
+// chat they deleted instead of the reason it failed.
+//
+// Only a transport that failed to carry the exchange is tagged. A server that
+// answered with an application error, and a server whose bytes the client
+// cannot parse, have both already done whatever they did to the turn -
+// replaying it hides a real fault and re-runs work of unknown extent, which
+// an idempotency key narrows but does not make safe to assume.
+const transportError = (message) => {
+  const err = new Error(message);
+  err.retryableTransport = true;
+  return err;
+};
+
 // Open a fresh socket for one chat exchange; resolves once it is usable.
 const openChatSocket = () =>
   new Promise((resolve, reject) => {
@@ -1409,7 +1431,7 @@ const openChatSocket = () =>
     const socket = new WebSocket(`${protocol}://${window.location.host}${apiBase}/chat/stream`);
     const timeout = setTimeout(() => {
       socket.close();
-      reject(new Error('WebSocket connection timeout'));
+      reject(transportError('WebSocket connection timeout'));
     }, 5000);
     socket.addEventListener('open', () => {
       clearTimeout(timeout);
@@ -1418,7 +1440,7 @@ const openChatSocket = () =>
     });
     socket.addEventListener('error', () => {
       clearTimeout(timeout);
-      reject(new Error('WebSocket connection failed'));
+      reject(transportError('WebSocket connection failed'));
     });
   });
 
@@ -1512,7 +1534,7 @@ const sendMessage = async (event) => {
           settled = true;
           cleanup();
           if (streamingMsg) streamingMsg.finalize('Timed out');
-          reject(new Error('Streaming timed out'));
+          reject(transportError('Streaming timed out'));
         }, 120000);
       };
       armIdleTimer();
@@ -1638,7 +1660,7 @@ const sendMessage = async (event) => {
           settled = true;
           cleanup();
           if (streamingMsg) streamingMsg.finalize('Connection error');
-          reject(new Error('WebSocket failed'));
+          reject(transportError('WebSocket failed'));
         }
       };
 
@@ -1653,7 +1675,7 @@ const sendMessage = async (event) => {
             resolve(messageDoneData);
           } else {
             if (streamingMsg) streamingMsg.finalize('Connection closed');
-            reject(new Error('Connection closed'));
+            reject(transportError('Connection closed'));
           }
         }
       };
@@ -1686,8 +1708,12 @@ const sendMessage = async (event) => {
     showTypingIndicator();
     updateStreamingUI(true);
 
-    const data = await chatViaWebSocketStreaming().catch(async () => {
-      // Fallback to REST API if WebSocket fails
+    const data = await chatViaWebSocketStreaming().catch(async (err) => {
+      // Only a failed transport is retried here. A server `error` event, a
+      // legacy `status != ok` envelope and a frame that would not parse all
+      // reach the caller instead, so the outer handler can name the cause.
+      if (!err?.retryableTransport) throw err;
+      // Fallback to REST API if the WebSocket transport fails
       const envelope = await requestEnvelope(
         `${apiBase}/chat`,
         { method: 'POST', headers: headers(idempotencyKey), body: JSON.stringify({ ...payload, stream: false }) },

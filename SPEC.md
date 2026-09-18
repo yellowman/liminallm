@@ -2599,10 +2599,14 @@ live in docs/ui.md; this section is the behavioral contract.
 - **surfaces**: conversations, notes (when enabled), knowledge contexts,
   files, artifacts, tools, insights, settings - each backed only by the
   §13 APIs.
-- **streaming**: WebSocket primary (§13.7) with HTTP fallback; tokens
-  accumulate into the message; cancel is a connection close or
-  `POST /v1/chat/cancel`; the UI renders the trace events it receives and
-  invents nothing.
+- **streaming**: WebSocket primary (§13.7) with HTTP fallback. The fallback
+  is for a transport that failed to carry the exchange - a socket that would
+  not open, errored, closed before a terminal event, or went idle. An answer
+  the server delivered is never replayed over it: an `error` event, a legacy
+  `status != ok` envelope, and a frame that will not parse each surface to
+  the user instead, because the turn has already happened. Tokens accumulate
+  into the message; cancel is a connection close or `POST /v1/chat/cancel`;
+  the UI renders the trace events it receives and invents nothing.
 - **tenant**: the tenant is the site the user visited. The login form has
   no tenant field, no request carries one, and the client never stores
   one as authority (§12.2).
