@@ -65,7 +65,7 @@ def _free_port() -> int:
 
 
 @pytest.fixture
-def live_server():
+def live_server(quiet_background_loops):
     """The real app over real HTTP. `TestClient` would not exercise the
     transport, and the transport is what this file is about."""
     from liminallm import app as app_module

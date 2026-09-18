@@ -45,7 +45,7 @@ def _free_port() -> int:
 
 
 @pytest.fixture
-def live():
+def live(quiet_background_loops):
     from liminallm import app as app_module
 
     config = uvicorn.Config(
