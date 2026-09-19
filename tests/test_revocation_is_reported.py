@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import uuid
 
+import psycopg
 import pytest
 
 PASSWORD = "TestPassword123!"
@@ -53,6 +54,7 @@ def account(client):
     assert other.status_code == 200, other.text
     stolen = other.json()["data"]["access_token"]
     return {
+        "user_id": mine["user_id"],
         "email": email,
         "headers": {"Authorization": f"Bearer {mine['access_token']}"},
         "stolen": {"Authorization": f"Bearer {stolen}"},
@@ -129,6 +131,39 @@ class TestWhenRevocationFails:
 
         assert _alive(client, account["stolen"]), (
             "the fixture expected the failure to leave the session alive"
+        )
+
+    def test_single_session_login_fails_closed_if_prior_sessions_survive(
+        self, client, runtime, account, monkeypatch
+    ):
+        """A single-session login must not create session N+1 after failing
+        to revoke sessions 1..N."""
+        with psycopg.connect(runtime.store.dsn, autocommit=True) as conn:
+            conn.execute(
+                "UPDATE app_user SET meta = jsonb_set("
+                "COALESCE(meta, '{}'::jsonb), '{single_session}', 'true') "
+                "WHERE id = %s",
+                (account["user_id"],),
+            )
+
+        monkeypatch.setattr(
+            runtime.store,
+            "revoke_user_sessions",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")),
+        )
+
+        resp = client.post(
+            "/v1/auth/login",
+            json={"email": account["email"], "password": PASSWORD},
+        )
+
+        assert resp.status_code == 401, (
+            "single-session mode created another session even though the "
+            f"prior sessions could not be revoked: {resp.text}"
+        )
+        assert _alive(client, account["stolen"]), (
+            "the fixture expected the failed revoke to leave the old session "
+            "alive, so the fail-closed assertion proved nothing"
         )
 
     def test_the_password_still_changed(
