@@ -55,62 +55,64 @@ VIEWPORT = {"width": 1440, "height": 900}
 #: Insights and Settings have no pane and select nothing.
 TABS = [
     ("notes-tab", "03-notes", ".note-item"),
-    ("contexts-tab", "04-contexts", ".context-card"),
+    ("contexts-tab", "04-contexts", ".row"),
     ("files-tab", "05-files", None),
-    ("artifacts-tab", "06-artifacts", ".artifact-card"),
-    ("tools-tab", "07-tools", ".tool-card"),
+    ("artifacts-tab", "06-artifacts", ".row"),
+    ("tools-tab", "07-tools", ".row"),
     ("insights-tab", "08-insights", None),
     ("settings-tab", "09-settings", None),
 ]
 
+#: The second question names nobody. Answering it about the same subject is
+#: the property the chat screenshot exists to show, so it must stay
+#: unanchored: no "the pause", no "the 2023 calls".
 FIRST_THREAD = [
-    "Who is Sergey Brin, and what is he best known for?",
-    "What did he study before that, and where?",
-]
-#: Extra threads, so every screen after the chat shot shows a used workspace
-#: in the conversation sidebar rather than a first-run one.
-EXTRA_THREADS = [
-    "Who was Hunter S. Thompson, and why does his reporting still get "
-    "argued about?",
-    "What is gonzo journalism, and which piece started it?",
+    "Why did the 2023 calls to pause frontier AI training fail to stop "
+    "any lab?",
+    "Which of those obstacles does competition between countries make worst?",
 ]
 
 DOC = (
-    "# Gonzo, in one page\n\n"
-    "Hunter S. Thompson filed *The Kentucky Derby Is Decadent and Depraved* "
-    "in 1970 against a closing deadline, sending pages torn straight from "
-    "his notebook. The reporter stopped pretending to be absent from the "
-    "story, and the method got a name.\n"
+    "# The pause debate, in one page\n\n"
+    "In March 2023 an open letter asked labs to stop training systems more "
+    "capable than GPT-4 for six months. No lab stopped. Its lasting effect "
+    "was to move the argument from *whether* frontier training should be "
+    "governed to *which lever does it*: compute thresholds, evaluation "
+    "before deployment, or reporting requirements.\n"
 )
 FILES = [
-    ("gonzo-in-one-page.md", DOC.encode(), "text/markdown"),
+    ("pause-debate-in-one-page.md", DOC.encode(), "text/markdown"),
     (
-        "thompson-reading-list.txt",
-        b"Hell's Angels (1967)\n"
-        b"The Kentucky Derby Is Decadent and Depraved (1970)\n"
-        b"Fear and Loathing in Las Vegas (1971)\n"
-        b"Fear and Loathing on the Campaign Trail '72 (1973)\n",
+        "frontier-ai-reading-list.txt",
+        b"Pause Giant AI Experiments: An Open Letter (2023)\n"
+        b"The Bletchley Declaration (2023)\n"
+        b"US Executive Order 14110 on AI (2023)\n"
+        b"EU AI Act, final text (2024)\n"
+        b"International AI Safety Report (2025)\n",
         "text/plain",
     ),
 ]
 NOTES = [
     (
-        "Gonzo starts at the Derby",
-        "The 1970 Scanlan's piece is the origin point: no finished draft, "
-        "notebook pages wired in as they were, the writer visibly inside the "
-        "scene. What reads as style began as a deadline being missed.",
+        "What the pause letter changed",
+        "No lab stopped training, so by its own terms it failed. What "
+        "changed was the default question: a frontier training run became "
+        "something a lab might owe an account of, and every rule since "
+        "argues over which account counts.",
     ),
     (
-        "The reporter is a character",
-        "New Journalism let reporting borrow the novel's tools. Gonzo went "
-        "further and made the reporter's own state part of the evidence, "
-        "which is either the point or the flaw depending on the reader.",
+        "Competition is the standing objection",
+        "Every proposal to slow the frontier meets the same reply: a "
+        "one-sided slowdown moves capability rather than removing it. That "
+        "reply is strongest where verification is weakest, which makes "
+        "measurement the load-bearing problem rather than persuasion.",
     ),
     (
-        "Fear and Loathing as reportage",
-        "Read as a road book it is a comedy; read as reporting it is an "
-        "argument about what the sixties turned into. Thompson's wave "
-        "passage does the work an editorial would have.",
+        "Compute is the governable surface",
+        "Weights copy and researchers move, but large training runs need "
+        "datacenters and fabrication that are few, fixed, and already "
+        "counted. That is why thresholds get written in FLOP: not because "
+        "the number means much, but because it is the part you can see.",
     ),
 ]
 
@@ -214,26 +216,65 @@ def unwrap(resp) -> dict:
 def seed(client, token: str) -> None:
     """Fill the workspace through the same API the SPA calls."""
     headers = {"Authorization": f"Bearer {token}"}
+    user_id = unwrap(client.get("/v1/me", headers=headers)).get("id")
 
-    client.post(
-        "/v1/contexts",
-        headers=headers,
-        json={
-            "name": "Gonzo",
-            "description": "Sources on Hunter S. Thompson and the New Journalism.",
-        },
+    context = unwrap(
+        client.post(
+            "/v1/contexts",
+            headers=headers,
+            json={
+                "name": "Frontier AI policy",
+                "description": (
+                    "Sources on the pause debate, compute governance, and "
+                    "international competition."
+                ),
+            },
+        )
     )
     for name, body, mime in FILES:
         client.post(
             "/v1/files/upload", headers=headers, files={"file": (name, body, mime)}
         )
+
+    # Index the uploads into the context. Without this the Contexts screen is
+    # captured reading "No sources added yet" and "0 chunks loaded", which
+    # documents an empty context rather than the retrieval the screen is for.
+    # The path is relative: it is resolved against the caller's own root, so
+    # "files" reaches `users/{user_id}/files`, where uploads land. Passing
+    # the rooted path instead produces `users/{id}/users/{id}/files`, which
+    # this endpoint accepts and indexes nothing from.
+    context_id = context.get("id")
+    if context_id:
+        added = client.post(
+            f"/v1/contexts/{context_id}/sources",
+            headers=headers,
+            json={"fs_path": "files", "recursive": True},
+        )
+        if added.status_code != 201:
+            raise SystemExit(
+                f"could not index the uploads into the context "
+                f"(HTTP {added.status_code}): {added.text[:300]}"
+            )
+        # 201 only means the path was accepted and recorded. A path that
+        # matched no document is indexed to nothing and still answers 201,
+        # so the chunks are what say the sources are really there. This
+        # reads the endpoint the Contexts screen itself reads, rather than
+        # a count field that endpoint does not return.
+        chunks = unwrap(
+            client.get(f"/v1/contexts/{context_id}/chunks?limit=20", headers=headers)
+        ).get("items")
+        if not chunks:
+            raise SystemExit(
+                "the context indexed no chunks, so the Contexts screen "
+                "would document an empty context"
+            )
+
     for title, content in NOTES:
         client.post(
             "/v1/notes", headers=headers, json={"title": title, "content": content}
         )
 
     # The admin console is a screen too, so the demo account needs the role.
-    user_id = unwrap(client.get("/v1/me", headers=headers)).get("id")
     if user_id:
         from liminallm.service.runtime import get_runtime
 
@@ -332,29 +373,31 @@ def capture(args: argparse.Namespace, base: str) -> list[pathlib.Path]:
         time.sleep(0.8)
         shot("02-chat")
 
-        # Set dressing: these exist so the conversation list is not empty in
-        # every screen after the chat shot. The first thread is the subject
-        # of a screenshot and so is fatal when it fails; one of these is not
-        # worth losing a whole live capture over.
-        for question in EXTRA_THREADS:
-            page.click("#new-thread")
-            time.sleep(1.2)
-            try:
-                ask([question])
-            except RuntimeError as exc:
-                print(f"  skipping an extra thread: {exc}", flush=True)
+        # This is the only thread the capture opens. Extra threads would be
+        # set dressing for a conversation list that no screen below shows:
+        # each section has its own pane, and the chat shot is already taken.
 
         for tab_id, name, pick in TABS:
             page.click(f"#main-tabs .rail-btn[data-tab='{tab_id}']")
             page.wait_for_selector(f"#{tab_id}.active", state="visible")
             time.sleep(1.2)
             if pick:
+                # Fatal, not a warning. A selector that no longer matches
+                # anything is how these images went stale: the pane renders,
+                # nothing is selected, and the capture succeeds with a shot
+                # of the empty state that looks deliberate. Renaming a class
+                # in the frontend has to break this script loudly.
                 item = f".pane-view[data-pane='{tab_id}'] {pick}"
-                if page.locator(item).count():
-                    page.locator(item).first.click()
-                    time.sleep(1.2)
-                else:
-                    print(f"  no {pick} to select for {name}", flush=True)
+                try:
+                    page.wait_for_selector(item, state="visible", timeout=15000)
+                except Exception as exc:  # noqa: BLE001 - re-raised below
+                    raise RuntimeError(
+                        f"nothing matched {pick!r} in the {tab_id} pane, so "
+                        f"{name} would document the empty state; check "
+                        "whether the frontend renamed the class"
+                    ) from exc
+                page.locator(item).first.click()
+                time.sleep(1.2)
             shot(name)
 
         page.goto(f"{base}/admin", wait_until="domcontentloaded")
