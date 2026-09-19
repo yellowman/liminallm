@@ -70,6 +70,7 @@ from liminallm.api.schemas import (
     ConfigPatchDecisionRequest,
     ConfigPatchListResponse,
     ConfigPatchRequest,
+    ContextSourceCreatedResponse,
     ContextSourceListResponse,
     ContextSourceRequest,
     ContextSourceResponse,
@@ -5444,6 +5445,19 @@ async def create_context(
     ) as idem:
         if idem.cached:
             return idem.cached
+        # Before the context is written, so a refusal leaves nothing behind.
+        # `ingest_text` answers 0 for text that is blank once stripped, and
+        # this route discarded that count - so `text: "   "` created a
+        # context, indexed nothing, and reported success. `text: ""` is
+        # already no text at all, because the truthiness check below skips
+        # ingestion for it; whitespace was the one input that claimed to be
+        # content and became none.
+        if body.text and not body.text.strip():
+            raise http_error(
+                "validation_error",
+                "the text supplied holds nothing to index",
+                status_code=400,
+            )
         ctx_meta = {"embedding_model_id": runtime.rag.embedding_model_id}
         ctx = runtime.store.upsert_context(
             owner_user_id=principal.user_id,
@@ -5733,8 +5747,10 @@ async def add_context_source(
 
         # Trigger indexing via RAG service with validated path
         # Pass allowed_base for defense-in-depth path traversal protection
-        def _ingest() -> None:
+        def _ingest() -> int:
             """Read each file and commit what was read, without letting go.
+
+            Answers how many chunks were created, which the caller is told.
 
             Reading and committing are two moments. Upload, extraction and
             deletion all treat a pathname as one critical section, and this
@@ -5775,7 +5791,7 @@ async def add_context_source(
                     namespace_key(files_dir, relative.as_posix()),
                 )
 
-            runtime.rag.ingest_path(
+            return runtime.rag.ingest_path(
                 context_id=context_id,
                 fs_path=str(validated_path),
                 recursive=body.recursive,
@@ -5786,7 +5802,7 @@ async def add_context_source(
         try:
             # In a thread, both because the lock must not be taken on the
             # event loop and because walking a tree was already blocking it.
-            await asyncio.to_thread(_ingest)
+            indexed = await asyncio.to_thread(_ingest)
         except PathLockTimeout as exc:
             try:
                 runtime.store.delete_context_source(source.id)
@@ -5832,9 +5848,34 @@ async def add_context_source(
                 status_code=409,
             )
 
+        # Zero chunks is reported, not refused. A source row is the statement
+        # "this context covers this path" - `contexts_covering_path` reads
+        # that table alone and says why: coverage must not evaporate because
+        # a cleanup removed the index. Every upload consults it to decide
+        # which contexts a new file belongs in, so covering a directory that
+        # is empty today is a normal thing to do, and deleting the row would
+        # silently break "point a context at my files, then upload into it".
+        #
+        # What was missing was any way for the caller to tell that from a
+        # mistyped path. Both answered 201 with a source record that looked
+        # identical, and the only trace of the difference was a log line on
+        # the server. Measured: a mistyped relative path produced a knowledge
+        # context reporting "0 chunks loaded" with no error anywhere. The
+        # count is in the response now, so the two are distinguishable.
+        if not indexed:
+            logger.warning(
+                "context_source_indexed_nothing",
+                context_id=context_id,
+                user_id=principal.user_id,
+                fs_path=body.fs_path,
+            )
+
         envelope = Envelope(
             status="ok",
-            data=ContextSourceResponse.model_validate(source),
+            data=ContextSourceCreatedResponse(
+                **ContextSourceResponse.model_validate(source).model_dump(),
+                chunk_count=indexed,
+            ),
             request_id=idem.request_id,
         )
         await idem.store_result(envelope)

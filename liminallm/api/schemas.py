@@ -836,6 +836,25 @@ class ContextSourceResponse(BaseModel):
     meta: Optional[dict] = None
 
 
+class ContextSourceCreatedResponse(ContextSourceResponse):
+    """The stored source, plus what indexing it produced just now.
+
+    `chunk_count` is deliberately outside the mirror above, and this is a
+    subclass rather than a field on it: it is the outcome of one request,
+    not a column, and `model_validate()` on the storage row could never
+    populate it.
+
+    It exists because zero is a legitimate answer that the caller could not
+    previously see. A source row is the statement "this context covers this
+    path", and it is read on every later upload to decide which contexts a
+    new file belongs in - so covering a directory that is empty today is a
+    normal thing to do. What was missing was any way to tell that from a
+    mistyped path, which indexed nothing and looked identical.
+    """
+
+    chunk_count: int
+
+
 class ContextSourceListResponse(BaseModel):
     """Response containing a list of context sources."""
     items: List[ContextSourceResponse]

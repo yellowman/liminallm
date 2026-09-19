@@ -264,7 +264,13 @@ class TestASourceBeneathAHiddenDirectoryIsStillInternal:
             json={"fs_path": str(target), "recursive": True},
         )
 
+        # Accepted, and reported as having indexed nothing. The property
+        # this test is about is the one below - nothing internal reaches the
+        # corpus - and it is unchanged either way. The source row is kept
+        # because it is coverage, which later uploads consult; what tells
+        # the caller nothing was taken is `chunk_count`.
         assert resp.status_code in (200, 201), resp.text
+        assert resp.json()["data"]["chunk_count"] == 0, resp.text
         assert not chunk_paths(context.id), (
             f"a source named beneath a hidden directory was indexed: "
             f"{chunk_paths(context.id)}"

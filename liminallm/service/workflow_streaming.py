@@ -51,6 +51,7 @@ from liminallm.service.tool_namespace import (
     ResolvedWorkflow,
     ToolResolutionScope,
 )
+from liminallm.service.tool_worker import NO_ANSWER_FALLBACK
 from liminallm.service.transcript import ModelTurn
 from liminallm.service.workflow_graph import graph_problems
 from liminallm.service.workflow_limits import (
@@ -1534,6 +1535,25 @@ class WorkflowStreamingMixin:
             self._merge_bindings(successful, seen, agent_bindings)
             self._merge_bindings(successful, seen, capability_bindings)
             bindings_sink.extend(successful)
+        # The worker's return carries this fallback and `stream_final`
+        # overwrites it, because on this path the parent writes the answer -
+        # so the parent needs it too. A final turn that produced no tokens
+        # left this empty, and the workflow layer turned that into its "No
+        # response generated." placeholder, which reads to the person who
+        # asked as a malfunction rather than as the honest result it is.
+        #
+        # Reachable: the rounds may end on a tool result, and a tool that
+        # returned nothing useful leaves the model with nothing to write
+        # from. Measured against a live provider, twice, with two `web_fetch`
+        # rounds and no prose after them.
+        if not content:
+            content = NO_ANSWER_FALLBACK
+            if not emitted_tokens:
+                # As a token as well, not only in the result. Nothing was
+                # streamed, so a client that renders the token stream and
+                # keeps `message_done` for bookkeeping shows an empty bubble.
+                emitted_tokens = True
+                yield {"event": "token", "data": content}
         completed = {
             "content": content,
             "usage": usage,

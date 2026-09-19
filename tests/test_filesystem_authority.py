@@ -504,7 +504,15 @@ class TestTheContextSourceRoute:
 
     def test_a_users_own_file_still_works(self, client, runtime):
         """The ordinary path must survive the fix, or the refusal above is
-        just a broken route."""
+        just a broken route.
+
+        The path is `files/notes.md` and not `notes.md`. An upload lands in
+        `users/{id}/files`, while a relative source path resolves against
+        `users/{id}` - so the bare name pointed one directory above the
+        document. This asserted 201 on a path that did not exist, and passed
+        because the route answered 201 for a source that indexed nothing.
+        It proved the opposite of what it claims whenever the route worked.
+        """
         user, headers = self._account(client, runtime)
         upload = client.post(
             "/v1/files/upload",
@@ -517,9 +525,15 @@ class TestTheContextSourceRoute:
         resp = client.post(
             f"/v1/contexts/{context_id}/sources",
             headers=headers,
-            json={"fs_path": "notes.md"},
+            json={"fs_path": "files/notes.md"},
         )
         assert resp.status_code == 201, resp.text
+        chunks = client.get(
+            f"/v1/contexts/{context_id}/chunks?limit=5", headers=headers
+        )
+        assert chunks.json()["data"]["items"], (
+            "201 with nothing indexed is the defect this route had"
+        )
 
 
 # ---------------------------------------------------------------------------
