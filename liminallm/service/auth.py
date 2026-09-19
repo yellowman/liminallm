@@ -977,39 +977,37 @@ class AuthService:
         return self.store.list_users(tenant_id=tenant_id, limit=limit)
 
     async def set_user_role(self, user_id: str, role: str) -> Optional[User]:
-        """Update user role and invalidate all existing sessions.
+        """Update a user's role only after their existing sessions are gone.
 
-        Issue 22.1: When role changes, existing sessions must be invalidated
-        to prevent users from retaining previous privilege levels.
+        A surviving refresh token is not pinned to the role in the token: the
+        refresh path reloads the user and issues credentials for the role the
+        account has *now*. Updating first and then failing revocation therefore
+        lets an old session inherit an upgrade.
+
+        Revoke first. If revocation fails, the role is unchanged and the
+        operation can truthfully fail. If revocation succeeds and the later
+        role write fails, the only side effect is an extra logout, which is
+        the safe direction.
         """
-        user = self.store.update_user_role(user_id, role)
-        if user:
-            # Revoke all sessions for this user to enforce new role. The role
-            # update is already committed, so failure is reported rather than
-            # rolled back - but the success log must not claim a delete that
-            # did not happen.
-            try:
-                revoked = await self.revoke_all_user_sessions(user_id)
-            except Exception as exc:
-                revoked = False
-                self.logger.warning(
-                    "user_role_session_revocation_failed",
-                    user_id=user_id,
-                    error=str(exc),
-                )
-            if revoked:
-                self.logger.info(
-                    "user_role_updated_sessions_revoked",
-                    user_id=user_id,
-                    new_role=role,
-                )
-            else:
-                self.logger.warning(
-                    "user_role_updated_sessions_survived",
-                    user_id=user_id,
-                    new_role=role,
-                )
-        return user
+        user = self.store.get_user(user_id)
+        if not user:
+            return None
+        revoked = await self.revoke_all_user_sessions(user_id)
+        if not revoked:
+            self.logger.warning(
+                "user_role_change_revocation_failed",
+                user_id=user_id,
+                requested_role=role,
+            )
+            raise RuntimeError("existing sessions could not be revoked")
+        updated = self.store.update_user_role(user_id, role)
+        if updated:
+            self.logger.info(
+                "user_role_updated_sessions_revoked",
+                user_id=user_id,
+                new_role=role,
+            )
+        return updated
 
     async def delete_user(self, user_id: str) -> bool:
         """Erase the account, then the copies of it that live outside Postgres.
