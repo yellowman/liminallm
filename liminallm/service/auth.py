@@ -984,20 +984,30 @@ class AuthService:
         """
         user = self.store.update_user_role(user_id, role)
         if user:
-            # Revoke all sessions for this user to enforce new role
+            # Revoke all sessions for this user to enforce new role. The role
+            # update is already committed, so failure is reported rather than
+            # rolled back - but the success log must not claim a delete that
+            # did not happen.
             try:
-                await self.revoke_all_user_sessions(user_id)
+                revoked = await self.revoke_all_user_sessions(user_id)
+            except Exception as exc:
+                revoked = False
+                self.logger.warning(
+                    "user_role_session_revocation_failed",
+                    user_id=user_id,
+                    error=str(exc),
+                )
+            if revoked:
                 self.logger.info(
                     "user_role_updated_sessions_revoked",
                     user_id=user_id,
                     new_role=role,
                 )
-            except Exception as exc:
-                # Log but don't fail role update if session revocation fails
+            else:
                 self.logger.warning(
-                    "user_role_session_revocation_failed",
+                    "user_role_updated_sessions_survived",
                     user_id=user_id,
-                    error=str(exc),
+                    new_role=role,
                 )
         return user
 
@@ -1098,7 +1108,16 @@ class AuthService:
                 user_id=user.id,
                 action="revoking_prior_sessions",
             )
-            await self.revoke_all_user_sessions(user.id)
+            revoked = await self.revoke_all_user_sessions(user.id)
+            if not revoked:
+                # Single-session is a constraint, not a best-effort cleanup.
+                # No new session exists yet, so this path can fail closed
+                # without rolling back any successful authentication state.
+                self.logger.warning(
+                    "single_session_prior_revocation_failed",
+                    user_id=user.id,
+                )
+                return None, None, {}
 
         mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
         require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
@@ -1709,12 +1728,22 @@ class AuthService:
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)
         try:
-            await self.revoke_all_user_sessions(user.id)
+            revoked = await self.revoke_all_user_sessions(user.id)
         except Exception as exc:
+            revoked = False
             self.logger.warning(
                 "revoke_sessions_failed", user_id=user.id, error=str(exc)
             )
-        self.logger.info("password_reset_completed", user_id=user.id)
+        if not revoked:
+            self.logger.warning(
+                "password_reset_sessions_survived",
+                user_id=user.id,
+            )
+        self.logger.info(
+            "password_reset_completed",
+            user_id=user.id,
+            other_sessions_revoked=revoked,
+        )
         return True
 
     async def request_email_verification(self, user: User) -> Optional[str]:
