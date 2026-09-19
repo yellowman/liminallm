@@ -137,9 +137,19 @@ class TestAFinalTurnThatProducedNothing:
             ],
         )
 
-        assert _done(events).get("content", "").strip(), (
+        completed = _done(events).get("content", "")
+        assert completed.strip(), (
             "a turn that emitted only whitespace completed with nothing to "
             "read"
+        )
+        streamed = "".join(
+            str(event.get("data") or "")
+            for event in events
+            if event.get("event") == "token"
+        )
+        assert streamed.strip() == completed, (
+            "the completed fallback was not streamed after blank tokens, so "
+            f"a token-rendering client still sees an empty bubble: {events}"
         )
 
     @pytest.mark.asyncio
