@@ -133,6 +133,30 @@ class TestWhenRevocationFails:
             "the fixture expected the failure to leave the session alive"
         )
 
+    @pytest.mark.asyncio
+    async def test_role_change_is_not_committed_if_sessions_survive(
+        self, runtime, account, monkeypatch
+    ):
+        """A stale refresh token must not inherit a role upgrade."""
+        before = runtime.store.get_user(account["user_id"])
+        assert before is not None and before.role != "admin"
+
+        monkeypatch.setattr(
+            runtime.store,
+            "revoke_user_sessions",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")),
+        )
+
+        with pytest.raises(RuntimeError, match="sessions could not be revoked"):
+            await runtime.auth.set_user_role(account["user_id"], "admin")
+
+        after = runtime.store.get_user(account["user_id"])
+        assert after is not None
+        assert after.role == before.role, (
+            "the role upgrade committed even though the bearer sessions that "
+            "would inherit it could not be revoked"
+        )
+
     def test_single_session_login_fails_closed_if_prior_sessions_survive(
         self, client, runtime, account, monkeypatch
     ):
