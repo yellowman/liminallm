@@ -19,6 +19,10 @@ check gets wrong: `_link_unused` renames on collision, so a file created as
 `out.csv` is published as `out (2).csv` when that name is taken. Comparing
 names would report a saved file as dropped. Dotfiles are skipped on purpose
 and are left out of the count for the same reason.
+
+The count also has to survive the interpreter result's MAX_ARTIFACTS bound.
+Otherwise the first ten names look completely saved while an eleventh file
+vanishes before the caller can compare created with published.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import uuid
 import pytest
 
 from liminallm.service import agent_tools
+from liminallm.service.interpreter import MAX_ARTIFACTS
 
 pytestmark = pytest.mark.slow
 
@@ -98,6 +103,23 @@ class TestAFileTheServerRefused:
         assert "WARNING" not in out, (
             f"a run that saved everything it created still warned: {out}"
         )
+
+    def test_the_publish_count_limit_is_reported(self, tmp_path):
+        code = "".join(
+            f"open('file-{i:02d}.csv','w').write('x')\\n"
+            for i in range(MAX_ARTIFACTS + 1)
+        ) + "print('done')\\n"
+        out, _session = _run(code, tmp_path)
+
+        if "the code interpreter is unavailable" in out:
+            pytest.skip("no sandbox confinement backend on this host")
+
+        assert "WARNING" in out, (
+            "a file beyond MAX_ARTIFACTS disappeared before the result could "
+            f"report it: {out}"
+        )
+        assert f"1 of {MAX_ARTIFACTS + 1}" in out, out
+        assert "artifact count limit" in out, out
 
     def test_a_dotfile_is_not_counted_as_dropped(self, tmp_path):
         """Dotfiles are refused deliberately and are not a loss to report.
