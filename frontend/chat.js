@@ -377,16 +377,29 @@ const showStatus = (message, isError = false) => {
   if (!isError && errorEl) errorEl.style.display = 'none';
 };
 
+/* A button whose label is an element - an icon - cannot have its text
+   swapped. Assigning `textContent` deletes the child, so the glyph would be
+   replaced by the word "Extracting..." and then by an empty string when the
+   original text (there was none) was restored: the icon never comes back.
+   Those buttons say they are busy by being disabled, and the status line
+   beside them carries the words. */
 const toggleButtonBusy = (button, isBusy, busyLabel = 'Working...') => {
   if (!button) return;
+  const labelIsMarkup = button.firstElementChild !== null;
   if (isBusy) {
-    button.dataset.label = button.textContent;
-    button.textContent = busyLabel;
+    if (!labelIsMarkup) {
+      button.dataset.label = button.textContent;
+      button.textContent = busyLabel;
+    }
+    button.setAttribute('aria-busy', 'true');
     button.disabled = true;
   } else {
-    button.textContent = button.dataset.label || button.textContent;
+    if (!labelIsMarkup) {
+      button.textContent = button.dataset.label || button.textContent;
+      delete button.dataset.label;
+    }
+    button.removeAttribute('aria-busy');
     button.disabled = false;
-    delete button.dataset.label;
   }
 };
 
@@ -2083,6 +2096,7 @@ const TYPE_GLYPH = {
   //: it are visibly the same thing.
   context: '<path d="M10 2.75 17.25 10 10 17.25 2.75 10Z"/>',
   file: '<path d="M6.25 2.75h5L15 6.5v10.75h-8.75Z"/><path d="M11 2.75v4h4"/>',
+  archive: '<path d="M3.25 6.5h13.5v9.75H3.25Z"/><path d="M2.5 3.75h15V6.5h-15Z"/><path d="M8.25 9.75h3.5"/>',
   unknown: '<path d="M6.25 2.75h5L15 6.5v10.75h-8.75Z"/><path d="M11 2.75v4h4"/>',
 };
 
@@ -2615,6 +2629,25 @@ const fetchUserFiles = async () => {
   }
 };
 
+/* Row actions. Each is a 20x20 line glyph in a 24px target, shown when the
+   row is hovered or focused - four permanent text buttons on every file was
+   more chrome than the file itself. The label lives in `title` and
+   `aria-label`, because an icon alone is not a name. */
+const ACTION_GLYPH = {
+  extract: '<path d="M10 3.25v8"/><path d="m6.75 8 3.25 3.25L13.25 8"/><path d="M3.75 13.5v2a1 1 0 0 0 1 1h10.5a1 1 0 0 0 1-1v-2"/>',
+  vault: '<path d="M5.25 3.25h9.5a1 1 0 0 1 1 1v12.5l-5.75-3-5.75 3V4.25a1 1 0 0 1 1-1Z"/>',
+  download: '<path d="M10 3.75v8.5"/><path d="m6.5 9 3.5 3.25L13.5 9"/><path d="M4 15.75h12"/>',
+  delete: '<path d="M4 6h12"/><path d="M8.25 6V4.5h3.5V6"/><path d="m5.5 6 .75 10.25h7.5L14.5 6"/>',
+};
+
+const actionButton = (action, label, { danger = false } = {}) => `
+  <button type="button" class="icon-btn compact${danger ? ' danger' : ''}"
+          data-action="${action}" title="${escapeAttr(label)}"
+          aria-label="${escapeAttr(label)}">
+    <svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${ACTION_GLYPH[action]}</svg>
+  </button>`;
+
 const renderFilesList = (files, total, hasNext) => {
   if (!filesListEl) return;
 
@@ -2628,17 +2661,18 @@ const renderFilesList = (files, total, hasNext) => {
   if (filesEmptyEl) filesEmptyEl.style.display = 'none';
 
   filesListEl.innerHTML = files.map(file => `
-    <div class="file-item" data-filename="${escapeAttr(file.name)}">
-      <div class="file-info">
-        <div class="file-name" title="${escapeAttr(file.name)}">${escapeHtml(file.name)}</div>
-        <div class="file-meta">${formatBytes(file.size)} · ${formatRelativeTime(file.modified_at)}</div>
-      </div>
-      <div class="file-actions">
-        ${isArchiveName(file.name) ? '<button type="button" class="download-btn" data-action="extract">Extract</button>' : ''}
-        <button type="button" class="download-btn" data-action="vault" title="Copy this file's text into your notes vault">Vault</button>
-        <button type="button" class="download-btn" data-action="download">Download</button>
-        <button type="button" class="delete-btn" data-action="delete">Delete</button>
-      </div>
+    <div class="row" data-filename="${escapeAttr(file.name)}">
+      ${typeIcon(isArchiveName(file.name) ? 'archive' : 'file')}
+      <span class="row-main">
+        <span class="row-name" title="${escapeAttr(file.name)}">${escapeHtml(file.name)}</span>
+        <span class="row-meta">${escapeHtml(`${formatBytes(file.size)} \u00b7 ${formatRelativeTime(file.modified_at)}`)}</span>
+      </span>
+      <span class="row-actions">
+        ${isArchiveName(file.name) ? actionButton('extract', 'Extract this archive') : ''}
+        ${actionButton('vault', "Copy this file's text into your notes vault")}
+        ${actionButton('download', 'Download')}
+        ${actionButton('delete', 'Delete', { danger: true })}
+      </span>
     </div>
   `).join('');
 
@@ -2654,8 +2688,11 @@ const renderFilesList = (files, total, hasNext) => {
 };
 
 const handleFileAction = async (event) => {
-  const target = event.target;
-  const action = target.dataset?.action;
+  /* The click can land on the glyph inside an icon button, so resolve the
+     element that carries the action rather than reading the event target
+     directly - `event.target.dataset.action` is undefined for an `<svg>`. */
+  const target = event.target.closest?.('[data-action]');
+  const action = target?.dataset?.action;
   if (!action) return;
 
   if (action === 'prev') {
@@ -2670,7 +2707,7 @@ const handleFileAction = async (event) => {
     return;
   }
 
-  const fileItem = target.closest('.file-item');
+  const fileItem = target.closest('.row');
   if (!fileItem) return;
   const filename = fileItem.dataset.filename;
   if (!filename) return;
