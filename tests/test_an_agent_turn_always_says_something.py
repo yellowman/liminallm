@@ -122,6 +122,27 @@ class TestAFinalTurnThatProducedNothing:
         )
 
     @pytest.mark.asyncio
+    async def test_a_turn_of_only_whitespace_is_no_prose_either(
+        self, engine, monkeypatch
+    ):
+        """Truthiness is not the test. A stream of two spaces and a newline
+        is non-empty and is still a blank bubble."""
+        events = await _run(
+            engine,
+            monkeypatch,
+            final_stream=[
+                {"event": "token", "data": "  "},
+                {"event": "token", "data": "\n"},
+                {"event": "message_done", "data": {"usage": {}}},
+            ],
+        )
+
+        assert _done(events).get("content", "").strip(), (
+            "a turn that emitted only whitespace completed with nothing to "
+            "read"
+        )
+
+    @pytest.mark.asyncio
     async def test_the_reader_is_told_rather_than_shown_a_blank(
         self, engine, monkeypatch
     ):
@@ -145,6 +166,118 @@ class TestAFinalTurnThatProducedNothing:
         assert streamed == _done(events).get("content"), (
             "what was streamed and what the turn recorded disagree"
         )
+
+
+class TestTheSubstitutedSentenceClaimsNothing:
+    """A sentence the server wrote rests on nothing that was retrieved.
+
+    `replaced_answer` returns None for empty content precisely so the
+    fallback cannot inherit the model's grounding, and
+    `TestASentenceTheServerWroteHasNoSources` pins that one node over.
+    Filling the emptiness in defeats the mechanism unless the substitution
+    is what decides the provenance - which is the defect this class exists
+    for. Measured before the guard: the fallback went out carrying bindings
+    for passages it never read.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_fallback_carries_no_bindings(self, engine, monkeypatch):
+        from liminallm.service.invocation import InvocationRegistry
+
+        monkeypatch.setattr(type(engine.llm), "supports_tools", True, raising=False)
+
+        served = [
+            {"context_id": "ctx-1", "source_id": "src_1", "evidence_id": "ev_1"},
+            {"context_id": "ctx-1", "source_id": "src_2", "evidence_id": "ev_2"},
+        ]
+
+        def serve(_invocation, _tool, _plan, context, *_a, **_k):
+            # What the broker does when it serves a search for the worker.
+            context.provenance_bindings.extend(served)
+            return dict(ROUNDS_WITHOUT_PROSE)
+
+        monkeypatch.setattr(engine, "_serve_invocation", serve)
+        engine.llm.stream_messages = lambda *a, **k: iter(
+            [{"event": "message_done", "data": {"content": "", "usage": {}}}]
+        )
+
+        sink: list = []
+        invocation = InvocationRegistry().open(
+            uuid.uuid4().hex, tool="agent.files_v1", user_id="u", tenant_id=None
+        )
+        events = []
+        async for event in engine._stream_agent_files_node(
+            NODE,
+            user_message=QUESTION,
+            context_id=None,
+            conversation_id=None,
+            adapters=[],
+            history=[],
+            vars_scope={},
+            source_registry=SourceRegistry(),
+            bindings_sink=sink,
+            user_id="u",
+            tenant_id=None,
+            invocation=invocation,
+        ):
+            events.append(event)
+
+        assert _done(events).get("content"), "the fixture did not substitute"
+        assert sink == [], (
+            "the server's own sentence claimed the model's grounding: it "
+            f"rests on none of {sink}"
+        )
+        assert not _done(events).get("validated_citations"), (
+            "the server's own sentence carried citations into offsets of a "
+            "string nobody was shown"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_real_answer_still_reports_its_grounding(
+        self, engine, monkeypatch
+    ):
+        """The control. Withholding bindings from every answer would pass
+        the test above and silently strip provenance from the product."""
+        from liminallm.service.invocation import InvocationRegistry
+
+        monkeypatch.setattr(type(engine.llm), "supports_tools", True, raising=False)
+        served = [
+            {"context_id": "ctx-1", "source_id": "src_1", "evidence_id": "ev_1"},
+        ]
+
+        def serve(_invocation, _tool, _plan, context, *_a, **_k):
+            context.provenance_bindings.extend(served)
+            return dict(ROUNDS_WITHOUT_PROSE)
+
+        monkeypatch.setattr(engine, "_serve_invocation", serve)
+        engine.llm.stream_messages = lambda *a, **k: iter(
+            [
+                {"event": "token", "data": "Verification is the problem."},
+                {"event": "message_done", "data": {"usage": {}}},
+            ]
+        )
+
+        sink: list = []
+        invocation = InvocationRegistry().open(
+            uuid.uuid4().hex, tool="agent.files_v1", user_id="u", tenant_id=None
+        )
+        async for _ in engine._stream_agent_files_node(
+            NODE,
+            user_message=QUESTION,
+            context_id=None,
+            conversation_id=None,
+            adapters=[],
+            history=[],
+            vars_scope={},
+            source_registry=SourceRegistry(),
+            bindings_sink=sink,
+            user_id="u",
+            tenant_id=None,
+            invocation=invocation,
+        ):
+            pass
+
+        assert sink, "an answer the model wrote lost the grounding behind it"
 
 
 class TestAnAnswerIsNeverOverwritten:

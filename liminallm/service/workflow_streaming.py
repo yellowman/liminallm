@@ -1529,12 +1529,6 @@ class WorkflowStreamingMixin:
         # supported it - the opening prompt's, and whatever its own searches
         # added. A fallback returned above and committed neither, leaving the
         # plain body to record the prompt it actually built.
-        if bindings_sink is not None:
-            successful: List[Dict[str, str]] = []
-            seen: set = set()
-            self._merge_bindings(successful, seen, agent_bindings)
-            self._merge_bindings(successful, seen, capability_bindings)
-            bindings_sink.extend(successful)
         # The worker's return carries this fallback and `stream_final`
         # overwrites it, because on this path the parent writes the answer -
         # so the parent needs it too. A final turn that produced no tokens
@@ -1546,14 +1540,33 @@ class WorkflowStreamingMixin:
         # returned nothing useful leaves the model with nothing to write
         # from. Measured against a live provider, twice, with two `web_fetch`
         # rounds and no prose after them.
-        if not content:
+        #
+        # Stripped, not truthy: a turn that emitted only whitespace produced
+        # no prose either, and leaves the same blank bubble.
+        substituted = not content.strip()
+        if substituted:
             content = NO_ANSWER_FALLBACK
             if not emitted_tokens:
                 # As a token as well, not only in the result. Nothing was
                 # streamed, so a client that renders the token stream and
                 # keeps `message_done` for bookkeeping shows an empty bubble.
-                emitted_tokens = True
                 yield {"event": "token", "data": content}
+        # Only the model's own answer inherits the assembly's grounding.
+        #
+        # `replaced_answer` returns None for empty content precisely so that
+        # a server-authored sentence cannot carry the model's sources, and
+        # `TestASentenceTheServerWroteHasNoSources` pins it one node over.
+        # Filling that emptiness in defeats the mechanism unless the
+        # substitution is what decides this: the sentence below rests on
+        # nothing that was retrieved, so it claims nothing that was
+        # retrieved. Measured before this guard: the fallback went out
+        # carrying two bindings for passages it never read.
+        if bindings_sink is not None and not substituted:
+            successful: List[Dict[str, str]] = []
+            seen: set = set()
+            self._merge_bindings(successful, seen, agent_bindings)
+            self._merge_bindings(successful, seen, capability_bindings)
+            bindings_sink.extend(successful)
         completed = {
             "content": content,
             "usage": usage,
@@ -1570,7 +1583,17 @@ class WorkflowStreamingMixin:
         # continuation the accepted answer was delivered as it stands, and
         # its citations are read the way the blocking path reads them: out
         # of the canonical copy of exactly the turn that was delivered.
-        if answer is not None:
+        #
+        # Not read at all for the substituted sentence, for the reason the
+        # bindings are not: a citation is an offset into the text that was
+        # delivered, and the text delivered here is the server's. A turn
+        # whose only output was a citation marker scrubs to nothing, fires
+        # the substitution, and would otherwise hand back offsets measured
+        # in a string nobody was shown, indexed into a sentence 55
+        # characters long.
+        if substituted:
+            citations = []
+        elif answer is not None:
             citations = self._recorded_citations(stream_context, invocation, content)
         else:
             citations = self._streamed_citations(
