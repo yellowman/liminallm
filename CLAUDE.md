@@ -50,7 +50,7 @@ is the only proof you fixed the cause and not the symptom. Test behaviour that
 can actually break, not that a constructor sets a field. If something is hard
 to test, that is information about the design, not permission to skip it.
 
-Eight rules under it, each earned by a bug this project shipped and a review
+Nine rules under it, each earned by a bug this project shipped and a review
 had to find.
 
 **Residuals are hypotheses.** Before implementing an `ISSUES.md` or inventory
@@ -96,6 +96,22 @@ you just handled. Fixes that stop at the reported line leave siblings behind.
 **A comment is not evidence.** Writing why the code is correct and writing the
 code both come from the same intent, so neither one checks the other. The same
 goes for a spec line. Verify first, then describe what you verified.
+
+**A witness is not established by turning green.** Passing after the fix is the
+one result every witness gives, including the ones that observe nothing. Before
+relying on it, show that the specific defect mutation makes it fail while an
+appropriate control still passes. For a concurrency or timing witness, repeat
+both enough times to establish that the outcome is not scheduling luck.
+
+Measured here, in one pull request, three separate witnesses passed before
+anyone checked and none of them worked. One asserted the defect: it pinned the
+unsafe behaviour, so the fix had to break it. One waited on a DOM state its own
+subject produced earlier in the same turn, so the wait returned before the
+thing it measured could happen. One waited on an event that fires before the
+recorder it then asserted against. The suite reported all three green, twice
+across a full lane, and a reader caught each one. If the synchronisation does
+not causally precede the assertion, green means the probe finished, not that
+the property holds.
 
 ### VI. Goal-driven execution
 
