@@ -1731,7 +1731,7 @@ class AuthService:
         user = self.store.get_user(user_id)
         if not user:
             self.logger.warning("password_reset_user_missing", user_id=user_id)
-            return False
+            return False, None
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)
         try:
