@@ -3692,13 +3692,20 @@ button.minor:hover {
 /* A list entry. No border: the row is separated from its neighbours by
    alignment and by the hover fill, which is enough once the entries are not
    each wearing a box. The radius exists only so the hover fill has a shape. */
+/* 30px is the control tier, not a floor for everything. A row is mostly text,
+   and text needs more room than a button does: measured, a single-line row at
+   the control height comes out near 32px and reads as cramped rather than
+   precise. The minimum here keeps a one-line row comfortable, and a row with
+   a metadata line grows past it on its own. What stays compact is the
+   controls inside the row, not the row. */
 .row {
   position: relative;
   display: flex;
   align-items: center;
   gap: 9px;
   width: 100%;
-  padding: 7px 8px;
+  min-height: 34px;
+  padding: 6px 8px;
   border: 0;
   border-radius: var(--radius-sm);
   background: none;
@@ -3750,6 +3757,7 @@ button.minor:hover {
   display: block;
   font-size: 13px;
   font-weight: 500;
+  line-height: 1.35;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -3760,6 +3768,7 @@ button.minor:hover {
   display: block;
   margin-top: 1px;
   font-size: 11.5px;
+  line-height: 1.3;
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -3791,8 +3800,15 @@ button.minor:hover {
 
 /* Metadata as text. `private`, `shared`, an artifact type and a version are
    facts about a thing, not controls, so they get a dot and a word rather
-   than a capsule each. */
-.meta {
+   than a capsule each.
+
+   Named `factline` rather than `meta` on purpose: `.meta` is already a class
+   in this application, worn by conversation items, API key items and the
+   line under every chat message, each styled through a compound selector. A
+   bare `.meta` rule here would have added `display: flex` to all three. No
+   test would have caught it - the browser witness for chat metadata asserts
+   on `textContent`. */
+.factline {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -3801,17 +3817,17 @@ button.minor:hover {
   min-width: 0;
 }
 
-.meta > * {
+.factline > * {
   min-width: 0;
 }
 
-.meta-sep::before {
+.fact-sep::before {
   content: "·";
   margin-right: 6px;
   color: var(--border-strong);
 }
 
-.meta-dot {
+.fact-dot {
   display: inline-block;
   width: 5px;
   height: 5px;
@@ -3820,15 +3836,15 @@ button.minor:hover {
   flex-shrink: 0;
 }
 
-.meta-dot.on {
+.fact-dot.on {
   background: var(--accent);
 }
 
-.meta-dot.warn {
+.fact-dot.warn {
   background: #b7791f;
 }
 
-.meta-dot.off {
+.fact-dot.off {
   background: var(--danger);
 }
 
