@@ -1682,6 +1682,15 @@ class AuthService:
         return token
 
     async def complete_password_reset(self, token: str, new_password: str) -> bool:
+        """Compatibility form: whether the reset itself completed."""
+        completed, _revoked = await self.complete_password_reset_with_revocation(
+            token, new_password
+        )
+        return completed
+
+    async def complete_password_reset_with_revocation(
+        self, token: str, new_password: str
+    ) -> tuple[bool, Optional[bool]]:
         """Consume the token, then act on what it named.
 
         In that order. Reading the token and deleting it after the password
@@ -1713,7 +1722,7 @@ class AuthService:
                         self._password_reset_tokens.pop(token, None)
         if not user_id:
             self.logger.warning("password_reset_invalid_token", token_prefix=token[:8])
-            return False
+            return False, None
         if isinstance(user_id, bytes):
             user_id = user_id.decode()
         # By id. `get_user_by_email` would resolve to whichever account owns
@@ -1742,7 +1751,7 @@ class AuthService:
             user_id=user.id,
             other_sessions_revoked=revoked,
         )
-        return True
+        return True, revoked
 
     async def request_email_verification(self, user: User) -> Optional[str]:
         """As above: the token is written under the account it names.
