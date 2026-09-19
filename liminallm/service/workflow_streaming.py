@@ -1546,11 +1546,13 @@ class WorkflowStreamingMixin:
         substituted = not content.strip()
         if substituted:
             content = NO_ANSWER_FALLBACK
-            if not emitted_tokens:
-                # As a token as well, not only in the result. Nothing was
-                # streamed, so a client that renders the token stream and
-                # keeps `message_done` for bookkeeping shows an empty bubble.
-                yield {"event": "token", "data": content}
+            # As a token as well, not only in the result. A stream that emitted
+            # only whitespace - or tokens scrubbed down to nothing - has still
+            # put no prose on the reader's screen, even though
+            # `emitted_tokens` is true. Appending the fallback is therefore
+            # required in every substituted case; non-blank output cannot
+            # reach this branch.
+            yield {"event": "token", "data": content}
         # Only the model's own answer inherits the assembly's grounding.
         #
         # `replaced_answer` returns None for empty content precisely so that
