@@ -133,6 +133,34 @@ class TestWhenRevocationFails:
             "the fixture expected the failure to leave the session alive"
         )
 
+    def test_password_reset_reports_surviving_sessions(
+        self, client, runtime, account, monkeypatch
+    ):
+        """Reset is already committed when revocation runs, so report partial
+        success rather than pretending the old bearer sessions died."""
+        user = runtime.store.get_user(account["user_id"])
+        assert user is not None
+        token = __import__("asyncio").run(runtime.auth.initiate_password_reset(user))
+        assert token
+
+        monkeypatch.setattr(
+            runtime.store,
+            "revoke_user_sessions",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down")),
+        )
+
+        resp = client.post(
+            "/v1/auth/reset/confirm",
+            json={"token": token, "new_password": NEW_PASSWORD},
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["other_sessions_revoked"] is False
+        assert _alive(client, account["stolen"]), (
+            "the fixture expected the failed revoke to leave the old session "
+            "alive, so the response flag proved nothing"
+        )
+
     @pytest.mark.asyncio
     async def test_role_change_is_not_committed_if_sessions_survive(
         self, runtime, account, monkeypatch
