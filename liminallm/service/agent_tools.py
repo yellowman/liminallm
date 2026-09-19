@@ -418,10 +418,11 @@ def run_python(
         timeout=PYTHON_TOOL_TIMEOUT,
         on_child=None if invocation is None else _register_child(invocation),
     )
+    created = result.get("created_files") or []
     published = _publish(
         session["workdir"],
         str(files_dir),
-        result.get("created_files") or [],
+        created,
         invocation=invocation,
         operation_seq=operation_seq,
         step=step,
@@ -436,6 +437,39 @@ def run_python(
         parts.append(
             f"files written (saved to the user's files): {', '.join(published)}"
         )
+
+    # What `publish_artifacts` refused, said out loud.
+    #
+    # It skips a created file for an extension outside the upload policy or
+    # a size over the artifact ceiling, and returns only the names it wrote.
+    # Nothing logged the difference and nothing told the model, so code that
+    # printed "saved report.xlsx" produced a turn asserting a file exists
+    # that was never written - the tool result held no contradiction for the
+    # model to notice. The description this tool is given says nothing about
+    # allowed types either, so the model cannot avoid it in advance.
+    #
+    # Counted, not compared by name. `_link_unused` renames on collision, so
+    # a file created as `out.csv` can be published as `out (2).csv`, and a
+    # name-based difference would report a saved file as dropped. Dotfiles
+    # are skipped deliberately and are excluded from the denominator for the
+    # same reason. The >10 case is invisible here either way: the truncation
+    # happens before `created_files` is built.
+    expected = [
+        entry
+        for entry in created
+        if not str(
+            entry.get("name") if isinstance(entry, dict) else entry
+        ).startswith(".")
+    ]
+    dropped = len(expected) - len(published)
+    if dropped > 0:
+        parts.append(
+            f"WARNING: {dropped} of {len(expected)} file(s) the code created "
+            "were NOT saved - the file type is not allowed, or the file is "
+            "too large. Tell the user which files were not saved. Allowed "
+            f"types: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}"
+        )
+
     if not parts:
         parts.append("(the code produced no output - remember to print())")
     return "\n\n".join(parts)

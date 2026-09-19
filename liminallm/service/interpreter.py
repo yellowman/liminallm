@@ -40,8 +40,11 @@ from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from liminallm.logging import get_logger
 from liminallm.service.confine import backend_name, confine
 from liminallm.service.invocation import require_live_lease
+
+logger = get_logger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 20
 MAX_OUTPUT_CHARS = 8_000
@@ -378,19 +381,33 @@ def publish_artifacts(
     published: list[str] = []
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
+    # Every skip below is logged. They were silent, and the caller returned
+    # only the names it wrote, so a file the model created and told the user
+    # about could vanish with no record anywhere - not in the tool result,
+    # not on the server. The caller now counts the difference and warns the
+    # model; this is the half an operator needs.
+    def _skipped(name: str, reason: str) -> None:
+        logger.info("artifact_not_published", name=name, reason=reason)
+
     for item in created[:MAX_ARTIFACTS]:
         name = str(item.get("name") or "")
         if not name or "/" in name or name.startswith("."):
+            # Deliberate: dotfiles and anything with a path separator are
+            # not artifacts. Logged at all so the count can be explained.
+            _skipped(name, "name is not publishable")
             continue
         if allowed_extensions is not None:
             if Path(name).suffix.lower() not in allowed_extensions:
+                _skipped(name, "extension not allowed for upload")
                 continue
         fd = open_produced_file(workdir, name)
         if fd is None:
+            _skipped(name, "could not be opened in the working directory")
             continue
         staged = dest / f".{uuid.uuid4().hex}.part"
         try:
             if os.fstat(fd).st_size > MAX_ARTIFACT_BYTES:
+                _skipped(name, f"larger than {MAX_ARTIFACT_BYTES} bytes")
                 continue
             # Filled under a hidden name, then given a visible one. The
             # staging name starts with a dot, so a listing skips it and an
@@ -412,9 +429,11 @@ def publish_artifacts(
             os.close(out_fd)
             out_name = _link_unused(dest, name, staged)
             if out_name is None:
+                _skipped(name, "no unused name was available in the file area")
                 continue
             published.append(out_name)
-        except OSError:
+        except OSError as exc:
+            _skipped(name, f"could not be written: {exc}")
             continue
         finally:
             os.close(fd)
