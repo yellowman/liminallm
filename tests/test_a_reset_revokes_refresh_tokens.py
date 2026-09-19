@@ -90,6 +90,7 @@ def test_a_reset_refuses_the_refresh_tokens_minted_before_it(client, account):
     confirmed = client.post("/v1/auth/reset/confirm",
                             json={"token": token, "new_password": NEW_PASSWORD})
     assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["data"]["other_sessions_revoked"] is True
 
     assert _sessions(account["user_id"]) == 0, (
         "the reset left a session behind"
