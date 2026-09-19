@@ -466,26 +466,32 @@
                   <p class="subtext">
                     Attach files to a context before asking questions. Leave Context ID blank to keep uploads private.
                   </p>
-                  <div class="input-grid">
+                  <!-- One line: choose a file, say where it goes, upload. The
+                       three controls were three stacked labelled fields over
+                       four rows, for a task that is one sentence long. -->
+                  <div class="upload-strip">
                     <div class="field compact">
-                      <label for="upload-context-id">Context ID</label>
+                      <label for="file-upload">File</label>
+                      <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
+                    </div>
+                    <div class="field compact">
+                      <label for="upload-context-id">Context</label>
                       <select id="upload-context-id">
                         <option value="">Private (no context)</option>
                       </select>
                     </div>
+                    <button type="button" class="primary" id="upload-file-btn">Upload</button>
+                  </div>
+                  <div class="small" id="file-upload-hint"></div>
+                  <!-- Chunk size is asked for rarely and read by almost nobody,
+                       so it is available rather than present. -->
+                  <details class="advanced">
+                    <summary>Advanced</summary>
                     <div class="field compact">
-                      <label for="upload-chunk-size">Chunk size (optional)</label>
+                      <label for="upload-chunk-size">Chunk size</label>
                       <input type="number" id="upload-chunk-size" placeholder="512" min="64" max="4000" step="64" />
                     </div>
-                  </div>
-                  <div class="field">
-                    <label for="file-upload">File</label>
-                    <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
-                    <div class="small" id="file-upload-hint"></div>
-                  </div>
-                  <div class="pill-row">
-                    <button type="button" class="minor" id="upload-file-btn">Upload file</button>
-                  </div>
+                  </details>
                   <div class="small" id="file-upload-status" role="status"></div>
                 </div>
               </section>

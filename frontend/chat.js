@@ -312,10 +312,12 @@ const PANE_ITEM_SELECTOR = [
   '.conversation-item',
   '.note-item',
   '.note-search-hit',
-  '.context-card',
-  '.artifact-card',
-  '.tool-card',
-  '.workflow-card',
+  //: `.row` is the flat list entry the panes are migrating onto, and it
+  //: covers every surface that has moved rather than needing one line each.
+  //: That is the point: the note above records that enumerating this list is
+  //: what went wrong last time, and one shared class is one fewer thing to
+  //: forget when the next pane converts.
+  '.row',
 ].join(', ');
 
 //: Kept rather than queried fresh each time, because the shell has to listen
@@ -375,16 +377,29 @@ const showStatus = (message, isError = false) => {
   if (!isError && errorEl) errorEl.style.display = 'none';
 };
 
+/* A button whose label is an element - an icon - cannot have its text
+   swapped. Assigning `textContent` deletes the child, so the glyph would be
+   replaced by the word "Extracting..." and then by an empty string when the
+   original text (there was none) was restored: the icon never comes back.
+   Those buttons say they are busy by being disabled, and the status line
+   beside them carries the words. */
 const toggleButtonBusy = (button, isBusy, busyLabel = 'Working...') => {
   if (!button) return;
+  const labelIsMarkup = button.firstElementChild !== null;
   if (isBusy) {
-    button.dataset.label = button.textContent;
-    button.textContent = busyLabel;
+    if (!labelIsMarkup) {
+      button.dataset.label = button.textContent;
+      button.textContent = busyLabel;
+    }
+    button.setAttribute('aria-busy', 'true');
     button.disabled = true;
   } else {
-    button.textContent = button.dataset.label || button.textContent;
+    if (!labelIsMarkup) {
+      button.textContent = button.dataset.label || button.textContent;
+      delete button.dataset.label;
+    }
+    button.removeAttribute('aria-busy');
     button.disabled = false;
-    delete button.dataset.label;
   }
 };
 
@@ -1800,24 +1815,28 @@ const renderContextsList = () => {
     return;
   }
 
+  /* The description is what tells two contexts apart, so it is the row's
+     second line. The truncated id that used to sit under it is not: nobody
+     picks a context by the first eight characters of its uuid, and the
+     detail view shows the whole thing. */
   list.innerHTML = state.contexts
     .map((ctx) => {
       const isSelected = ctx.id === state.selectedContext?.id;
+      const description = ctx.description || 'No description';
       return `
-        <div class="context-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(ctx.id)}">
-          <div class="name">${escapeHtml(ctx.name)}</div>
-          <div class="description">${escapeHtml(ctx.description || 'No description')}</div>
-          <div class="stats">
-            <span class="stat">ID: ${escapeHtml(ctx.id.slice(0, 8))}...</span>
-            <span class="stat">Created: ${new Date(ctx.created_at).toLocaleDateString()}</span>
-          </div>
-        </div>
+        <button type="button" class="row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(ctx.id)}" title="${escapeAttr(`${ctx.name} \u2014 ${description}`)}">
+          ${typeIcon('context')}
+          <span class="row-main">
+            <span class="row-name">${escapeHtml(ctx.name)}</span>
+            <span class="row-meta">${escapeHtml(description)}</span>
+          </span>
+        </button>
       `;
     })
     .join('');
 
-  list.querySelectorAll('.context-card').forEach((card) => {
-    card.addEventListener('click', () => selectContext(card.dataset.id));
+  list.querySelectorAll('.row').forEach((row) => {
+    row.addEventListener('click', () => selectContext(row.dataset.id));
   });
 };
 
@@ -1843,7 +1862,10 @@ const selectContext = async (contextId) => {
     details.innerHTML = `
       <div class="detail-header">
         <h4>${escapeHtml(ctx.name)}</h4>
-        <span class="visibility-badge ${ctx.visibility || 'private'}">${ctx.visibility || 'private'}</span>
+        <span class="factline">${visibilityMark(ctx.visibility || 'private')}${escapeHtml(
+          (ctx.visibility || 'private').charAt(0).toUpperCase()
+          + (ctx.visibility || 'private').slice(1)
+        )}</span>
       </div>
       <div class="detail-row">
         <span class="detail-label">ID</span>
@@ -1923,12 +1945,14 @@ const renderContextSources = (sources) => {
     .map((s) => {
       const date = s.created_at ? new Date(s.created_at).toLocaleDateString() : '-';
       return `
-        <div class="source-item">
-          <div class="source-path monospace">${escapeHtml(s.fs_path || s.path || '-')}</div>
-          <div class="source-meta">
-            <span>${s.recursive ? 'Recursive' : 'Single file'}</span>
-            <span>Added ${date}</span>
-          </div>
+        <div class="row" title="${escapeAttr(s.fs_path || s.path || '-')}">
+          ${typeIcon('file')}
+          <span class="row-main">
+            <span class="row-name monospace">${escapeHtml(s.fs_path || s.path || '-')}</span>
+            <span class="row-meta">${escapeHtml(
+              `${s.recursive ? 'Recursive' : 'Single file'} \u00b7 added ${date}`
+            )}</span>
+          </span>
         </div>
       `;
     })
@@ -2059,6 +2083,39 @@ const fetchArtifacts = async () => {
   }
 };
 
+/* The line icons a row leads with. Same grammar as the rail - a 20x20 box,
+   1.5px stroke, round caps and joins, unfilled - because a row in the pane
+   and a destination in the rail are the same kind of object at different
+   scales, and the workspace looked bolted on when only one of them said so. */
+const TYPE_GLYPH = {
+  workflow: '<path d="M5.5 4.5h4a3 3 0 0 1 3 3v5a3 3 0 0 0 3 3h1"/><circle cx="4" cy="4.5" r="1.5"/><circle cx="17" cy="15.5" r="1.5"/><circle cx="4" cy="15.5" r="1.5"/><path d="M5.5 15.5h4a3 3 0 0 0 3-3"/>',
+  tool: '<path d="M12.9 3.1a3.6 3.6 0 0 0-4.7 4.7l-5 5a1.2 1.2 0 0 0 0 1.7l1.3 1.3a1.2 1.2 0 0 0 1.7 0l5-5a3.6 3.6 0 0 0 4.7-4.7l-2.3 2.3-2-2Z"/>',
+  adapter: '<path d="M10 2.75 17.5 7 10 11.25 2.5 7Z"/><path d="m3.75 10 6.25 3.5L16.25 10"/>',
+  policy: '<path d="M10 2.75 16.25 5v5.5c0 3.5-2.5 5.5-6.25 6.75C6.25 16 3.75 14 3.75 10.5V5Z"/>',
+  //: The rail's own contexts glyph, so the destination and the rows inside
+  //: it are visibly the same thing.
+  context: '<path d="M10 2.75 17.25 10 10 17.25 2.75 10Z"/>',
+  file: '<path d="M6.25 2.75h5L15 6.5v10.75h-8.75Z"/><path d="M11 2.75v4h4"/>',
+  archive: '<path d="M3.25 6.5h13.5v9.75H3.25Z"/><path d="M2.5 3.75h15V6.5h-15Z"/><path d="M8.25 9.75h3.5"/>',
+  unknown: '<path d="M6.25 2.75h5L15 6.5v10.75h-8.75Z"/><path d="M11 2.75v4h4"/>',
+};
+
+const typeIcon = (type) => {
+  const glyph = TYPE_GLYPH[type] || TYPE_GLYPH.unknown;
+  return `<svg class="row-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" `
+    + `stroke="currentColor" stroke-width="1.5" stroke-linecap="round" `
+    + `stroke-linejoin="round">${glyph}</svg>`;
+};
+
+/* Visibility gets a dot only when it means the thing is reachable by someone
+   else. Private is the default and says so in words; a dot on every row would
+   be decoration rather than a signal. */
+const visibilityMark = (visibility) => {
+  if (visibility === 'global') return '<span class="fact-dot on"></span>';
+  if (visibility === 'shared') return '<span class="fact-dot warn"></span>';
+  return '';
+};
+
 const renderArtifactsList = () => {
   const list = $('artifacts-list');
   if (!list) return;
@@ -2068,33 +2125,34 @@ const renderArtifactsList = () => {
     return;
   }
 
-  // A card, not a table row. Five columns need more than the 240px pane has,
-  // so the table scrolled sideways and the name - the only thing you pick a
-  // row by - was the part that went off the edge, while the version and the
-  // date kept their full slots. Same shape as the contexts and tools lists.
+  /* A flat row, not a card. Each entry used to wear a border inside the
+     pane's border, with its type and visibility as two uppercase capsules
+     and its version and date on a third line - about 100px of pane for one
+     artifact, and eight of them filled a 900px screen. The name is what a
+     row is picked by, so it leads; everything else is one muted line under
+     it, which is the same information in a third of the height. */
   list.innerHTML = state.artifacts
     .map((a) => {
       const isSelected = a.id === state.selectedArtifact?.id;
       const type = a.type || 'unknown';
       const visibility = a.visibility || 'private';
+      const when = new Date(a.updated_at).toLocaleDateString();
+      const shown = visibility.charAt(0).toUpperCase() + visibility.slice(1);
+      const facts = `${shown} \u00b7 ${type} v${a.version || 1} \u00b7 ${when}`;
       return `
-        <div class="artifact-card ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(a.id)}">
-          <div class="name">${escapeHtml(a.name || a.id)}</div>
-          <div class="badges">
-            <span class="type-badge ${escapeAttr(type)}">${escapeHtml(type)}</span>
-            <span class="visibility-badge ${escapeAttr(visibility)}">${escapeHtml(visibility)}</span>
-          </div>
-          <div class="stats">
-            <span class="stat">v${escapeHtml(String(a.version || 1))}</span>
-            <span class="stat">${escapeHtml(new Date(a.updated_at).toLocaleDateString())}</span>
-          </div>
-        </div>
+        <button type="button" class="row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(a.id)}" title="${escapeAttr(a.name || a.id)}">
+          ${typeIcon(type)}
+          <span class="row-main">
+            <span class="row-name">${escapeHtml(a.name || a.id)}</span>
+            <span class="row-meta">${visibilityMark(visibility)}${escapeHtml(facts)}</span>
+          </span>
+        </button>
       `;
     })
     .join('');
 
-  list.querySelectorAll('.artifact-card').forEach((card) => {
-    card.addEventListener('click', () => selectArtifact(card.dataset.id));
+  list.querySelectorAll('.row').forEach((row) => {
+    row.addEventListener('click', () => selectArtifact(row.dataset.id));
   });
 };
 
@@ -2110,7 +2168,7 @@ const selectArtifact = async (artifactId) => {
     details.innerHTML = `
       <div class="detail-header">
         <h4>${escapeHtml(artifact.name || artifact.id)}</h4>
-        <span class="type-badge ${artifact.type || 'unknown'}">${escapeHtml(artifact.type || 'unknown')}</span>
+        <span class="factline">${escapeHtml(artifact.type || 'unknown')}</span>
       </div>
       <div class="detail-row">
         <span class="detail-label">ID</span>
@@ -2571,6 +2629,25 @@ const fetchUserFiles = async () => {
   }
 };
 
+/* Row actions. Each is a 20x20 line glyph in a 24px target, shown when the
+   row is hovered or focused - four permanent text buttons on every file was
+   more chrome than the file itself. The label lives in `title` and
+   `aria-label`, because an icon alone is not a name. */
+const ACTION_GLYPH = {
+  extract: '<path d="M10 3.25v8"/><path d="m6.75 8 3.25 3.25L13.25 8"/><path d="M3.75 13.5v2a1 1 0 0 0 1 1h10.5a1 1 0 0 0 1-1v-2"/>',
+  vault: '<path d="M5.25 3.25h9.5a1 1 0 0 1 1 1v12.5l-5.75-3-5.75 3V4.25a1 1 0 0 1 1-1Z"/>',
+  download: '<path d="M10 3.75v8.5"/><path d="m6.5 9 3.5 3.25L13.5 9"/><path d="M4 15.75h12"/>',
+  delete: '<path d="M4 6h12"/><path d="M8.25 6V4.5h3.5V6"/><path d="m5.5 6 .75 10.25h7.5L14.5 6"/>',
+};
+
+const actionButton = (action, label, { danger = false } = {}) => `
+  <button type="button" class="icon-btn compact${danger ? ' danger' : ''}"
+          data-action="${action}" title="${escapeAttr(label)}"
+          aria-label="${escapeAttr(label)}">
+    <svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${ACTION_GLYPH[action]}</svg>
+  </button>`;
+
 const renderFilesList = (files, total, hasNext) => {
   if (!filesListEl) return;
 
@@ -2584,17 +2661,18 @@ const renderFilesList = (files, total, hasNext) => {
   if (filesEmptyEl) filesEmptyEl.style.display = 'none';
 
   filesListEl.innerHTML = files.map(file => `
-    <div class="file-item" data-filename="${escapeAttr(file.name)}">
-      <div class="file-info">
-        <div class="file-name" title="${escapeAttr(file.name)}">${escapeHtml(file.name)}</div>
-        <div class="file-meta">${formatBytes(file.size)} · ${formatRelativeTime(file.modified_at)}</div>
-      </div>
-      <div class="file-actions">
-        ${isArchiveName(file.name) ? '<button type="button" class="download-btn" data-action="extract">Extract</button>' : ''}
-        <button type="button" class="download-btn" data-action="vault" title="Copy this file's text into your notes vault">Vault</button>
-        <button type="button" class="download-btn" data-action="download">Download</button>
-        <button type="button" class="delete-btn" data-action="delete">Delete</button>
-      </div>
+    <div class="row" data-filename="${escapeAttr(file.name)}">
+      ${typeIcon(isArchiveName(file.name) ? 'archive' : 'file')}
+      <span class="row-main">
+        <span class="row-name" title="${escapeAttr(file.name)}">${escapeHtml(file.name)}</span>
+        <span class="row-meta">${escapeHtml(`${formatBytes(file.size)} \u00b7 ${formatRelativeTime(file.modified_at)}`)}</span>
+      </span>
+      <span class="row-actions">
+        ${isArchiveName(file.name) ? actionButton('extract', 'Extract this archive') : ''}
+        ${actionButton('vault', "Copy this file's text into your notes vault")}
+        ${actionButton('download', 'Download')}
+        ${actionButton('delete', 'Delete', { danger: true })}
+      </span>
     </div>
   `).join('');
 
@@ -2610,8 +2688,11 @@ const renderFilesList = (files, total, hasNext) => {
 };
 
 const handleFileAction = async (event) => {
-  const target = event.target;
-  const action = target.dataset?.action;
+  /* The click can land on the glyph inside an icon button, so resolve the
+     element that carries the action rather than reading the event target
+     directly - `event.target.dataset.action` is undefined for an `<svg>`. */
+  const target = event.target.closest?.('[data-action]');
+  const action = target?.dataset?.action;
   if (!action) return;
 
   if (action === 'prev') {
@@ -2626,7 +2707,7 @@ const handleFileAction = async (event) => {
     return;
   }
 
-  const fileItem = target.closest('.file-item');
+  const fileItem = target.closest('.row');
   if (!fileItem) return;
   const filename = fileItem.dataset.filename;
   if (!filename) return;
@@ -3407,22 +3488,29 @@ const renderToolsList = () => {
     return;
   }
 
+  /* Same row as the artifacts pane, so the two lists are one thing learned
+     once. The description is the row's second line rather than a paragraph
+     inside a card, and it truncates instead of reflowing the entry to three
+     lines in a 240px column. */
   toolsList.innerHTML = tools
     .map((tool) => {
       const isSelected = selectedTool?.id === tool.id;
       const name = tool.name || tool.schema?.name || tool.id;
       const description = tool.description || tool.schema?.description || 'No description';
       return `
-        <div class="tool-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(tool.id)}">
-          <div class="tool-name">${escapeHtml(name)}</div>
-          <div class="tool-description">${escapeHtml(description)}</div>
-        </div>
+        <button type="button" class="row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(tool.id)}" title="${escapeAttr(`${name} \u2014 ${description}`)}">
+          ${typeIcon('tool')}
+          <span class="row-main">
+            <span class="row-name">${escapeHtml(name)}</span>
+            <span class="row-meta">${escapeHtml(description)}</span>
+          </span>
+        </button>
       `;
     })
     .join('');
 
-  toolsList.querySelectorAll('.tool-card').forEach((card) => {
-    card.addEventListener('click', () => selectTool(card.dataset.id));
+  toolsList.querySelectorAll('.row').forEach((row) => {
+    row.addEventListener('click', () => selectTool(row.dataset.id));
   });
 };
 
@@ -3556,23 +3644,29 @@ const renderWorkflowsList = () => {
     return;
   }
 
+  /* The same row again. Workflows share the Tools pane, so leaving them as
+     cards would have put two vocabularies in one column - the thing this
+     whole change exists to stop. */
   workflowsList.innerHTML = workflows
     .map((wf) => {
       const isSelected = selectedWorkflow?.id === wf.id;
+      const visibility = wf.visibility || 'private';
+      const shown = visibility.charAt(0).toUpperCase() + visibility.slice(1);
+      const name = wf.name || wf.id;
       return `
-        <div class="workflow-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(wf.id)}">
-          <div class="workflow-name">${escapeHtml(wf.name || wf.id)}</div>
-          <div class="workflow-meta">
-            <span class="visibility-badge ${wf.visibility || 'private'}">${wf.visibility || 'private'}</span>
-            <span>v${wf.version || 1}</span>
-          </div>
-        </div>
+        <button type="button" class="row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(wf.id)}" title="${escapeAttr(name)}">
+          ${typeIcon('workflow')}
+          <span class="row-main">
+            <span class="row-name">${escapeHtml(name)}</span>
+            <span class="row-meta">${visibilityMark(visibility)}${escapeHtml(`${shown} \u00b7 v${wf.version || 1}`)}</span>
+          </span>
+        </button>
       `;
     })
     .join('');
 
-  workflowsList.querySelectorAll('.workflow-card').forEach((card) => {
-    card.addEventListener('click', () => selectWorkflow(card.dataset.id));
+  workflowsList.querySelectorAll('.row').forEach((row) => {
+    row.addEventListener('click', () => selectWorkflow(row.dataset.id));
   });
 };
 
@@ -3589,7 +3683,10 @@ const selectWorkflow = (workflowId) => {
     details.innerHTML = `
       <div class="detail-header">
         <h4>${escapeHtml(wf.name || wf.id)}</h4>
-        <span class="visibility-badge ${wf.visibility || 'private'}">${wf.visibility || 'private'}</span>
+        <span class="factline">${visibilityMark(wf.visibility || 'private')}${escapeHtml(
+          (wf.visibility || 'private').charAt(0).toUpperCase()
+          + (wf.visibility || 'private').slice(1)
+        )}</span>
       </div>
       <div class="detail-row">
         <span class="detail-label">ID</span>

@@ -82,6 +82,13 @@ dev = [
   "pytest-xdist>=3.5",
   "ruff>=0.4",
   "bandit>=1.7",
+  # `tests/test_css_hygiene.py` parses `frontend/styles.css`. Two classes of
+  # defect shipped that a brace-balance check cannot see, because both are
+  # valid CSS: a selector naming an element that does not exist, and a
+  # removed rule body leaving its selector and comma attached to the next
+  # rule. Chosen over Stylelint because it needs no Node toolchain - this
+  # repository has no package.json, and the lint job is ruff on Python.
+  "tinycss2>=1.2",
   # `tests/test_declared_dependencies.py` reads pyproject.toml. `tomllib` is
   # stdlib from 3.11; 3.10 is this project's floor and needs the backport.
   "tomli>=2.0; python_version < '3.11'",
