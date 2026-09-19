@@ -130,10 +130,12 @@ layout, styling, and client implementation patterns. The frontend source
 - CSS custom properties for theming: `--accent`, `--text`, `--panel`,
   `--border`, and so on. Control sizing is tokenized too: `--ctl-h`,
   `--ctl-h-sm`, `--icon-hit`, `--icon-glyph`, `--chip-h`.
-- list classes: `.row` is the one list primitive every pane uses - a flat
-  row with `.row-icon`, `.row-name`, `.row-meta` and hover-revealed
+- list classes: `.row` is the flat list primitive used by the migrated
+  contextual panes - Contexts, Artifacts, Tools, Workflows and Files. It
+  carries `.row-icon`, `.row-name`, `.row-meta` and hover-revealed
   `.row-actions`. A selected row takes a faint fill and a 2px left marker,
-  which is the same selection language the application rail uses.
+  which is the same selection language the application rail uses. Notes and
+  Chat still use their own list classes.
 - component classes: `.panel`, `.badge`, `.table`, `.code-block`,
   `.factline` (a dot-separated line of facts), `.chip`, `.figures`,
   `.deflist`, `.hairline-table`, `.icon-btn`.

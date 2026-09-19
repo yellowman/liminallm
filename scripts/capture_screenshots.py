@@ -46,19 +46,22 @@ EMAIL = "ada@example.com"
 PASSWORD = "Screenshot-Demo-2026!"
 VIEWPORT = {"width": 1440, "height": 900}
 
-#: The chat screen is captured before the extra threads are opened, so it
-#: shows a conversation rather than an empty new thread.
 #: Each row is (section, image, what to select in its pane first). The pane
 #: navigates and the workspace shows the selection, so a section with a pane
 #: is photographed with something selected: a shot of "Select a context to
 #: view details" documents the empty state rather than the screen. Files,
 #: Insights and Settings have no pane and select nothing.
+#:
+#: Each selector names its own list container. A bare `.row` would defeat
+#: the point: the Tools pane holds a tool list and a workflow list, so an
+#: empty tool list would still match a workflow row and photograph the wrong
+#: thing without failing.
 TABS = [
-    ("notes-tab", "03-notes", ".note-item"),
-    ("contexts-tab", "04-contexts", ".row"),
+    ("notes-tab", "03-notes", "#note-list .note-item"),
+    ("contexts-tab", "04-contexts", "#contexts-list .row"),
     ("files-tab", "05-files", None),
-    ("artifacts-tab", "06-artifacts", ".row"),
-    ("tools-tab", "07-tools", ".row"),
+    ("artifacts-tab", "06-artifacts", "#artifacts-list .row"),
+    ("tools-tab", "07-tools", "#tools-list .row"),
     ("insights-tab", "08-insights", None),
     ("settings-tab", "09-settings", None),
 ]
@@ -231,10 +234,24 @@ def seed(client, token: str) -> None:
             },
         )
     )
+    context_id = context.get("id")
+    if not context_id:
+        # Every later step needs this id. Skipping them quietly is what
+        # produces a capture of empty screens that looks deliberate.
+        raise SystemExit(f"the context was not created: {context}")
+
     for name, body, mime in FILES:
-        client.post(
+        uploaded = client.post(
             "/v1/files/upload", headers=headers, files={"file": (name, body, mime)}
         )
+        if uploaded.status_code >= 400:
+            # Checked per file. Chunks appearing at all does not say both
+            # documents are there, so one failed upload would otherwise be
+            # masked by the other one indexing successfully.
+            raise SystemExit(
+                f"could not upload {name} "
+                f"(HTTP {uploaded.status_code}): {uploaded.text[:300]}"
+            )
 
     # Index the uploads into the context. Without this the Contexts screen is
     # captured reading "No sources added yet" and "0 chunks loaded", which
@@ -243,31 +260,29 @@ def seed(client, token: str) -> None:
     # "files" reaches `users/{user_id}/files`, where uploads land. Passing
     # the rooted path instead produces `users/{id}/users/{id}/files`, which
     # this endpoint accepts and indexes nothing from.
-    context_id = context.get("id")
-    if context_id:
-        added = client.post(
-            f"/v1/contexts/{context_id}/sources",
-            headers=headers,
-            json={"fs_path": "files", "recursive": True},
+    added = client.post(
+        f"/v1/contexts/{context_id}/sources",
+        headers=headers,
+        json={"fs_path": "files", "recursive": True},
+    )
+    if added.status_code != 201:
+        raise SystemExit(
+            f"could not index the uploads into the context "
+            f"(HTTP {added.status_code}): {added.text[:300]}"
         )
-        if added.status_code != 201:
-            raise SystemExit(
-                f"could not index the uploads into the context "
-                f"(HTTP {added.status_code}): {added.text[:300]}"
-            )
-        # 201 only means the path was accepted and recorded. A path that
-        # matched no document is indexed to nothing and still answers 201,
-        # so the chunks are what say the sources are really there. This
-        # reads the endpoint the Contexts screen itself reads, rather than
-        # a count field that endpoint does not return.
-        chunks = unwrap(
-            client.get(f"/v1/contexts/{context_id}/chunks?limit=20", headers=headers)
-        ).get("items")
-        if not chunks:
-            raise SystemExit(
-                "the context indexed no chunks, so the Contexts screen "
-                "would document an empty context"
-            )
+    # 201 only means the path was accepted and recorded. A path that matched
+    # no document is indexed to nothing and still answers 201, so the chunks
+    # are what say the sources are really there. This reads the endpoint the
+    # Contexts screen itself reads, rather than a count field that endpoint
+    # does not return.
+    chunks = unwrap(
+        client.get(f"/v1/contexts/{context_id}/chunks?limit=20", headers=headers)
+    ).get("items")
+    if not chunks:
+        raise SystemExit(
+            "the context indexed no chunks, so the Contexts screen "
+            "would document an empty context"
+        )
 
     for title, content in NOTES:
         client.post(
