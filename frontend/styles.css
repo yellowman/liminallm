@@ -2122,7 +2122,7 @@ button.minor:hover {
   background: var(--accent-light);
 }
 
-/* Card lists (contexts, tools, workflows) */
+/* Pane lists (contexts, tools, workflows, artifacts) */
 .contexts-list,
 .tools-list,
 .workflows-list,
@@ -2138,29 +2138,15 @@ button.minor:hover {
    its own `min-width: 0` for this reason; anything else put in these lists
    needs the same. */
 
-
 /* The pane reads a step quieter than the workspace beside it: it is
    secondary navigation, and it has 219px to say a name in. One step down is
    a few more characters before the ellipsis on every row, which is the whole
    point of the column. Meta stays at 11px, matching the conversation list.
 
-   `overflow-wrap` on the names for the same reason as `min-width: 0` above:
-   a dotted tool id or a uuid is one unbreakable word, and an unbreakable
-   word sets a min-content floor no narrow column can meet. */
-.context-pane __DEAD_NAME__ {
-  font-size: 12px;
-  overflow-wrap: anywhere;
-}
-
-.context-pane __DEAD_DESC__ {
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-/* The same step down, for the rows that replaced those cards. A row solves
-   the unbreakable-word problem differently - it truncates rather than
-   wrapping mid-word, and carries the full string in its `title` - but the
-   reason the pane is quieter than the workspace has not changed. */
+   A dotted tool id or a uuid is one unbreakable word, and an unbreakable
+   word sets a min-content floor no narrow column can meet. A row answers
+   that by truncating rather than wrapping mid-word, and carries the full
+   string in its `title`. */
 .context-pane .row-name {
   font-size: 12px;
 }
