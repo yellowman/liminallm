@@ -179,11 +179,19 @@ def execute_python(code: str, workdir: str, confine_root: str = "") -> dict[str,
     for p in sorted(Path(workdir).iterdir()):
         if p.is_file() and p.name not in before:
             created.append({"name": p.name, "size": p.stat().st_size})
+    # Keep the returned file list bounded, but preserve the count needed to
+    # say when that bound itself caused files not to be published. Hidden
+    # files are intentionally not artifacts, so they are not part of the
+    # user-visible loss count.
+    created_non_hidden_file_count = sum(
+        1 for item in created if not str(item.get("name") or "").startswith(".")
+    )
     return {
         "ok": ok,
         "stdout": _truncate(stdout.getvalue()),
         "stderr": _truncate(stderr.getvalue()),
         "created_files": created[:MAX_ARTIFACTS],
+        "created_non_hidden_file_count": created_non_hidden_file_count,
     }
 
 
