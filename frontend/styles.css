@@ -12,9 +12,24 @@
   --text: #191c20;
   --text-muted: #626872;
   --shadow: 0 1px 2px rgba(16, 20, 28, 0.05);
-  --radius: 10px;
-  --radius-sm: 8px;
-  --ctl-h: 36px;
+  /* Geometry. The rail is the model the rest of the application follows: a
+     20px glyph in a 36px hit area, no border or background until hover, and
+     selection carried by a faint fill plus a 2px marker. What made the
+     workspace look unlike it was not colour but enclosure - a bordered,
+     rounded, shadowed panel holding bordered rounded sections holding
+     bordered rounded cards. These tokens set the smaller end of that, and
+     the vocabulary at the end of this file provides the flat alternatives. */
+  --radius: 8px;
+  --radius-sm: 6px;
+  /* Desktop density. Large enough to hit, small enough that a form reads as
+     instrumentation rather than a questionnaire. The admin settings grid
+     already sat at 28px and was the closest thing here to the rail. */
+  --ctl-h: 30px;
+  --ctl-h-sm: 26px;
+  /* A glyph smaller than its target: precise to look at, easy to hit. */
+  --icon-hit: 28px;
+  --icon-glyph: 18px;
+  --chip-h: 20px;
   --font: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
   --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, Cambria, "Times New Roman", serif;
   --font-mono: "SF Mono", "Fira Code", Consolas, monospace;
@@ -553,26 +568,57 @@ body {
 
 /* Layout with sidebar */
 
+/* An action that is only an icon, in the rail's grammar: nothing at rest, a
+   faint fill on hover. The size was already right; the border was the part
+   that made a row of these read as a row of boxes. The glyph is smaller than
+   the target, so it looks precise without being hard to hit. */
 .icon-btn {
-  width: 28px;
-  height: 28px;
+  width: var(--icon-hit);
+  height: var(--icon-hit);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: var(--panel);
+  border: 0;
+  background: none;
   color: var(--text-muted);
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  padding: 0;
+  transition: background 130ms ease, color 130ms ease;
 }
 
 .icon-btn:hover {
   background: var(--panel-muted);
-  border-color: var(--border-strong);
   color: var(--text);
+}
+
+.icon-btn:focus-visible {
+  outline: none;
+  color: var(--text);
+  box-shadow: 0 0 0 2px rgba(14, 138, 109, 0.10);
+}
+
+.icon-btn.danger:hover {
+  background: var(--danger-light);
+  color: var(--danger);
+}
+
+.icon-btn svg {
+  width: var(--icon-glyph);
+  height: var(--icon-glyph);
+  display: block;
+}
+
+.icon-btn.compact {
+  width: 24px;
+  height: 24px;
+}
+
+.icon-btn.compact svg {
+  width: 16px;
+  height: 16px;
 }
 
 .sidebar-search {
@@ -801,12 +847,14 @@ body {
 }
 
 /* Panel styles */
+/* A working surface, not a card. The shadow is gone: a panel that fills its
+   band is not floating above anything, and a shadow on it only competes with
+   the menus and dialogs that genuinely do float. */
 .panel {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 20px;
-  box-shadow: var(--shadow);
+  padding: 16px 18px;
 }
 
 .panel h2 {
@@ -838,11 +886,20 @@ body {
 }
 
 /* Collapsible sections */
+/* A division of the panel, not a box inside it. A border here is the second
+   enclosure around the same content and the third around anything in a list
+   below it; a hairline says the same thing with one line. The first section
+   needs no rule, because the panel heading above it already separates. */
 .panel-section {
-  margin: 12px 0;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 12px 14px;
+  margin: 14px 0 0;
+  padding: 14px 0 0;
+  border-top: 1px solid var(--border);
+}
+
+.panel-section:first-of-type {
+  margin-top: 12px;
+  padding-top: 0;
+  border-top: 0;
 }
 
 .panel-section.collapsed .section-content {
@@ -945,7 +1002,7 @@ body {
 .field select:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(14, 138, 109, 0.12);
+  box-shadow: 0 0 0 2px rgba(14, 138, 109, 0.10);
 }
 
 textarea {
@@ -2751,7 +2808,7 @@ button.minor:hover {
 .form-group input:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(14, 138, 109, 0.12);
+  box-shadow: 0 0 0 2px rgba(14, 138, 109, 0.10);
 }
 
 .form-group .small {
@@ -3610,4 +3667,313 @@ button.minor:hover {
 
 .citation-more:hover {
   color: var(--text);
+}
+
+/* ---------------------------------------------------------------------------
+   Flat vocabulary
+
+   One rule generated everything below it: if something is not a destination,
+   a primary action, a floating object, or an isolated editing surface, it
+   does not get its own rounded rectangle.
+
+   The rail already worked this way and the workspace did not, which is why
+   the two read as different products bolted together. These classes give the
+   workspace the rail's grammar - transparent at rest, faint fill on hover,
+   selection as a pale wash plus a 2px marker - so a list of contexts, tools,
+   workflows or artifacts can stop being a stack of cards.
+
+   Surfaces migrate onto these one at a time, so most of what is below is
+   unused until a surface adopts it. Two changes are not additions and do move
+   every screen at once, deliberately, because each is a single definition
+   rather than per-surface markup: `.icon-btn` loses its border, and `--ctl-h`
+   drops from 36px to 30px.
+   --------------------------------------------------------------------------- */
+
+/* A list entry. No border: the row is separated from its neighbours by
+   alignment and by the hover fill, which is enough once the entries are not
+   each wearing a box. The radius exists only so the hover fill has a shape. */
+.row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.row:hover {
+  background: var(--panel-muted);
+}
+
+/* Selection, said the way the rail says it. */
+.row.selected {
+  background: var(--accent-light);
+}
+
+.row.selected::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: var(--accent);
+}
+
+.row.selected .row-name {
+  color: var(--accent-strong);
+}
+
+/* The type marker. A line icon rather than a coloured capsule saying the
+   same word. */
+.row-icon {
+  flex-shrink: 0;
+  width: var(--icon-glyph);
+  height: var(--icon-glyph);
+  color: var(--text-muted);
+}
+
+.row-main {
+  min-width: 0;
+  flex: 1;
+}
+
+.row-name {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Everything that used to be a row of pills. */
+.row-meta {
+  display: block;
+  margin-top: 1px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Secondary actions cost nothing until wanted. Focus-within keeps them
+   reachable from the keyboard, where hover cannot help. */
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 130ms ease;
+}
+
+.row:hover .row-actions,
+.row:focus-within .row-actions,
+.row.selected .row-actions {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .row-actions {
+    opacity: 1;
+  }
+}
+
+/* Metadata as text. `private`, `shared`, an artifact type and a version are
+   facts about a thing, not controls, so they get a dot and a word rather
+   than a capsule each. */
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  min-width: 0;
+}
+
+.meta > * {
+  min-width: 0;
+}
+
+.meta-sep::before {
+  content: "·";
+  margin-right: 6px;
+  color: var(--border-strong);
+}
+
+.meta-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--border-strong);
+  flex-shrink: 0;
+}
+
+.meta-dot.on {
+  background: var(--accent);
+}
+
+.meta-dot.warn {
+  background: #b7791f;
+}
+
+.meta-dot.off {
+  background: var(--danger);
+}
+
+/* An enclosure only where the enclosure is the behaviour: a filter you can
+   click, a token you can remove, a choice in a set. Not a label. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--chip-h);
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.chip:hover {
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+.chip.active {
+  border-color: transparent;
+  background: var(--accent-light);
+  color: var(--accent-strong);
+}
+
+.chip svg {
+  width: 12px;
+  height: 12px;
+}
+
+/* A figure on the canvas. Insights counted four things inside four tiles;
+   the numbers are the content and the tiles were packaging. */
+.figures {
+  display: flex;
+  align-items: flex-start;
+  gap: 28px;
+}
+
+.figure-value {
+  display: block;
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+}
+
+.figure-label {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+/* Aligned facts, where a list of them used to be a grid of boxes. */
+.deflist {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 14px;
+  font-size: 12.5px;
+}
+
+.deflist dt {
+  color: var(--text-muted);
+}
+
+.deflist dd {
+  margin: 0;
+}
+
+/* A table that is structure rather than an object: rules between rows, no
+   frame around the whole. Version history is the case this exists for. */
+.hairline-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.hairline-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  padding: 0 10px 5px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.hairline-table td {
+  padding: 6px 10px 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.hairline-table tr:last-child td {
+  border-bottom: 0;
+}
+
+.hairline-table tbody tr:hover {
+  background: var(--panel-muted);
+}
+
+/* A heading for a division of an open surface. The action sits on the same
+   line because a section that needs a button does not need a toolbar. */
+.section-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 0 6px;
+}
+
+.section-bar h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* A quiet input: no perimeter until the perimeter is useful. */
+.input-quiet {
+  height: var(--ctl-h);
+  width: 100%;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--panel-muted);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+}
+
+.input-quiet:hover {
+  border-color: var(--border);
+}
+
+.input-quiet:focus {
+  outline: none;
+  background: var(--panel);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(14, 138, 109, 0.10);
 }
