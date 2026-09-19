@@ -450,24 +450,31 @@ def run_python(
     #
     # Counted, not compared by name. `_link_unused` renames on collision, so
     # a file created as `out.csv` can be published as `out (2).csv`, and a
-    # name-based difference would report a saved file as dropped. Dotfiles
-    # are skipped deliberately and are excluded from the denominator for the
-    # same reason. The >10 case is invisible here either way: the truncation
-    # happens before `created_files` is built.
-    expected = [
-        entry
-        for entry in created
-        if not str(
-            entry.get("name") if isinstance(entry, dict) else entry
-        ).startswith(".")
-    ]
-    dropped = len(expected) - len(published)
+    # name-based difference would report a saved file as dropped. Dotfiles are
+    # skipped deliberately and are excluded from the denominator.
+    #
+    # `execute_python` bounds the returned file list to MAX_ARTIFACTS so the
+    # child cannot choose an arbitrarily large result. It therefore reports
+    # the total non-hidden file count separately; otherwise files beyond that
+    # bound disappear before this comparison and the count-limit case remains
+    # silent.
+    expected_count = result.get("created_non_hidden_file_count")
+    if type(expected_count) is not int or expected_count < 0:
+        expected_count = sum(
+            1
+            for entry in created
+            if not str(
+                entry.get("name") if isinstance(entry, dict) else entry
+            ).startswith(".")
+        )
+    dropped = max(0, expected_count - len(published))
     if dropped > 0:
         parts.append(
-            f"WARNING: {dropped} of {len(expected)} file(s) the code created "
-            "were NOT saved - the file type is not allowed, or the file is "
-            "too large. Tell the user which files were not saved. Allowed "
-            f"types: {', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}"
+            f"WARNING: {dropped} of {expected_count} file(s) the code created "
+            "were NOT saved - the file type is not allowed, the file is too "
+            "large, or the artifact count limit was reached. Tell the user "
+            "which files were not saved. Allowed types: "
+            f"{', '.join(sorted(ALLOWED_UPLOAD_EXTENSIONS))}"
         )
 
     if not parts:
