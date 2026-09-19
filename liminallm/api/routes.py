@@ -1175,10 +1175,15 @@ async def confirm_reset(body: PasswordResetConfirm, request: Request):
         limit=5,
         window_seconds=300,
     )
-    ok = await runtime.auth.complete_password_reset(body.token, body.new_password)
+    ok, revoked = await runtime.auth.complete_password_reset_with_revocation(
+        body.token, body.new_password
+    )
     if not ok:
         raise http_error("validation_error", "invalid token", status_code=400)
-    return Envelope(status="ok", data={"status": "reset"})
+    return Envelope(
+        status="ok",
+        data={"status": "reset", "other_sessions_revoked": revoked},
+    )
 
 
 @router.get("/me", response_model=Envelope, tags=["auth"])
