@@ -1194,20 +1194,32 @@ class AuthService:
 
     async def revoke_all_user_sessions(
         self, user_id: str, except_session_id: Optional[str] = None
-    ) -> int:
-        """Revoke all sessions for a user, optionally keeping one session active.
+    ) -> bool:
+        """Revoke all sessions for a user, optionally keeping one active.
 
         Args:
             user_id: The user whose sessions to revoke
             except_session_id: Optional session ID to keep active (e.g., current session)
 
         Returns:
-            Number of sessions revoked
+            Whether the stored sessions were actually revoked.
+
+        The answer matters because the caller has usually just told somebody
+        their other sessions are gone. `auth_session` is the revocation
+        mechanism, not a cache of one: `_authenticate_access_token` reads the
+        row and refuses the token when it is missing, and there is no token
+        version or epoch behind it. So a failed delete leaves a stolen
+        session working for the rest of its lifetime.
+
+        Raising is the wrong answer and was measured to be: the password is
+        already committed by the time this runs, so a failure here would
+        report that the change did not happen when it did. The failure is
+        returned instead, for the caller to put in its own response.
         """
-        revoked_count = 0
+        revoked = False
         try:
             self.store.revoke_user_sessions(user_id, except_session_id)
-            revoked_count = -1  # the bulk delete does not report a count
+            revoked = True
         except Exception as exc:
             self.logger.warning(
                 "revoke_user_sessions_failed", user_id=user_id, error=str(exc)
@@ -1222,7 +1234,7 @@ class AuthService:
                     user_id=user_id,
                     error=str(exc),
                 )
-        return revoked_count
+        return revoked
 
     async def resolve_session(
         self,

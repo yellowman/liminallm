@@ -1126,12 +1126,22 @@ async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(
     # Disable MFA by setting enabled=False
     runtime.store.set_user_mfa_secret(principal.user_id, mfa_cfg.secret, enabled=False)
 
-    # SECURITY: Revoke all other sessions to force re-authentication
-    await runtime.auth.revoke_all_user_sessions(
+    # SECURITY: Revoke all other sessions to force re-authentication.
+    #
+    # Reported, not assumed. `auth_session` is the revocation mechanism -
+    # `_authenticate_access_token` reads the row and refuses the token when
+    # it is gone, and no token version stands behind it - so a failed delete
+    # leaves every other session working. This answered "disabled" either
+    # way, which tells somebody who disabled MFA because a session was stolen
+    # that the stolen one is gone when it is not.
+    revoked = await runtime.auth.revoke_all_user_sessions(
         principal.user_id, except_session_id=principal.session_id
     )
 
-    return Envelope(status="ok", data={"status": "disabled"})
+    return Envelope(
+        status="ok",
+        data={"status": "disabled", "other_sessions_revoked": revoked},
+    )
 
 
 @router.post("/auth/reset/request", response_model=Envelope, tags=["auth"])
@@ -1315,18 +1325,27 @@ async def change_password(
     # Save new password
     runtime.auth.save_password(principal.user_id, body.new_password)
 
-    # SECURITY: Revoke all other sessions to force re-authentication
-    await runtime.auth.revoke_all_user_sessions(
+    # SECURITY: Revoke all other sessions to force re-authentication.
+    # Reported rather than assumed, for the reason given on MFA disable
+    # above: the row is the mechanism, and a failed delete leaves a stolen
+    # session alive for its full lifetime while this answered "changed".
+    revoked = await runtime.auth.revoke_all_user_sessions(
         principal.user_id, except_session_id=principal.session_id
     )
 
     # Issue 51.6: Audit logging for password change (GDPR/SOC2 compliance)
+    # The outcome is in the audit line too: a change whose revocation failed
+    # is the one an operator most needs to find afterwards.
     logger.info(
         "user_password_changed",
         user_id=principal.user_id,
         session_id=principal.session_id,
+        other_sessions_revoked=revoked,
     )
-    return Envelope(status="ok", data={"status": "changed"})
+    return Envelope(
+        status="ok",
+        data={"status": "changed", "other_sessions_revoked": revoked},
+    )
 
 
 @router.post("/auth/logout", response_model=Envelope, tags=["auth"])
