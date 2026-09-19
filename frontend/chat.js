@@ -312,7 +312,6 @@ const PANE_ITEM_SELECTOR = [
   '.conversation-item',
   '.note-item',
   '.note-search-hit',
-  '.context-card',
   //: `.row` is the flat list entry the panes are migrating onto, and it
   //: covers every surface that has moved rather than needing one line each.
   //: That is the point: the note above records that enumerating this list is
@@ -1803,24 +1802,28 @@ const renderContextsList = () => {
     return;
   }
 
+  /* The description is what tells two contexts apart, so it is the row's
+     second line. The truncated id that used to sit under it is not: nobody
+     picks a context by the first eight characters of its uuid, and the
+     detail view shows the whole thing. */
   list.innerHTML = state.contexts
     .map((ctx) => {
       const isSelected = ctx.id === state.selectedContext?.id;
+      const description = ctx.description || 'No description';
       return `
-        <div class="context-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(ctx.id)}">
-          <div class="name">${escapeHtml(ctx.name)}</div>
-          <div class="description">${escapeHtml(ctx.description || 'No description')}</div>
-          <div class="stats">
-            <span class="stat">ID: ${escapeHtml(ctx.id.slice(0, 8))}...</span>
-            <span class="stat">Created: ${new Date(ctx.created_at).toLocaleDateString()}</span>
-          </div>
-        </div>
+        <button type="button" class="row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(ctx.id)}" title="${escapeAttr(`${ctx.name} \u2014 ${description}`)}">
+          ${typeIcon('context')}
+          <span class="row-main">
+            <span class="row-name">${escapeHtml(ctx.name)}</span>
+            <span class="row-meta">${escapeHtml(description)}</span>
+          </span>
+        </button>
       `;
     })
     .join('');
 
-  list.querySelectorAll('.context-card').forEach((card) => {
-    card.addEventListener('click', () => selectContext(card.dataset.id));
+  list.querySelectorAll('.row').forEach((row) => {
+    row.addEventListener('click', () => selectContext(row.dataset.id));
   });
 };
 
@@ -1846,7 +1849,10 @@ const selectContext = async (contextId) => {
     details.innerHTML = `
       <div class="detail-header">
         <h4>${escapeHtml(ctx.name)}</h4>
-        <span class="visibility-badge ${ctx.visibility || 'private'}">${ctx.visibility || 'private'}</span>
+        <span class="factline">${visibilityMark(ctx.visibility || 'private')}${escapeHtml(
+          (ctx.visibility || 'private').charAt(0).toUpperCase()
+          + (ctx.visibility || 'private').slice(1)
+        )}</span>
       </div>
       <div class="detail-row">
         <span class="detail-label">ID</span>
@@ -1926,12 +1932,14 @@ const renderContextSources = (sources) => {
     .map((s) => {
       const date = s.created_at ? new Date(s.created_at).toLocaleDateString() : '-';
       return `
-        <div class="source-item">
-          <div class="source-path monospace">${escapeHtml(s.fs_path || s.path || '-')}</div>
-          <div class="source-meta">
-            <span>${s.recursive ? 'Recursive' : 'Single file'}</span>
-            <span>Added ${date}</span>
-          </div>
+        <div class="row" title="${escapeAttr(s.fs_path || s.path || '-')}">
+          ${typeIcon('file')}
+          <span class="row-main">
+            <span class="row-name monospace">${escapeHtml(s.fs_path || s.path || '-')}</span>
+            <span class="row-meta">${escapeHtml(
+              `${s.recursive ? 'Recursive' : 'Single file'} \u00b7 added ${date}`
+            )}</span>
+          </span>
         </div>
       `;
     })
@@ -2071,6 +2079,10 @@ const TYPE_GLYPH = {
   tool: '<path d="M12.9 3.1a3.6 3.6 0 0 0-4.7 4.7l-5 5a1.2 1.2 0 0 0 0 1.7l1.3 1.3a1.2 1.2 0 0 0 1.7 0l5-5a3.6 3.6 0 0 0 4.7-4.7l-2.3 2.3-2-2Z"/>',
   adapter: '<path d="M10 2.75 17.5 7 10 11.25 2.5 7Z"/><path d="m3.75 10 6.25 3.5L16.25 10"/>',
   policy: '<path d="M10 2.75 16.25 5v5.5c0 3.5-2.5 5.5-6.25 6.75C6.25 16 3.75 14 3.75 10.5V5Z"/>',
+  //: The rail's own contexts glyph, so the destination and the rows inside
+  //: it are visibly the same thing.
+  context: '<path d="M10 2.75 17.25 10 10 17.25 2.75 10Z"/>',
+  file: '<path d="M6.25 2.75h5L15 6.5v10.75h-8.75Z"/><path d="M11 2.75v4h4"/>',
   unknown: '<path d="M6.25 2.75h5L15 6.5v10.75h-8.75Z"/><path d="M11 2.75v4h4"/>',
 };
 
@@ -2142,7 +2154,7 @@ const selectArtifact = async (artifactId) => {
     details.innerHTML = `
       <div class="detail-header">
         <h4>${escapeHtml(artifact.name || artifact.id)}</h4>
-        <span class="type-badge ${artifact.type || 'unknown'}">${escapeHtml(artifact.type || 'unknown')}</span>
+        <span class="factline">${escapeHtml(artifact.type || 'unknown')}</span>
       </div>
       <div class="detail-row">
         <span class="detail-label">ID</span>
@@ -3634,7 +3646,10 @@ const selectWorkflow = (workflowId) => {
     details.innerHTML = `
       <div class="detail-header">
         <h4>${escapeHtml(wf.name || wf.id)}</h4>
-        <span class="visibility-badge ${wf.visibility || 'private'}">${wf.visibility || 'private'}</span>
+        <span class="factline">${visibilityMark(wf.visibility || 'private')}${escapeHtml(
+          (wf.visibility || 'private').charAt(0).toUpperCase()
+          + (wf.visibility || 'private').slice(1)
+        )}</span>
       </div>
       <div class="detail-row">
         <span class="detail-label">ID</span>

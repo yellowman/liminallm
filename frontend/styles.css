@@ -2131,54 +2131,12 @@ button.minor:hover {
   gap: 8px;
 }
 
-/* `min-width: 0` because these are grid items, and a grid item defaults to
-   `min-width: auto` - it refuses to shrink below its own min-content width.
-   A monospace name like `code.python_v1` set that floor above the 219px the
-   pane's list track actually has, so every card sat 15px wider than the list
-   holding it and 5px outside the pane. The container was the right width the
-   whole time; the items were not obliged to respect it. */
-.context-card,
-
-
-.context-card:hover {
-  border-color: var(--border-strong);
-  background: var(--panel-muted);
-}
-
-.context-card.selected {
-  border-color: var(--accent);
-  background: var(--accent-light);
-}
-
-.context-card .name {
-  font-weight: 600;
-  margin-bottom: 2px;
-}
-
-.context-card .description {
-  font-size: 13px;
-  color: var(--text-muted);
-  margin-bottom: 6px;
-}
-
-/* Wraps between stats, never inside one. In a 240px pane a nowrap row of
-   two label-and-value pairs broke wherever it ran out of room, so a card
-   read "ID:" / "0c3beee3..." / "Created:" / "8/30/2026" down four lines
-   with the labels orphaned from their values. */
-.context-card .stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px 14px;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.context-card .stat {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  white-space: nowrap;
-}
+/* The lists above are grids, and a grid item defaults to `min-width: auto` -
+   it refuses to shrink below its own min-content width. A monospace name like
+   `code.python_v1` set that floor above the 219px the pane's list track
+   actually has, so every item sat outside the pane holding it. `.row` carries
+   its own `min-width: 0` for this reason; anything else put in these lists
+   needs the same. */
 
 
 /* The pane reads a step quieter than the workspace beside it: it is
@@ -2189,12 +2147,12 @@ button.minor:hover {
    `overflow-wrap` on the names for the same reason as `min-width: 0` above:
    a dotted tool id or a uuid is one unbreakable word, and an unbreakable
    word sets a min-content floor no narrow column can meet. */
-.context-pane .context-card .name {
+.context-pane __DEAD_NAME__ {
   font-size: 12px;
   overflow-wrap: anywhere;
 }
 
-.context-pane .context-card .description {
+.context-pane __DEAD_DESC__ {
   font-size: 12px;
   line-height: 1.45;
 }
@@ -2212,14 +2170,18 @@ button.minor:hover {
 }
 
 /* Detail blocks (contexts, tools, workflows, patches) */
+/* A detail view is the panel's content, not an object sitting inside it. The
+   rows below are already divided by hairlines; a filled, rounded box around
+   them was the second enclosure, inside the panel that was already the
+   first. Removing it converts every detail view at once - contexts, tools,
+   workflows, artifacts and config patches - because they were one rule all
+   along. */
 .context-details,
 .tool-details,
 .workflow-details,
 .artifact-details,
 .patch-details {
-  background: var(--panel-muted);
-  border-radius: var(--radius-sm);
-  padding: 14px 16px;
+  padding: 2px 0 0;
 }
 
 .context-details .detail-header,
@@ -2283,32 +2245,6 @@ button.minor:hover {
   margin-bottom: 16px;
 }
 
-.source-item {
-  padding: 10px 14px;
-  background: var(--panel-muted);
-  border-radius: var(--radius-sm);
-  border-left: 2px solid var(--accent);
-}
-
-.source-path {
-  font-weight: 600;
-  font-size: 13px;
-  word-break: break-all;
-  margin-bottom: 4px;
-}
-
-.source-meta {
-  display: flex;
-  gap: 12px;
-  font-size: 11.5px;
-  color: var(--text-muted);
-}
-
-.source-meta span {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
 
 .schema-viewer {
   background: var(--panel);
@@ -2494,20 +2430,6 @@ button.minor:hover {
   font-family: var(--font-mono);
 }
 
-/* Type / visibility badges - neutral, uniform */
-.type-badge,
-.visibility-badge {
-  display: inline-block;
-  padding: 1px 7px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-  background: var(--panel);
-  color: var(--text-muted);
-  border: 1px solid var(--border-strong);
-}
 
 /* Auth form links */
 .auth-links {
