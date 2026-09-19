@@ -313,9 +313,12 @@ const PANE_ITEM_SELECTOR = [
   '.note-item',
   '.note-search-hit',
   '.context-card',
-  '.artifact-card',
-  '.tool-card',
-  '.workflow-card',
+  //: `.row` is the flat list entry the panes are migrating onto, and it
+  //: covers every surface that has moved rather than needing one line each.
+  //: That is the point: the note above records that enumerating this list is
+  //: what went wrong last time, and one shared class is one fewer thing to
+  //: forget when the next pane converts.
+  '.row',
 ].join(', ');
 
 //: Kept rather than queried fresh each time, because the shell has to listen
@@ -2059,6 +2062,34 @@ const fetchArtifacts = async () => {
   }
 };
 
+/* The line icons a row leads with. Same grammar as the rail - a 20x20 box,
+   1.5px stroke, round caps and joins, unfilled - because a row in the pane
+   and a destination in the rail are the same kind of object at different
+   scales, and the workspace looked bolted on when only one of them said so. */
+const TYPE_GLYPH = {
+  workflow: '<path d="M5.5 4.5h4a3 3 0 0 1 3 3v5a3 3 0 0 0 3 3h1"/><circle cx="4" cy="4.5" r="1.5"/><circle cx="17" cy="15.5" r="1.5"/><circle cx="4" cy="15.5" r="1.5"/><path d="M5.5 15.5h4a3 3 0 0 0 3-3"/>',
+  tool: '<path d="M12.9 3.1a3.6 3.6 0 0 0-4.7 4.7l-5 5a1.2 1.2 0 0 0 0 1.7l1.3 1.3a1.2 1.2 0 0 0 1.7 0l5-5a3.6 3.6 0 0 0 4.7-4.7l-2.3 2.3-2-2Z"/>',
+  adapter: '<path d="M10 2.75 17.5 7 10 11.25 2.5 7Z"/><path d="m3.75 10 6.25 3.5L16.25 10"/>',
+  policy: '<path d="M10 2.75 16.25 5v5.5c0 3.5-2.5 5.5-6.25 6.75C6.25 16 3.75 14 3.75 10.5V5Z"/>',
+  unknown: '<path d="M6.25 2.75h5L15 6.5v10.75h-8.75Z"/><path d="M11 2.75v4h4"/>',
+};
+
+const typeIcon = (type) => {
+  const glyph = TYPE_GLYPH[type] || TYPE_GLYPH.unknown;
+  return `<svg class="row-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" `
+    + `stroke="currentColor" stroke-width="1.5" stroke-linecap="round" `
+    + `stroke-linejoin="round">${glyph}</svg>`;
+};
+
+/* Visibility gets a dot only when it means the thing is reachable by someone
+   else. Private is the default and says so in words; a dot on every row would
+   be decoration rather than a signal. */
+const visibilityMark = (visibility) => {
+  if (visibility === 'global') return '<span class="fact-dot on"></span>';
+  if (visibility === 'shared') return '<span class="fact-dot warn"></span>';
+  return '';
+};
+
 const renderArtifactsList = () => {
   const list = $('artifacts-list');
   if (!list) return;
@@ -2068,33 +2099,34 @@ const renderArtifactsList = () => {
     return;
   }
 
-  // A card, not a table row. Five columns need more than the 240px pane has,
-  // so the table scrolled sideways and the name - the only thing you pick a
-  // row by - was the part that went off the edge, while the version and the
-  // date kept their full slots. Same shape as the contexts and tools lists.
+  /* A flat row, not a card. Each entry used to wear a border inside the
+     pane's border, with its type and visibility as two uppercase capsules
+     and its version and date on a third line - about 100px of pane for one
+     artifact, and eight of them filled a 900px screen. The name is what a
+     row is picked by, so it leads; everything else is one muted line under
+     it, which is the same information in a third of the height. */
   list.innerHTML = state.artifacts
     .map((a) => {
       const isSelected = a.id === state.selectedArtifact?.id;
       const type = a.type || 'unknown';
       const visibility = a.visibility || 'private';
+      const when = new Date(a.updated_at).toLocaleDateString();
+      const shown = visibility.charAt(0).toUpperCase() + visibility.slice(1);
+      const facts = `${shown} \u00b7 ${type} v${a.version || 1} \u00b7 ${when}`;
       return `
-        <div class="artifact-card ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(a.id)}">
-          <div class="name">${escapeHtml(a.name || a.id)}</div>
-          <div class="badges">
-            <span class="type-badge ${escapeAttr(type)}">${escapeHtml(type)}</span>
-            <span class="visibility-badge ${escapeAttr(visibility)}">${escapeHtml(visibility)}</span>
-          </div>
-          <div class="stats">
-            <span class="stat">v${escapeHtml(String(a.version || 1))}</span>
-            <span class="stat">${escapeHtml(new Date(a.updated_at).toLocaleDateString())}</span>
-          </div>
-        </div>
+        <button type="button" class="row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(a.id)}" title="${escapeAttr(a.name || a.id)}">
+          ${typeIcon(type)}
+          <span class="row-main">
+            <span class="row-name">${escapeHtml(a.name || a.id)}</span>
+            <span class="row-meta">${visibilityMark(visibility)}${escapeHtml(facts)}</span>
+          </span>
+        </button>
       `;
     })
     .join('');
 
-  list.querySelectorAll('.artifact-card').forEach((card) => {
-    card.addEventListener('click', () => selectArtifact(card.dataset.id));
+  list.querySelectorAll('.row').forEach((row) => {
+    row.addEventListener('click', () => selectArtifact(row.dataset.id));
   });
 };
 
@@ -3407,22 +3439,29 @@ const renderToolsList = () => {
     return;
   }
 
+  /* Same row as the artifacts pane, so the two lists are one thing learned
+     once. The description is the row's second line rather than a paragraph
+     inside a card, and it truncates instead of reflowing the entry to three
+     lines in a 240px column. */
   toolsList.innerHTML = tools
     .map((tool) => {
       const isSelected = selectedTool?.id === tool.id;
       const name = tool.name || tool.schema?.name || tool.id;
       const description = tool.description || tool.schema?.description || 'No description';
       return `
-        <div class="tool-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(tool.id)}">
-          <div class="tool-name">${escapeHtml(name)}</div>
-          <div class="tool-description">${escapeHtml(description)}</div>
-        </div>
+        <button type="button" class="row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(tool.id)}" title="${escapeAttr(`${name} \u2014 ${description}`)}">
+          ${typeIcon('tool')}
+          <span class="row-main">
+            <span class="row-name">${escapeHtml(name)}</span>
+            <span class="row-meta">${escapeHtml(description)}</span>
+          </span>
+        </button>
       `;
     })
     .join('');
 
-  toolsList.querySelectorAll('.tool-card').forEach((card) => {
-    card.addEventListener('click', () => selectTool(card.dataset.id));
+  toolsList.querySelectorAll('.row').forEach((row) => {
+    row.addEventListener('click', () => selectTool(row.dataset.id));
   });
 };
 
@@ -3556,23 +3595,29 @@ const renderWorkflowsList = () => {
     return;
   }
 
+  /* The same row again. Workflows share the Tools pane, so leaving them as
+     cards would have put two vocabularies in one column - the thing this
+     whole change exists to stop. */
   workflowsList.innerHTML = workflows
     .map((wf) => {
       const isSelected = selectedWorkflow?.id === wf.id;
+      const visibility = wf.visibility || 'private';
+      const shown = visibility.charAt(0).toUpperCase() + visibility.slice(1);
+      const name = wf.name || wf.id;
       return `
-        <div class="workflow-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(wf.id)}">
-          <div class="workflow-name">${escapeHtml(wf.name || wf.id)}</div>
-          <div class="workflow-meta">
-            <span class="visibility-badge ${wf.visibility || 'private'}">${wf.visibility || 'private'}</span>
-            <span>v${wf.version || 1}</span>
-          </div>
-        </div>
+        <button type="button" class="row ${isSelected ? 'selected' : ''}" data-id="${escapeAttr(wf.id)}" title="${escapeAttr(name)}">
+          ${typeIcon('workflow')}
+          <span class="row-main">
+            <span class="row-name">${escapeHtml(name)}</span>
+            <span class="row-meta">${visibilityMark(visibility)}${escapeHtml(`${shown} \u00b7 v${wf.version || 1}`)}</span>
+          </span>
+        </button>
       `;
     })
     .join('');
 
-  workflowsList.querySelectorAll('.workflow-card').forEach((card) => {
-    card.addEventListener('click', () => selectWorkflow(card.dataset.id));
+  workflowsList.querySelectorAll('.row').forEach((row) => {
+    row.addEventListener('click', () => selectWorkflow(row.dataset.id));
   });
 };
 

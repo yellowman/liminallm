@@ -1208,7 +1208,25 @@ class TestAPaneListFitsItsPane:
     POPULATED = ["tools-tab"]
 
     def _overflow(self, page):
-        """How far the widest thing in the pane sticks out past it."""
+        """How far the widest thing in the pane sticks out past it.
+
+        `scrollWidth` alone cannot tell two different things apart. An element
+        that pushes the column wider is a defect: its far side exists and can
+        only be reached by scrolling. An element that clips its own overflow -
+        a `nowrap` name or description ending in an ellipsis - also reports a
+        `scrollWidth` of the whole string, and nothing about it is reachable
+        by scrolling, because the overflow is hidden by design.
+
+        Measured when the pane lists became rows: the tools pane reported
+        `row-meta` as 480px past its own width while `pane.scrollWidth`
+        equalled `pane.clientWidth`, so there was no sideways scroll to do.
+        Counting that as a failure would have meant either abandoning
+        truncation or editing the assertion to fit, and the assertion is
+        right - it is the measurement that could not see the difference.
+
+        So an element that clips is skipped, and the pane's own scrollability
+        is checked directly, which is what the assertion claims.
+        """
         return page.evaluate(
             """() => {
               const pane = document.querySelector('.context-pane');
@@ -1217,11 +1235,24 @@ class TestAPaneListFitsItsPane:
               let worst = 0, culprit = '';
               for (const el of pane.querySelectorAll('*')) {
                 if (!el.getClientRects().length) continue;
+                const style = getComputedStyle(el);
+                const clips = style.overflowX === 'hidden'
+                           || style.overflowX === 'clip';
+                if (clips) continue;
                 const over = el.scrollWidth - limit;
                 if (over > worst) {
                   worst = over;
                   culprit = el.className || el.tagName;
                 }
+              }
+              const body = pane.querySelector('.pane-body');
+              const scrolls = Math.max(
+                pane.scrollWidth - pane.clientWidth,
+                body ? body.scrollWidth - body.clientWidth : 0,
+              );
+              if (scrolls > worst) {
+                worst = scrolls;
+                culprit = 'the pane itself';
               }
               return {over: Math.round(worst), culprit, limit: Math.round(limit)};
             }"""
@@ -1245,6 +1276,54 @@ class TestAPaneListFitsItsPane:
         finally:
             context.close()
 
+    def test_the_measurement_still_catches_a_pane_forcing_element(
+        self, browser, server
+    ):
+        """The control for `_overflow`, which now skips elements that clip.
+
+        Skipping them is right - a name ending in an ellipsis is not reachable
+        by scrolling, so counting it as overflow is a false positive. But a
+        check that skips things can be weakened into one that catches nothing,
+        and this file's whole subject is a list that outgrew its column. So
+        put something in the pane that genuinely forces it wider, and require
+        the measurement to say so.
+        """
+        context, page = _signed_in_page(browser, server, DESKTOP)
+        try:
+            page.click('.rail-btn[data-tab="tools-tab"]')
+            page.wait_for_selector(".context-pane .row:visible", timeout=15000)
+            assert self._overflow(page)["over"] <= 1, (
+                "the pane is already overflowing, so this probe cannot show "
+                "that the measurement notices when one starts"
+            )
+
+            page.evaluate(
+                """() => {
+                  // Nested inside the list rather than appended to the pane
+                  // body. `.pane-body > *` caps every direct child at 100%, so
+                  // that is the one place an element cannot overflow from -
+                  // measured, a 600px div put there rendered at 219px and the
+                  // probe reported nothing while proving nothing. The hidden
+                  // pane views also keep their lists, so take a rendered one.
+                  const list = [...document.querySelectorAll('.context-pane .pane-body > *')]
+                    .find(e => e.getClientRects().length);
+                  const wide = document.createElement('div');
+                  wide.className = 'probe-wide';
+                  wide.style.width = '600px';
+                  wide.textContent = 'x';
+                  list.appendChild(wide);
+                }"""
+            )
+
+            result = self._overflow(page)
+            assert result["over"] > 1, (
+                "a 600px element was added to a 240px pane and the "
+                "measurement reported nothing, so it would no longer catch "
+                "the list that outgrew its column"
+            )
+        finally:
+            context.close()
+
     @pytest.mark.parametrize("tab", POPULATED)
     def test_a_row_leads_with_its_name(self, browser, server, tab):
         """The other half. A list that fits but shows the wrong field first
@@ -1253,12 +1332,16 @@ class TestAPaneListFitsItsPane:
         context, page = _signed_in_page(browser, server, DESKTOP)
         try:
             page.click(f'.rail-btn[data-tab="{tab}"]')
-            page.wait_for_selector(".tool-card", timeout=15000)
+            page.wait_for_selector(".context-pane .row:visible", timeout=15000)
             leads = page.evaluate(
                 """() => {
-                  const card = document.querySelector('.tool-card');
+                  // `.row` is shared by every migrated pane, and the views that
+                  // are not showing keep their rows in the DOM, so the first
+                  // match is often a hidden one. Take the first rendered row.
+                  const card = [...document.querySelectorAll('.context-pane .row')]
+                    .find(e => e.getClientRects().length);
                   const pane = document.querySelector('.context-pane');
-                  const name = card.querySelector('.tool-name');
+                  const name = card.querySelector('.row-name');
                   const p = pane.getBoundingClientRect();
                   const n = name.getBoundingClientRect();
                   return {
