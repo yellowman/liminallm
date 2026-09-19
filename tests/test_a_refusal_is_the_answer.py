@@ -246,6 +246,30 @@ class TestTheChatWire:
             "generated nothing"
         )
 
+    def test_a_tool_loop_final_refusal_is_the_content(self):
+        """The agent/tool path has its own chat reader and must preserve the
+        same refusal on the final round, when no tools are offered."""
+        from openai.types.chat import ChatCompletionMessage
+
+        backend = _backend(
+            self._blocking_client(
+                ChatCompletionMessage(
+                    role="assistant", content=None, refusal=REFUSAL
+                )
+            )
+        )
+
+        out = backend.generate_with_tools(
+            [{"role": "user", "content": "hi"}],
+            [],
+            [],
+        )
+
+        assert out["content"] == REFUSAL, (
+            "the tool-loop chat reader dropped the model's refusal even "
+            "though the ordinary blocking reader preserves it"
+        )
+
     def test_a_blocking_answer_is_unaffected(self):
         """The control on the blocking reader."""
         from openai.types.chat import ChatCompletionMessage
