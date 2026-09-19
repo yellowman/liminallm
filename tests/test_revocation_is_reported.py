@@ -22,6 +22,7 @@ password really did change, and the caller is told the revocation did not.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import psycopg
@@ -140,7 +141,7 @@ class TestWhenRevocationFails:
         success rather than pretending the old bearer sessions died."""
         user = runtime.store.get_user(account["user_id"])
         assert user is not None
-        token = __import__("asyncio").run(runtime.auth.initiate_password_reset(user))
+        token = asyncio.run(runtime.auth.initiate_password_reset(user))
         assert token
 
         monkeypatch.setattr(
