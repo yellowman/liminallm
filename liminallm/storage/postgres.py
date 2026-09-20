@@ -3472,18 +3472,26 @@ class PostgresStore:
     #: operation spans several store transactions and Redis bookkeeping.
     _USER_AUTH_STATE_LOCK = 0x61757468  # "auth"
 
-    def _acquire_user_auth_state_connection(self, identity: str):
-        """Checkout a connection and wait for the advisory lock off-loop."""
+    def _try_acquire_user_auth_state_connection(self, identity: str):
+        """Try once for the advisory lock without parking a worker on it."""
         cm = self.pool.connection()
         conn = cm.__enter__()
         key = (self._USER_AUTH_STATE_LOCK, identity)
         try:
-            conn.execute("SELECT pg_advisory_lock(%s, hashtext(%s))", key)
+            row = conn.execute(
+                "SELECT pg_try_advisory_lock(%s, hashtext(%s)) AS acquired",
+                key,
+            ).fetchone()
+            acquired = bool(row and row.get("acquired"))
+            if not acquired:
+                conn.rollback()
+                cm.__exit__(None, None, None)
+                return None
             conn.commit()
+            return cm, conn
         except Exception:
             cm.__exit__(*sys.exc_info())
             raise
-        return cm, conn
 
     def _release_user_auth_state_connection(self, cm, conn, identity: str) -> None:
         key = (self._USER_AUTH_STATE_LOCK, identity)
@@ -3497,11 +3505,13 @@ class PostgresStore:
     async def hold_user_auth_state(self, user_id: str):
         """Hold one user's authentication/session state across an operation.
 
-        Advisory-lock acquisition can wait behind another request, so it runs
-        off the event loop. Once acquired, store calls made by this task reuse
-        the locked connection; that lets the holder keep making progress even
-        when other same-user requests occupy pool slots waiting for the lock.
+        A blocking advisory wait cannot run on the request thread, and parking
+        many executor workers on it creates the same deadlock one layer over.
+        Each failed attempt therefore uses `pg_try_advisory_lock`, returns its
+        pool connection immediately, and backs off asynchronously. Only the
+        holder keeps a connection.
 
+        Once acquired, store calls made by this task reuse that connection.
         Same-user nesting is reentrant in the task. Cross-user nesting is
         refused rather than silently dropping one user's serialization.
         """
@@ -3516,20 +3526,27 @@ class PostgresStore:
             yield
             return
 
-        cm, conn = await asyncio.to_thread(
-            self._acquire_user_auth_state_connection, identity
-        )
+        state = None
+        delay = 0.005
+        while state is None:
+            state = await asyncio.to_thread(
+                self._try_acquire_user_auth_state_connection,
+                identity,
+            )
+            if state is None:
+                await asyncio.sleep(delay)
+                delay = min(0.05, delay * 2)
+
+        cm, conn = state
         token = self._auth_state_connection.set((conn, identity))
         try:
             yield
         finally:
             self._auth_state_connection.reset(token)
-            await asyncio.to_thread(
-                self._release_user_auth_state_connection,
-                cm,
-                conn,
-                identity,
-            )
+            # Unlock cannot wait on another holder: this session owns the
+            # lock. Keep release independent of the executor so a saturated
+            # worker pool can never prevent the holder from making progress.
+            self._release_user_auth_state_connection(cm, conn, identity)
 
     _USER_LIFETIME_LOCK = 0x6C696675  # "lifu"
 
