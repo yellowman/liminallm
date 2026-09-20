@@ -6,6 +6,13 @@ site, streaming and cancellation semantics. This file records the current
 layout, styling, and client implementation patterns. The frontend source
 (`frontend/`) is authoritative where this file lags.
 
+For the rules behind the styling rather than the styling itself - the type
+scale, the control tiers, what earns an enclosure, how a long page is
+divided, and what is specified but not yet built - read
+[the design language](DESIGN_LANGUAGE.md). Its part one is shared with the
+sibling project `liminal`, so a change to a rule is a change to both. This
+file describes the screens; that file decides what they may look like.
+
 ## layout architecture
 
 - **sidebar-main layout**: persistent conversation list sidebar (280px) with
@@ -38,7 +45,8 @@ layout, styling, and client implementation patterns. The frontend source
 - context binding dropdown for the active `knowledge_context`; optional
   `workflow_id` text input.
 - optimistic UI: user messages render before server confirmation.
-- assistant prose is set in a serif column with a github-grade markdown
+- assistant prose is set in the interface family, one step larger and looser
+  than the chrome (15px/1.65, capped at 88ch), with a github-grade markdown
   renderer (escape-first: html-escape, then rewrite to a fixed safe tag set;
   nested/task lists, aligned tables, blockquotes, autolinks, backslash
   escapes, lightweight syntax highlighting across nine language families).
@@ -100,12 +108,32 @@ layout, styling, and client implementation patterns. The frontend source
 - auto-save with a 1-second debounce; restoration on conversation load;
   draft-count indicator in the composer.
 
-## file upload panel
+## files panel
 
-- a single strip in the Files tab - file, context, and the upload button on
-  one line; context dropdown (or private/no context); chunk size (64-4000,
+- two sections under bands, Upload and Library, neither of them collapsible.
+- upload is a single strip - file, context, and the upload button on one
+  line; context dropdown (or private/no context); chunk size (64-4000,
   validated) behind an `Advanced` disclosure; client-side size and extension
   checks before upload; inline progress and result feedback.
+- the library is a grid: icon, name, size, modified, row actions, under a
+  heading line naming the columns. The band carries the file count, and a
+  `.summary-line` under the list carries what is shown and how many bytes of
+  it. A single page gets no pager.
+- row actions (extract, vault, download, delete) reveal on hover or focus;
+  delete is red at rest, because among four grey glyphs the destructive one
+  was distinguishable only by reading its tooltip.
+
+## notes editor
+
+- title, a state cue, and a compact toolbar on one line: Preview (a pressed
+  toggle), Witness, Save, and delete as a red icon button.
+- the state cue is a dot and the words `Unsaved changes`, and it is empty
+  when the note is saved - a line reading `Saved` at all times says nothing,
+  and this one has to be noticed the once it appears. Every write to the
+  dirty flag goes through one setter, so the cue cannot drift from the flag
+  it reports.
+- delete asks first, by the note's title. A note is the one thing here the
+  reader wrote themselves, and deleting a file or revoking a key both ask.
 
 ## feedback controls
 
@@ -132,37 +160,32 @@ layout, styling, and client implementation patterns. The frontend source
 
 ## styling system
 
-- CSS custom properties for theming: `--accent`, `--text`, `--panel`,
-  `--border`, and so on. Control sizing is tokenized too: `--ctl-h`,
-  `--ctl-h-sm`, `--icon-hit`, `--icon-glyph`, `--chip-h`.
-- list classes: `.row` is the one flat list primitive. It carries
-  `.row-icon`, `.row-name`, `.row-meta` and hover-revealed `.row-actions`,
-  and a selected row takes a faint fill and a 2px left marker - the same
-  selection language the application rail uses. Every list wears it:
-  Contexts, Artifacts, Tools, Workflows, Files, Insights, API keys, and -
-  through the same rule rather than a copy of it - `.conversation-item` and
-  `.note-item`, which keep their own names for the states they carry
-  (`active`, `contradicted`, `evolved`).
-- component classes: `.panel`, `.badge` (a bar title with a status dot, not
-  a capsule), `.table`, `.code-block`, `.detail-row` with `.detail-label`
-  (a label and its value, divided by a hairline), `.factline` (a
-  dot-separated line of facts), `.chip`, `.figures`, `.icon-btn`.
-- long-page classes: `.section-band` is a section's header - a 16px line
-  glyph (`.section-icon`), a 13px semibold title, and a `.section-description`
-  that carries either what the section is for or how much is in it. It spans
-  its column and has no radius, because it marks a boundary rather than
-  holding anything. `.setting-group` is everything under one band.
-  `.settings-layout` puts a sticky `.settings-index` beside the sections
-  rather than above them; the index marks the section being read with the
-  rail's selection language, and `trackSections` in `common.js` keeps that
-  mark current. `.sticky-actions` pins a decision bar to the foot of a long
-  form. `.setting-editor` is the one enclosure this vocabulary still uses: a
-  form that opens in answer to a choice and ends in a decision.
-- utility classes: `.hidden`, `.flex-row`, `.pill-row`, `.divider`, `.mb-14`,
-  `.monospace`.
-- the page scrolls as a document. `.topbar` and `.settings-index` are sticky
-  against it, so nothing between them and the viewport may set `overflow`:
-  that would make itself the scroll container those two resolve against, and
-  an unbounded scroll container never scrolls. `.main-content` had exactly
-  that and the index scrolled away with the page.
-- media queries at 1080px (hide sidebar) and 640px (single-column layout).
+The tokens, the class vocabulary and the reasons behind them live in
+[the design language](DESIGN_LANGUAGE.md). What follows is where each class
+is used, which is this file's job.
+
+- tokens: `--accent`, `--text`, `--panel`, `--border` and the rest of the
+  palette; `--ctl-h`, `--ctl-h-sm`, `--icon-hit`, `--icon-glyph`,
+  `--chip-h`, `--topbar-h` for geometry.
+- `.row` is worn by every list: Contexts, Artifacts, Tools, Workflows,
+  Files, Insights, API keys, and - through the same rule rather than a copy
+  of it - `.conversation-item` and `.note-item`, which keep their own names
+  for the states they carry (`active`, `contradicted`, `evolved`).
+- `.section-band` divides Files, Insights, the Settings tab and the admin
+  console's seventeen setting groups. `.settings-layout` and
+  `.settings-index` are used by the Settings tab and the admin console.
+  `.sticky-actions` has one caller, the admin console's settings form.
+  `.setting-editor` has five: the MFA setup and disable forms, the one-time
+  API key display, the add-user form, and patch details.
+- `.file-table-head`, `.row.file-row` and `.file-facts` are the Files
+  library. `.summary-line` is used under it. `.utility-strip` is the note
+  editor's toolbar.
+- other components: `.panel`, `.badge`, `.table`, `.code-block`,
+  `.detail-row` with `.detail-label`, `.factline`, `.fact-dot`, `.chip`,
+  `.figures`, `.icon-btn`.
+- utility classes: `.hidden`, `.flex-row`, `.pill-row`, `.divider`,
+  `.mb-14`, `.monospace`.
+- media queries at 1080px (hide sidebar), 900px, 860px (the settings index
+  becomes a jump strip), 800px, 720px (the file grid becomes rows) and 640px
+  (single-column layout), plus `(hover: none)`, where row actions stay
+  visible because nothing can hover to reveal them.

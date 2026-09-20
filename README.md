@@ -43,7 +43,7 @@ override behind its menu.
 **notes.** a searchable vault. the pane lists and searches it, selecting a
 note opens it for editing, and sweep and graph operate across the whole set.
 
-![Notes screen with a searchable note list in the pane and the selected note open in an editor.](docs/screenshots/03-notes.png)
+![Notes screen with a searchable note list in the pane and the selected note open in an editor. The editor's toolbar holds Preview, Witness, Save and a red delete icon, with a cue beside the title that reads "Unsaved changes" while there are any.](docs/screenshots/03-notes.png)
 
 **contexts.** knowledge contexts group uploaded sources for retrieval. the
 pane lists them and the workspace shows the selected one. a conversation can
@@ -54,7 +54,7 @@ be pointed at one from the chat screen's menu.
 **files.** uploads are attached to a context, or kept private when no context
 is given. the same screen browses everything already uploaded.
 
-![Files screen with the upload form and the list of uploaded files.](docs/screenshots/05-files.png)
+![Files screen with two titled bands. Upload holds a one-line strip: choose a file, pick a context, upload. Library holds a table of files with name, size and modified columns under a heading line, and a summary of the count and total size beneath it.](docs/screenshots/05-files.png)
 
 **artifacts.** workflows, policies, adapters, and tools are all artifacts.
 the pane filters them by type and visibility; the workspace shows the
@@ -71,7 +71,7 @@ invokes it.
 **insights.** preference events are summarized here, so you can see what your
 feedback has shaped and which adapters it reached.
 
-![Insights screen summarizing preference events by total, positive, negative, and neutral.](docs/screenshots/08-insights.png)
+![Insights screen with four titled bands: Summary, showing total, positive, negative and neutral counts as plain figures; Top adapters; Recent preferences; and Clusters.](docs/screenshots/08-insights.png)
 
 **settings.** account and session details, including the role and tenant the
 current session carries. fourteen sections under a sticky index that marks

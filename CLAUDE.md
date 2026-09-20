@@ -157,6 +157,19 @@ through.
 
 ## This repository
 
+### Design language
+
+`docs/DESIGN_LANGUAGE.md` is the single design standard for the frontend.
+Read it before changing anything under `frontend/`, and before adding a class
+name, a control height, a focus style, a selection style or a button
+hierarchy. Its part one is shared with the sibling project `liminal`, so a
+change to a rule there is a change to both projects; part two records this
+project's expression of it and where it deliberately departs.
+
+`docs/ui.md` describes what each screen contains. The design language decides
+what a screen may look like. Neither one is authoritative over `frontend/`
+itself, so correct the file when it lags.
+
 ### Writing style
 
 Follow the `writing-style` skill (`.claude/skills/writing-style/SKILL.md`) for
