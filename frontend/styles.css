@@ -32,7 +32,6 @@
   /* A glyph smaller than its target: precise to look at, easy to hit. */
   --icon-hit: 28px;
   --icon-glyph: 18px;
-  --chip-h: 20px;
   /* Two families, not three. `--font-serif` was an Iowan/Palatino/Georgia
      stack used for the assistant's prose and the note editor, and it made
      Chat and Notes read as a different product from the rail beside them -
@@ -3499,38 +3498,6 @@ button.minor:hover {
   background: var(--danger);
 }
 
-/* An enclosure only where the enclosure is the behaviour: a filter you can
-   click, a token you can remove, a choice in a set. Not a label. */
-.chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  height: var(--chip-h);
-  padding: 0 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: none;
-  color: var(--text-muted);
-  font-size: 11.5px;
-  line-height: 1;
-  cursor: pointer;
-}
-
-.chip:hover {
-  background: var(--panel-muted);
-  color: var(--text);
-}
-
-.chip.active {
-  border-color: transparent;
-  background: var(--accent-light);
-  color: var(--accent-strong);
-}
-
-.chip svg {
-  width: 12px;
-  height: 12px;
-}
 
 /* A figure on the canvas. Insights counted four things inside four tiles;
    the numbers are the content and the tiles were packaging. */

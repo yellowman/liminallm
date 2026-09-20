@@ -85,7 +85,15 @@ jobs:
           # pytest-xdist is in the dev extra, but this line is what runs when
           # the `|| pip install .` fallback fired - and a missing plugin turns
           # `-n 4` into an unrecognized-argument crash, not a serial run.
-          pip install pytest pytest-cov pytest-xdist jax jaxlib
+          #
+          # tinycss2 is here for the opposite reason. The CSS hygiene module
+          # reaches it through `importorskip`, so without it that whole file
+          # skips: the dead-selector guard, the orphan-class guard and the
+          # undefined-token guard all report nothing while the job stays
+          # green. A missing plugin fails loudly; a missing parser fails
+          # silently, which is the worse of the two and the one that needs
+          # naming here.
+          pip install pytest pytest-cov pytest-xdist jax jaxlib tinycss2
 
       - name: Compile Python files
         run: python -m compileall liminallm

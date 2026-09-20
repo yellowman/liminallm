@@ -255,17 +255,50 @@ def defined_class_names(css: str) -> set:
     return set(re.findall(r"\.([a-zA-Z][\w-]*)", body))
 
 
-def names_frontend_can_produce() -> set:
-    """Every word in the markup and scripts, which is deliberately coarse.
+def without_comments(text: str, suffix: str) -> str:
+    """The source with its comments removed, so prose is not evidence.
 
-    A precise reading of `class="..."` would miss a name assembled from
-    parts, and missing one here means deleting a rule that is in use. The
-    error this must not make is the destructive one.
+    A comment is where a name goes to be discussed, not produced. Retirement
+    notes, design rationale and the word for a thing in passing all put a
+    class name in the file without anything ever setting it, and a word set
+    that counts them tells this check a dead rule is live. Measured: `.chip`
+    had no caller and passed for exactly that reason, because
+    `common.js` describes citation chips in prose.
+
+    Coarse in the other direction on purpose. `//` is only taken as a
+    comment when it does not follow a colon, so the `//` in a URL survives;
+    a `//` inside a string literal would still be cut, which can only make
+    this stricter, and a name that appears nowhere but inside such a string
+    is not one this check should call live either.
+    """
+    if suffix == ".html":
+        return re.sub(r"<!--.*?-->", " ", text, flags=re.S)
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    return re.sub(r"(?<!:)//[^\n]*", " ", text)
+
+
+def names_frontend_can_produce() -> set:
+    """Every word in the markup and scripts outside a comment.
+
+    Still deliberately coarse within that. A precise reading of `class="..."`
+    would miss a name assembled from parts, and missing one here means
+    deleting a rule that is in use, which is the destructive error.
+
+    Dropping comments was measured before it was made: across the 257
+    classes the stylesheet defines, it moves exactly one - `chip` - from
+    live to orphaned, and that one had no caller.
     """
     words: set = set()
     for path in sorted(FRONTEND.iterdir()):
         if path.suffix in {".html", ".js"}:
-            words |= set(re.findall(r"[\w-]+", path.read_text(encoding="utf-8")))
+            words |= set(
+                re.findall(
+                    r"[\w-]+",
+                    without_comments(
+                        path.read_text(encoding="utf-8"), path.suffix
+                    ),
+                )
+            )
     return words
 
 
@@ -299,6 +332,42 @@ class TestNoRuleStylesSomethingThatCannotAppear:
             - BUILT_AT_RUNTIME
         )
         assert orphans == {"ghost-town"}
+
+    def test_a_name_only_a_comment_mentions_cannot_keep_a_rule_alive(self):
+        """The control the other one is not.
+
+        `.ghost-town` appears nowhere at all, so it proves the check can see
+        an orphan - not that a comment fails to hide one. Those are different
+        claims, and the second is the one that was false: the word set read
+        every word of every script including its comments, so a class was
+        live if anyone had ever written its name in prose.
+
+        This feeds the two comment syntaxes a script can carry and requires
+        the name to stay orphaned in both.
+        """
+        for source in ("// styled by .drifter\n", "/* .drifter, retired */\n"):
+            assert "drifter" not in set(
+                re.findall(r"[\w-]+", without_comments(source, ".js"))
+            ), f"a comment kept the name alive: {source!r}"
+        assert "drifter" in set(
+            re.findall(
+                r"[\w-]+",
+                without_comments("el.className = 'drifter';\n", ".js"),
+            )
+        ), "stripping comments also removed a real assignment"
+
+    def test_a_url_is_not_mistaken_for_a_comment(self):
+        """`//` after a colon is a scheme, not a comment. Cutting there
+        would drop the rest of the line, which is where a name can be."""
+        kept = set(
+            re.findall(
+                r"[\w-]+",
+                without_comments(
+                    "fetch('https://x/y'); el.className = 'kept';\n", ".js"
+                ),
+            )
+        )
+        assert "kept" in kept, kept
 
     def test_a_name_only_a_comment_mentions_is_not_a_definition(self):
         """Retirement comments name what they retired. Counting those would
