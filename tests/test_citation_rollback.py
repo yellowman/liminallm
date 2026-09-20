@@ -782,10 +782,12 @@ class TestTheStreamedTransportBehavesTheSame:
         engine.invocations.configure_citation_offers(False)
         user_id, opened = self._streaming(engine, monkeypatch, store)
         written: list = []
+        written_nonces: list[str] = []
 
         def _generate_stream(prompt, adapters=None, context_snippets=None,
                              history=None, *, user_id=None, instruction=None):
             nonce = opened[-1].citations.nonce
+            written_nonces.append(nonce)
             text = f"400 hours, ref {nonce} and [cite:{nonce}-1]"
             written.append(text)
             yield {"event": "token", "data": text}
@@ -797,9 +799,12 @@ class TestTheStreamedTransportBehavesTheSame:
 
         events = await self._run(engine, user_id)
 
-        assert written
-        assert not opened[-1].citations
-        nonce = opened[-1].citations.nonce
+        assert written and written_nonces
+        assert not any(inv.citations for inv in opened)
+        # The turn opens more than one invocation. Capture the nonce from the
+        # invocation that actually streamed instead of assuming the final
+        # bookkeeping invocation is the same one.
+        nonce = written_nonces[0]
         tokens = "".join(
             event["data"] for event in events if event.get("event") == "token"
         )
