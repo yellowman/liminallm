@@ -324,6 +324,19 @@ def capture(args: argparse.Namespace, base: str) -> list[pathlib.Path]:
         page = browser.new_page(viewport=VIEWPORT, device_scale_factor=2)
 
         def shot(name: str) -> None:
+            # The pointer stays wherever it last clicked, so a rail button's
+            # tooltip sat open over the workspace in every shot taken after
+            # it, and a clicked row kept its hover actions revealed. A
+            # tooltip nobody is pointing at is the capture's artefact, not
+            # the product's state, so park the pointer somewhere empty
+            # first.
+            #
+            # The rail's own middle, between its two icon groups. The right
+            # gutter looked emptier and was not: `.turn-rail` lives at that
+            # edge and opens a 264px card of turn labels on hover, which
+            # then sat over the answer in two captures.
+            page.mouse.move(24, VIEWPORT["height"] // 2)
+            time.sleep(0.4)
             path = args.out / f"{name}.png"
             page.screenshot(path=str(path))
             shots.append(path)
