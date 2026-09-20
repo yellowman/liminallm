@@ -1180,8 +1180,11 @@ async def confirm_reset(body: PasswordResetConfirm, request: Request):
     )
     if not ok:
         if revoked is False:
+            # SPEC §18 exposes only the stable public error-code set.
+            # The 503 and message describe the incomplete operation; the
+            # stable code for a server-side failure is `server_error`.
             raise http_error(
-                "reset_incomplete",
+                "server_error",
                 "password reset could not revoke existing sessions",
                 status_code=503,
             )
