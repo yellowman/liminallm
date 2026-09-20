@@ -1,10 +1,10 @@
 """Taking a turn's citation namespace out of an answer as it is written.
 
-`scrub_positions` answers the question for a finished string: what crossed,
-and where every character came from. A streamed answer has no finished string
-until it is over, and the tokens have already reached the reader by then. So
-this is the same transformation performed incrementally, by a parent that
-holds the raw text and releases only what can no longer change.
+`reader_positions` answers the question for a finished string: what a reader
+may see, and where every surviving character came from. A streamed answer has
+no finished string until it is over, and the tokens have already reached the
+reader by then. So this is the same transformation performed incrementally,
+by a parent that holds raw text and releases only what can no longer change.
 
 The rule it exists to keep is that a marker never becomes observable. Emitting
 `[cite:K7Q2ABCD-1]` and cleaning it up at the end is not a boundary: once a
@@ -36,10 +36,12 @@ matched across a junction immediately found an occurrence overlapping the one
 the oracle takes, and released two characters the finished scrub does not
 contain.
 
-The transformation itself is unchanged. `scrub_positions` is still what
-defines it, still the only thing that produces the finished public text and
-the origin map, and `finish` asks it once and checks that what went out is
-what it says.
+The transformation has two deliberately different halves. The namespace
+scrub stays the narrow wire rule: this turn's nonce is removed, including its
+bare forms. The reader cleanup is wider and then removes every closed
+`[cite:...]` marker, including malformed and stale ones. `reader_positions`
+composes those rules for the finished string and origin map; `finish` asks it
+once and checks that what went out is exactly what it says.
 
 Whoever wires this owes it a ceiling anyway, because nothing else provides
 one: `MAX_GENERATION_TOKENS` is only ever subtracted from the context window
@@ -53,7 +55,10 @@ import re
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-from liminallm.service.citations import scrub_positions
+from liminallm.service.citations import (
+    MAX_CITATION_MARKER_BODY,
+    reader_positions,
+)
 
 #: The keyword a bracketed marker is written with, between `[` and the handle.
 _CITE = "[cite:"
@@ -447,6 +452,110 @@ class _Pass:
             self._reader._release(text)
 
 
+class _ClosedMarkerStripper:
+    """The reader-side `strip_citations` pass, incrementally.
+
+    The namespace automaton above is intentionally narrower: it protects the
+    turn's own handles on the wire. What a reader sees has a stronger cleanup
+    rule - every *closed* marker-shaped token goes, even `[cite:,]`, a stale
+    handle, or a case-variant keyword. An unclosed marker stays because there
+    is no safe boundary at which to delete the rest of a sentence.
+
+    This runs after the namespace passes. It holds only a possible marker and
+    the horizontal whitespace immediately before it. The marker body is
+    bounded by `MAX_CITATION_MARKER_BODY`, so a provider cannot make the hold
+    grow without limit. When the bound is exceeded the first `[` is settled
+    and the remainder is replayed, which lets a later marker inside the
+    overlong text still be recognized.
+    """
+
+    __slots__ = ("_reader", "_spaces", "_candidate")
+
+    def __init__(self, reader: "CanonicalCitationStream") -> None:
+        self._reader = reader
+        self._spaces: List[str] = []
+        self._candidate: Optional[List[str]] = None
+
+    def push(self, text: str) -> None:
+        queue: Deque[str] = deque(text)
+        while queue:
+            character = queue.popleft()
+            self._reader._work += 1
+
+            if self._candidate is None:
+                if self._reader._alphabet.is_space(character):
+                    self._spaces.append(character)
+                    continue
+                if self._reader._alphabet.cite_at(0, character):
+                    self._candidate = [character]
+                    continue
+                self._flush_spaces()
+                self._reader._release_public(character)
+                continue
+
+            candidate = self._candidate
+            if len(candidate) < len(_CITE):
+                if self._reader._alphabet.cite_at(len(candidate), character):
+                    candidate.append(character)
+                    continue
+                # A failed keyword prefix can contain no second `[`: every
+                # character after its first is fixed by "[cite:". So it is
+                # settled whole, and only the failing character needs another
+                # look in case *it* begins a marker.
+                self._flush_candidate()
+                queue.appendleft(character)
+                continue
+
+            body_len = len(candidate) - len(_CITE)
+            if character == "]":
+                # A complete closed marker. Drop its leading spaces too, the
+                # same rule `strip_citations` uses.
+                self._spaces.clear()
+                self._candidate = None
+                continue
+            if character == "\n":
+                # Newline ends the grammar without ending a marker. Everything
+                # held is literal prose, and the newline is reconsidered as
+                # ordinary text.
+                self._flush_candidate()
+                queue.appendleft(character)
+                continue
+            if body_len < MAX_CITATION_MARKER_BODY:
+                candidate.append(character)
+                continue
+
+            # This character would be body character 65, so the first `[`
+            # cannot start CITATION_RE. Settle that one character and replay
+            # the bounded remainder: a nested `[cite:` near the end may still
+            # become a real marker when future text arrives.
+            prefix = "".join(self._spaces) + candidate[0]
+            self._spaces.clear()
+            remainder = candidate[1:] + [character]
+            self._candidate = None
+            self._reader._release_public(prefix)
+            queue.extendleft(reversed(remainder))
+
+    def finish(self) -> None:
+        """No future character can close what remains."""
+        if self._candidate is not None:
+            self._flush_candidate()
+        else:
+            self._flush_spaces()
+
+    def _flush_spaces(self) -> None:
+        if self._spaces:
+            self._reader._release_public("".join(self._spaces))
+            self._spaces.clear()
+
+    def _flush_candidate(self) -> None:
+        candidate = self._candidate
+        assert candidate is not None
+        text = "".join(self._spaces) + "".join(candidate)
+        self._spaces.clear()
+        self._candidate = None
+        self._reader._release_public(text)
+
+
 class CanonicalCitationStream:
     """One streamed answer, in both representations at once.
 
@@ -454,16 +563,11 @@ class CanonicalCitationStream:
     never edited: it is what a citation is read out of, and the only text that
     can honestly say what the model wrote.
 
-    The public side is what has been released. `scrub_positions` remains the
-    definition of what that is - `finish` produces the finished text and the
-    origin map with it, and checks that what went out is exactly it - and the
-    passes above are how the same answer is reached one character at a time,
-    without rescanning what is already settled.
-
-    Not a general filter. It removes exactly this turn's namespace, in the
-    forms `scrub_positions` removes it, and leaves every other bracketed
-    thing - another turn's marker, prose about citations, an array index -
-    exactly as the model wrote it.
+    The public side is what has been released. `reader_positions` defines
+    that exact string and its origin map. The namespace passes above remove
+    this turn's handles; the bounded marker stripper then applies the broader
+    reader rule and removes every closed marker-shaped token. Ordinary
+    bracketed prose and unclosed `[cite:` text are left as written.
     """
 
     def __init__(self, nonce: str) -> None:
@@ -482,6 +586,7 @@ class CanonicalCitationStream:
         #: remove; a pass is added when the one above it removes something,
         #: exactly as `_scrub_text` repeats only when a pass found a match.
         self._passes: List[_Pass] = [_Pass(self)]
+        self._marker_stripper = _ClosedMarkerStripper(self)
         self._finished = False
         self._verdict: Optional[bool] = None
         #: Where a release lands while a call is collecting one. Set by
@@ -565,7 +670,12 @@ class CanonicalCitationStream:
             index += 1
 
     def _release(self, text: str) -> None:
-        """Text that has fallen out of the bottom pass."""
+        """Namespace-clean text entering the reader-side marker cleanup."""
+        if text:
+            self._marker_stripper.push(text)
+
+    def _release_public(self, text: str) -> None:
+        """Text that has cleared both citation cleanup stages."""
         if not text:
             return
         self._released_parts.append(text)
@@ -580,8 +690,8 @@ class CanonicalCitationStream:
         each pass settles the handle it was holding and hands the rest down.
 
         `origins[i]` is the index in the canonical text of the character at
-        `i` in the public text, the same map `scrub_positions` returns and
-        `citation_payload` reads. Both come from the whole-string scrub, which
+        `i` in the public text, the same map `reader_positions` returns and
+        `citation_payload` reads. Both come from the whole-string cleanup, which
         stays the authority on the finished answer: this is where the two are
         compared - as equality, in both directions - and a reader that
         disagreed with it has no answer anyone can vouch for.
@@ -596,10 +706,11 @@ class CanonicalCitationStream:
             while index < len(self._passes):
                 self._passes[index].close()
                 index += 1
+            self._marker_stripper.finish()
         finally:
             self._fresh = None
         tail = "".join(fresh)
-        public, origins = scrub_positions(self.canonical, self.nonce)
+        public, origins = reader_positions(self.canonical, self.nonce)
         self._finished = True
         released = self.released
         if released != public:
@@ -663,7 +774,7 @@ class CanonicalStreamTooLong(RuntimeError):
 
 
 class ScrubbedTokenStream:
-    """A provider's event iterator with this turn's namespace taken out.
+    """A provider stream cleaned for a reader as it is emitted.
 
     Wraps the iterator rather than the consumer, so the scrubbing happens on
     whichever thread pulls the provider - which is `StreamPump`'s own producer
