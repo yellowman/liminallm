@@ -75,6 +75,7 @@ class TestAMarkerNeverBecomesObservable:
             "[cite:]",
             "[cite:OTHER-1]",
             "[CITE:not-an-issued-handle]",
+            f"[cite:{NONCE[:4]}NOPE-1]",
             f"[cite:{NONCE}-]",
         ],
     )
@@ -229,15 +230,14 @@ class TestTheHoldAsksTheSameEngineTheScrubAsks:
             assert reader.intact()
 
 
-class TestWhatIsNotThisTurnsNamespaceIsLeftAlone:
+class TestOrdinaryBracketedProseIsLeftAlone:
     @pytest.mark.parametrize("text", [
         "see [1] and [2]",
         "index a[b]c",
-        "[cite:OLDTURN-1] was another turn",
-        "[cite:] is not a handle",
         "brackets [ and ] alone",
         "a colon: and a dash - and 999",
-        f"[cite:{NONCE[:4]}NOPE-1] is not this turn",
+        "[cite:OLDTURN-1 is unclosed prose",
+        "[cite: is also unclosed prose",
     ])
     def test_it_survives_every_split(self, text):
         expected, _origins = reader_positions(text, NONCE)
