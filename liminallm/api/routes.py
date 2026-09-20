@@ -1329,20 +1329,28 @@ async def change_password(
         window_seconds=300,
     )
 
-    # Verify current password
-    if not runtime.auth.verify_password(principal.user_id, body.current_password):
-        raise http_error("unauthorized", "current password is incorrect", status_code=401)
+    # Password proof, credential rotation, and publication/revocation of
+    # sessions share one cross-replica order with login and password reset.
+    # Otherwise a concurrent login can prove the old password before this
+    # write, pause, and publish a new session after the revocation below.
+    with runtime.store.hold_user_auth_state(principal.user_id):
+        if not runtime.auth.verify_password(
+            principal.user_id, body.current_password
+        ):
+            raise http_error(
+                "unauthorized",
+                "current password is incorrect",
+                status_code=401,
+            )
 
-    # Save new password
-    runtime.auth.save_password(principal.user_id, body.new_password)
+        runtime.auth.save_password(principal.user_id, body.new_password)
 
-    # SECURITY: Revoke all other sessions to force re-authentication.
-    # Reported rather than assumed, for the reason given on MFA disable
-    # above: the row is the mechanism, and a failed delete leaves a stolen
-    # session alive for its full lifetime while this answered "changed".
-    revoked = await runtime.auth.revoke_all_user_sessions(
-        principal.user_id, except_session_id=principal.session_id
-    )
+        # The password is already committed if revocation fails, so unlike a
+        # reset this operation reports the two outcomes separately rather
+        # than pretending the password change itself did not happen.
+        revoked = await runtime.auth.revoke_all_user_sessions(
+            principal.user_id, except_session_id=principal.session_id
+        )
 
     # Issue 51.6: Audit logging for password change (GDPR/SOC2 compliance)
     # The outcome is in the audit line too: a change whose revocation failed
