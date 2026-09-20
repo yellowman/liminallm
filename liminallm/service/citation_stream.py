@@ -813,7 +813,7 @@ class ScrubbedTokenStream:
         events: Any,
         nonce: str,
         *,
-        max_canonical_chars: int = MAX_CANONICAL_CHARS,
+        max_canonical_chars: Optional[int] = MAX_CANONICAL_CHARS,
         scrub_namespace: bool = True,
     ) -> None:
         self._events = iter(events)
@@ -876,7 +876,10 @@ class ScrubbedTokenStream:
 
     def _take(self, chunk: str) -> str:
         """One raw chunk in, whatever is safe to show out."""
-        if self.reader.canonical_length + len(chunk) > self._limit:
+        if (
+            self._limit is not None
+            and self.reader.canonical_length + len(chunk) > self._limit
+        ):
             # Past the ceiling. Not truncated: earlier public tokens have
             # already reached the client, so quietly stopping here would hand
             # them a shorter answer that looks finished. The provider is cut
