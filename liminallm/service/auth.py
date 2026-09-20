@@ -1108,6 +1108,15 @@ class AuthService:
                 return None, None, {}
             if not self._site_matches(user, tenant_id):
                 return None, None, {}
+
+            # Password verification can overlap a mailbox verification commit.
+            # Re-read after the credential proof before judging the grace
+            # period, so authorization is based on the state that exists now,
+            # not the snapshot from before the proof. The auth-state lock
+            # serializes credential/session mutation; email verification is a
+            # separate authority transition and is deliberately allowed to
+            # become visible here.
+            user = self.store.get_user(user.id) or user
             await self._require_verification_grace(user)
 
             # SPEC §12.1: single-session mode is a constraint, not cleanup.
