@@ -1009,13 +1009,24 @@ class ScrubbedTokenStream:
             and str(reported) != self.reader.canonical
         ):
             self.contradicted = True
-            return [{
+            # The contradiction is terminal just like a backend error. Settle
+            # any suffix the reader was holding *before* the error leaves:
+            # trailing whitespace or an unclosed marker prefix can no longer
+            # become part of a future closed marker. Returning the error first
+            # and relying on the iterator's later StopIteration probe emitted
+            # that suffix after the terminal event, which breaks consumers
+            # that correctly treat error as last.
+            tail = self.reader.fail()
+            error = {
                 "event": "error",
                 "data": {
                     "code": "server_error",
                     "message": "provider stream contradicted its own tokens",
                 },
-            }]
+            }
+            if tail:
+                return [{"event": "token", "data": tail}, error]
+            return [error]
         tail, self.origins = self.reader.finish()
         if self._verify_reported:
             data["content"] = self.reader.released
