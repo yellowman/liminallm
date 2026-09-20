@@ -864,6 +864,11 @@ class ScrubbedTokenStream:
         self._limit = max_canonical_chars
         self._verify_reported = verify_reported
         self._pending: List[Dict[str, Any]] = []
+        #: A provider exception/exhaustion whose final safe reader suffix had
+        #: to be emitted first. The next pull replays the original termination
+        #: exactly; the wrapper never converts failure into completion.
+        self._terminal_error: Optional[Exception] = None
+        self._terminal_stop = False
         #: Set when the provider's own final content did not match the tokens
         #: it sent. The completion is refused rather than believed, and the
         #: reader is left unfinished, which is what `intact` reports.
@@ -899,7 +904,24 @@ class ScrubbedTokenStream:
         while True:
             if self._pending:
                 return self._pending.pop(0)
-            event = next(self._events)
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            if self._terminal_stop:
+                raise StopIteration
+            try:
+                event = next(self._events)
+            except StopIteration:
+                tail = self.reader.fail()
+                if tail:
+                    self._terminal_stop = True
+                    return {"event": "token", "data": tail}
+                raise
+            except Exception as exc:
+                tail = self.reader.fail()
+                if tail:
+                    self._terminal_error = exc
+                    return {"event": "token", "data": tail}
+                raise
             if not isinstance(event, dict):
                 return event
             kind = event.get("event")
