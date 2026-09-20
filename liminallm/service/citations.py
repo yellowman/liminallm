@@ -79,6 +79,11 @@ MIN_NONCE_BITS = 40
 #: cannot swallow the rest of a sentence.
 CITATION_RE = re.compile(r"\[(?i:cite):([^\]\n]{0,64})\]")
 
+#: Reader-side cleanup includes the horizontal spacing immediately before a
+#: marker. Kept as one compiled expression so the finished-string helper and
+#: the incremental stream implement the same grammar.
+CITATION_STRIP_RE = re.compile(r"[ \t]*" + CITATION_RE.pattern)
+
 #: An empty table's mappings. Frozen like a built one's, so the default is not
 #: the one writable `CitationTable` in the system. Behind a factory because
 #: `dataclasses` refuses a mappingproxy as a bare default.
@@ -1016,6 +1021,41 @@ def scrub_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
     return _scrub_text(text, _namespace_pattern(nonce))
 
 
+def reader_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
+    """The text a reader may see, and each surviving character's origin.
+
+    Reader cleanup is deliberately wider than the worker/wire scrub. First
+    this turn's namespace is removed with `scrub_positions`; then every
+    closed marker-shaped `[cite:...]` token is removed with the same grammar
+    as `strip_citations`, whether its handle resolves, is malformed, or
+    belongs to another turn.
+
+    The second pass is intentionally one pass, like `strip_citations`.
+    Keeping it separate from `scrub_namespace` preserves that narrower
+    boundary: a worker asked to search for the literal `[cite:OLDTURN-1]`
+    must still receive what the model wrote, while a reader should never see
+    citation offer syntax.
+
+    The origin map is carried through both transformations so a validated
+    citation's public offset indexes the exact string the reader holds.
+    """
+    public, origins = scrub_positions(text, nonce)
+    matches = list(CITATION_STRIP_RE.finditer(public))
+    if not matches:
+        return public, origins
+
+    kept: List[str] = []
+    kept_origins: List[int] = []
+    cursor = 0
+    for match in matches:
+        kept.append(public[cursor : match.start()])
+        kept_origins.extend(origins[cursor : match.start()])
+        cursor = match.end()
+    kept.append(public[cursor:])
+    kept_origins.extend(origins[cursor:])
+    return "".join(kept), kept_origins
+
+
 def public_index(origins: Sequence[int], index: int) -> int:
     """Where position `index` of the original text landed after scrubbing.
 
@@ -1116,4 +1156,4 @@ def strip_citations(answer: str) -> str:
     closed up, so a sentence does not end with a gap where a handle used to
     be.
     """
-    return re.sub(r"[ \t]*" + CITATION_RE.pattern, "", answer or "")
+    return CITATION_STRIP_RE.sub("", answer or "")
