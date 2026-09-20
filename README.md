@@ -74,9 +74,10 @@ feedback has shaped and which adapters it reached.
 ![Insights screen summarizing preference events by total, positive, negative, and neutral.](docs/screenshots/08-insights.png)
 
 **settings.** account and session details, including the role and tenant the
-current session carries.
+current session carries. fourteen sections under a sticky index that marks
+the one being read; five of them appear only for the `admin` role.
 
-![Settings screen showing session information and account preferences.](docs/screenshots/09-settings.png)
+![Settings screen with a sticky section index on the left, listing session, email, password, two-factor, API keys, preferences, local storage, upload limits, about, and five admin sections. The workspace shows session information, email verification, and the change-password form, each under its own titled band.](docs/screenshots/09-settings.png)
 
 **admin console.** a separate page at `/admin`, guarded by the `admin` role.
 it reviews configuration patch proposals, administers tenant users, and

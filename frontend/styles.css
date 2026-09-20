@@ -25,14 +25,24 @@
      instrumentation rather than a questionnaire. The admin settings grid
      already sat at 28px and was the closest thing here to the rail. */
   --ctl-h: 30px;
-  --ctl-h-sm: 26px;
+  /* The settings form's tier. It sat at a hardcoded 28px in three places
+     while this token said 26 and named nothing, so the one number a reader
+     would change was not the one the page used. */
+  --ctl-h-sm: 28px;
   /* A glyph smaller than its target: precise to look at, easy to hit. */
   --icon-hit: 28px;
   --icon-glyph: 18px;
   --chip-h: 20px;
+  /* Two families, not three. `--font-serif` was an Iowan/Palatino/Georgia
+     stack used for the assistant's prose and the note editor, and it made
+     Chat and Notes read as a different product from the rail beside them -
+     a reader crossing 48px went from a technical instrument to a magazine.
+     Worse, the stack is heterogeneous: which face a reader actually got
+     depended on their operating system, so the reading column had no
+     settled shape to design against. Retired; the reading surfaces are set
+     in the interface family, one step larger and looser than the chrome. */
   --font: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-  --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, Cambria, "Times New Roman", serif;
-  --font-mono: "SF Mono", "Fira Code", Consolas, monospace;
+  --font-mono: "JetBrains Mono", "SF Mono", "Fira Code", Consolas, monospace;
   --code-bg: #f6f8fa;
   --syn-kw: #cf222e;
   --syn-str: #0a3069;
@@ -41,7 +51,10 @@
   --sidebar-width: 272px;
   --rail-width: 48px;
   --pane-width: 240px;
-  --topbar-h: 56px;
+  /* 48, not 56. It holds one 30px control tier and a title, so the extra
+     8px was margin above the reading column on every screen. Verified
+     against the captures: nothing in the bar crowds at 48. */
+  --topbar-h: 48px;
   --content-max: 1100px;
 }
 
@@ -696,11 +709,19 @@ body {
    application reads. */
 
 /* Main content area */
+/* No `overflow-y` here. It said `auto`, and measured on both the chat tab
+   and Settings its `scrollHeight` equalled its `clientHeight` - nothing to
+   scroll, because nothing above it bounds its height. What it did do was
+   make itself a scroll container, which is what `position: sticky` resolves
+   against: a sticky descendant was pinned to a box that never moves, so it
+   scrolled away with the page. Measured on Settings, the index sat 1987px
+   above the viewport with the declaration and at the intended 68px without
+   it, while every other box on both tabs read the same either way. The page
+   scrolls as a document, which is also why `.topbar` sticks. */
 .main-content {
   flex: 1;
   min-width: 0;
   padding: 20px 24px 32px;
-  overflow-y: auto;
   width: 100%;
   max-width: var(--content-max);
   margin: 0 auto;
@@ -1120,7 +1141,7 @@ button.minor:hover {
   border: none;
   color: var(--text-muted);
   display: flex;
-  font-family: var(--font-serif);
+  font-family: var(--font);
   font-style: italic;
   font-size: 15px;
   gap: 8px;
@@ -1184,18 +1205,20 @@ button.minor:hover {
   font-size: 14.5px;
 }
 
-/* Assistant prose is set in serif, open on the page; the renderer controls
-   breaks, so pre-wrap is turned off. */
+/* Assistant prose is an open column on the page rather than a bubble; the
+   renderer controls breaks, so pre-wrap is turned off. One step larger and
+   looser than the chrome around it, which is what marks it as the thing to
+   read - the previous answer was a different typeface, which marked it as a
+   different product. The letter-spacing went with the serif: it was an
+   optical correction for that face and sets Inter slightly loose. */
 .message.assistant .bubble {
   white-space: normal;
   background: transparent;
   border: none;
   border-radius: 0;
   padding: 0;
-  font-family: var(--font-serif);
-  font-size: 16px;
-  line-height: 1.68;
-  letter-spacing: 0.003em;
+  font-size: 15px;
+  line-height: 1.65;
 }
 
 .bubble p {
@@ -1218,7 +1241,7 @@ button.minor:hover {
 .bubble h5,
 .bubble h6 {
   margin: 22px 0 10px;
-  font-family: var(--font-serif);
+  font-family: var(--font);
   font-weight: 600;
   line-height: 1.25;
   letter-spacing: -0.01em;
@@ -2836,7 +2859,7 @@ button.minor:hover {
 #note-title {
   flex: 1;
   min-width: 0;
-  font-family: var(--font-serif);
+  font-family: var(--font);
   font-size: 22px;
   font-weight: 600;
   border: none;
@@ -2854,7 +2877,7 @@ button.minor:hover {
   flex: 1;
   min-height: 300px;
   resize: vertical;
-  font-family: var(--font-serif);
+  font-family: var(--font);
   font-size: 16px;
   line-height: 1.7;
   border: 1px solid var(--border);
@@ -2869,7 +2892,7 @@ button.minor:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px 16px;
-  font-family: var(--font-serif);
+  font-family: var(--font);
   font-size: 16px;
   line-height: 1.7;
 }
@@ -2906,7 +2929,7 @@ button.minor:hover {
 }
 
 .witness-summary {
-  font-family: var(--font-serif);
+  font-family: var(--font);
   font-size: 15px;
   font-style: italic;
 }
@@ -2967,7 +2990,7 @@ button.minor:hover {
   align-items: center;
   justify-content: center;
   text-align: center;
-  font-family: var(--font-serif);
+  font-family: var(--font);
   font-size: 15px;
   line-height: 1.9;
   padding: 40px;
@@ -3037,7 +3060,7 @@ button.minor:hover {
   align-items: center;
   gap: 6px;
   font-size: 13px;
-  color: var(--muted);
+  color: var(--text-muted);
   white-space: nowrap;
 }
 
@@ -3046,43 +3069,11 @@ button.minor:hover {
   accent-color: var(--accent);
 }
 
-/* Jump list: seventeen groups do not fit on a screen. */
-.settings-nav {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  margin-bottom: 16px;
-}
-
-.group-chip {
-  padding: 3px 9px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  font-size: 11.5px;
-  color: var(--muted);
-  text-decoration: none;
-  white-space: nowrap;
-}
-
-.group-chip:hover {
-  color: var(--text);
-  border-color: var(--accent);
-}
-
-.setting-group {
-  margin-bottom: 18px;
-  scroll-margin-top: 12px;
-}
-
-.setting-group h4 {
-  margin: 0 0 8px;
-  padding-bottom: 5px;
-  border-bottom: 1px solid var(--border);
-  font-size: 11.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.07em;
-  color: var(--muted);
-}
+/* `.settings-nav` and `.group-chip` were a wrapped row of seventeen
+   capsules above the form - a jump list that read as seventeen buttons and
+   scrolled away at the point a reader needed it. `.settings-index` replaces
+   both: the same links, beside the form and staying there. `.setting-group`
+   and its uppercase `h4` are now the shared `.section-band`. */
 
 .setting-grid {
   display: grid;
@@ -3127,7 +3118,7 @@ button.minor:hover {
 .setting-row select {
   width: 100%;
   min-width: 0;
-  height: 28px;
+  height: var(--ctl-h-sm);
   padding: 0 7px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -3153,7 +3144,7 @@ button.minor:hover {
 .setting-help {
   font-size: 11px;
   line-height: 1.35;
-  color: var(--muted);
+  color: var(--text-muted);
   /* One line, then a tooltip. Full text on hover; the description is a
      reminder, not something an operator reads a hundred times. */
   display: -webkit-box;
@@ -3183,29 +3174,13 @@ button.minor:hover {
   border: 1px solid var(--border);
   font-size: 10px;
   font-weight: 400;
-  color: var(--muted);
+  color: var(--text-muted);
   vertical-align: middle;
 }
 
-/* Always reachable: the save button should not be a hundred controls away. */
-.settings-actions {
-  position: sticky;
-  bottom: 0;
-  z-index: 2;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-top: 4px;
-  padding: 10px 0;
-  border-top: 1px solid var(--border);
-  /* Matches the card it sits in, not the page behind it. */
-  background: var(--panel);
-}
-
-.settings-actions button[disabled] {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
+/* `.settings-actions` was the admin console's own sticky save bar. The
+   Settings tab needed the same thing, so it is `.sticky-actions` in the
+   shared vocabulary rather than a second copy under a second name. */
 
 /* The tools a turn used, as icons. `.meta` uppercases its text, which turned
    a list of internal identifiers into a row of shouted underscores under
@@ -3519,6 +3494,200 @@ button.minor:hover {
    whoever reads this file next, and kept working by whoever changes the
    tokens under it. Removed; the shapes they described are available again
    the day something needs them. */
+
+/* ---------------------------------------------------------------------------
+   Long pages: the band and the index.
+
+   Settings is nine sections and the admin console is seventeen groups, and
+   both read as one undifferentiated page because every heading looks like
+   every other heading. Removing enclosure from the previous sweep made that
+   worse, not better: the boxes were bad structure, and taking them away left
+   no structure at all.
+
+   The answer is not to put the boxes back. Two things do the work a reader
+   actually needs on a long page - knowing where a section starts, and knowing
+   where they are in the whole. A band answers the first and an index answers
+   the second, and neither is an enclosure around content.
+   --------------------------------------------------------------------------- */
+
+/* A section's header, spanning its column. No radius and no side border,
+   because a band is not a card: it marks a boundary rather than holding
+   anything. The faint fill is what makes it work while scrolling, which is
+   the one moment a long page has to be legible at a glance - a hairline
+   alone is visible when read and invisible when scanned. */
+.section-band {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 26px 0 12px;
+  padding: 6px 10px;
+  background: var(--panel-muted);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.section-band:first-child {
+  margin-top: 0;
+}
+
+/* The rail's drawing, one size down: a line glyph, never a filled shape. */
+.section-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--text-muted);
+}
+
+.section-band h2,
+.section-band h3,
+.section-band h4 {
+  flex: none;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text);
+}
+
+/* What the section is for, or how much is in it. It takes the rest of the
+   band and sets to the right, so a count lands at the far edge and a
+   sentence still has the width to be one. */
+.section-description {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  font-weight: 400;
+  color: var(--text-muted);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+/* Everything under one band, to the next band. Named so the index can find
+   its sections and a jump link has something to land on.
+
+   The scroll margin clears the sticky bar for the same reason the index's
+   offset does. Without it a jump scrolls the section to the top of the
+   viewport, which is behind the bar: measured at 34px of a 48px bar over
+   the band the jump exists to reveal. */
+.setting-group {
+  margin: 0 0 22px;
+  scroll-margin-top: calc(var(--topbar-h) + 12px);
+}
+
+/* The index beside the sections, not above them. Above meant it scrolled
+   away at exactly the point a reader had lost track of where they were. */
+.settings-layout {
+  display: grid;
+  grid-template-columns: 188px minmax(0, 1fr);
+  gap: 26px;
+  align-items: start;
+}
+
+/* `.topbar` is sticky at the top of the page, so anything else sticky has
+   to start below it or spend its first rows behind it. Both pages carrying
+   this pattern wear that same bar - scoping the offset to the workspace
+   left the admin console's index sitting at 12px under a 48px bar. */
+.settings-index {
+  position: sticky;
+  top: calc(var(--topbar-h) + 12px);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: calc(100vh - var(--topbar-h) - 40px);
+  overflow-y: auto;
+}
+
+/* The rail's grammar again, at the rail's scale: nothing at rest, a faint
+   fill and a 2px marker for the section being read. A jump list of capsules
+   was the previous answer and read as seventeen buttons. */
+.settings-index a {
+  padding: 4px 9px;
+  border-left: 2px solid transparent;
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: 12.5px;
+  line-height: 1.35;
+  color: var(--text-muted);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.settings-index a:hover {
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+.settings-index a.current {
+  border-left-color: var(--accent);
+  background: var(--accent-light);
+  color: var(--accent-strong);
+  font-weight: 500;
+}
+
+/* One column once the index would take a third of the width. Sticky goes
+   with it: a narrow screen has no room to spare for a fixed column. */
+@media (max-width: 860px) {
+  .settings-layout {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .settings-index {
+    position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
+    max-height: none;
+  }
+
+  .settings-index a {
+    border-left: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: var(--radius-sm);
+  }
+
+  .settings-index a.current {
+    border-left-color: transparent;
+    border-bottom-color: var(--accent);
+  }
+}
+
+/* One of the four things that still earns an enclosure: an editing surface
+   isolated from the page around it. It appears in answer to a choice, it
+   ends in a decision, and while it is open it is the only thing on the page
+   a reader should be acting on - which is what the border is saying. */
+.setting-editor {
+  margin: 10px 0 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-muted);
+}
+
+.setting-editor > :last-child {
+  margin-bottom: 0;
+}
+
+/* Always reachable: a decision about something a hundred controls up the
+   page must not require scrolling back to it. */
+.sticky-actions {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 14px;
+  padding: 10px 0;
+  border-top: 1px solid var(--border);
+  /* Matches the panel it sits in, not the page behind it. */
+  background: var(--panel);
+}
+
+.sticky-actions button[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 
 
 /* Upload is one line, not a stack of labelled fields. The file input is the

@@ -724,419 +724,480 @@
               </div>
               <p class="subtext">Configure your preferences and account settings.</p>
 
-              <div class="divider"></div>
+              <div class="settings-layout">
+                <nav class="settings-index" id="settings-index" aria-label="Settings sections">
+                  <a href="#settings-session">Session</a>
+                  <a href="#settings-email">Email</a>
+                  <a href="#settings-password">Password</a>
+                  <a href="#settings-mfa">Two-factor</a>
+                  <a href="#settings-api-keys">API keys</a>
+                  <a href="#settings-preferences">Preferences</a>
+                  <a href="#settings-drafts">Local storage</a>
+                  <a href="#settings-uploads">Upload limits</a>
+                  <a href="#settings-about">About</a>
+                  <a href="#settings-admin-config" data-admin-only class="hidden">Admin settings</a>
+                  <a href="#settings-admin-users" data-admin-only class="hidden">Users</a>
+                  <a href="#settings-admin-adapters" data-admin-only class="hidden">Adapters</a>
+                  <a href="#settings-admin-objects" data-admin-only class="hidden">Storage objects</a>
+                  <a href="#settings-admin-patches" data-admin-only class="hidden">Config patches</a>
+                </nav>
 
-              <h3>Session information</h3>
-              <div>
-                <div class="detail-row">
-                  <span class="detail-label">User ID</span>
-                  <span class="monospace" id="setting-user-id">-</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Role</span>
-                  <span id="setting-role">-</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Tenant</span>
-                  <span id="setting-tenant">-</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Session ID</span>
-                  <span id="setting-session-id">-</span>
-                </div>
-              </div>
-
-              <div class="divider"></div>
-
-              <h3>Email Verification</h3>
-              <p class="subtext">Verify your email address to unlock all features.</p>
-              <div>
-                <div class="detail-row">
-                  <span class="detail-label">Email Status</span>
-                  <span id="setting-email-verified">Loading...</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Email Address</span>
-                  <span id="setting-email-address">-</span>
-                </div>
-              </div>
-              <div id="email-verify-actions" class="pill-row">
-                <button class="minor hidden" id="resend-verification-btn">Resend verification email</button>
-              </div>
-              <div id="email-verify-status" class="small" role="status"></div>
-
-              <div class="divider"></div>
-
-              <h3>Change Password</h3>
-              <p class="subtext">Update your account password.</p>
-              <form id="password-change-form">
-                <div class="field">
-                  <label for="current-password">Current Password</label>
-                  <input type="password" id="current-password" placeholder="Enter current password" required autocomplete="current-password" />
-                </div>
-                <div class="field">
-                  <label for="new-password">New Password</label>
-                  <input type="password" id="new-password" placeholder="Enter new password (min 8 characters)" required minlength="8" autocomplete="new-password" />
-                </div>
-                <div class="field">
-                  <label for="confirm-password">Confirm New Password</label>
-                  <input type="password" id="confirm-password" placeholder="Confirm new password" required minlength="8" autocomplete="new-password" />
-                </div>
-                <div class="pill-row">
-                  <button type="submit" class="primary" id="change-password-btn">Change Password</button>
-                </div>
-              </form>
-              <div id="password-change-status" class="small" role="status"></div>
-
-              <div class="divider"></div>
-
-              <h3>Two-Factor Authentication</h3>
-              <p class="subtext">Protect your account with a TOTP authenticator app.</p>
-              <div>
-                <div class="detail-row">
-                  <span class="detail-label">MFA Status</span>
-                  <span id="setting-mfa-status">Loading...</span>
-                </div>
-              </div>
-
-              <!-- MFA Setup Section (hidden by default) -->
-              <div id="mfa-setup-section" class="hidden">
-                <div class="mfa-qr-container" id="mfa-qr-container">
-                  <p class="subtext">Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.):</p>
-                  <div id="mfa-qr-code" class="mfa-qr-code"></div>
-                  <div class="field">
-                    <label>Or enter this secret manually:</label>
-                    <code id="mfa-secret-display" class="mfa-secret"></code>
-                  </div>
-                </div>
-                <form id="mfa-verify-form">
-                  <div class="field">
-                    <label for="mfa-setup-code">Enter code from authenticator</label>
-                    <input type="text" id="mfa-setup-code" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" required />
-                  </div>
-                  <div class="pill-row">
-                    <button type="submit" class="primary" id="mfa-verify-btn">Verify & Enable</button>
-                    <button type="button" class="ghost" id="mfa-cancel-btn">Cancel</button>
-                  </div>
-                </form>
-                <div id="mfa-setup-status" class="small" role="status"></div>
-              </div>
-
-              <!-- MFA Disable Section (hidden by default) -->
-              <div id="mfa-disable-section" class="hidden">
-                <form id="mfa-disable-form">
-                  <div class="field">
-                    <label for="mfa-disable-code">Enter current MFA code to disable</label>
-                    <input type="text" id="mfa-disable-code" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" required />
-                  </div>
-                  <div class="pill-row">
-                    <button type="submit" class="ghost" id="mfa-disable-btn">Disable MFA</button>
-                    <button type="button" class="ghost" id="mfa-disable-cancel-btn">Cancel</button>
-                  </div>
-                </form>
-                <div id="mfa-disable-status" class="small" role="status"></div>
-              </div>
-
-              <!-- MFA Actions -->
-              <div id="mfa-actions" class="pill-row">
-                <button class="primary hidden" id="mfa-enable-btn">Enable MFA</button>
-                <button class="ghost hidden" id="mfa-show-disable-btn">Disable MFA</button>
-              </div>
-
-              <div class="divider"></div>
-
-              <h3>API Keys</h3>
-              <p class="subtext">Bearer keys for the agent surfaces (<code>POST /v1/responses</code> and the MCP endpoint <code>POST /v1/mcp</code>). A key can chat and search your notes/contexts, nothing else - it cannot read conversations or manage keys. Conversations agents start appear in your sidebar tagged “api”.</p>
-              <form id="api-key-create-form">
-                <div class="field">
-                  <label for="api-key-name">Key name</label>
-                  <input type="text" id="api-key-name" placeholder="e.g. my agent runner" maxlength="100" />
-                </div>
-                <div class="pill-row">
-                  <button type="submit" class="primary" id="api-key-create-btn">Create key</button>
-                </div>
-              </form>
-              <div id="api-key-plaintext" class="hidden">
-                <p class="subtext">Copy this key now - it is shown only once:</p>
-                <code id="api-key-plaintext-value" class="mfa-secret"></code>
-              </div>
-              <div id="api-key-list"></div>
-              <div id="api-key-status" class="small" role="status"></div>
-
-              <div class="divider"></div>
-
-              <h3>Preferences</h3>
-              <p class="subtext">Customize your experience with locale, timezone, and voice settings.</p>
-              <form id="user-settings-form">
-                <div class="input-grid">
-                  <div class="field">
-                    <label for="setting-locale">Locale</label>
-                    <select id="setting-locale">
-                      <option value="">Auto-detect</option>
-                      <option value="en-US">English (US)</option>
-                      <option value="en-GB">English (UK)</option>
-                      <option value="es-ES">Spanish (Spain)</option>
-                      <option value="fr-FR">French (France)</option>
-                      <option value="de-DE">German (Germany)</option>
-                      <option value="ja-JP">Japanese</option>
-                      <option value="zh-CN">Chinese (Simplified)</option>
-                    </select>
-                  </div>
-                  <div class="field">
-                    <label for="setting-timezone">Timezone</label>
-                    <select id="setting-timezone">
-                      <option value="">Auto-detect</option>
-                      <option value="UTC">UTC</option>
-                      <option value="America/New_York">Eastern Time (US)</option>
-                      <option value="America/Chicago">Central Time (US)</option>
-                      <option value="America/Denver">Mountain Time (US)</option>
-                      <option value="America/Los_Angeles">Pacific Time (US)</option>
-                      <option value="Europe/London">London</option>
-                      <option value="Europe/Paris">Paris</option>
-                      <option value="Europe/Berlin">Berlin</option>
-                      <option value="Asia/Tokyo">Tokyo</option>
-                      <option value="Asia/Shanghai">Shanghai</option>
-                      <option value="Australia/Sydney">Sydney</option>
-                    </select>
-                  </div>
-                </div>
-                <div class="field">
-                  <label for="setting-default-voice">Default Voice</label>
-                  <select id="setting-default-voice">
-                    <option value="">System default</option>
-                    <option value="alloy">Alloy</option>
-                    <option value="echo">Echo</option>
-                    <option value="fable">Fable</option>
-                    <option value="onyx">Onyx</option>
-                    <option value="nova">Nova</option>
-                    <option value="shimmer">Shimmer</option>
-                  </select>
-                </div>
-                <div class="pill-row">
-                  <button type="submit" class="primary" id="save-user-settings-btn">Save Preferences</button>
-                </div>
-              </form>
-              <div id="user-settings-status" class="small" role="status"></div>
-
-              <div class="divider"></div>
-
-              <h3>Local storage</h3>
-              <p class="subtext">Draft messages are saved locally in your browser.</p>
-              <div class="pill-row">
-                <button class="minor" id="clear-drafts-btn">Clear saved drafts</button>
-                <button class="ghost" id="export-drafts-btn">Export drafts</button>
-              </div>
-              <div id="drafts-status" class="small" role="status"></div>
-
-              <div class="divider"></div>
-
-              <h3>Upload limits</h3>
-              <div>
-                <div class="detail-row">
-                  <span class="detail-label">Max file size</span>
-                  <span id="setting-max-upload">Loading...</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Allowed types</span>
-                  <span id="setting-allowed-types">.txt, .md, .pdf, .json, .csv, .yaml</span>
-                </div>
-              </div>
-
-              <div class="divider"></div>
-
-              <h3>About</h3>
-              <div>
-                <div class="detail-row">
-                  <span class="detail-label">Version</span>
-                  <span id="setting-version">-</span>
-                </div>
-                <div class="detail-row">
-                  <span class="detail-label">Build</span>
-                  <span class="monospace" id="setting-build">-</span>
-                </div>
-              </div>
-
-              <!-- Admin Settings Section (only visible to admins) -->
-              <div id="admin-settings-section" class="hidden">
-                <div class="divider"></div>
-                <h3>Admin Settings</h3>
-                <p class="subtext">System-wide settings (admin only). Changes take effect immediately.</p>
-
-                <div class="form-group">
-                  <label for="admin-default-page-size">Default page size</label>
-                  <input type="number" id="admin-default-page-size" min="1" max="1000" value="100" />
-                  <span class="small">Default number of items per page (1-1000)</span>
-                </div>
-
-                <div class="form-group">
-                  <label for="admin-max-page-size">Max page size</label>
-                  <input type="number" id="admin-max-page-size" min="1" max="1000" value="500" />
-                  <span class="small">Maximum allowed page size (1-1000)</span>
-                </div>
-
-                <div class="form-group">
-                  <label for="admin-default-conversations-limit">Default conversations limit</label>
-                  <input type="number" id="admin-default-conversations-limit" min="1" max="500" value="50" />
-                  <span class="small">Default limit for conversation list (1-500)</span>
-                </div>
-
-                <div class="pill-row mt-12">
-                  <button class="primary" id="save-admin-settings-btn">Save settings</button>
-                  <button class="ghost" id="reload-admin-settings-btn">Reload</button>
-                </div>
-                <div id="admin-settings-status" class="small" role="status"></div>
-
-                <!-- Users Management -->
-                <div class="divider"></div>
-                <h3>Users Management</h3>
-                <p class="subtext">Manage system users, roles, and permissions.</p>
-
-                <div class="pill-row mb-12">
-                  <button class="ghost" id="refresh-users-btn">Refresh</button>
-                  <button class="primary" id="show-add-user-btn">Add User</button>
-                </div>
-
-                <div id="add-user-form-section" class="hidden">
-                  <div class="input-grid">
-                    <div class="field">
-                      <label for="new-user-email">Email</label>
-                      <input type="email" id="new-user-email" placeholder="user@example.com" required />
+                <div>
+                  <section class="setting-group" id="settings-session">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="7" r="3"/><path d="M4 16.5c0-2.8 2.7-4.5 6-4.5s6 1.7 6 4.5"/></svg>
+                      <h3>Session information</h3>
+                      <span class="section-description">Who you are signed in as</span>
                     </div>
-                    <div class="field">
-                      <label for="new-user-password">Password</label>
-                      <input type="password" id="new-user-password" placeholder="Strong password" required />
+                    <div class="detail-row">
+                      <span class="detail-label">User ID</span>
+                      <span class="monospace" id="setting-user-id">-</span>
                     </div>
-                    <div class="field">
-                      <label for="new-user-role">Role</label>
-                      <select id="new-user-role">
-                        <option value="user">User</option>
-                        <option value="admin">Admin</option>
-                      </select>
+                    <div class="detail-row">
+                      <span class="detail-label">Role</span>
+                      <span id="setting-role">-</span>
                     </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Tenant</span>
+                      <span id="setting-tenant">-</span>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Session ID</span>
+                      <span id="setting-session-id">-</span>
+                    </div>
+                  </section>
+
+                  <section class="setting-group" id="settings-email">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="14" height="10" rx="1.5"/><path d="M3.6 6l6.4 4.6L16.4 6"/></svg>
+                      <h3>Email verification</h3>
+                      <span class="section-description">Verify your address to unlock all features</span>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Email status</span>
+                      <span id="setting-email-verified">Loading...</span>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Email address</span>
+                      <span id="setting-email-address">-</span>
+                    </div>
+                    <div id="email-verify-actions" class="pill-row">
+                      <button class="minor hidden" id="resend-verification-btn">Resend verification email</button>
+                    </div>
+                    <div id="email-verify-status" class="small" role="status"></div>
+                  </section>
+
+                  <section class="setting-group" id="settings-password">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="9" width="12" height="8" rx="1.5"/><path d="M7 9V6.6a3 3 0 0 1 6 0V9"/></svg>
+                      <h3>Change password</h3>
+                      <span class="section-description">Update your account password</span>
+                    </div>
+                    <form id="password-change-form">
+                      <div class="field">
+                        <label for="current-password">Current password</label>
+                        <input type="password" id="current-password" placeholder="Enter current password" required autocomplete="current-password" />
+                      </div>
+                      <div class="field">
+                        <label for="new-password">New password</label>
+                        <input type="password" id="new-password" placeholder="Enter new password (min 8 characters)" required minlength="8" autocomplete="new-password" />
+                      </div>
+                      <div class="field">
+                        <label for="confirm-password">Confirm new password</label>
+                        <input type="password" id="confirm-password" placeholder="Confirm new password" required minlength="8" autocomplete="new-password" />
+                      </div>
+                      <div class="pill-row">
+                        <button type="submit" class="primary" id="change-password-btn">Change password</button>
+                      </div>
+                    </form>
+                    <div id="password-change-status" class="small" role="status"></div>
+                  </section>
+
+                  <section class="setting-group" id="settings-mfa">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2.8l6 2.1v4.4c0 3.5-2.4 6.6-6 7.5-3.6-.9-6-4-6-7.5V4.9z"/><path d="M7.6 10l1.7 1.7 3.1-3.4"/></svg>
+                      <h3>Two-factor authentication</h3>
+                      <span class="section-description">A TOTP authenticator app</span>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">MFA status</span>
+                      <span id="setting-mfa-status">Loading...</span>
+                    </div>
+
+                    <!-- MFA Setup Section (hidden by default) -->
+                    <div id="mfa-setup-section" class="setting-editor hidden">
+                      <div class="mfa-qr-container" id="mfa-qr-container">
+                        <p class="subtext">Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.):</p>
+                        <div id="mfa-qr-code" class="mfa-qr-code"></div>
+                        <div class="field">
+                          <label>Or enter this secret manually:</label>
+                          <code id="mfa-secret-display" class="mfa-secret"></code>
+                        </div>
+                      </div>
+                      <form id="mfa-verify-form">
+                        <div class="field">
+                          <label for="mfa-setup-code">Enter code from authenticator</label>
+                          <input type="text" id="mfa-setup-code" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" required />
+                        </div>
+                        <div class="pill-row">
+                          <button type="submit" class="primary" id="mfa-verify-btn">Verify &amp; enable</button>
+                          <button type="button" class="ghost" id="mfa-cancel-btn">Cancel</button>
+                        </div>
+                      </form>
+                      <div id="mfa-setup-status" class="small" role="status"></div>
+                    </div>
+
+                    <!-- MFA Disable Section (hidden by default) -->
+                    <div id="mfa-disable-section" class="setting-editor hidden">
+                      <form id="mfa-disable-form">
+                        <div class="field">
+                          <label for="mfa-disable-code">Enter current MFA code to disable</label>
+                          <input type="text" id="mfa-disable-code" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" required />
+                        </div>
+                        <div class="pill-row">
+                          <button type="submit" class="ghost" id="mfa-disable-btn">Disable MFA</button>
+                          <button type="button" class="ghost" id="mfa-disable-cancel-btn">Cancel</button>
+                        </div>
+                      </form>
+                      <div id="mfa-disable-status" class="small" role="status"></div>
+                    </div>
+
+                    <!-- MFA Actions -->
+                    <div id="mfa-actions" class="pill-row">
+                      <button class="primary hidden" id="mfa-enable-btn">Enable MFA</button>
+                      <button class="ghost hidden" id="mfa-show-disable-btn">Disable MFA</button>
+                    </div>
+                  </section>
+
+                  <section class="setting-group" id="settings-api-keys">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.2" cy="10" r="3.2"/><path d="M9.4 10H17M14.6 10v2.6M12.2 10v2.2"/></svg>
+                      <h3>API keys</h3>
+                      <span class="section-description">Bearer keys for the agent surfaces</span>
+                    </div>
+                    <p class="subtext">Bearer keys for the agent surfaces (<code>POST /v1/responses</code> and the MCP endpoint <code>POST /v1/mcp</code>). A key can chat and search your notes/contexts, nothing else - it cannot read conversations or manage keys. Conversations agents start appear in your sidebar tagged “api”.</p>
+                    <form id="api-key-create-form">
+                      <div class="field">
+                        <label for="api-key-name">Key name</label>
+                        <input type="text" id="api-key-name" placeholder="e.g. my agent runner" maxlength="100" />
+                      </div>
+                      <div class="pill-row">
+                        <button type="submit" class="primary" id="api-key-create-btn">Create key</button>
+                      </div>
+                    </form>
+                    <div id="api-key-plaintext" class="setting-editor hidden">
+                      <p class="subtext">Copy this key now - it is shown only once:</p>
+                      <code id="api-key-plaintext-value" class="mfa-secret"></code>
+                    </div>
+                    <div id="api-key-list"></div>
+                    <div id="api-key-status" class="small" role="status"></div>
+                  </section>
+
+                  <section class="setting-group" id="settings-preferences">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6.25h7.5M14.25 6.25h2.75M3 13.75h2.75M9.5 13.75H17"/><circle cx="12.4" cy="6.25" r="1.9"/><circle cx="7.6" cy="13.75" r="1.9"/></svg>
+                      <h3>Preferences</h3>
+                      <span class="section-description">Locale, timezone and voice</span>
+                    </div>
+                    <form id="user-settings-form">
+                      <div class="input-grid">
+                        <div class="field">
+                          <label for="setting-locale">Locale</label>
+                          <select id="setting-locale">
+                            <option value="">Auto-detect</option>
+                            <option value="en-US">English (US)</option>
+                            <option value="en-GB">English (UK)</option>
+                            <option value="es-ES">Spanish (Spain)</option>
+                            <option value="fr-FR">French (France)</option>
+                            <option value="de-DE">German (Germany)</option>
+                            <option value="ja-JP">Japanese</option>
+                            <option value="zh-CN">Chinese (Simplified)</option>
+                          </select>
+                        </div>
+                        <div class="field">
+                          <label for="setting-timezone">Timezone</label>
+                          <select id="setting-timezone">
+                            <option value="">Auto-detect</option>
+                            <option value="UTC">UTC</option>
+                            <option value="America/New_York">Eastern Time (US)</option>
+                            <option value="America/Chicago">Central Time (US)</option>
+                            <option value="America/Denver">Mountain Time (US)</option>
+                            <option value="America/Los_Angeles">Pacific Time (US)</option>
+                            <option value="Europe/London">London</option>
+                            <option value="Europe/Paris">Paris</option>
+                            <option value="Europe/Berlin">Berlin</option>
+                            <option value="Asia/Tokyo">Tokyo</option>
+                            <option value="Asia/Shanghai">Shanghai</option>
+                            <option value="Australia/Sydney">Sydney</option>
+                          </select>
+                        </div>
+                      </div>
+                      <div class="field">
+                        <label for="setting-default-voice">Default voice</label>
+                        <select id="setting-default-voice">
+                          <option value="">System default</option>
+                          <option value="alloy">Alloy</option>
+                          <option value="echo">Echo</option>
+                          <option value="fable">Fable</option>
+                          <option value="onyx">Onyx</option>
+                          <option value="nova">Nova</option>
+                          <option value="shimmer">Shimmer</option>
+                        </select>
+                      </div>
+                      <div class="pill-row">
+                        <button type="submit" class="primary" id="save-user-settings-btn">Save preferences</button>
+                      </div>
+                    </form>
+                    <div id="user-settings-status" class="small" role="status"></div>
+                  </section>
+
+                  <section class="setting-group" id="settings-drafts">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="10" cy="5.4" rx="6" ry="2.4"/><path d="M4 5.4v9.2c0 1.3 2.7 2.4 6 2.4s6-1.1 6-2.4V5.4"/><path d="M4 10c0 1.3 2.7 2.4 6 2.4s6-1.1 6-2.4"/></svg>
+                      <h3>Local storage</h3>
+                      <span class="section-description">Drafts saved in this browser</span>
+                    </div>
+                    <div class="pill-row">
+                      <button class="minor" id="clear-drafts-btn">Clear saved drafts</button>
+                      <button class="ghost" id="export-drafts-btn">Export drafts</button>
+                    </div>
+                    <div id="drafts-status" class="small" role="status"></div>
+                  </section>
+
+                  <section class="setting-group" id="settings-uploads">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 12.4V3.4M6.6 6.8L10 3.4l3.4 3.4"/><path d="M3.6 12.4v3a1.2 1.2 0 0 0 1.2 1.2h10.4a1.2 1.2 0 0 0 1.2-1.2v-3"/></svg>
+                      <h3>Upload limits</h3>
+                      <span class="section-description">What this server accepts</span>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Max file size</span>
+                      <span id="setting-max-upload">Loading...</span>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Allowed types</span>
+                      <span id="setting-allowed-types">.txt, .md, .pdf, .json, .csv, .yaml</span>
+                    </div>
+                  </section>
+
+                  <section class="setting-group" id="settings-about">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7"/><path d="M10 9.4v4.1M10 6.6v.01"/></svg>
+                      <h3>About</h3>
+                      <span class="section-description">Version and build</span>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Version</span>
+                      <span id="setting-version">-</span>
+                    </div>
+                    <div class="detail-row">
+                      <span class="detail-label">Build</span>
+                      <span class="monospace" id="setting-build">-</span>
+                    </div>
+                  </section>
+
+                  <!-- Admin Settings Section (only visible to admins) -->
+                  <div id="admin-settings-section" class="hidden">
+                    <section class="setting-group" id="settings-admin-config">
+                      <div class="section-band">
+                        <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3.4" y="4" width="13.2" height="4.6" rx="1.2"/><rect x="3.4" y="11.4" width="13.2" height="4.6" rx="1.2"/><path d="M6.2 6.3v.01M6.2 13.7v.01"/></svg>
+                        <h3>Admin settings</h3>
+                        <span class="section-description">System-wide, applied immediately</span>
+                      </div>
+
+                      <div class="form-group">
+                        <label for="admin-default-page-size">Default page size</label>
+                        <input type="number" id="admin-default-page-size" min="1" max="1000" value="100" />
+                        <span class="small">Default number of items per page (1-1000)</span>
+                      </div>
+
+                      <div class="form-group">
+                        <label for="admin-max-page-size">Max page size</label>
+                        <input type="number" id="admin-max-page-size" min="1" max="1000" value="500" />
+                        <span class="small">Maximum allowed page size (1-1000)</span>
+                      </div>
+
+                      <div class="form-group">
+                        <label for="admin-default-conversations-limit">Default conversations limit</label>
+                        <input type="number" id="admin-default-conversations-limit" min="1" max="500" value="50" />
+                        <span class="small">Default limit for conversation list (1-500)</span>
+                      </div>
+
+                      <div class="pill-row mt-12">
+                        <button class="primary" id="save-admin-settings-btn">Save settings</button>
+                        <button class="ghost" id="reload-admin-settings-btn">Reload</button>
+                      </div>
+                      <div id="admin-settings-status" class="small" role="status"></div>
+                    </section>
+
+                    <!-- Users Management -->
+                    <section class="setting-group" id="settings-admin-users">
+                      <div class="section-band">
+                        <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="7.6" cy="7.4" r="2.8"/><path d="M2.8 16c0-2.5 2.2-4 4.8-4s4.8 1.5 4.8 4"/><path d="M13.4 5a2.8 2.8 0 0 1 0 5.2M14.4 12.3c1.7.5 2.8 1.7 2.8 3.7"/></svg>
+                        <h3>Users</h3>
+                        <span class="section-description">Accounts, roles and tenants</span>
+                      </div>
+
+                      <div class="pill-row mb-12">
+                        <button class="ghost" id="refresh-users-btn">Refresh</button>
+                        <button class="primary" id="show-add-user-btn">Add user</button>
+                      </div>
+
+                      <div id="add-user-form-section" class="setting-editor hidden">
+                        <div class="input-grid">
+                          <div class="field">
+                            <label for="new-user-email">Email</label>
+                            <input type="email" id="new-user-email" placeholder="user@example.com" required />
+                          </div>
+                          <div class="field">
+                            <label for="new-user-password">Password</label>
+                            <input type="password" id="new-user-password" placeholder="Strong password" required />
+                          </div>
+                          <div class="field">
+                            <label for="new-user-role">Role</label>
+                            <select id="new-user-role">
+                              <option value="user">User</option>
+                              <option value="admin">Admin</option>
+                            </select>
+                          </div>
+                        </div>
+                        <div class="pill-row">
+                          <button class="primary" id="create-user-btn">Create user</button>
+                          <button class="ghost" id="cancel-add-user-btn">Cancel</button>
+                        </div>
+                        <div id="create-user-status" class="small" role="status"></div>
+                      </div>
+
+                      <div class="table-wrapper">
+                        <table class="table" id="users-table">
+                          <thead>
+                            <tr>
+                              <th>Email</th>
+                              <th>Role</th>
+                              <th>Tenant</th>
+                              <th>Created</th>
+                              <th>Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody id="users-table-body">
+                            <tr><td colspan="5" class="empty">Loading users...</td></tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+
+                    <!-- Adapters List -->
+                    <section class="setting-group" id="settings-admin-adapters">
+                      <div class="section-band">
+                        <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3.2l6.4 3.2L10 9.6 3.6 6.4z"/><path d="M3.6 10l6.4 3.2L16.4 10M3.6 13.6l6.4 3.2 6.4-3.2"/></svg>
+                        <h3>Adapters</h3>
+                        <span class="section-description">Active LoRA adapters</span>
+                      </div>
+
+                      <div class="pill-row mb-12">
+                        <button class="ghost" id="refresh-adapters-btn">Refresh</button>
+                      </div>
+
+                      <div class="table-wrapper">
+                        <table class="table" id="adapters-table">
+                          <thead>
+                            <tr>
+                              <th>ID</th>
+                              <th>User</th>
+                              <th>Cluster</th>
+                              <th>Model</th>
+                              <th>Created</th>
+                            </tr>
+                          </thead>
+                          <tbody id="adapters-table-body">
+                            <tr><td colspan="5" class="empty">Loading adapters...</td></tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+
+                    <!-- Storage Objects -->
+                    <section class="setting-group" id="settings-admin-objects">
+                      <div class="section-band">
+                        <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3.2l6.4 3.2v7L10 16.8l-6.4-3.4v-7z"/><path d="M3.6 6.4L10 9.8l6.4-3.4M10 9.8v7"/></svg>
+                        <h3>Storage objects</h3>
+                        <span class="section-description">Files and objects stored</span>
+                      </div>
+
+                      <div class="pill-row mb-12">
+                        <button class="ghost" id="refresh-objects-btn">Refresh</button>
+                      </div>
+
+                      <div class="table-wrapper">
+                        <table class="table" id="objects-table">
+                          <thead>
+                            <tr>
+                              <th>Key</th>
+                              <th>Bucket</th>
+                              <th>Size</th>
+                              <th>Type</th>
+                              <th>Created</th>
+                            </tr>
+                          </thead>
+                          <tbody id="objects-table-body">
+                            <tr><td colspan="5" class="empty">Loading objects...</td></tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+
+                    <!-- Config Patches -->
+                    <section class="setting-group" id="settings-admin-patches">
+                      <div class="section-band">
+                        <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5.4 3.4h6L15 7v9.6H5.4z"/><path d="M11.4 3.4V7H15M8 11h4.4M8 13.4h4.4"/></svg>
+                        <h3>Config patches</h3>
+                        <span class="section-description">Proposed artifact configuration changes</span>
+                      </div>
+
+                      <div class="pill-row mb-12">
+                        <button class="ghost" id="refresh-patches-btn">Refresh</button>
+                        <select id="patches-status-filter">
+                          <option value="">All statuses</option>
+                          <option value="pending">Pending</option>
+                          <option value="approved">Approved</option>
+                          <option value="rejected">Rejected</option>
+                          <option value="applied">Applied</option>
+                        </select>
+                      </div>
+
+                      <div class="table-wrapper">
+                        <table class="table" id="patches-table">
+                          <thead>
+                            <tr>
+                              <th>ID</th>
+                              <th>Artifact</th>
+                              <th>Proposer</th>
+                              <th>Status</th>
+                              <th>Created</th>
+                              <th>Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody id="patches-table-body">
+                            <tr><td colspan="6" class="empty">Loading patches...</td></tr>
+                          </tbody>
+                        </table>
+                      </div>
+
+                      <!-- Patch Details -->
+                      <div id="patch-details-section" class="setting-editor hidden">
+                        <h4>Patch details</h4>
+                        <div id="patch-details-content" class="patch-details">
+                          <!-- Filled by JavaScript -->
+                        </div>
+                        <div class="pill-row mt-12">
+                          <button class="primary" id="approve-patch-btn">Approve</button>
+                          <button class="ghost" id="reject-patch-btn">Reject</button>
+                          <button class="minor" id="apply-patch-btn" disabled>Apply</button>
+                        </div>
+                        <div id="patch-action-status" class="small" role="status"></div>
+                      </div>
+                    </section>
                   </div>
-                  <div class="pill-row">
-                    <button class="primary" id="create-user-btn">Create User</button>
-                    <button class="ghost" id="cancel-add-user-btn">Cancel</button>
-                  </div>
-                  <div id="create-user-status" class="small" role="status"></div>
-                </div>
-
-                <div class="table-wrapper">
-                  <table class="table" id="users-table">
-                    <thead>
-                      <tr>
-                        <th>Email</th>
-                        <th>Role</th>
-                        <th>Tenant</th>
-                        <th>Created</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody id="users-table-body">
-                      <tr><td colspan="5" class="empty">Loading users...</td></tr>
-                    </tbody>
-                  </table>
-                </div>
-
-                <!-- Adapters List -->
-                <div class="divider"></div>
-                <h3>Adapters</h3>
-                <p class="subtext">Active LoRA adapters in the system.</p>
-
-                <div class="pill-row mb-12">
-                  <button class="ghost" id="refresh-adapters-btn">Refresh</button>
-                </div>
-
-                <div class="table-wrapper">
-                  <table class="table" id="adapters-table">
-                    <thead>
-                      <tr>
-                        <th>ID</th>
-                        <th>User</th>
-                        <th>Cluster</th>
-                        <th>Model</th>
-                        <th>Created</th>
-                      </tr>
-                    </thead>
-                    <tbody id="adapters-table-body">
-                      <tr><td colspan="5" class="empty">Loading adapters...</td></tr>
-                    </tbody>
-                  </table>
-                </div>
-
-                <!-- Storage Objects -->
-                <div class="divider"></div>
-                <h3>Storage Objects</h3>
-                <p class="subtext">Files and objects stored in the system.</p>
-
-                <div class="pill-row mb-12">
-                  <button class="ghost" id="refresh-objects-btn">Refresh</button>
-                </div>
-
-                <div class="table-wrapper">
-                  <table class="table" id="objects-table">
-                    <thead>
-                      <tr>
-                        <th>Key</th>
-                        <th>Bucket</th>
-                        <th>Size</th>
-                        <th>Type</th>
-                        <th>Created</th>
-                      </tr>
-                    </thead>
-                    <tbody id="objects-table-body">
-                      <tr><td colspan="5" class="empty">Loading objects...</td></tr>
-                    </tbody>
-                  </table>
-                </div>
-
-                <!-- Config Patches -->
-                <div class="divider"></div>
-                <h3>Config Patches</h3>
-                <p class="subtext">Review and manage proposed artifact configuration changes.</p>
-
-                <div class="pill-row mb-12">
-                  <button class="ghost" id="refresh-patches-btn">Refresh</button>
-                  <select id="patches-status-filter">
-                    <option value="">All statuses</option>
-                    <option value="pending">Pending</option>
-                    <option value="approved">Approved</option>
-                    <option value="rejected">Rejected</option>
-                    <option value="applied">Applied</option>
-                  </select>
-                </div>
-
-                <div class="table-wrapper">
-                  <table class="table" id="patches-table">
-                    <thead>
-                      <tr>
-                        <th>ID</th>
-                        <th>Artifact</th>
-                        <th>Proposer</th>
-                        <th>Status</th>
-                        <th>Created</th>
-                        <th>Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody id="patches-table-body">
-                      <tr><td colspan="6" class="empty">Loading patches...</td></tr>
-                    </tbody>
-                  </table>
-                </div>
-
-                <!-- Patch Details Modal -->
-                <div id="patch-details-section" class="hidden">
-                  <div class="divider"></div>
-                  <h4>Patch Details</h4>
-                  <div id="patch-details-content" class="patch-details">
-                    <!-- Filled by JavaScript -->
-                  </div>
-                  <div class="pill-row mt-12">
-                    <button class="primary" id="approve-patch-btn">Approve</button>
-                    <button class="ghost" id="reject-patch-btn">Reject</button>
-                    <button class="minor" id="apply-patch-btn" disabled>Apply</button>
-                  </div>
-                  <div id="patch-action-status" class="small" role="status"></div>
                 </div>
               </div>
             </div>

@@ -306,3 +306,82 @@ class TestNoRuleStylesSomethingThatCannotAppear:
         assert defined_class_names(
             "/* `.stat-card` was retired here. */\n.row { color: red }"
         ) == {"row"}
+
+
+def undefined_custom_properties(css: str, also_defined: set | None = None):
+    """Every `var(--name)` with no fallback that no file defines `--name`.
+
+    An undefined custom property does not fail loudly. The declaration
+    becomes invalid at computed-value time, so an inherited property such as
+    `color` silently takes its parent's value and the rule appears to work.
+    That is what `var(--muted)` did on the settings form: five declarations
+    meant to quiet a label, a help line, a badge and a jump link, all
+    computing to the body's full-strength text colour.
+
+    A reference carrying a fallback - `var(--x, 12px)` - is deliberate and
+    not reported.
+    """
+    body = re.sub(r"/\*.*?\*/", " ", css, flags=re.S)
+    defined = set(re.findall(r"(--[\w-]+)\s*:", body)) | (also_defined or set())
+    used = {
+        name
+        for name, tail in re.findall(r"var\(\s*(--[\w-]+)\s*([,)])", body)
+        if tail == ")"
+    }
+    return sorted(used - defined)
+
+
+def custom_properties_frontend_defines() -> set:
+    """Names an HTML or JS file sets, so a token living outside the
+    stylesheet is not reported as missing. Nothing does this today; the
+    check reads for it anyway, because the error to avoid here is the one
+    that sends a reader deleting a live token."""
+    names: set = set()
+    for path in sorted(FRONTEND.iterdir()):
+        if path.suffix in {".html", ".js"}:
+            names |= set(
+                re.findall(r"(--[\w-]+)\s*:", path.read_text(encoding="utf-8"))
+            )
+    return names
+
+
+class TestEveryTokenAReferenceNamesIsDefined:
+    """`--muted` was referenced five times and defined nowhere.
+
+    The settings form is the densest surface in the product and reads by
+    contrast: a 12px label at full strength above an 11px help line at half.
+    With the token missing, both were full strength and the contrast the
+    layout depends on was simply absent - on screen, in the screenshots, and
+    in every review that read the file rather than the pixels.
+    """
+
+    def test_no_reference_names_a_token_nothing_defines(self, stylesheet):
+        missing = undefined_custom_properties(
+            stylesheet, custom_properties_frontend_defines()
+        )
+        assert not missing, (
+            "these tokens are read and never defined, so each declaration "
+            "reading one is dropped and the property falls back to its "
+            "inherited or initial value: " + ", ".join(missing)
+        )
+
+    def test_the_missing_token_is_reported(self):
+        """The control, verbatim in the shape that shipped."""
+        assert undefined_custom_properties(
+            ":root { --text-muted: #626872 }\n"
+            ".setting-help { color: var(--muted); }\n"
+        ) == ["--muted"]
+
+    def test_a_defined_token_is_not_reported(self):
+        assert (
+            undefined_custom_properties(
+                ":root { --text-muted: #626872 }\n"
+                ".setting-help { color: var(--text-muted); }\n"
+            )
+            == []
+        )
+
+    def test_a_reference_with_a_fallback_is_not_reported(self):
+        """`var(--x, 12px)` degrades to the fallback by design, so an
+        undefined name there is a choice rather than an oversight."""
+        assert undefined_custom_properties(".a { top: var(--not-set, 12px); }") == []
