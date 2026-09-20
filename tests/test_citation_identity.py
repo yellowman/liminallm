@@ -378,6 +378,20 @@ class TestTheBlockingReaderGetsTheSameCleanup:
         assert answer.citations == []
 
 
+    def test_marker_only_model_output_is_no_replacement(self):
+        """Reader cleanup can erase the whole model answer.
+
+        That must remain "no replacement", so the workflow's server-authored
+        fallback cannot inherit the model turn's grounding or citations.
+        """
+        answer = replaced_answer(
+            "[cite:,]",
+            [{"source_id": "src_1", "evidence_id": "ev_1"}],
+            [{"source_id": "src_1", "public_offset": 0}],
+        )
+        assert answer is None
+
+
     @pytest.mark.parametrize("offset", [-1, 999])
     def test_reader_cleanup_does_not_repair_an_invalid_citation_offset(
         self, offset
