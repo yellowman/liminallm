@@ -1536,9 +1536,12 @@ class TestAStreamedToolObeysTheSameControlPlane:
             "wf", None, "hi", None, user_id="u", trace_sink=trace)]
 
         tokens = [e["data"] for e in events if e.get("event") == "token"]
-        assert tokens == ["PARTIAL "], (
-            f"a second answer was streamed into the same bubble: {tokens}"
+        public = "".join(tokens)
+        assert public == "PARTIAL ", (
+            "the partial answer changed or a recovery answer was appended: "
+            f"{tokens}"
         )
+        assert "RECOVERED ANSWER" not in public
         assert "recover" not in self._nodes_run(trace), self._nodes_run(trace)
         assert len(calls) == 1, f"the model was called again after partial output: {calls}"
 
