@@ -569,6 +569,29 @@ class TestReaderCleanupWithoutAnIssuedNamespace:
         assert stream.reader.intact() is False
 
 
+    def test_a_provider_exception_releases_the_suffix_then_re_raises(self):
+        """The production shape: the provider iterator raises, not an event."""
+        def events():
+            yield {"event": "token", "data": "PARTIAL "}
+            raise RuntimeError("backend died")
+
+        stream = ScrubbedTokenStream(
+            events(),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+        iterator = iter(stream)
+
+        first = next(iterator)
+        second = next(iterator)
+        assert first == {"event": "token", "data": "PARTIAL"}
+        assert second == {"event": "token", "data": " "}
+        with pytest.raises(RuntimeError, match="backend died"):
+            next(iterator)
+        assert stream.reader.intact() is False
+
     def test_broad_only_cleanup_preserves_message_done_only_answers(self):
         """Some backends report the whole answer only at completion."""
         reported = "Alpha [cite:,] Beta."
