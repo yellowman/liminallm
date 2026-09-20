@@ -575,6 +575,34 @@ class Answer(NamedTuple):
     citations: List[Dict[str, Any]]
 
 
+def reader_answer(
+    content: Any,
+    bindings: Optional[Sequence[Binding]],
+    citations: Optional[Sequence[Dict[str, Any]]],
+) -> Answer:
+    """Reader-clean content and the records whose coordinates index it.
+
+    Unlike `replaced_answer`, this always returns an Answer, including when
+    cleanup removes all text. Storage needs that shape: "[cite:,]" must become
+    the empty string rather than remain merely because an empty string is not
+    a workflow replacement.
+    """
+    text = str(content or "")
+    public, origins = strip_citation_positions(text)
+    moved: List[Dict[str, Any]] = []
+    for citation in citations or []:
+        item = dict(citation)
+        offset = item.get("public_offset")
+        if (
+            isinstance(offset, int)
+            and not isinstance(offset, bool)
+            and 0 <= offset <= len(text)
+        ):
+            item["public_offset"] = public_index(origins, offset)
+        moved.append(item)
+    return Answer(public, list(bindings or []), moved)
+
+
 def replaced_answer(
     content: Any,
     bindings: Optional[Sequence[Binding]],
@@ -603,25 +631,12 @@ def replaced_answer(
     if not content:
         return None
 
-    # This is the common reader boundary for blocking and streamed workflow
-    # results. Streaming has already applied the same cleanup incrementally,
-    # so this is an identity there; blocking answers arrive with only the
-    # narrower worker/wire namespace scrub and need the broad marker cleanup
-    # here. Content and citation coordinates move together.
-    text = str(content)
-    public, origins = strip_citation_positions(text)
-    moved: List[Dict[str, Any]] = []
-    for citation in citations or []:
-        item = dict(citation)
-        offset = item.get("public_offset")
-        if (
-            isinstance(offset, int)
-            and not isinstance(offset, bool)
-            and 0 <= offset <= len(text)
-        ):
-            item["public_offset"] = public_index(origins, offset)
-        moved.append(item)
-    return Answer(public, list(bindings or []), moved)
+    # Reader cleanup can turn marker-only model output into no answer at all.
+    # That is still "no replacement": returning an empty Answer here would
+    # replace the previous content and, worse, carry this node's bindings into
+    # the server-authored fallback sentence.
+    cleaned = reader_answer(content, bindings, citations)
+    return cleaned if cleaned.content else None
 
 
 #: Source kinds whose `locator` is a reference a reader can follow.
