@@ -804,27 +804,14 @@ class TestAMarkerCarryingSeveralHandles:
         found = validate_citations(f"Both [cite:{first}, {second}].", table)
         assert [o.source_id for o in found] == ["src_1", "src_2"]
 
-    def test_the_scrub_still_leaves_the_wreckage_and_says_so(self):
-        """Half of this defect is deliberately not fixed here, and pinning
-        that is the point: a reader of this file should not have to run the
-        code to find out how far the repair went.
+    def test_the_scrub_removes_the_whole_marker(self):
+        """No wreckage, and the reason it matters is the offsets below.
 
-        The namespace scrub removes each handle as a bare nonce and leaves
-        the punctuation, so `[cite:,]` still reaches the reader. Teaching it
-        to take the whole marker is one line, and it is the wrong line on its
-        own: `CanonicalCitationStream` implements the same language by hand,
-        over a character at a time, and `finish` raises when the two
-        disagree. Measured - with the scrub taught and the stream not, a
-        merged marker made the turn fail *and* still showed the wreckage.
-
-        The stream cannot simply be taught to match. Holding a handle past
-        the comma needs the held text not to be handed on, and an abandoned
-        run like `[cite:H1,xyz` then leaves the first handle on the tape with
-        nothing to remove it - a live nonce released to the reader, which is
-        the one thing this module exists to prevent.
-
-        No nonce leaks today: both handles are removed, and what is left is
-        punctuation. See `_namespace_pattern`.
+        The namespace pattern's bracketed alternatives needed a `]` straight
+        after the handle, so a merged marker failed them and then matched the
+        bare-nonce alternative once per handle *inside* the brackets. That
+        removed the content and left the punctuation: `[cite:,]`, with one
+        comma per handle beyond the first.
         """
         from liminallm.service.citations import scrub_positions
 
@@ -834,8 +821,8 @@ class TestAMarkerCarryingSeveralHandles:
         public, _origins = scrub_positions(
             f"Both agree [cite:{first},{second}].", table.nonce
         )
-        assert public == "Both agree [cite:,].", repr(public)
-        assert table.nonce not in public, "a live handle reached the reader"
+        assert public == "Both agree.", repr(public)
+        assert table.nonce not in public
 
     def test_three_handles(self):
         from liminallm.service.citations import scrub_positions
@@ -848,11 +835,50 @@ class TestAMarkerCarryingSeveralHandles:
             "src_2",
             "src_3",
         ]
-        # One comma per handle beyond the first, which is how the marker in
-        # the screenshots could be read back as "this cited two sources".
         public, _ = scrub_positions(answer, table.nonce)
-        assert public == "All three [cite:,,].", repr(public)
-        assert table.nonce not in public
+        assert public == "All three.", repr(public)
+
+    def test_the_citations_land_where_the_reader_sees_them(self):
+        """The half of this that a resolution test cannot see.
+
+        `transfer_citations` derives `public_offset` from the *narrow* scrub,
+        while a reader gets the broader projection. Those are the same string
+        for an ordinary marker, because the narrow scrub removes it whole -
+        and they were not the same for a merged one, because it left
+        `[cite:,]` behind.
+
+        So resolving the handles without also removing the marker produces
+        citations that anchor in a coordinate space nobody renders in.
+        Measured on this text before the scrub was fixed: the narrow scrub
+        gave `'Both agree [cite:,]. Next.'` against a reader's
+        `'Both agree. Next.'`, and both citations carried offset 11, which
+        falls *after* the full stop rather than before it. Every character
+        after the marker drifts by the width of the wreckage.
+        """
+        from liminallm.service.citations import scrub_positions, transfer_citations
+        from liminallm.service.citation_stream import reader_positions
+
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        text = f"Both agree [cite:{first},{second}]. Next."
+
+        worker, _ = scrub_positions(text, table.nonce)
+        reader, _ = reader_positions(text, table.nonce)
+        assert worker == reader, (
+            "the narrow scrub and the reader projection disagree, so any "
+            f"offset taken from one is wrong in the other: {worker!r} vs "
+            f"{reader!r}"
+        )
+
+        payload = transfer_citations({"content": text}, table, worker)
+        assert [c["source_id"] for c in payload] == ["src_1", "src_2"], payload
+        offsets = {c["public_offset"] for c in payload}
+        assert offsets == {len("Both agree")}, (
+            f"the citations do not anchor where the claim ends: {offsets}"
+        )
+        for c in payload:
+            assert reader[: c["public_offset"]] == "Both agree"
 
     def test_an_unresolvable_component_does_not_carry_the_others(self):
         """A merged marker is not a licence to repair. Each component is

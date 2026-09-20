@@ -1039,8 +1039,11 @@ def _namespace_pattern(nonce: str) -> "re.Pattern[str]":
     as it is until both move together. See `marker_handles`.
     """
     token = re.escape(nonce)
+    handle = rf"{token}(?:-\d+)?"
     return re.compile(
-        rf"[ \t]*(?:\[cite:{token}(?:-\d+)?\]|{token}(?:-\d+)?)",
+        rf"[ \t]*(?:"
+        rf"\[cite:[ \t]*{handle}(?:[ \t]*,[ \t]*{handle})*[ \t]*\]"
+        rf"|{handle})",
         re.IGNORECASE,
     )
 
