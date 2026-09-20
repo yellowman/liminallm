@@ -106,9 +106,9 @@ class TestAFileTheServerRefused:
 
     def test_the_publish_count_limit_is_reported(self, tmp_path):
         code = "".join(
-            f"open('file-{i:02d}.csv','w').write('x')\\n"
+            f"open('file-{i:02d}.csv','w').write('x')\n"
             for i in range(MAX_ARTIFACTS + 1)
-        ) + "print('done')\\n"
+        ) + "print('done')\n"
         out, _session = _run(code, tmp_path)
 
         if "the code interpreter is unavailable" in out:
