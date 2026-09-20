@@ -13,6 +13,7 @@ import asyncio
 import json
 import random
 import string
+import threading
 import uuid
 from copy import deepcopy
 from types import SimpleNamespace
@@ -3307,27 +3308,90 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
     async def test_a_stream_cancelled_mid_marker_shows_and_grants_nothing(
         self, store, monkeypatch
     ):
-        """The held fragment is never flushed by cleanup, and an unfinished
-        stream is authority for nothing.
+        """The actual cancel path makes no held citation bytes public.
 
-        The visible text ends on a full stop deliberately. This is the one
-        witness here that reads a stream mid-hold, and the hold reaches back
-        over any character a handle could start with - so a prefix ending in
-        `s` releases one character less whenever the turn's nonce happens to
-        begin with `S`, which is a real letter of the alphabet and about one
-        turn in thirty. Correct, and nondeterministic to assert against; a
-        full stop is in no marker of any nonce.
+        This used to simulate cancellation by returning from the provider
+        generator. That is natural EOF, not cancellation, and under SPEC §2.2
+        an unclosed `[cite:` at a natural end is ordinary prose. Drive the
+        real path instead: the provider blocks after the prefix has entered
+        the scrubber, `cancel_event` revokes the invocation, StreamPump calls
+        the scrubber's abort handle, and the provider's blocked read wakes.
         """
         engine = get_runtime().workflow
         user_id, opened = self._streamed(
             engine, monkeypatch, store,
-            chunks=["400 hours. ", "[cite:", "{H}", "]"],
-            cancel_after=2,
+            # Establish the real retrieval/offer/invocation fixture. The
+            # backend stream is replaced below with one that can actually be
+            # aborted while the scrubber is holding syntax.
+            chunks=["unused"],
         )
 
-        events = await self._run(engine, user_id)
+        blocked = threading.Event()
+        release = threading.Event()
+
+        class CancellableStream:
+            def __init__(self):
+                self.index = 0
+                self.aborted = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.index == 0:
+                    self.index += 1
+                    return {"event": "token", "data": "400 hours. "}
+                if self.index == 1:
+                    self.index += 1
+                    return {"event": "token", "data": "[cite:"}
+                blocked.set()
+                release.wait(5)
+                if self.aborted:
+                    raise ConnectionError("cancelled")
+                raise StopIteration
+
+            @property
+            def armed(self):
+                return True
+
+            def abort(self):
+                self.aborted = True
+                release.set()
+
+            def close(self):
+                release.set()
+
+        monkeypatch.setattr(
+            engine.llm.backend,
+            "generate_stream",
+            lambda *a, **k: CancellableStream(),
+            raising=False,
+        )
+
+        cancel_event = asyncio.Event()
+
+        async def collect():
+            return [
+                event
+                async for event in engine.run_streaming(
+                    None,
+                    None,
+                    "how long",
+                    "ctx",
+                    user_id,
+                    cancel_event=cancel_event,
+                )
+            ]
+
+        task = asyncio.create_task(collect())
+        assert await asyncio.to_thread(blocked.wait, 5), (
+            "the provider never blocked after the held marker prefix"
+        )
+        cancel_event.set()
+        events = await asyncio.wait_for(task, timeout=10)
 
         assert self._tokens(events) == "400 hours."
+        assert any(event.get("event") == "cancel_ack" for event in events), events
         assert "[cite:" not in json.dumps(events)
         assert self._cited(events) == []
         cited = [inv for inv in opened if inv.citations]
