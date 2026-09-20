@@ -27,7 +27,10 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from liminallm.logging import log_routing_trace, log_workflow_trace
 from liminallm.service.broker import InvocationContext
-from liminallm.service.citation_stream import ScrubbedTokenStream
+from liminallm.service.citation_stream import (
+    MAX_CANONICAL_CHARS,
+    ScrubbedTokenStream,
+)
 from liminallm.service.citations import (
     citation_payload,
     replaced_answer,
@@ -971,6 +974,9 @@ class WorkflowStreamingMixin:
                 # Preserve coincidental nonce text in that case, while still
                 # enforcing the unconditional reader rule for closed markers.
                 scrub_namespace=bool(invocation.citations),
+                max_canonical_chars=(
+                    MAX_CANONICAL_CHARS if invocation.citations else None
+                ),
             )
             streamed["stream"] = filtered
             return filtered
@@ -1451,6 +1457,9 @@ class WorkflowStreamingMixin:
                         raw,
                         invocation.citations.nonce,
                         scrub_namespace=bool(invocation.citations),
+                        max_canonical_chars=(
+                            MAX_CANONICAL_CHARS if invocation.citations else None
+                        ),
                     )
                     streamed["stream"] = filtered
                     return filtered
