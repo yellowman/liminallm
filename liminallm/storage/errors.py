@@ -12,6 +12,24 @@ class ConstraintViolation(Exception):
         self.detail = detail or {}
 
 
+class AuthStateLockTimeout(RuntimeError):
+    """One user's authentication state stayed locked past the deadline.
+
+    `hold_user_auth_state` serializes password proof, session publication,
+    credential rotation, revocation and role changes for a single user across
+    replicas. It used to retry `pg_try_advisory_lock` forever. Postgres drops
+    an advisory lock when the holding session dies, so a crashed replica
+    resolves itself - but a *live* holder that is wedged does not, and every
+    subsequent auth operation for that user waited behind it with nothing to
+    show for the wait.
+
+    Raised rather than proceeding unlocked. Continuing without the lock is
+    the one outcome the lock exists to prevent: a login that proved the old
+    password could publish a session after a reset had revoked everything and
+    rotated the credential. A refused request is recoverable; that is not.
+    """
+
+
 class ConversationGone(ConstraintViolation):
     """The conversation this work belongs to was deleted while it ran.
 

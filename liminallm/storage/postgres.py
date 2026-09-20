@@ -54,6 +54,7 @@ from liminallm.storage.cursors import (
     decode_time_id_cursor,
 )
 from liminallm.storage.errors import (
+    AuthStateLockTimeout,
     ConstraintViolation,
     ConversationGone,
     TrainingInProgress,
@@ -3472,6 +3473,18 @@ class PostgresStore:
     #: operation spans several store transactions and Redis bookkeeping.
     _USER_AUTH_STATE_LOCK = 0x61757468  # "auth"
 
+    #: How long a caller waits for another holder to finish before failing.
+    #:
+    #: Derived from what one holder can legitimately take, not picked round.
+    #: The longest operation under this lock is a password reset: revoke
+    #: sessions (a Postgres statement plus Redis bookkeeping, and the Redis
+    #: client's socket and connect timeouts are 5s), then hash the new
+    #: credential with argon2, then write. Six seconds is a slow but honest
+    #: holder, so the deadline is comfortably past one of those and well
+    #: inside the 30s a filesystem publication gets - a queue two deep here
+    #: means something is wrong rather than busy.
+    _AUTH_STATE_LOCK_TIMEOUT_SECONDS = 15.0
+
     def _try_acquire_user_auth_state_connection(self, identity: str):
         """Try once for the advisory lock without parking a worker on it."""
         cm = self.pool.connection()
@@ -3502,7 +3515,9 @@ class PostgresStore:
             cm.__exit__(None, None, None)
 
     @contextlib.asynccontextmanager
-    async def hold_user_auth_state(self, user_id: str):
+    async def hold_user_auth_state(
+        self, user_id: str, *, timeout: float | None = None
+    ):
         """Hold one user's authentication/session state across an operation.
 
         A blocking advisory wait cannot run on the request thread, and parking
@@ -3514,6 +3529,15 @@ class PostgresStore:
         Once acquired, store calls made by this task reuse that connection.
         Same-user nesting is reentrant in the task. Cross-user nesting is
         refused rather than silently dropping one user's serialization.
+
+        The wait is bounded. Postgres releases an advisory lock when the
+        holding session dies, so a crashed replica frees itself, but a live
+        wedged holder does not - and this retried forever, so every later
+        auth operation for that user queued behind it indefinitely. Past the
+        deadline it raises `AuthStateLockTimeout`. It does not proceed
+        unlocked: running without the lock is the exact outcome the lock
+        exists to prevent, and a refused request is recoverable where a
+        session published after a reset is not.
         """
         identity = str(user_id)
         held = self._auth_state_connection.get()
@@ -3528,6 +3552,12 @@ class PostgresStore:
 
         state = None
         delay = 0.005
+        limit = (
+            self._AUTH_STATE_LOCK_TIMEOUT_SECONDS if timeout is None else timeout
+        )
+        # Monotonic: a deadline built from wall-clock time moves when the
+        # host's clock does, and this one decides whether to refuse a login.
+        deadline = time.monotonic() + limit
         while state is None:
             attempt = asyncio.create_task(
                 asyncio.to_thread(
@@ -3564,7 +3594,20 @@ class PostgresStore:
                 attempt.add_done_callback(release_late_acquisition)
                 raise
             if state is None:
-                await asyncio.sleep(delay)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.logger.warning(
+                        "auth_state_lock_timeout",
+                        user_id=identity,
+                        waited_seconds=round(limit, 3),
+                    )
+                    raise AuthStateLockTimeout(
+                        "another operation is holding this account's "
+                        "authentication state"
+                    )
+                # Never sleep past the deadline: the last wait should end at
+                # it rather than one backoff interval after it.
+                await asyncio.sleep(min(delay, remaining))
                 delay = min(0.05, delay * 2)
 
         cm, conn = state

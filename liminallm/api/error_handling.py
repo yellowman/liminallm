@@ -12,7 +12,7 @@ from liminallm.logging import (
 from liminallm.service.artifact_validation import ArtifactValidationError
 from liminallm.service.errors import ServiceError
 from liminallm.service.fs import PathTraversalError
-from liminallm.storage.errors import ConstraintViolation
+from liminallm.storage.errors import AuthStateLockTimeout, ConstraintViolation
 
 logger = get_logger(__name__)
 
@@ -91,6 +91,30 @@ def register_exception_handlers(app: FastAPI) -> None:
             detail=exc.detail,
         )
         return _error_response(exc.status_code, exc.message, exc.detail, code=error_code)
+
+    @app.exception_handler(AuthStateLockTimeout)
+    async def handle_auth_state_lock_timeout(
+        request: Request, exc: AuthStateLockTimeout
+    ):
+        """Refused, never served unlocked.
+
+        Handled centrally because all six callers of
+        `hold_user_auth_state` - login, OAuth session publication, session
+        rotation, credential rotation, reset and role change - want the same
+        answer, and one of them forgetting to catch it is how a request would
+        end up served without the serialization it asked for.
+
+        503 rather than 409: nothing about the caller's request is wrong and
+        retrying is the right move, which is what the code says. SPEC §18
+        exposes only the stable public codes, so this is `server_error`.
+        """
+        logger.error(
+            "auth_state_lock_timeout",
+            path=request.url.path,
+            method=request.method,
+            error=str(exc),
+        )
+        return _error_response(503, str(exc), code="server_error")
 
     @app.exception_handler(ArtifactValidationError)
     async def handle_validation_error(request: Request, exc: ArtifactValidationError):
