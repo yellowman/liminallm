@@ -830,6 +830,7 @@ class ScrubbedTokenStream:
         *,
         max_canonical_chars: Optional[int] = MAX_CANONICAL_CHARS,
         scrub_namespace: bool = True,
+        verify_reported: bool = True,
     ) -> None:
         self._events = iter(events)
         self.reader = CanonicalCitationStream(
@@ -840,6 +841,7 @@ class ScrubbedTokenStream:
             track_origins=scrub_namespace,
         )
         self._limit = max_canonical_chars
+        self._verify_reported = verify_reported
         self._pending: List[Dict[str, Any]] = []
         #: Set when the provider's own final content did not match the tokens
         #: it sent. The completion is refused rather than believed, and the
@@ -913,10 +915,15 @@ class ScrubbedTokenStream:
     def _complete(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
         """The end of the stream, in public terms.
 
-        The provider's own `content` is checked against the tokens it sent
-        rather than trusted in place of them. They are two claims about one
-        answer, and a provider that contradicts itself has not given the
-        parent an answer it can read citations out of.
+        When citation authority is active, the provider's own `content` is
+        checked against the tokens it sent rather than trusted in place of
+        them. They are two claims about one answer, and disagreement means the
+        parent has no canonical answer it can safely read citations out of.
+
+        Broad-only cleanup on an uncited stream deliberately does not add that
+        failure mode: those streams bypassed this wrapper before marker cleanup
+        was installed. Their reader text is still built from the tokens, but a
+        provider-final mismatch alone does not newly fail the turn.
 
         A contradiction becomes an error rather than a quieter completion.
         Refusing the citations is not enough on its own: `message_done` is
@@ -939,7 +946,11 @@ class ScrubbedTokenStream:
         """
         data = dict(event.get("data") or {})
         reported = data.get("content")
-        if reported is not None and str(reported) != self.reader.canonical:
+        if (
+            self._verify_reported
+            and reported is not None
+            and str(reported) != self.reader.canonical
+        ):
             self.contradicted = True
             return [{
                 "event": "error",
