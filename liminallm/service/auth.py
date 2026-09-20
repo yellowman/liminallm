@@ -959,7 +959,7 @@ class AuthService:
         # password login, reset, role changes and rotation. If reset wins the
         # lock first this is a genuinely post-reset login; if OAuth wins first,
         # reset sees and revokes the session it created.
-        with self.store.hold_user_auth_state(user.id):
+        async with self.store.hold_user_auth_state(user.id):
             fresh = self.store.get_user(user.id)
             if fresh is None:
                 return None, None, {}
@@ -1003,7 +1003,7 @@ class AuthService:
         role write and immediately observe the new privilege through session
         authentication.
         """
-        with self.store.hold_user_auth_state(user_id):
+        async with self.store.hold_user_auth_state(user_id):
             user = self.store.get_user(user_id)
             if not user:
                 return None
@@ -1102,7 +1102,7 @@ class AuthService:
         user = self.store.get_user_by_email(email)
         if not user:
             return None, None, {}
-        with self.store.hold_user_auth_state(user.id):
+        async with self.store.hold_user_auth_state(user.id):
             user = self.store.get_user(user.id)
             if not user or not self.verify_password(user.id, password):
                 return None, None, {}
@@ -1371,7 +1371,7 @@ class AuthService:
             if rotated_to:
                 return None
 
-            with self.store.hold_user_auth_state(sess.user_id):
+            async with self.store.hold_user_auth_state(sess.user_id):
                 # A reset may have deleted the session while this request was
                 # waiting for the user's auth-state lock. Never create a
                 # successor from a session that no longer exists.
@@ -1750,7 +1750,7 @@ class AuthService:
         # gives those acts, password login, OAuth session publication, and
         # session rotation a single order. A login that proved the old
         # password cannot publish a session after this reset completes.
-        with self.store.hold_user_auth_state(user_id):
+        async with self.store.hold_user_auth_state(user_id):
             user = self.store.get_user(user_id)
             if not user:
                 self.logger.warning("password_reset_user_missing", user_id=user_id)
