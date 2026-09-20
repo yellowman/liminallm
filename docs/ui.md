@@ -97,9 +97,10 @@ layout, styling, and client implementation patterns. The frontend source
 
 ## file upload panel
 
-- collapsible panel in the Files tab; context dropdown (or private/no
-  context); optional chunk size (64–4000, validated); client-side size and
-  extension checks before upload; inline progress and result feedback.
+- a single strip in the Files tab - file, context, and the upload button on
+  one line; context dropdown (or private/no context); chunk size (64-4000,
+  validated) behind an `Advanced` disclosure; client-side size and extension
+  checks before upload; inline progress and result feedback.
 
 ## feedback controls
 
@@ -127,9 +128,17 @@ layout, styling, and client implementation patterns. The frontend source
 ## styling system
 
 - CSS custom properties for theming: `--accent`, `--text`, `--panel`,
-  `--border`, and so on.
+  `--border`, and so on. Control sizing is tokenized too: `--ctl-h`,
+  `--ctl-h-sm`, `--icon-hit`, `--icon-glyph`, `--chip-h`.
+- list classes: `.row` is the flat list primitive used by the migrated
+  contextual panes - Contexts, Artifacts, Tools, Workflows and Files. It
+  carries `.row-icon`, `.row-name`, `.row-meta` and hover-revealed
+  `.row-actions`. A selected row takes a faint fill and a 2px left marker,
+  which is the same selection language the application rail uses. Notes and
+  Chat still use their own list classes.
 - component classes: `.panel`, `.badge`, `.table`, `.code-block`,
-  `.context-card`, `.type-badge`, `.visibility-badge`.
+  `.factline` (a dot-separated line of facts), `.chip`, `.figures`,
+  `.deflist`, `.hairline-table`, `.icon-btn`.
 - utility classes: `.hidden`, `.flex-row`, `.pill-row`, `.divider`, `.mb-14`,
   `.monospace`.
 - media queries at 1080px (hide sidebar) and 640px (single-column layout).

@@ -133,13 +133,17 @@ class TestEveryStartedServiceIsStopped:
         class FakeResponse:
             """The API answers in an envelope, and the script reads it.
 
-            `main` takes the access token out of the login response, so a
-            double that returns nothing would fail there instead of in
-            `capture`, and this test would stop being about teardown.
+            `main` takes the access token out of the login response, and
+            `seed` refuses to continue past a context it did not create, an
+            upload that failed, or a context that indexed nothing. A double
+            that returns less than that fails inside seeding instead of in
+            `capture`, and this test stops being about teardown.
             """
 
-            def __init__(self, data):
+            def __init__(self, data, status_code=200):
                 self._data = data
+                self.status_code = status_code
+                self.text = ""
 
             def json(self):
                 return {"status": "ok", "data": self._data, "error": None}
@@ -151,10 +155,16 @@ class TestEveryStartedServiceIsStopped:
             def __init__(self, *_args, **_kwargs):
                 pass
 
-            def post(self, *_args, **_kwargs):
-                return FakeResponse({"access_token": "seed-token"})
+            def post(self, url, *_args, **_kwargs):
+                if url.endswith("/sources"):
+                    return FakeResponse({"id": "source-1"}, status_code=201)
+                if url.endswith("/contexts"):
+                    return FakeResponse({"id": "context-1"}, status_code=201)
+                return FakeResponse({"access_token": "seed-token"}, status_code=201)
 
-            def get(self, *_args, **_kwargs):
+            def get(self, url, *_args, **_kwargs):
+                if "/chunks" in url:
+                    return FakeResponse({"items": [{"id": "chunk-1"}]})
                 # No id, so seeding stops before the role promotion: that
                 # step reaches the runtime, which this test never boots.
                 return FakeResponse({})
