@@ -466,6 +466,26 @@ class TestTheFilterKeepsTheHandlesThePumpReachesFor:
         stream.abort()
         assert provider.aborted
 
+    def test_abort_does_not_flush_a_held_marker_fragment(self):
+        """Caller abandonment makes no new bytes public.
+
+        The reader has already withheld the marker-shaped suffix. An abort is
+        not a provider terminal event, so teardown must not reinterpret that
+        private hold as ordinary partial prose and emit it.
+        """
+        provider = self._Provider([])
+        stream = ScrubbedTokenStream(provider, NONCE)
+        assert stream.reader.push("answer [cite:") == "answer"
+        assert stream.reader.released == "answer"
+
+        stream.abort()
+
+        with pytest.raises(StopIteration):
+            next(stream)
+        assert stream.reader.released == "answer"
+        assert "[cite:" not in stream.reader.released
+        assert not stream.reader.intact()
+
     def test_armed_is_the_backends_answer(self):
         assert ScrubbedTokenStream(self._Provider([], armed=True), NONCE).armed
         assert not ScrubbedTokenStream(self._Provider([], armed=False), NONCE).armed
