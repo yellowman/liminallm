@@ -23,7 +23,7 @@ password really did change, and the caller is told the revocation did not.
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 import threading
 import uuid
 
@@ -289,12 +289,12 @@ class TestResetAndLoginHaveOneOrder:
         reset_acquired = threading.Event()
         result: dict = {}
 
-        @contextmanager
-        def observed_hold(user_id):
+        @asynccontextmanager
+        async def observed_hold(user_id):
             is_reset = threading.current_thread().name == "reset-race"
             if is_reset:
                 reset_attempted.set()
-            with original_hold(user_id):
+            async with original_hold(user_id):
                 if is_reset:
                     reset_acquired.set()
                 yield
