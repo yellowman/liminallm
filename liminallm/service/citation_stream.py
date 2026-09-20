@@ -43,10 +43,12 @@ bare forms. The reader cleanup is wider and then removes every closed
 composes those rules for the finished string and origin map; `finish` asks it
 once and checks that what went out is exactly what it says.
 
-Whoever wires this owes it a ceiling anyway, because nothing else provides
-one: `MAX_GENERATION_TOKENS` is only ever subtracted from the context window
-to leave room for a reply, and no backend here sends a max-output parameter,
-so a reply's length is the provider's to choose.
+Citation-bearing streams keep the ceiling this reader historically supplied:
+`MAX_GENERATION_TOKENS` is only subtracted from the context window and no
+backend here sends a max-output parameter. Broad-only cleanup is also installed
+on ordinary uncited streams now, but passes no ceiling there - fixing internal
+syntax must not introduce a new reply-length policy on traffic that previously
+bypassed this wrapper.
 """
 
 from __future__ import annotations
@@ -762,12 +764,11 @@ class CanonicalCitationStream:
         return bool(self._verdict)
 
 
-#: How much canonical text one streamed answer may accumulate.
+#: Default ceiling for streams whose citation namespace is active.
 #:
-#: A ceiling is needed because nothing else supplies one. `MAX_GENERATION_TOKENS`
-#: is only ever subtracted from the context window to leave room for a reply,
-#: and no backend here sends a max-output parameter, so a provider decides how
-#: long an answer runs.
+#: This is the existing citation-stream bound, not a product-wide output cap.
+#: Broad-only cleanup of an uncited stream passes `None` and preserves the
+#: no-ceiling behavior that stream had before reader marker cleanup was added.
 #:
 #: Four characters per token against that same 4,096, which is the length the
 #: rest of the system already treats as a whole reply. Cutting it finer would
