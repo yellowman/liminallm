@@ -21,7 +21,7 @@ from liminallm.service.citation_stream import (
     CanonicalStreamTooLong,
     ScrubbedTokenStream,
 )
-from liminallm.service.citations import reader_positions
+from liminallm.service.citations import public_index, reader_positions
 from liminallm.service.node_attempt import StreamPump
 from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
 
@@ -492,6 +492,37 @@ class TestWhatTheFilterLetsThrough:
             data["content"] = content
         out.append({"event": "message_done", "data": data})
         return out
+
+    def test_the_live_malformed_marker_never_leaves(self):
+        """The captured product defect: three live runs rendered `[cite:,]`.
+
+        Drive the same `ScrubbedTokenStream` the workflow hands to
+        `StreamPump`, with the malformed marker cut across provider tokens.
+        """
+        raw = ["Alpha ", "[ci", "te:,]", " Beta."]
+        stream = ScrubbedTokenStream(
+            self._events(*raw, content="".join(raw)), NONCE
+        )
+        events = list(stream)
+        tokens = "".join(
+            str(event.get("data") or "")
+            for event in events
+            if event.get("event") == "token"
+        )
+        assert tokens == "Alpha Beta."
+        assert "[cite:" not in tokens.lower()
+        assert events[-1]["data"]["content"] == tokens
+        assert stream.reader.intact()
+
+    def test_a_malformed_marker_before_a_real_citation_does_not_shift_it(self):
+        """Cleanup and citation coordinates describe the same public string."""
+        malformed = "[cite:,]"
+        text = f"Alpha {malformed}. Beta {MARKER}."
+        reader, public, origins = _read(NONCE, list(text))
+        assert public == "Alpha. Beta."
+        marker_start = text.index(MARKER)
+        assert public_index(origins, marker_start) == len("Alpha. Beta")
+        assert reader.intact()
 
     def test_a_marker_split_across_tokens_never_leaves(self):
         raw = ["400 hours ", "[ci", "te:" + NONCE, "-1]", " exactly"]
