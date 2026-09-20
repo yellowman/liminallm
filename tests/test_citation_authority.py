@@ -3421,20 +3421,16 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("agent", [False, True])
-    async def test_with_the_gate_off_the_provider_is_not_filtered_at_all(
+    async def test_with_the_gate_off_only_reader_cleanup_is_installed(
         self, store, monkeypatch, agent
     ):
-        """Production, and the difference is not cosmetic.
+        """Offers off disables namespace authority, not the reader boundary.
 
-        With offers off no marker is ever shown, so a filter in the path would
-        remove nothing - but it would still hold text, still scan the whole
-        answer per chunk, and still stop an answer at its ceiling. The gate is
-        what keeps a streamed turn the shape it was before any of this
-        existed: the transformation does not run, rather than running and
-        finding nothing to do.
-
-        Both call sites, because both consult the gate separately and a turn
-        that reaches production through the agent is the same turn.
+        A closed `[cite:...]` token is never reader prose under SPEC §2.2, so
+        the broad cleanup wrapper must still be present. What offers-off must
+        *not* add is namespace scrubbing for the invocation's unused nonce,
+        the citation-stream output ceiling, or provider contradiction
+        authority checks.
         """
         engine = get_runtime().workflow
         user_id, _opened = self._streamed(
@@ -3445,7 +3441,7 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         real = workflow_module_streaming.ScrubbedTokenStream
 
         def _counting(*args, **kwargs):
-            built.append(args)
+            built.append((args, kwargs))
             return real(*args, **kwargs)
 
         monkeypatch.setattr(
@@ -3455,24 +3451,23 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         events = await self._run(engine, user_id)
 
         assert self._tokens(events) == "plain answer"
-        assert built == [], "the filter was built with offers off"
+        assert built, "the reader cleanup boundary was bypassed with offers off"
+        for _args, kwargs in built:
+            assert kwargs.get("scrub_namespace") is False, kwargs
+            assert kwargs.get("max_canonical_chars") is None, kwargs
+            assert kwargs.get("verify_reported") is False, kwargs
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("agent", [False, True])
-    async def test_a_turn_that_committed_no_handle_is_not_filtered_either(
+    async def test_a_turn_with_no_handle_preserves_its_unused_nonce(
         self, store, monkeypatch, agent
     ):
-        """The feature being on is not the same fact as this turn offering
-        something.
+        """No handle means no namespace was shown, not no reader cleanup.
 
-        A conversation with nothing citable retrieves nothing, places no
-        marker and commits no handle, so the model is never shown this turn's
-        namespace. Filtering it anyway would edit prose on the strength of a
-        coincidence - the answer here contains the freshly minted nonce, which
-        the model cannot have been copying - and would make every ordinary
-        answer pay the scrub and the length ceiling once this is enabled.
-
-        Both call sites, because each decides this for itself.
+        Every invocation mints a random nonce. If nothing citable was offered,
+        that nonce is ordinary coincidental prose and must survive byte for
+        byte. The broad reader filter is still installed so a hallucinated
+        closed marker such as `[cite:,]` cannot leak.
         """
         engine = get_runtime().workflow
         user_id, opened = self._streamed(
@@ -3484,7 +3479,7 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         real = workflow_module_streaming.ScrubbedTokenStream
 
         def _counting(*args, **kwargs):
-            built.append(args)
+            built.append((args, kwargs))
             return real(*args, **kwargs)
 
         monkeypatch.setattr(
@@ -3496,10 +3491,15 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         assert not any(inv.citations for inv in opened), (
             "the fixture committed a handle, so nothing was being tested"
         )
-        assert built == [], "a turn with no handle still built the filter"
-        # The namespace reaches the client untouched. Matched against the
-        # turn's own nonces rather than one invocation's, because a turn opens
-        # several and the answer names the one that streamed.
+        assert built, "a no-handle turn bypassed reader marker cleanup"
+        for _args, kwargs in built:
+            assert kwargs.get("scrub_namespace") is False, kwargs
+            assert kwargs.get("max_canonical_chars") is None, kwargs
+            assert kwargs.get("verify_reported") is False, kwargs
+
+        # The unused nonce reaches the client untouched. Matched against the
+        # turn's own nonces because a turn opens several invocations and the
+        # answer names the one that actually streamed.
         public = self._tokens(events)
         prefix, suffix = "the token is ", " as it happens"
         assert public.startswith(prefix) and public.endswith(suffix), public
