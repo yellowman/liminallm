@@ -761,6 +761,27 @@ class CanonicalCitationStream:
         self._verdict = True
         return tail, origins
 
+    def fail(self) -> str:
+        """Settle the reader-visible suffix of a stream that ended in error.
+
+        A backend error is terminal: no future character can turn trailing
+        spaces or an unclosed `[cite:` prefix into a closed marker. Those
+        bytes therefore become ordinary reader text at the instant of failure
+        and must be released before the error event. Dropping them would make
+        installing broad cleanup change an uncited partial answer byte-for-byte.
+
+        This deliberately does **not** make the stream authoritative. `finish`
+        is reused only as the finished-string oracle and to flush the held
+        suffix; the verdict is then forced false so no citation can be granted
+        from a failed/partial answer.
+        """
+        if self._finished:
+            self._verdict = False
+            return ""
+        tail, _origins = self.finish()
+        self._verdict = False
+        return tail
+
     def intact(self) -> bool:
         """Whether this stream finished, and released what it should have.
 
@@ -893,6 +914,15 @@ class ScrubbedTokenStream:
             if kind == "message_done":
                 self._pending.extend(self._complete(event))
                 continue
+            if kind == "error":
+                # The provider has ended the answer. Anything the reader held
+                # only because a future character *might* have completed a
+                # marker is ordinary partial text now. Release that suffix
+                # before the error, but keep the stream non-authoritative.
+                tail = self.reader.fail()
+                if tail:
+                    self._pending.append(event)
+                    return {"event": "token", "data": tail}
             return event
 
     def _take(self, chunk: str) -> str:
