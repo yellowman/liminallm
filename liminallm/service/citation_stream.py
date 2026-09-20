@@ -871,6 +871,11 @@ class ScrubbedTokenStream:
         #: exactly; the wrapper never converts failure into completion.
         self._terminal_error: Optional[Exception] = None
         self._terminal_stop = False
+        #: Set when the consumer explicitly aborts this stream. Cancellation
+        #: is not provider failure or natural exhaustion: bytes still held
+        #: because they might become citation syntax were never shown, and
+        #: caller abandonment must not make them visible during teardown.
+        self._aborted = False
         #: Set when the provider's own final content did not match the tokens
         #: it sent. The completion is refused rather than believed, and the
         #: reader is left unfinished, which is what `intact` reports.
@@ -891,6 +896,11 @@ class ScrubbedTokenStream:
         return bool(getattr(self._events, "armed", False))
 
     def abort(self) -> None:
+        # StreamPump.stop() reaches this method before it interrupts the
+        # provider. Remember that the ensuing StopIteration/exception is
+        # teardown, not a natural/error terminal event whose held suffix may
+        # now be published.
+        self._aborted = True
         abort = getattr(self._events, "abort", None)
         if callable(abort):
             abort()
@@ -913,12 +923,22 @@ class ScrubbedTokenStream:
             try:
                 event = next(self._events)
             except StopIteration:
+                if self._aborted:
+                    # The caller walked away. Held bytes were never public and
+                    # stay that way; flushing them would leak a partial marker
+                    # during cancellation cleanup.
+                    raise
                 tail = self.reader.fail()
                 if tail:
                     self._terminal_stop = True
                     return {"event": "token", "data": tail}
                 raise
             except Exception as exc:
+                if self._aborted:
+                    # A backend abort commonly surfaces as an exception from
+                    # the read it interrupted. StreamPump already knows this
+                    # is cancellation and suppresses the provider error.
+                    raise
                 tail = self.reader.fail()
                 if tail:
                     self._terminal_error = exc
