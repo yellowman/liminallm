@@ -486,6 +486,29 @@ class TestTheFilterKeepsTheHandlesThePumpReachesFor:
         assert "[cite:" not in stream.reader.released
         assert not stream.reader.intact()
 
+    def test_abort_error_event_does_not_flush_a_held_marker_fragment(self):
+        """An abort may surface in-band instead of as an exception/EOF.
+
+        StreamPump suppresses the event after stop, but the wrapper owns the
+        reader boundary and must not publish held syntax even when pulled
+        directly during teardown.
+        """
+        provider = iter([
+            {"event": "error", "data": {"message": "stream aborted"}},
+        ])
+        stream = ScrubbedTokenStream(provider, NONCE)
+        assert stream.reader.push("answer [cite:") == "answer"
+        assert stream.reader.released == "answer"
+
+        stream.abort()
+        event = next(stream)
+
+        assert event["event"] == "error"
+        assert stream.reader.released == "answer"
+        assert "[cite:" not in stream.reader.released
+        assert not stream.reader.intact()
+
+
     def test_armed_is_the_backends_answer(self):
         assert ScrubbedTokenStream(self._Provider([], armed=True), NONCE).armed
         assert not ScrubbedTokenStream(self._Provider([], armed=False), NONCE).armed
