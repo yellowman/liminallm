@@ -21,7 +21,7 @@ from liminallm.service.citation_stream import (
     CanonicalStreamTooLong,
     ScrubbedTokenStream,
 )
-from liminallm.service.citations import scrub_positions
+from liminallm.service.citations import reader_positions
 from liminallm.service.node_attempt import StreamPump
 from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
 
@@ -64,6 +64,34 @@ class TestAMarkerNeverBecomesObservable:
         _reader, public, _origins = _read(NONCE, [f"400 hours {MARKER} exactly"])
         assert public == "400 hours exactly"
 
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            "[cite:,]",
+            "[cite:]",
+            "[cite:OTHER-1]",
+            "[CITE:not-an-issued-handle]",
+            f"[cite:{NONCE}-]",
+        ],
+    )
+    def test_a_closed_malformed_or_stale_marker_never_reaches_the_reader(
+        self, marker
+    ):
+        """Reader cleanup is wider than citation validation.
+
+        These all resolve to no source, which is exactly why leaving one in
+        the answer is visible internal syntax rather than a usable citation.
+        The live failure was `[cite:,]`; every split is included because a
+        provider may cut the marker anywhere.
+        """
+        text = f"Alpha {marker}. Beta."
+        expected, expected_origins = reader_positions(text, NONCE)
+        assert expected == "Alpha. Beta."
+        for chunks in _every_split(text):
+            _reader, public, origins = _read(NONCE, chunks)
+            assert public == expected, (marker, chunks, public)
+            assert origins == expected_origins, (marker, chunks)
+
     @pytest.mark.parametrize("text", [
         f"400 hours {MARKER} exactly",
         f"{MARKER} leads",
@@ -78,7 +106,7 @@ class TestAMarkerNeverBecomesObservable:
     def test_every_split_agrees_with_the_finished_scrub(self, text):
         """The split is the whole problem: a provider may cut anywhere, and
         the same text must scrub to the same thing however it arrives."""
-        expected, expected_origins = scrub_positions(text, NONCE)
+        expected, expected_origins = reader_positions(text, NONCE)
         for chunks in _every_split(text):
             _reader, public, origins = _read(NONCE, chunks)
             assert public == expected, (chunks, public, expected)
@@ -116,7 +144,7 @@ class TestAMarkerNeverBecomesObservable:
         not depend on a lottery.
         """
         text = "K7Q2K7Q2k7q2abcdABCD"
-        expected, _origins = scrub_positions(text, NONCE)
+        expected, _origins = reader_positions(text, NONCE)
         assert expected == "K7Q2", expected
         for chunks in [["K7Q2K7Q2k7q2ab", "cdABCD"], list(text),
                        ["K7Q2K7Q2k7q2", "abcd", "ABCD"]]:
@@ -171,7 +199,7 @@ class TestTheHoldAsksTheSameEngineTheScrubAsks:
         (S_NONCE, "K" + KELVIN.upper() + "7Q2" + LONG_S + "BCD"),
     ])
     def test_every_split_still_agrees_with_the_finished_scrub(self, nonce, text):
-        expected, expected_origins = scrub_positions(text, nonce)
+        expected, expected_origins = reader_positions(text, nonce)
         assert expected != text, "the fixture is not a namespace occurrence"
         for chunks in _every_split(text):
             _reader, public, origins = _read(nonce, chunks)
@@ -193,7 +221,7 @@ class TestTheHoldAsksTheSameEngineTheScrubAsks:
                 seen += reader.push(chunk)
             tail, _origins = reader.finish()
             seen += tail
-            assert seen == scrub_positions(text, nonce)[0], chunks
+            assert seen == reader_positions(text, nonce)[0], chunks
             assert reader.intact()
 
 
@@ -208,7 +236,7 @@ class TestWhatIsNotThisTurnsNamespaceIsLeftAlone:
         f"[cite:{NONCE[:4]}NOPE-1] is not this turn",
     ])
     def test_it_survives_every_split(self, text):
-        expected, _origins = scrub_positions(text, NONCE)
+        expected, _origins = reader_positions(text, NONCE)
         assert expected == text, "the fixture is not testing what it says"
         for chunks in _every_split(text):
             _reader, public, _o = _read(NONCE, chunks)
@@ -221,7 +249,7 @@ class TestTheOriginMapIsTheOneCitationsAreReadWith:
         this map. A stream that produced its own would be a second
         implementation of the rule that decides where a citation points."""
         text = f"alpha {NONCE} beta {MARKER} gamma"
-        expected, expected_origins = scrub_positions(text, NONCE)
+        expected, expected_origins = reader_positions(text, NONCE)
         for chunks in _every_split(text):
             _reader, public, origins = _read(NONCE, chunks)
             assert public == expected
@@ -231,7 +259,7 @@ class TestTheOriginMapIsTheOneCitationsAreReadWith:
         """The second removal's offsets depend on the first having happened,
         which is the case a per-chunk map would get wrong."""
         text = f"one {NONCE} two {MARKER} three"
-        expected, expected_origins = scrub_positions(text, NONCE)
+        expected, expected_origins = reader_positions(text, NONCE)
         _reader, public, origins = _read(NONCE, list(text))
         assert public == expected == "one two three"
         assert origins == expected_origins
@@ -268,7 +296,7 @@ class TestTheStreamAgreesWithTheFinishedScrubOnAnythingAtAll:
             ))
             bounds = [0] + cuts + [len(text)]
             chunks = [text[a:b] for a, b in zip(bounds, bounds[1:]) if b > a]
-            expected, expected_origins = scrub_positions(text, NONCE)
+            expected, expected_origins = reader_positions(text, NONCE)
             reader, public, origins = _read(NONCE, chunks or [""])
             assert public == expected, (text, chunks)
             assert origins == expected_origins, (text, chunks)
@@ -279,7 +307,7 @@ class TestTheStreamAgreesWithTheFinishedScrubOnAnythingAtAll:
         rng = random.Random(451)
         for _ in range(300):
             text = "".join(rng.choice(self.PIECES) for _ in range(rng.randint(1, 6)))
-            expected, _origins = scrub_positions(text, NONCE)
+            expected, _origins = reader_positions(text, NONCE)
             _reader, public, _o = _read(NONCE, list(text) or [""])
             assert public == expected, text
 
@@ -357,7 +385,7 @@ class TestTheGuardsOnStateThatShouldNotHappen:
         # What a hold that never let go would have left behind.
         reader._released_parts = ["400 hours"]
         reader._released_len = len("400 hours")
-        assert scrub_positions(reader.canonical, NONCE)[0].startswith("400 hours")
+        assert reader_positions(reader.canonical, NONCE)[0].startswith("400 hours")
         with pytest.raises(ValueError):
             reader.finish()
         assert not reader.intact()
@@ -383,7 +411,7 @@ class TestTheGuardsOnStateThatShouldNotHappen:
         reader.push(f"400 hours {MARKER}")
         reader._released_parts = ["hours"]
         reader._released_len = len("hours")
-        assert "hours" in scrub_positions(reader.canonical, NONCE)[0]
+        assert "hours" in reader_positions(reader.canonical, NONCE)[0]
         with pytest.raises(ValueError):
             reader.finish()
         assert not reader.intact()
@@ -513,7 +541,7 @@ class TestWhatTheFilterLetsThrough:
         stream = ScrubbedTokenStream(self._events(*raw, content=text), NONCE)
         events = list(stream)
         tokens = "".join(e["data"] for e in events if e["event"] == "token")
-        assert tokens == scrub_positions(text, NONCE)[0] == "answer [cite:"
+        assert tokens == reader_positions(text, NONCE)[0] == "answer [cite:"
         assert NONCE not in tokens
         assert stream.reader.intact()
 
