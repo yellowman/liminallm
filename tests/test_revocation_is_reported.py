@@ -134,11 +134,15 @@ class TestWhenRevocationFails:
             "the fixture expected the failure to leave the session alive"
         )
 
-    def test_password_reset_reports_surviving_sessions(
+    def test_password_reset_does_not_complete_if_sessions_survive(
         self, client, runtime, account, monkeypatch
     ):
-        """Reset is already committed when revocation runs, so report partial
-        success rather than pretending the old bearer sessions died."""
+        """SPEC §§12.1/13.2 make credential rotation and revocation one reset.
+
+        If the canonical session delete fails, consume the one-time token but
+        leave the credential unchanged and report that the reset did not
+        complete.
+        """
         user = runtime.store.get_user(account["user_id"])
         assert user is not None
         token = asyncio.run(runtime.auth.initiate_password_reset(user))
@@ -155,11 +159,12 @@ class TestWhenRevocationFails:
             json={"token": token, "new_password": NEW_PASSWORD},
         )
 
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["data"]["other_sessions_revoked"] is False
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"]["code"] == "reset_incomplete"
+        assert runtime.auth.verify_password(account["user_id"], PASSWORD)
+        assert not runtime.auth.verify_password(account["user_id"], NEW_PASSWORD)
         assert _alive(client, account["stolen"]), (
-            "the fixture expected the failed revoke to leave the old session "
-            "alive, so the response flag proved nothing"
+            "the fixture expected the failed revoke to leave the old session alive"
         )
 
     @pytest.mark.asyncio
