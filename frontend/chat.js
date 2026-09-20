@@ -234,6 +234,66 @@ const stableHash = (str) => {
   return Math.abs(hash >>> 0).toString(16);
 };
 
+//: A schema rendered the way the fields above it are rendered.
+//:
+//: An artifact's schema, a tool's inputs and a workflow's definition were
+//: each a `JSON.stringify` in a bordered box, directly under a run of
+//: label-and-value rows carrying the same kind of information. Most of what
+//: is in them is flat - a kind, a mode, a rank, a scope, a base model - so
+//: the reader was being asked to parse punctuation to read a value that the
+//: four rows above it would have simply stated.
+//:
+//: Scalars become rows. An array of scalars becomes one row, joined, because
+//: `layers: 0, 1, 2, 3` is the whole fact. Anything genuinely nested keeps
+//: its literal form, since there is no honest way to flatten an object
+//: without deciding what to drop, and a schema is one of the few places
+//: where the punctuation is the content.
+const SCHEMA_SCALARS = ['string', 'number', 'boolean'];
+
+const schemaValueRow = (key, value) => {
+  const label = escapeHtml(String(key));
+  if (value === null) return `<span class="muted">null</span>`;
+  if (Array.isArray(value) && value.every((v) => SCHEMA_SCALARS.includes(typeof v))) {
+    return value.length
+      ? `<span class="monospace">${escapeHtml(value.join(', '))}</span>`
+      : `<span class="muted">none</span>`;
+  }
+  if (SCHEMA_SCALARS.includes(typeof value)) {
+    return `<span class="monospace">${escapeHtml(String(value))}</span>`;
+  }
+  return null;
+};
+
+const renderSchemaFields = (schema) => {
+  const source = schema && typeof schema === 'object' && !Array.isArray(schema)
+    ? schema
+    : null;
+  if (!source) {
+    return `<pre class="schema-viewer">${escapeHtml(
+      JSON.stringify(schema ?? {}, null, 2))}</pre>`;
+  }
+  const rows = [];
+  const nested = {};
+  for (const [key, value] of Object.entries(source)) {
+    const rendered = schemaValueRow(key, value);
+    if (rendered === null) {
+      nested[key] = value;
+      continue;
+    }
+    rows.push(
+      `<div class="detail-row"><span class="detail-label">${escapeHtml(key)}</span>`
+      + `${rendered}</div>`);
+  }
+  if (!rows.length && !Object.keys(nested).length) {
+    return '<p class="subtext">No schema recorded.</p>';
+  }
+  const tail = Object.keys(nested).length
+    ? `<pre class="schema-viewer">${escapeHtml(
+        JSON.stringify(nested, null, 2))}</pre>`
+    : '';
+  return rows.join('') + tail;
+};
+
 const formatBytes = (bytes) => {
   if (!bytes && bytes !== 0) return '0 bytes';
   const thresh = 1024;
@@ -672,10 +732,6 @@ const initCollapsibleSections = () => {
       const section = header.closest('.panel-section');
       if (!section) return;
       section.classList.toggle('collapsed');
-      // Lazy-load the files list the first time the section opens.
-      if (section.id === 'files-section' && !section.classList.contains('collapsed')) {
-        fetchUserFiles();
-      }
     });
   });
 };
@@ -2204,7 +2260,7 @@ const selectArtifact = async (artifactId) => {
       </div>
       <div class="divider"></div>
       <h4>Schema</h4>
-      <pre class="schema-viewer">${escapeHtml(JSON.stringify(artifact.schema || {}, null, 2))}</pre>
+      ${renderSchemaFields(artifact.schema)}
     `;
   }
 
@@ -2664,24 +2720,52 @@ const actionButton = (action, label, { danger = false } = {}) => `
          stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${ACTION_GLYPH[action]}</svg>
   </button>`;
 
+const filesTableHeadEl = document.querySelector('#files-section .file-table-head');
+const filesSummaryEl = $('files-summary');
+const filesSummaryTextEl = $('files-summary-text');
+const filesCountEl = $('files-count');
+
+/* A heading over no rows names columns that are not there, and a summary of
+   nothing is a line of punctuation. Both follow the list rather than sitting
+   above and below it regardless. */
+const showFilesFurniture = (visible) => {
+  filesTableHeadEl?.classList.toggle('hidden', !visible);
+  filesSummaryEl?.classList.toggle('hidden', !visible);
+};
+
 const renderFilesList = (files, total, hasNext) => {
   if (!filesListEl) return;
+
+  if (filesCountEl) {
+    filesCountEl.textContent = total
+      ? `${total} file${total === 1 ? '' : 's'}`
+      : 'Everything you have uploaded';
+  }
 
   if (files.length === 0) {
     filesListEl.innerHTML = '';
     if (filesEmptyEl) filesEmptyEl.style.display = 'block';
     if (filesPaginationEl) filesPaginationEl.innerHTML = '';
+    showFilesFurniture(false);
     return;
   }
 
   if (filesEmptyEl) filesEmptyEl.style.display = 'none';
+  showFilesFurniture(true);
 
+  /* The size and the date are columns, not a fact line. A filename runs to
+     whatever length it runs to, so a fact line starts them somewhere
+     different on every row and the one thing a file list is read for -
+     comparing them down the column - cannot be done. `.file-facts` is
+     `display: contents`, so they are cells here and one line under the name
+     on a narrow screen, with no second copy in the markup. */
   filesListEl.innerHTML = files.map(file => `
-    <div class="row" data-filename="${escapeAttr(file.name)}">
+    <div class="row file-row" data-filename="${escapeAttr(file.name)}">
       ${typeIcon(isArchiveName(file.name) ? 'archive' : 'file')}
-      <span class="row-main">
-        <span class="row-name" title="${escapeAttr(file.name)}">${escapeHtml(file.name)}</span>
-        <span class="row-meta">${escapeHtml(`${formatBytes(file.size)} \u00b7 ${formatRelativeTime(file.modified_at)}`)}</span>
+      <span class="row-name" title="${escapeAttr(file.name)}">${escapeHtml(file.name)}</span>
+      <span class="file-facts">
+        <span class="file-fact">${escapeHtml(formatBytes(file.size))}</span>
+        <span class="file-fact" title="${escapeAttr(file.modified_at || '')}">${escapeHtml(formatRelativeTime(file.modified_at))}</span>
       </span>
       <span class="row-actions">
         ${isArchiveName(file.name) ? actionButton('extract', 'Extract this archive') : ''}
@@ -2692,14 +2776,30 @@ const renderFilesList = (files, total, hasNext) => {
     </div>
   `).join('');
 
-  // Render pagination
+  /* What is on screen, and how much of it there is. The page's own bytes
+     rather than the library's: the endpoint sends a count and this page's
+     files, so a total size would be a number nothing measured - and when
+     the page is the whole library there is no distinction to draw, so the
+     line does not draw one. */
+  const hasPrev = filesOffset > 0;
+  const paged = hasPrev || hasNext;
+  if (filesSummaryTextEl) {
+    const shown = files.reduce((bytes, file) => bytes + (file.size || 0), 0);
+    const size = formatBytes(shown);
+    filesSummaryTextEl.textContent = paged
+      ? `${filesOffset + 1}-${filesOffset + files.length} of ${total} \u00b7 ${size} on this page`
+      : `${total} file${total === 1 ? '' : 's'} \u00b7 ${size}`;
+  }
+
+  // Two disabled buttons are a control that says "there is nowhere to go" in
+  // the most prominent way available. One page needs no pager.
   if (filesPaginationEl) {
-    const hasPrev = filesOffset > 0;
-    filesPaginationEl.innerHTML = `
+    filesPaginationEl.innerHTML = paged
+      ? `
       <button type="button" class="minor" ${!hasPrev ? 'disabled' : ''} data-action="prev">Previous</button>
-      <span class="small">${filesOffset + 1}-${Math.min(filesOffset + files.length, total)} of ${total}</span>
       <button type="button" class="minor" ${!hasNext ? 'disabled' : ''} data-action="next">Next</button>
-    `;
+    `
+      : '';
   }
 };
 
@@ -3568,7 +3668,7 @@ const selectTool = async (toolId) => {
       </div>
       <div class="divider"></div>
       <h4>Inputs</h4>
-      <pre class="schema-viewer">${escapeHtml(JSON.stringify(inputs, null, 2))}</pre>
+      ${renderSchemaFields(inputs)}
     `;
   }
 
@@ -3723,7 +3823,7 @@ const selectWorkflow = (workflowId) => {
       </div>
       <div class="divider"></div>
       <h4>Schema</h4>
-      <pre class="schema-viewer">${escapeHtml(JSON.stringify(schema, null, 2))}</pre>
+      ${renderSchemaFields(schema)}
     `;
   }
 };
@@ -4032,9 +4132,9 @@ const initEventListeners = () => {
   if (refreshFilesBtn) refreshFilesBtn.addEventListener('click', fetchUserFiles);
   if (filesListEl) filesListEl.addEventListener('click', handleFileAction);
   if (filesPaginationEl) filesPaginationEl.addEventListener('click', handleFileAction);
-  // Note: the files section expand/collapse (and its lazy fetch) is handled
-  // by initCollapsibleSections; a second toggle listener here made every
-  // click toggle twice, so the section could never be opened.
+  // The files section no longer collapses - it is a band over a table, not a
+  // fold - so opening the tab is what loads the list, in the rail handler
+  // beside the other sections' fetches.
 
   // Settings
   $('clear-drafts-btn')?.addEventListener('click', handleClearDrafts);

@@ -19,6 +19,22 @@ const notesState = {
   searchTimer: null,
 };
 
+/* Whether the editor holds edits that are not in the vault yet.
+ *
+ * The flag existed and nothing showed it, so a note with unsaved changes
+ * looked exactly like a saved one: the only way to find out was to leave
+ * and come back to find the text gone. Every write to it goes through here
+ * so the word beside the title cannot drift from the flag it reports. */
+const setNoteDirty = (dirty) => {
+  notesState.dirty = dirty;
+  const state = $('note-state');
+  if (!state) return;
+  // A dot and a word, which is how state reads everywhere else here.
+  state.innerHTML = dirty
+    ? '<span class="fact-dot on"></span>Unsaved changes'
+    : '';
+};
+
 const notesApi = async (path, options = {}) => {
   const resp = await fetchWithRetry(`${apiBase}${path}`, {
     headers: headers(),
@@ -79,7 +95,7 @@ const openNote = async (noteId) => {
   try {
     const note = await notesApi(`/notes/${encodeURIComponent(noteId)}`);
     notesState.currentId = note.id;
-    notesState.dirty = false;
+    setNoteDirty(false);
     showNoteEditor(true);
     $('note-title').value = note.title;
     $('note-content').value = note.content;
@@ -139,7 +155,7 @@ const saveCurrentNote = async () => {
       const note = await notesApi('/notes', { method: 'POST', body: JSON.stringify({ title, content }) });
       notesState.currentId = note.id;
     }
-    notesState.dirty = false;
+    setNoteDirty(false);
     await fetchNotes();
     await openNote(notesState.currentId);
     showStatus('Saved');
@@ -150,9 +166,17 @@ const saveCurrentNote = async () => {
 
 const deleteCurrentNote = async () => {
   if (!notesState.currentId) return;
+  /* Deleting a file and revoking a key both ask first; deleting a note did
+     not, and a note is the one thing here the reader wrote themselves. The
+     control was an unlabelled tick away from the Save button, so the whole
+     confirmation was a single click on a glyph. */
+  const title = $('note-title')?.value.trim();
+  const named = title ? `"${title}"` : 'this note';
+  if (!window.confirm(`Delete ${named}? This cannot be undone.`)) return;
   try {
     await notesApi(`/notes/${encodeURIComponent(notesState.currentId)}`, { method: 'DELETE' });
     notesState.currentId = null;
+    setNoteDirty(false);
     showNoteEditor(false);
     await fetchNotes();
   } catch (err) {
@@ -359,7 +383,7 @@ const drawNoteGraph = async () => {
 const initNotes = () => {
   $('note-new-btn')?.addEventListener('click', () => {
     notesState.currentId = null;
-    notesState.dirty = false;
+    setNoteDirty(false);
     showNoteEditor(true);
     $('note-title').value = '';
     $('note-content').value = '';
@@ -375,8 +399,8 @@ const initNotes = () => {
     setNotePreview($('note-preview')?.classList.contains('hidden')));
   $('note-graph-btn')?.addEventListener('click', drawNoteGraph);
   $('note-sweep-btn')?.addEventListener('click', runVaultSweep);
-  $('note-content')?.addEventListener('input', () => { notesState.dirty = true; });
-  $('note-title')?.addEventListener('input', () => { notesState.dirty = true; });
+  $('note-content')?.addEventListener('input', () => { setNoteDirty(true); });
+  $('note-title')?.addEventListener('input', () => { setNoteDirty(true); });
   $('note-content')?.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveCurrentNote(); }
   });

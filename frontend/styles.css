@@ -620,6 +620,13 @@ body {
   box-shadow: 0 0 0 2px rgba(14, 138, 109, 0.10);
 }
 
+/* Red at rest, not only on hover. Among four identical grey glyphs the one
+   that destroys something was distinguishable only by reading its tooltip,
+   which is the one thing a reader will not do before clicking. */
+.icon-btn.danger {
+  color: var(--danger);
+}
+
 .icon-btn.danger:hover {
   background: var(--danger-light);
   color: var(--danger);
@@ -646,9 +653,18 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
-.sidebar-search input {
+/* Both pane search fields, because there is one of these per side pane and
+   they sit in the same place doing the same job. The vault's was never
+   given an appearance at all - the only rules reaching it set `flex`,
+   `min-width` and `max-width` - so it wore the user agent's: Arial at
+   13.33px, square corners and a 2px inset grey border, next to this one.
+
+   The compact tier, not the 32px this rule used to carry, which was not a
+   height the design language defines. A search field is a filter. */
+.sidebar-search input,
+.notes-side-head input[type="search"] {
   width: 100%;
-  height: 32px;
+  height: var(--ctl-h-sm);
   padding: 0 10px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -658,8 +674,13 @@ body {
   color: var(--text);
 }
 
-.sidebar-search input:focus {
-  outline: none;
+/* No `outline: none` here. It was harmless while this rule reached one
+   control that had no other indicator to lose, but extending the rule to a
+   field whose only focus cue is the browser's outline would have removed
+   it. The border change is an addition to that outline, not a replacement
+   for it. */
+.sidebar-search input:focus,
+.notes-side-head input[type="search"]:focus {
   border-color: var(--border-strong);
 }
 
@@ -2223,12 +2244,14 @@ button.minor:hover {
 }
 
 
+/* No border and no fill. This sits inside `.panel`, on `.panel`'s own
+   background, so the box it used to draw was a card inside a card that
+   separated nothing - the heading above it and the mono type already say
+   where the literal content starts. It now holds only what could not be
+   flattened into rows, which is the case the literal form is for. */
 .schema-viewer {
-  background: var(--panel);
   color: var(--text);
-  border: 1px solid var(--border);
-  padding: 14px;
-  border-radius: var(--radius-sm);
+  margin: 10px 0 0;
   font-family: var(--font-mono);
   font-size: 12.5px;
   overflow-x: auto;
@@ -2697,11 +2720,16 @@ button.minor:hover {
 }
 
 /* Files list */
+/* No top margin. It was here to clear a Refresh strip that sat above the
+   list; the refresh moved into the band and a column heading took its
+   place, so the margin fell between the heading and the rows it labels and
+   left the heading equidistant from the band above and the table below -
+   measured at 12px to each. A heading belongs to its columns.
+   Rows still get their own gap. */
 .files-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-top: 12px;
 }
 
 /* The files library is `.row` now: a type glyph, the name, size and age on
@@ -2751,8 +2779,12 @@ button.minor:hover {
   min-width: 0;
 }
 
+/* Square, and on the same tier as the field it shares a row with. Both were
+   30px before the field was styled, the field only because that was the
+   height the user agent gave it. */
 #note-new-btn {
-  width: var(--ctl-h);
+  width: var(--ctl-h-sm);
+  height: var(--ctl-h-sm);
   flex-shrink: 0;
   font-size: 18px;
   line-height: 1;
@@ -2854,6 +2886,42 @@ button.minor:hover {
   display: flex;
   gap: 12px;
   align-items: center;
+}
+
+/* The editor's own state, beside the title it is about. A dot and a word,
+   which is how state reads everywhere else here. Empty when saved: a line
+   that says "Saved" at all times says nothing, and this one has to be
+   noticed the once it appears. */
+.note-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* Empty when the note is saved, and then it must not take a gap. A flex
+   item with no content is still an item, so `.note-editor-head`'s 12px
+   gap was counted twice and the title lost 12px for ever - measured at
+   24px between the title and the toolbar with nothing in between. */
+.note-state:empty {
+  display: none;
+}
+
+/* `.utility-strip.note-toolbar`, not `.note-toolbar`. A bare class ties
+   with `.utility-strip` and the later rule wins, which is source order -
+   and `.utility-strip` is declared later in this file, so `flex-wrap:
+   nowrap` and `margin: 0` here never applied and the editor's actions
+   wrapped on a narrow editor. The same trap as `button.ghost` outranking
+   `.voice-btn`: two names on the element beat one.
+   Compact tier and no wrapping, because these act on the note beside them
+   rather than being the page's own actions. */
+.utility-strip.note-toolbar {
+  flex: none;
+  flex-wrap: nowrap;
+  margin: 0;
 }
 
 #note-title {
@@ -3526,8 +3594,21 @@ button.minor:hover {
   border-bottom: 1px solid var(--border);
 }
 
-.section-band:first-child {
+/* Only where the group around it already supplies the gap. Written as a
+   bare `:first-child` this matched every band on every page - each one is
+   the first child of its own section element - so the 26px above a band
+   never applied anywhere, and Files' second band sat flush against the
+   control above it. */
+.setting-group > .section-band:first-child {
   margin-top: 0;
+}
+
+/* An action belonging to the section rather than to a row inside it, at the
+   far end of the band. Compact on purpose: a band is a landmark, and a
+   full-height button in one turns it into a toolbar. */
+.section-band .icon-btn {
+  flex: none;
+  margin: -3px -4px -3px 0;
 }
 
 /* The rail's drawing, one size down: a line glyph, never a filled shape. */
@@ -3625,10 +3706,18 @@ button.minor:hover {
 }
 
 /* One column once the index would take a third of the width. Sticky goes
-   with it: a narrow screen has no room to spare for a fixed column. */
+   with it: a narrow screen has no room to spare for a fixed column.
+
+   `minmax(0, 1fr)` rather than `1fr`, for the same reason the two-column
+   rule above says it: a plain `1fr` track takes `auto` as its minimum, so
+   it grows to the min-content width of its contents instead of holding the
+   width it was given. The widest thing in Settings is the admin users
+   table, and this column collapsing to one track is what put it in charge
+   of the page - 300px of sideways scroll on a 390px screen, with the
+   table's own scrolling wrapper stretched wide rather than scrolling. */
 @media (max-width: 860px) {
   .settings-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 14px;
   }
 
@@ -3687,6 +3776,146 @@ button.minor:hover {
 .sticky-actions button[disabled] {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Controls that decide what a list shows, rather than acting on it: a
+   filter, a sort, a refresh, a toggle. Compact tier throughout, because
+   they sit above the content and must not outweigh it. */
+.utility-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+
+.utility-strip button,
+.utility-strip select,
+.utility-strip input {
+  height: var(--ctl-h-sm);
+  font-size: 12px;
+}
+
+/* A fact about the list, not a control: how many there are, how far through
+   them you are. It sits under the list, where a reader looks after reading
+   it rather than before. */
+.summary-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+/* Anything the reader acts on goes to the far end, away from the fact. */
+.summary-line > .pagination-controls {
+  margin-left: auto;
+  margin-top: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   A file list is a table of facts, so the facts line up.
+
+   `.row`'s fact line puts the size and the date after the name, which means
+   they start at a different place on every line and cannot be compared down
+   the column - the one thing a file list is read for. The same row, laid out
+   on a grid, and a heading line so the eye knows what the columns are.
+   --------------------------------------------------------------------------- */
+.file-table-head,
+.row.file-row {
+  /* One declaration for both, because two grids resolve their tracks
+     independently: an `auto` action column sized by its own contents would
+     leave the heading's columns in different places from the rows'. Four
+     compact icon buttons and their gaps come to 102px. */
+  --file-actions: 104px;
+  display: grid;
+  grid-template-columns:
+    var(--icon-glyph) minmax(0, 1fr) 84px 116px var(--file-actions);
+  align-items: center;
+  gap: 9px;
+}
+
+.file-table-head {
+  margin-top: 2px;
+  padding: 4px 8px 5px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/* A size and a date are read down the column, so they are tabular and they
+   truncate rather than push the name's column narrower. */
+.file-fact {
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row.file-row .row-actions {
+  justify-content: flex-end;
+}
+
+/* `display: contents` so the two facts are grid items in their own columns
+   here, and one flex line under the name on a narrow screen - without a
+   second copy of them in the markup to hide. */
+.file-facts {
+  display: contents;
+}
+
+/* Below this the columns cost more than they give: four of them leave the
+   name nothing, and a filename is the column a file list is read for. The
+   facts go under it, which is where they sit in every other list here. */
+@media (max-width: 720px) {
+  .file-table-head {
+    display: none;
+  }
+
+  .row.file-row {
+    grid-template-columns: var(--icon-glyph) minmax(0, 1fr) var(--file-actions);
+    grid-template-areas:
+      "icon name  actions"
+      "icon facts actions";
+    row-gap: 1px;
+  }
+
+  .row.file-row > .row-icon {
+    grid-area: icon;
+    align-self: start;
+    margin-top: 2px;
+  }
+
+  .row.file-row > .row-name {
+    grid-area: name;
+  }
+
+  .row.file-row > .row-actions {
+    grid-area: actions;
+  }
+
+  .row.file-row > .file-facts {
+    grid-area: facts;
+    display: flex;
+    gap: 5px;
+    min-width: 0;
+  }
+
+  /* The dot the fact line uses everywhere else, once the two facts are on
+     one line and no longer separated by a column. */
+  .file-facts > .file-fact + .file-fact::before {
+    content: "\00b7";
+    margin-right: 5px;
+  }
 }
 
 

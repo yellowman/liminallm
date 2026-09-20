@@ -427,11 +427,12 @@
                 <div id="note-editor" class="note-editor hidden">
                   <div class="note-editor-head">
                     <input type="text" id="note-title" placeholder="Title" maxlength="200" autocomplete="off" />
-                    <div class="pill-row">
+                    <span class="note-state" id="note-state" role="status" aria-live="polite"></span>
+                    <div class="utility-strip note-toolbar">
                       <button class="minor" id="note-preview-btn" aria-pressed="false">Preview</button>
                       <button class="ghost" id="note-witness-btn" title="Check this note against the rest of the vault">Witness</button>
                       <button class="primary" id="note-save-btn">Save</button>
-                      <button class="minor danger" id="note-delete-btn" title="Delete note">✕</button>
+                      <button class="icon-btn compact danger" id="note-delete-btn" title="Delete this note" aria-label="Delete this note"><svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h12"/><path d="M8.25 6V4.5h3.5V6"/><path d="m5.5 6 .75 10.25h7.5L14.5 6"/></svg></button>
                     </div>
                   </div>
                   <textarea id="note-content" placeholder="Write. Link with [[Title]]." spellcheck="true"></textarea>
@@ -458,57 +459,59 @@
                 <h2>Files</h2>
               </div>
               <p class="subtext">Upload knowledge into a context, and browse everything you have uploaded.</p>
-              <section class="panel-section" id="upload-section" aria-label="Upload files">
-                <div class="section-header clickable" id="upload-section-toggle">
-                  <h3>Upload knowledge <span class="toggle-icon">+</span></h3>
+              <section id="upload-section" aria-label="Upload files">
+                <div class="section-band">
+                  <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 12.4V3.4M6.6 6.8L10 3.4l3.4 3.4"/><path d="M3.6 12.4v3a1.2 1.2 0 0 0 1.2 1.2h10.4a1.2 1.2 0 0 0 1.2-1.2v-3"/></svg>
+                  <h3>Upload</h3>
+                  <span class="section-description">Attach files to a context, or leave it blank to keep them private</span>
                 </div>
-                <div class="section-content">
-                  <p class="subtext">
-                    Attach files to a context before asking questions. Leave Context ID blank to keep uploads private.
-                  </p>
-                  <!-- One line: choose a file, say where it goes, upload. The
-                       three controls were three stacked labelled fields over
-                       four rows, for a task that is one sentence long. -->
-                  <div class="upload-strip">
-                    <div class="field compact">
-                      <label for="file-upload">File</label>
-                      <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
-                    </div>
-                    <div class="field compact">
-                      <label for="upload-context-id">Context</label>
-                      <select id="upload-context-id">
-                        <option value="">Private (no context)</option>
-                      </select>
-                    </div>
-                    <button type="button" class="primary" id="upload-file-btn">Upload</button>
+                <!-- One line: choose a file, say where it goes, upload. The
+                     three controls were three stacked labelled fields over
+                     four rows, for a task that is one sentence long. -->
+                <div class="upload-strip">
+                  <div class="field compact">
+                    <label for="file-upload">File</label>
+                    <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
                   </div>
-                  <div class="small" id="file-upload-hint"></div>
-                  <!-- Chunk size is asked for rarely and read by almost nobody,
-                       so it is available rather than present. -->
-                  <details class="advanced">
-                    <summary>Advanced</summary>
-                    <div class="field compact">
-                      <label for="upload-chunk-size">Chunk size</label>
-                      <input type="number" id="upload-chunk-size" placeholder="512" min="64" max="4000" step="64" />
-                    </div>
-                  </details>
-                  <div class="small" id="file-upload-status" role="status"></div>
+                  <div class="field compact">
+                    <label for="upload-context-id">Context</label>
+                    <select id="upload-context-id">
+                      <option value="">Private (no context)</option>
+                    </select>
+                  </div>
+                  <button type="button" class="primary" id="upload-file-btn">Upload</button>
                 </div>
+                <div class="small" id="file-upload-hint"></div>
+                <!-- Chunk size is asked for rarely and read by almost nobody,
+                     so it is available rather than present. -->
+                <details class="advanced">
+                  <summary>Advanced</summary>
+                  <div class="field compact">
+                    <label for="upload-chunk-size">Chunk size</label>
+                    <input type="number" id="upload-chunk-size" placeholder="512" min="64" max="4000" step="64" />
+                  </div>
+                </details>
+                <div class="small" id="file-upload-status" role="status"></div>
               </section>
 
-              <section class="panel-section" id="files-section" aria-label="My files">
-                <div class="section-header clickable" id="files-section-toggle">
-                  <h3>My files <span class="toggle-icon">+</span></h3>
+              <section id="files-section" aria-label="My files">
+                <div class="section-band">
+                  <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 5.6a1 1 0 0 1 1-1h3.1l1.5 2h7.8a1 1 0 0 1 1 1v6.8a1 1 0 0 1-1 1H3.8a1 1 0 0 1-1-1Z"/></svg>
+                  <h3>Library</h3>
+                  <span class="section-description" id="files-count">Everything you have uploaded</span>
+                  <button type="button" class="icon-btn compact" id="refresh-files-btn" title="Refresh the file list" aria-label="Refresh the file list"><svg viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.2 8.4a6.4 6.4 0 1 0 .3 3.4"/><path d="M16.6 4.4v4h-4"/></svg></button>
                 </div>
-                <div class="section-content">
-                  <p class="subtext">
-                    Browse and download your uploaded files.
-                  </p>
-                  <div class="pill-row">
-                    <button type="button" class="minor" id="refresh-files-btn">Refresh</button>
-                  </div>
-                  <div id="files-list" class="files-list"></div>
-                  <div id="files-empty" class="small">No files uploaded yet.</div>
+                <div class="file-table-head" aria-hidden="true">
+                  <span></span>
+                  <span>Name</span>
+                  <span>Size</span>
+                  <span>Modified</span>
+                  <span></span>
+                </div>
+                <div id="files-list" class="files-list"></div>
+                <div id="files-empty" class="small">No files uploaded yet.</div>
+                <div id="files-summary" class="summary-line hidden">
+                  <span id="files-summary-text"></span>
                   <div id="files-pagination" class="pagination-controls"></div>
                 </div>
               </section>
@@ -668,9 +671,11 @@
               </div>
               <p class="subtext">View your preference history and insights about how your feedback shapes model behavior.</p>
 
-              <div class="divider"></div>
-
-              <h3>Summary</h3>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3.8 16.4v-4.2M8 16.4v-8M12.2 16.4v-3M16.4 16.4v-9.8"/></svg>
+                <h3>Summary</h3>
+                <span class="section-description">Every rating you have given</span>
+              </div>
               <div id="insights-summary" class="figures">
                 <div>
                   <span class="figure-value" id="insights-total-events">-</span>
@@ -690,26 +695,29 @@
                 </div>
               </div>
 
-              <div class="divider"></div>
-
-              <h3>Top Adapters</h3>
-              <p class="subtext">Adapters that have received the most positive feedback.</p>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3.2l6.4 3.2L10 9.6 3.6 6.4z"/><path d="M3.6 10l6.4 3.2L16.4 10M3.6 13.6l6.4 3.2 6.4-3.2"/></svg>
+                <h3>Top adapters</h3>
+                <span class="section-description">The ones your positive feedback reached most</span>
+              </div>
               <div id="insights-top-adapters" class="insights-adapters">
                 <div class="empty">No adapter data yet</div>
               </div>
 
-              <div class="divider"></div>
-
-              <h3>Recent Preferences</h3>
-              <p class="subtext">Your most recent feedback events.</p>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M16.4 11.4a1.4 1.4 0 0 1-1.4 1.4H7l-3 2.8V5a1.4 1.4 0 0 1 1.4-1.4H15A1.4 1.4 0 0 1 16.4 5Z"/></svg>
+                <h3>Recent preferences</h3>
+                <span class="section-description">Your most recent feedback events</span>
+              </div>
               <div id="insights-recent-list" class="insights-recent">
                 <div class="empty">No preference events yet</div>
               </div>
 
-              <div class="divider"></div>
-
-              <h3>Clusters</h3>
-              <p class="subtext">Semantic clusters identified from your preferences. These represent emergent skill areas.</p>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="6.4" cy="6.6" r="2.6"/><circle cx="13.8" cy="5.8" r="1.8"/><circle cx="12.6" cy="13.4" r="3"/><path d="M8.6 8.4l2.2 3M8.8 5.9l2.4-.1"/></svg>
+                <h3>Clusters</h3>
+                <span class="section-description">Emergent skill areas found in your preferences</span>
+              </div>
               <div id="insights-clusters" class="insights-clusters">
                 <div class="empty">No clusters identified yet</div>
               </div>
