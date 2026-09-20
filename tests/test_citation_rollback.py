@@ -767,12 +767,17 @@ class TestTheStreamedTransportBehavesTheSame:
         assert tokens == "400 hours"
 
     @pytest.mark.asyncio
-    async def test_with_the_policy_off_the_answer_is_byte_identical(
+    async def test_with_the_policy_off_the_unused_nonce_survives_but_marker_syntax_does_not(
         self, store, monkeypatch
     ):
-        """Gate off, and an answer that happens to contain the execution's own
-        unused nonce. No handle was ever issued, so there is no namespace to
-        contain and nothing may touch the text."""
+        """Policy off means no namespace authority, not no reader cleanup.
+
+        The invocation's random nonce was never offered, so its plain-text
+        occurrence must survive. A *closed* `[cite:...]` token is different:
+        SPEC §2.2 now names it internal citation syntax whether it resolves or
+        not, so the reader boundary removes it even while citation authority
+        is off.
+        """
         engine = get_runtime().workflow
         engine.invocations.configure_citation_offers(False)
         user_id, opened = self._streaming(engine, monkeypatch, store)
@@ -794,10 +799,14 @@ class TestTheStreamedTransportBehavesTheSame:
 
         assert written
         assert not opened[-1].citations
+        nonce = opened[-1].citations.nonce
         tokens = "".join(
             event["data"] for event in events if event.get("event") == "token"
         )
-        assert tokens == written[0]
+        assert tokens == f"400 hours, ref {nonce} and"
+        assert nonce in tokens, "the unused nonce was treated as issued authority"
+        assert "[cite:" not in tokens.lower()
+
 
 
 class TestTheFinalTransferReturnsNothingOnBothTransports:
