@@ -331,3 +331,143 @@ class TestTheNoteEditorSaysWhatStateItIsIn:
             ), "the note went anyway, so the question it asked meant nothing"
         finally:
             context.close()
+
+
+class TestEveryControlWearsTheDesignLanguage:
+    """The vault search field was the only control in the app that did not.
+
+    Two rules reached it and between them they set `flex`, `min-width` and
+    `max-width` - layout, nothing that sets appearance - so it fell back to
+    the user agent's: Arial at 13.33px, square corners and a 2px inset grey
+    border, beside Inter at 13.5px with 6px corners everywhere else. It is
+    the field a reader types into to search their own notes.
+
+    The first test is the guard and the second is the instance. The guard
+    is the one that matters: it asks the question of every control in the
+    document, so the next control added without an appearance rule fails
+    here rather than shipping.
+    """
+
+    def test_no_control_renders_in_the_browsers_own_font(self, browser, server):
+        email, _ = _account(server)
+        context, page = _signed_in(browser, server, email)
+        try:
+            tabs = [
+                "chat-tab", "notes-tab", "contexts-tab", "files-tab",
+                "artifacts-tab", "tools-tab", "insights-tab", "settings-tab",
+            ]
+            scan = """() => {
+              const out = [];
+              document.querySelectorAll('input, select, textarea').forEach((el) => {
+                const box = el.getBoundingClientRect();
+                if (box.width < 2 || box.height < 2) return;
+                const s = getComputedStyle(el);
+                const family = s.fontFamily.split(',')[0].replace(/["']/g, '').trim();
+                if (/Inter|JetBrains|Fira|ui-sans|system-ui/i.test(family)) return;
+                out.push((el.id || el.tagName.toLowerCase()) + ': ' + family);
+              });
+              return out;
+            }"""
+            unstyled = {}
+            total = 0
+            for tab in tabs:
+                page.click(f"#main-tabs .rail-btn[data-tab='{tab}']")
+                page.wait_for_selector(f"#{tab}.active", state="visible")
+                page.wait_for_timeout(600)
+                total = max(
+                    total,
+                    page.evaluate(
+                        "() => document.querySelectorAll("
+                        "'input, select, textarea').length"
+                    ),
+                )
+                for row in page.evaluate(scan):
+                    unstyled.setdefault(row, tab)
+
+            # The control: the sweep has to be looking at something. A
+            # document with no controls would pass the assertion below
+            # while measuring nothing at all.
+            assert total >= 20, f"only {total} controls found, so this proves little"
+            assert not unstyled, (
+                "these controls were never given an appearance and render in "
+                f"the browser's default font: {unstyled}"
+            )
+        finally:
+            context.close()
+
+    def test_the_two_search_fields_match_each_other(self, browser, server):
+        email, _ = _account(server)
+        context, page = _signed_in(browser, server, email)
+        try:
+            read = """(sel) => {
+              const el = document.querySelector(sel);
+              if (!el) return null;
+              const s = getComputedStyle(el);
+              return {
+                h: Math.round(el.getBoundingClientRect().height),
+                family: s.fontFamily.split(',')[0].replace(/["']/g, '').trim(),
+                radius: s.borderTopLeftRadius,
+                border: `${s.borderTopWidth} ${s.borderTopStyle}`,
+                pad: s.paddingLeft,
+              };
+            }"""
+            page.click("#main-tabs .rail-btn[data-tab='notes-tab']")
+            page.wait_for_selector("#notes-tab.active", state="visible")
+            page.wait_for_timeout(700)
+            vault = page.evaluate(read, "#note-search-input")
+
+            page.click("#main-tabs .rail-btn[data-tab='chat-tab']")
+            page.wait_for_timeout(700)
+            conversations = page.evaluate(read, "#conversation-search")
+
+            assert vault and conversations, (vault, conversations)
+            assert vault == conversations, (
+                "the two search fields sit in the same position in sibling "
+                f"panes and do not match: vault={vault} "
+                f"conversations={conversations}"
+            )
+            # Part one puts a filter in the compact tier and gives a control
+            # a 6px corner. Naming the values keeps the shared rule honest
+            # if someone later edits only one of the two call sites.
+            assert vault["radius"] == "6px", vault
+            assert vault["h"] == 28, vault
+        finally:
+            context.close()
+
+    def test_the_vault_search_row_lines_up(self, browser, server):
+        """The field shares a row with the new-note button.
+
+        Both were 30px before the field was styled, but the field only
+        because that was the height the user agent chose for it. Putting it
+        on the compact tier without moving the button left the two 2px
+        apart at the bottom edge, which is the kind of thing that survives
+        a review because it looks like a rendering artefact.
+        """
+        email, _ = _account(server)
+        context, page = _signed_in(browser, server, email)
+        try:
+            page.click("#main-tabs .rail-btn[data-tab='notes-tab']")
+            page.wait_for_selector("#notes-tab.active", state="visible")
+            page.wait_for_timeout(700)
+            row = page.evaluate(
+                """() => {
+                  const out = {};
+                  document.querySelectorAll(
+                    '.notes-side-head input, .notes-side-head button'
+                  ).forEach((el) => {
+                    const b = el.getBoundingClientRect();
+                    out[el.id || el.tagName.toLowerCase()] = {
+                      h: Math.round(b.height),
+                      bottom: Math.round(b.bottom),
+                    };
+                  });
+                  return out;
+                }"""
+            )
+            assert len(row) >= 2, f"nothing to compare in the row: {row}"
+            heights = {v["h"] for v in row.values()}
+            bottoms = {v["bottom"] for v in row.values()}
+            assert len(heights) == 1, f"the row's controls differ in height: {row}"
+            assert len(bottoms) == 1, f"the row's controls do not share a baseline: {row}"
+        finally:
+            context.close()

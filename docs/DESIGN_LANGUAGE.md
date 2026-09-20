@@ -557,20 +557,6 @@ The same element is also a `<div>` with `cursor: pointer`, so opening a
 result is available only to a pointer - the note list defect again, in the
 list a reader reaches by typing.
 
-**The vault search field wears no part of this design language.** It renders
-in Arial at 13.33px, with square corners and the browser's own 2px inset
-grey border, against Inter at 13.5px with 6px corners and a 1px
-`rgb(227, 228, 232)` border on every other input. Its padding is 1px 2px
-where a styled control has 0 10px.
-
-Two rules reach it, `styles.css:370` and `styles.css:2761`, and between them
-they set `flex`, `min-width` and `max-width`. Nothing sets appearance, so
-the control falls back to the user agent's. It is the only control in the
-app in that state, and it is the one §16 is about: the field a reader types
-into to search their own notes. The conversation search field in the pane
-beside it is styled but renders at 32px, so the two search fields do not
-match each other either. Present since #193; no later change touched it.
-
 **Status carried in colour alone.** `.note-item.contradicted` and
 `.note-item.evolved` change only the title's colour - no dot, no word, no
 `title` attribute. `.voice-btn.playing` does the same. Five lines away,
@@ -669,12 +655,12 @@ on `.tick-mark`. The last three are marks a few pixels across rather than
 surfaces, so they are the defensible end of the list. The rail is not: it is
 the app's primary navigation and it is the one control tier at 9px.
 
-**No filter is in the compact tier.** Part one puts a filter at 28px.
-Measured on all five: the artifact type and visibility filters and the patch
-status filter render at 30px, and the conversation search at **32px**, which
-is not a height the standard defines. `--ctl-h-sm` is declared once and
-referenced twice - by `.setting-row input, .setting-row select` and by
-`.utility-strip button, select, input` - and no filter is inside either.
+**Three filters are still outside the compact tier.** Part one puts a filter
+at 28px. The artifact type and visibility filters and the patch status
+filter render at 30px. The two pane search fields were the other two and are
+now on the tier, which is what carried `--ctl-h-sm` from two call sites to
+three; the three that remain are `select` elements with no shared rule
+between them.
 
 **Six bare `:focus` selectors** in four rule blocks. Three style text-entry
 controls, where the two selectors behave alike; `.field select:focus` is a
