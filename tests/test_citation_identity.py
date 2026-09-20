@@ -22,7 +22,10 @@ from liminallm.service.citations import (
     build_citation_table,
     extend_citation_table,
     mint_nonce,
+    replaced_answer,
+    scrub_positions,
     strip_citations,
+    transfer_citations,
     validate_citations,
 )
 from liminallm.service.provenance import ProvenanceError, SourceRegistry, binding
@@ -337,6 +340,42 @@ class TestUncitedProseIsFine:
     def test_an_answer_with_no_citations_is_not_an_error(self):
         _registry, _bindings, table = _turn("manual.md")
         assert validate_citations("Nothing to cite here.", table) == []
+
+
+class TestTheBlockingReaderGetsTheSameCleanup:
+    def test_a_malformed_marker_is_removed_after_authority_transfer(self):
+        """The blocking production sequence, not only the helper in isolation.
+
+        The worker receives the narrow namespace-scrubbed answer, because its
+        boundary must preserve unrelated citation-shaped prose. Citation
+        authority is transferred against that exact string. Only then does the
+        shared answer boundary apply reader cleanup.
+        """
+        registry, bindings, table = _turn("manual.md")
+        handle = table.handle_for("src_1")
+        canonical = f"Alpha [cite:,]. Beta [cite:{handle}]."
+        worker_content, _ = scrub_positions(canonical, table.nonce)
+        assert worker_content == "Alpha [cite:,]. Beta."
+
+        citations = transfer_citations(
+            {"content": canonical}, table, worker_content
+        )
+        assert len(citations) == 1, citations
+
+        answer = replaced_answer(worker_content, bindings, citations)
+        assert answer is not None
+        content, kept_bindings, moved = answer
+        assert content == "Alpha. Beta."
+        assert kept_bindings == bindings
+        assert len(moved) == 1
+        assert moved[0]["source_id"] == "src_1"
+        assert moved[0]["public_offset"] == len("Alpha. Beta")
+
+    def test_plain_blocking_content_is_an_identity(self):
+        answer = replaced_answer("plain answer", [], [])
+        assert answer is not None
+        assert answer.content == "plain answer"
+        assert answer.citations == []
 
 
 class TestTheMarkersCanBeTakenBackOut:
