@@ -14,9 +14,10 @@ each an automaton over arriving characters, which is the same shape
 `_scrub_text` has: remove every leftmost non-overlapping match, hand what
 survives to the next pass, and stop when a pass removes nothing.
 
-`scrub_positions` is still what the answer *is*. It is asked once, at
-completion, for the finished text and the origin map, and the reader's
-released text is checked against it there.
+`reader_positions` is what the reader-facing answer *is*. It composes the
+turn's namespace scrub with the broader closed-marker cleanup, is asked once
+at completion for the finished text and origin map, and the incremental
+reader is checked against it there.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from liminallm.service.citation_stream import (
     CanonicalCitationStream,
     ScrubbedTokenStream,
 )
-from liminallm.service.citations import scrub_positions
+from liminallm.service.citations import reader_positions
 
 NONCE = "K7Q2ABCD"
 
@@ -92,7 +93,7 @@ def _chunkings(text, rng):
 
 def _agrees(nonce, text, chunks):
     """Run one stream and say how it disagreed with the oracle, or None."""
-    expected, expected_origins = scrub_positions(text, nonce)
+    expected, expected_origins = reader_positions(text, nonce)
     reader = CanonicalCitationStream(nonce)
     out = []
     seen = ""
@@ -213,7 +214,7 @@ class TestAPassIsWhereASpliceIsReconsidered:
 
     def test_a_junction_is_not_matched_before_the_pass_that_owns_it(self):
         text = "SK SKSKSKSK-3sksksksk"
-        expected, _origins = scrub_positions(text, OVERLAPPING)
+        expected, _origins = reader_positions(text, OVERLAPPING)
         assert expected == "SK", expected
         for chunks in ([text], list(text), ["SK SKSKSKSK-3", "sksksksk"]):
             problem = _agrees(OVERLAPPING, text, chunks)
@@ -230,7 +231,7 @@ class TestAPassIsWhereASpliceIsReconsidered:
         actually be given.
         """
         text = "AAABAAABA"
-        expected, _origins = scrub_positions(text, BORDERED)
+        expected, _origins = reader_positions(text, BORDERED)
         assert expected == "A", expected
         for chunks in ([text], list(text), ["AAAB", "AAABA"], ["AAABAAAB", "A"]):
             problem = _agrees(BORDERED, text, chunks)
@@ -240,7 +241,7 @@ class TestAPassIsWhereASpliceIsReconsidered:
         """The other half of the rule, and the reason a chain is needed at
         all: what one pass leaves adjacent, the next pass matches."""
         text = "K7Q2K7Q2k7q2abcdABCD"
-        expected, _origins = scrub_positions(text, NONCE)
+        expected, _origins = reader_positions(text, NONCE)
         assert expected == "K7Q2", expected
         for chunks in ([text], list(text), ["K7Q2K7Q2k7q2ab", "cdABCD"]):
             problem = _agrees(NONCE, text, chunks)
@@ -298,7 +299,7 @@ class TestTheChainCanBeDeeperThanTheInterpretersStack:
         public = reader.push(text) + reader.finish()[0]
         assert len(reader._passes) == 201
         assert deepest == 1, f"a pass closed another, {deepest} deep"
-        assert public == scrub_positions(text, NONCE)[0]
+        assert public == reader_positions(text, NONCE)[0]
         assert reader.intact()
 
     def test_a_removal_while_the_passes_below_hold_text_still_closes(self):
@@ -306,7 +307,7 @@ class TestTheChainCanBeDeeperThanTheInterpretersStack:
         its own tail when the answer ends, so closing walks a chain that is
         still handing text down as it goes."""
         text = _cascade(200)
-        expected, expected_origins = scrub_positions(text, NONCE)
+        expected, expected_origins = reader_positions(text, NONCE)
         reader = CanonicalCitationStream(NONCE)
         out = [reader.push(character) for character in text]
         tail, origins = reader.finish()
@@ -331,7 +332,7 @@ class TestTheChainCanBeDeeperThanTheInterpretersStack:
             "the deepest chain the ceiling allows is shallower than this "
             f"interpreter's recursion limit ({sys.getrecursionlimit()})"
         )
-        expected, expected_origins = scrub_positions(text, NONCE)
+        expected, expected_origins = reader_positions(text, NONCE)
 
         reader = CanonicalCitationStream(NONCE)
         public = reader.push(text)
@@ -438,19 +439,19 @@ class TestTheWorkIsLinearInTheAnswer:
 
 
 class TestTheWholeStringScrubIsAskedOnce:
-    """`scrub_positions` is the oracle, and an oracle asked per chunk is the
+    """`reader_positions` is the oracle, and an oracle asked per chunk is the
     cost this tranche removed."""
 
     @pytest.fixture()
     def counted(self, monkeypatch):
         calls = []
-        real = citation_stream.scrub_positions
+        real = citation_stream.reader_positions
 
         def counting(text, nonce):
             calls.append(len(text))
             return real(text, nonce)
 
-        monkeypatch.setattr(citation_stream, "scrub_positions", counting)
+        monkeypatch.setattr(citation_stream, "reader_positions", counting)
         return calls
 
     def test_pushing_never_asks_it(self, counted):
