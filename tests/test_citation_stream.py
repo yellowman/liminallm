@@ -558,6 +558,33 @@ class TestReaderCleanupWithoutAnIssuedNamespace:
         assert events[-1]["event"] == "message_done"
         assert events[-1]["data"]["content"] == "provider-final-differs"
 
+    def test_unfinished_exhaustion_does_not_flush_a_held_marker(self):
+        """No message_done means no completed answer.
+
+        Bare iterator exhaustion is neither an explicit provider failure nor a
+        success boundary. Text still held because it could be citation syntax
+        was never shown and must not become visible just because the provider
+        disappeared without a terminal event.
+        """
+        stream = ScrubbedTokenStream(
+            iter([
+                {"event": "token", "data": "answer"},
+                {"event": "token", "data": "[cite:"},
+            ]),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+        iterator = iter(stream)
+
+        assert next(iterator) == {"event": "token", "data": "answer"}
+        with pytest.raises(StopIteration):
+            next(iterator)
+        assert stream.reader.released == "answer"
+        assert "[cite:" not in stream.reader.released
+        assert not stream.reader.intact()
+
     def test_a_terminal_error_releases_the_now_settled_suffix(self):
         """A failed stream keeps the exact partial bytes already produced.
 
