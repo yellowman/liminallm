@@ -79,7 +79,8 @@ layout, styling, and client implementation patterns. The frontend source
 
 ## settings panel
 
-- session information: user ID, role, tenant, truncated session ID.
+- session information: user ID, role, tenant, truncated session ID, as
+  hairline-divided `.detail-row` pairs rather than filled boxes.
 - local storage management: draft count, clear-drafts, export-drafts (JSON
   download).
 - upload limits from `GET /v1/files/limits`.
@@ -104,8 +105,8 @@ layout, styling, and client implementation patterns. The frontend source
 
 ## feedback controls
 
-- thumbs up/down, disabled until an assistant message exists; optional notes
-  field; target conversation/message display; JSON preview of adapters,
+- thumbs up/down, disabled until an assistant message exists; voice input
+  and read-aloud as icon buttons beside them; optional notes field; target conversation/message display; JSON preview of adapters,
   context snippets, gates, and routing/workflow traces.
 - endpoint: `POST /v1/preferences`.
 
@@ -130,15 +131,18 @@ layout, styling, and client implementation patterns. The frontend source
 - CSS custom properties for theming: `--accent`, `--text`, `--panel`,
   `--border`, and so on. Control sizing is tokenized too: `--ctl-h`,
   `--ctl-h-sm`, `--icon-hit`, `--icon-glyph`, `--chip-h`.
-- list classes: `.row` is the flat list primitive used by the migrated
-  contextual panes - Contexts, Artifacts, Tools, Workflows and Files. It
-  carries `.row-icon`, `.row-name`, `.row-meta` and hover-revealed
-  `.row-actions`. A selected row takes a faint fill and a 2px left marker,
-  which is the same selection language the application rail uses. Notes and
-  Chat still use their own list classes.
-- component classes: `.panel`, `.badge`, `.table`, `.code-block`,
-  `.factline` (a dot-separated line of facts), `.chip`, `.figures`,
-  `.deflist`, `.hairline-table`, `.icon-btn`.
+- list classes: `.row` is the one flat list primitive. It carries
+  `.row-icon`, `.row-name`, `.row-meta` and hover-revealed `.row-actions`,
+  and a selected row takes a faint fill and a 2px left marker - the same
+  selection language the application rail uses. Every list wears it:
+  Contexts, Artifacts, Tools, Workflows, Files, Insights, API keys, and -
+  through the same rule rather than a copy of it - `.conversation-item` and
+  `.note-item`, which keep their own names for the states they carry
+  (`active`, `contradicted`, `evolved`).
+- component classes: `.panel`, `.badge` (a bar title with a status dot, not
+  a capsule), `.table`, `.code-block`, `.detail-row` with `.detail-label`
+  (a label and its value, divided by a hairline), `.factline` (a
+  dot-separated line of facts), `.chip`, `.figures`, `.icon-btn`.
 - utility classes: `.hidden`, `.flex-row`, `.pill-row`, `.divider`, `.mb-14`,
   `.monospace`.
 - media queries at 1080px (hide sidebar) and 640px (single-column layout).
