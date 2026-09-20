@@ -234,6 +234,66 @@ const stableHash = (str) => {
   return Math.abs(hash >>> 0).toString(16);
 };
 
+//: A schema rendered the way the fields above it are rendered.
+//:
+//: An artifact's schema, a tool's inputs and a workflow's definition were
+//: each a `JSON.stringify` in a bordered box, directly under a run of
+//: label-and-value rows carrying the same kind of information. Most of what
+//: is in them is flat - a kind, a mode, a rank, a scope, a base model - so
+//: the reader was being asked to parse punctuation to read a value that the
+//: four rows above it would have simply stated.
+//:
+//: Scalars become rows. An array of scalars becomes one row, joined, because
+//: `layers: 0, 1, 2, 3` is the whole fact. Anything genuinely nested keeps
+//: its literal form, since there is no honest way to flatten an object
+//: without deciding what to drop, and a schema is one of the few places
+//: where the punctuation is the content.
+const SCHEMA_SCALARS = ['string', 'number', 'boolean'];
+
+const schemaValueRow = (key, value) => {
+  const label = escapeHtml(String(key));
+  if (value === null) return `<span class="muted">null</span>`;
+  if (Array.isArray(value) && value.every((v) => SCHEMA_SCALARS.includes(typeof v))) {
+    return value.length
+      ? `<span class="monospace">${escapeHtml(value.join(', '))}</span>`
+      : `<span class="muted">none</span>`;
+  }
+  if (SCHEMA_SCALARS.includes(typeof value)) {
+    return `<span class="monospace">${escapeHtml(String(value))}</span>`;
+  }
+  return null;
+};
+
+const renderSchemaFields = (schema) => {
+  const source = schema && typeof schema === 'object' && !Array.isArray(schema)
+    ? schema
+    : null;
+  if (!source) {
+    return `<pre class="schema-viewer">${escapeHtml(
+      JSON.stringify(schema ?? {}, null, 2))}</pre>`;
+  }
+  const rows = [];
+  const nested = {};
+  for (const [key, value] of Object.entries(source)) {
+    const rendered = schemaValueRow(key, value);
+    if (rendered === null) {
+      nested[key] = value;
+      continue;
+    }
+    rows.push(
+      `<div class="detail-row"><span class="detail-label">${escapeHtml(key)}</span>`
+      + `${rendered}</div>`);
+  }
+  if (!rows.length && !Object.keys(nested).length) {
+    return '<p class="subtext">No schema recorded.</p>';
+  }
+  const tail = Object.keys(nested).length
+    ? `<pre class="schema-viewer">${escapeHtml(
+        JSON.stringify(nested, null, 2))}</pre>`
+    : '';
+  return rows.join('') + tail;
+};
+
 const formatBytes = (bytes) => {
   if (!bytes && bytes !== 0) return '0 bytes';
   const thresh = 1024;
@@ -2200,7 +2260,7 @@ const selectArtifact = async (artifactId) => {
       </div>
       <div class="divider"></div>
       <h4>Schema</h4>
-      <pre class="schema-viewer">${escapeHtml(JSON.stringify(artifact.schema || {}, null, 2))}</pre>
+      ${renderSchemaFields(artifact.schema)}
     `;
   }
 
@@ -3608,7 +3668,7 @@ const selectTool = async (toolId) => {
       </div>
       <div class="divider"></div>
       <h4>Inputs</h4>
-      <pre class="schema-viewer">${escapeHtml(JSON.stringify(inputs, null, 2))}</pre>
+      ${renderSchemaFields(inputs)}
     `;
   }
 
@@ -3763,7 +3823,7 @@ const selectWorkflow = (workflowId) => {
       </div>
       <div class="divider"></div>
       <h4>Schema</h4>
-      <pre class="schema-viewer">${escapeHtml(JSON.stringify(schema, null, 2))}</pre>
+      ${renderSchemaFields(schema)}
     `;
   }
 };

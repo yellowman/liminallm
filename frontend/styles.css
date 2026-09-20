@@ -2244,12 +2244,14 @@ button.minor:hover {
 }
 
 
+/* No border and no fill. This sits inside `.panel`, on `.panel`'s own
+   background, so the box it used to draw was a card inside a card that
+   separated nothing - the heading above it and the mono type already say
+   where the literal content starts. It now holds only what could not be
+   flattened into rows, which is the case the literal form is for. */
 .schema-viewer {
-  background: var(--panel);
   color: var(--text);
-  border: 1px solid var(--border);
-  padding: 14px;
-  border-radius: var(--radius-sm);
+  margin: 10px 0 0;
   font-family: var(--font-mono);
   font-size: 12.5px;
   overflow-x: auto;

@@ -1799,3 +1799,139 @@ class TestTheChatWindowIsTheWindow:
             ), "the toggle no longer opens the detail it names"
         finally:
             context.close()
+
+
+class TestADetailPaneDrawsNoBoxThatSeparatesNothing:
+    """An artifact's schema was a bordered box inside `.panel`'s bordered box.
+
+    Both carried the same background, so the inner border separated the
+    literal content from nothing: the heading above it and the mono type
+    already said where the schema started. The design language asks to avoid
+    a card inside a card unless the inner surface is a genuinely different
+    interactive object, and a block of text is not one.
+
+    A tinted inner surface is a different case and is allowed through here -
+    a fill the reader can see is doing work the border is not. What this
+    pins is the box that draws a line around content already on its own
+    background.
+
+    These screens were also where the enclosure census went wrong. It walked
+    each tab with nothing selected, so no detail pane was ever in the tree,
+    and it reported no nesting anywhere. The selection below is the whole
+    point of the test.
+    """
+
+    NESTED = """() => {
+      const vis = (c) => c && c !== 'transparent' && !/rgba\\(.*,\\s*0\\)$/.test(c);
+      const panel = document.querySelector('.tab-panel.active');
+      if (!panel) return null;
+      const draws = (el) => {
+        const s = getComputedStyle(el);
+        if ((parseFloat(s.borderTopLeftRadius) || 0) <= 0) return false;
+        const bw = parseFloat(s.borderTopWidth) || 0;
+        const p = el.parentElement;
+        const parentBg = p ? getComputedStyle(p).backgroundColor : '';
+        const bordered = bw > 0 && vis(s.borderTopColor);
+        const filled = vis(s.backgroundColor) && s.backgroundColor !== parentBg;
+        return {any: bordered || filled, bordered, filled};
+      };
+      const out = [];
+      panel.querySelectorAll('*').forEach((el) => {
+        const box = el.getBoundingClientRect();
+        if (box.width < 4 || box.height < 4) return;
+        const tag = el.tagName.toLowerCase();
+        if (['button', 'input', 'select', 'textarea', 'a', 'svg', 'path']
+            .includes(tag)) return;
+        const self = draws(el);
+        if (!self || !self.any) return;
+        // Only a box that adds no fill of its own is a box that separates
+        // nothing. A tinted surface is allowed.
+        if (self.filled) return;
+        let enclosed = false;
+        for (let p = el.parentElement; p && p !== panel; p = p.parentElement) {
+          const d = draws(p);
+          if (d && d.any) { enclosed = true; break; }
+        }
+        if (enclosed) {
+          out.push(String(el.className || tag).trim().split(/\\s+/)[0]);
+        }
+      });
+      return out;
+    }"""
+
+    @pytest.mark.parametrize("viewport", [DESKTOP], ids=["desktop"])
+    def test_no_untinted_card_sits_inside_another(self, browser, server, viewport):
+        context, page = _signed_in_page(browser, server, viewport)
+        try:
+            selections = {
+                "contexts-tab": "#contexts-list .row",
+                "artifacts-tab": "#artifacts-list .row",
+                "tools-tab": "#tools-list .row",
+            }
+            offenders = {}
+            opened = 0
+            for tab, selector in selections.items():
+                page.click(f"#main-tabs .rail-btn[data-tab='{tab}']")
+                page.wait_for_selector(f"#{tab}.active", state="visible")
+                page.wait_for_timeout(700)
+                try:
+                    page.wait_for_selector(selector, timeout=15000)
+                    page.click(f"{selector} >> nth=0")
+                    page.wait_for_timeout(1200)
+                    opened += 1
+                except Exception:  # noqa: BLE001
+                    continue
+                found = page.evaluate(self.NESTED)
+                if found:
+                    offenders[tab] = sorted(set(found))
+
+            # The control. With nothing selected there is no detail pane, and
+            # the sweep below would pass while looking at an empty workspace -
+            # which is exactly the mistake this test exists to not repeat.
+            assert opened >= 2, (
+                f"only {opened} detail panes opened, so this proves little"
+            )
+            assert not offenders, (
+                "these draw a bordered box inside another enclosure, on the "
+                f"same background, so the border separates nothing: {offenders}"
+            )
+
+            # The sweep above is not enough on its own. `.schema-viewer` now
+            # renders only when a schema holds something that could not be
+            # flattened into rows, so on a pane whose schema is entirely flat
+            # there is no element to find and the sweep passes whatever the
+            # stylesheet says. Measured: restoring the border to the rule left
+            # the sweep green. This asks the stylesheet directly, on an
+            # element built for the purpose inside a real `.panel`.
+            drawn = page.evaluate(
+                """() => {
+                  const panel = document.querySelector('.tab-panel.active .panel')
+                    || document.querySelector('.panel');
+                  if (!panel) return null;
+                  const pre = document.createElement('pre');
+                  pre.className = 'schema-viewer';
+                  pre.textContent = '{}';
+                  panel.appendChild(pre);
+                  const s = getComputedStyle(pre);
+                  const out = {
+                    border: s.borderTopWidth,
+                    radius: s.borderTopLeftRadius,
+                    background: s.backgroundColor,
+                    panelBackground: getComputedStyle(panel).backgroundColor,
+                    font: s.fontFamily.split(',')[0].replace(/["']/g, ''),
+                  };
+                  pre.remove();
+                  return out;
+                }"""
+            )
+            assert drawn is not None, "no panel to measure against"
+            assert drawn["font"].startswith("JetBrains"), drawn
+            assert drawn["border"] == "0px", (
+                f"the schema block draws a border inside the panel: {drawn}"
+            )
+            assert drawn["radius"] == "0px", drawn
+            assert drawn["background"] in ("rgba(0, 0, 0, 0)", drawn["panelBackground"]), (
+                f"the schema block fills its own box: {drawn}"
+            )
+        finally:
+            context.close()

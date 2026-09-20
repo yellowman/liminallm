@@ -486,19 +486,32 @@ of the rendered tree on each tab, counting the enclosures actually painted:
 a non-zero radius together with either a visible border or a fill differing
 from the parent.
 
-**One content enclosure per tab, and it is `.panel` every time** - seven in
-total, chat having none. **No card inside a card anywhere.** Two radius
-values across every content surface, 6px and 8px, both tokens.
+`.panel` is the only enclosure a screen draws for itself, once per tab,
+seven in total with chat having none. Two radius values across every content
+surface, 6px and 8px, both tokens.
 
-The probe carries a positive control, because every reading here is a
-negative one: it builds a known enclosure inside the active panel and
-requires the census to report it, which took the count from 1 to 2 and back
-to 1 on removal. Without that, "the app draws no cards" and "the probe
-cannot see cards" are the same output.
+**Three cards sit inside that card**, all of them in a detail pane:
+`.schema-viewer` under an artifact's schema and under a tool's inputs, and
+`.code-block` under a context's sources. Each is a 6px bordered box inside
+`.panel`'s 8px bordered box, on the same background, which part one asks to
+avoid unless the inner surface is a genuinely different interactive object.
+A block of literal text is not one. Mono type and the `h4` above it already
+separate the schema from the rows; the border is a second answer to a
+question already answered.
 
-One gap: chat bubbles are not in this census. The stub backend returned no
-assistant turn, so the screen whose main content is a rounded filled shape
-had nothing in it. The bubble radii are known from the stylesheet - 12px and
+An earlier version of this section said there were none, and that was a
+measurement error worth recording rather than quietly fixing. The census
+walked each tab with nothing selected, and a detail pane only renders after
+a selection - so the half of the app that shows a schema was never in the
+tree it walked. Its positive control was real but answered a different
+question: it proved the probe could see an enclosure, not that the probe was
+looking at the screens that have them. Selecting an item on each tab first,
+using the selectors the capture script already keeps for this reason, found
+all three.
+
+One gap remains: chat bubbles. The stub backend returned no assistant turn,
+so the screen whose main content is a rounded filled shape had nothing in
+it. The bubble radii are known from the stylesheet - 12px and
 `16px 16px 4px 16px` - but whether chat nests enclosures at depth is not
 measured.
 
