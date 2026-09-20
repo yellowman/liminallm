@@ -350,7 +350,6 @@ token, not the call site.
 | `--ctl-h-sm` | 28px | The compact tier, including the settings form |
 | `--icon-hit` | 28px | An icon button's target |
 | `--icon-glyph` | 18px | The glyph inside it |
-| `--chip-h` | 20px | A chip |
 | `--radius` / `--radius-sm` | 8px / 6px | Surface and control |
 | `--topbar-h` | 48px | The workspace bar, which is sticky |
 | `--accent` | green | State, in this project |
@@ -369,7 +368,6 @@ any `var(--name)` without a fallback that nothing defines.
 |---|---|
 | `.row` | The one flat list primitive, with `.row-icon`, `.row-name`, `.row-meta`, `.row-actions` |
 | `.factline`, `.fact-dot` | A fact line, and a status dot |
-| `.chip` | An enclosure that is part of the behaviour. Defined and not yet called - see part three |
 | `.figures` | Numbers without tiles |
 | `.detail-row`, `.detail-label` | A label and its value, divided by a hairline |
 | `.section-band`, `.section-icon`, `.section-description` | A major section's landmark |
@@ -592,14 +590,23 @@ them.
 | `bar-primary` on "New thread" | **Defined nowhere.** The one primary the chat view declares renders as a bordered secondary, so Chat has no primary at all. |
 | `.table tr.clickable.selected` | **Never applied.** No code sets the class. The patch list, where clicking opens a detail panel, has no selection state. |
 | `.patch-status.pending` | **Missing.** `admin-tab.js:396` computes `pending`; no rule matches, so it falls to neutral grey where part one assigns amber. |
-| `.chip` | **No caller.** The sanctioned chip vocabulary is unused, while four ad-hoc enclosures exist beside it. |
 | `.bar-actions` at 32px | **Dead for buttons, live for anchors** - a tier part one does not have. |
 | `.table th` 13px | **Dead.** A later rule at equal specificity sets 11.5px. |
 
-`.chip` also passes `tests/test_css_hygiene.py`, which should have reported
-it. That check strips comments from the stylesheet but not from the scripts,
-so the word "chip" inside a code comment counts as markup that can produce
-the class. The guard has a hole.
+`.chip` and the hole that hid it are both closed. The orphan-class guard
+read every word of every script including its comments, so a class counted as
+producible if anyone had written its name in prose - and `common.js` discusses
+citation chips. Comments no longer count. Measured before the change and
+after: across the 257 classes the stylesheet defines it moves exactly one,
+`chip`, from live to orphaned, and that one had no caller. The rules and the
+`--chip-h` token that only they read are gone, and a control now feeds the
+check a name that appears in a comment and nowhere else and requires it to
+stay orphaned.
+
+The live chip vocabulary is `attachment-chip`, `tool-chip`, `chip-name` and
+`chip-kind`. `attachment-chip` is one of the four true pills, sized by
+padding rather than by a height token, so part one's 20-22px chip tier has no
+expression here at all.
 
 ## Vocabulary that does not exist as specified
 
