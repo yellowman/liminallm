@@ -987,6 +987,62 @@ class TestTheRealPumpCanStillStopABlockedProvider:
         def close(self):
             self.closed = True
 
+    class _CleanAbortBackend:
+        """A cancellable backend whose abort ends iteration normally.
+
+        Several SDK streams surface cancellation this way rather than by
+        raising. StreamPump must still classify the stop as interrupted:
+        the stop request, not the iterator's spelling of termination, owns
+        that verdict.
+        """
+
+        def __init__(self):
+            self._released = threading.Event()
+            self._sent = False
+            self.aborted = False
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if not self._sent:
+                self._sent = True
+                return {"event": "token", "data": "400 hours"}
+            self._released.wait(timeout=10)
+            if self.aborted:
+                raise StopIteration
+            raise StopIteration
+
+        @property
+        def armed(self):
+            return True
+
+        def abort(self):
+            self.aborted = True
+            self._released.set()
+
+        def close(self):
+            self.closed = True
+
+    @pytest.mark.asyncio
+    async def test_a_clean_eof_after_stop_is_still_interrupted(self):
+        backend = self._CleanAbortBackend()
+        wrapper = ScrubbedTokenStream(backend, NONCE)
+        pump = StreamPump(lambda: wrapper, label="citation-clean-abort").start()
+
+        events = pump.events()
+        first = await asyncio.wait_for(events.__anext__(), timeout=5)
+        assert first == {"event": "token", "data": "400 hours"}
+
+        assert await asyncio.wait_for(pump.wait_dead(2.0), timeout=5)
+        assert backend.aborted
+        assert backend.closed
+        assert pump.interrupted, (
+            "abort ended with StopIteration and was mistaken for natural "
+            "completion"
+        )
+
     @pytest.mark.asyncio
     async def test_stopping_the_pump_reaches_the_backend_through_the_wrapper(self):
         backend = self._BlockingBackend()
