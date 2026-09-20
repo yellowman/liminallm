@@ -61,6 +61,7 @@ from liminallm.service.citations import (
     MAX_CITATION_MARKER_BODY,
     reader_positions,
     strip_citation_positions,
+    strip_citations,
 )
 
 #: The keyword a bracketed marker is written with, between `[` and the handle.
@@ -573,9 +574,16 @@ class CanonicalCitationStream:
     bracketed prose and unclosed `[cite:` text are left as written.
     """
 
-    def __init__(self, nonce: str, *, scrub_namespace: bool = True) -> None:
+    def __init__(
+        self,
+        nonce: str,
+        *,
+        scrub_namespace: bool = True,
+        track_origins: bool = True,
+    ) -> None:
         self.nonce = nonce
         self._scrub_namespace = scrub_namespace
+        self._track_origins = track_origins
         self._alphabet = _Alphabet(nonce)
         self._failure = self._alphabet.failure()
         self._canonical: List[str] = []
@@ -723,8 +731,14 @@ class CanonicalCitationStream:
         tail = "".join(fresh)
         if self._scrub_namespace:
             public, origins = reader_positions(self.canonical, self.nonce)
-        else:
+        elif self._track_origins:
             public, origins = strip_citation_positions(self.canonical)
+        else:
+            # Empty citation tables cannot project an offset, so ordinary
+            # broad-only streams need the finished-string equality oracle but
+            # not one integer per surviving character.
+            public = strip_citations(self.canonical)
+            origins = []
         self._finished = True
         released = self.released
         if released != public:
@@ -819,7 +833,11 @@ class ScrubbedTokenStream:
     ) -> None:
         self._events = iter(events)
         self.reader = CanonicalCitationStream(
-            nonce, scrub_namespace=scrub_namespace
+            nonce,
+            scrub_namespace=scrub_namespace,
+            # No issued namespace means no valid citation can exist, so there
+            # is no downstream consumer for an origin map.
+            track_origins=scrub_namespace,
         )
         self._limit = max_canonical_chars
         self._pending: List[Dict[str, Any]] = []
