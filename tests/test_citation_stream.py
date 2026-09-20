@@ -538,6 +538,37 @@ class TestReaderCleanupWithoutAnIssuedNamespace:
         assert events[-1]["event"] == "message_done"
         assert events[-1]["data"]["content"] == "provider-final-differs"
 
+    def test_a_terminal_error_releases_the_now_settled_suffix(self):
+        """A failed stream keeps the exact partial bytes already produced.
+
+        The broad reader has to hold trailing spaces and an unclosed marker
+        prefix while more text may arrive. Once an error terminates the
+        stream, those bytes can no longer become a closed citation marker and
+        must be released before the error. The stream remains non-authoritative.
+        """
+        events = iter([
+            {"event": "token", "data": "PARTIAL "},
+            {"event": "error", "data": {"message": "backend died"}},
+        ])
+        stream = ScrubbedTokenStream(
+            events,
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+
+        got = list(stream)
+        public = "".join(
+            str(event.get("data") or "")
+            for event in got
+            if event.get("event") == "token"
+        )
+        assert public == "PARTIAL "
+        assert got[-1]["event"] == "error"
+        assert stream.reader.intact() is False
+
+
     def test_broad_only_cleanup_preserves_message_done_only_answers(self):
         """Some backends report the whole answer only at completion."""
         reported = "Alpha [cite:,] Beta."
