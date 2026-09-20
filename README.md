@@ -49,7 +49,7 @@ note opens it for editing, and sweep and graph operate across the whole set.
 pane lists them and the workspace shows the selected one. a conversation can
 be pointed at one from the chat screen's menu.
 
-![Contexts screen with a context list in the pane and the selected context's details and sources in the workspace.](docs/screenshots/04-contexts.png)
+![Contexts screen with a context list in the pane. The workspace holds four titled bands: create a context, its details, its sources, and a form for adding another.](docs/screenshots/04-contexts.png)
 
 **files.** uploads are attached to a context, or kept private when no context
 is given. the same screen browses everything already uploaded.
@@ -60,13 +60,13 @@ is given. the same screen browses everything already uploaded.
 the pane filters them by type and visibility; the workspace shows the
 selected artifact and its version history.
 
-![Artifacts screen with type and visibility filters above an artifact list in the pane, and the selected artifact's details and version history in the workspace.](docs/screenshots/06-artifacts.png)
+![Artifacts screen with type and visibility filters above an artifact list in the pane. The workspace holds two titled bands, artifact details and version history, with the schema's flat fields as label-and-value rows.](docs/screenshots/06-artifacts.png)
 
 **tools.** the pane lists the registered tool specifications a workflow can
 call, and the workflows themselves. the workspace shows the selected one and
 invokes it.
 
-![Tools screen with tool and workflow lists in the pane and the selected tool's details and invoke form in the workspace.](docs/screenshots/07-tools.png)
+![Tools screen with tool and workflow lists in the pane. The workspace holds three titled bands: tool details, invoke tool, and workflow details.](docs/screenshots/07-tools.png)
 
 **insights.** preference events are summarized here, so you can see what your
 feedback has shaped and which adapters it reached.
