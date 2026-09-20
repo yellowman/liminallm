@@ -29,6 +29,7 @@ import pytest
 from liminallm.storage.errors import AuthStateLockTimeout
 
 PASSWORD = "TestPassword123!"
+NEW_PASSWORD = "Another-1234!"
 
 
 async def _held_by_someone_else(store, user_id):
@@ -141,6 +142,54 @@ class TestTheWaitIsBounded:
         assert await _attempt(store, user["id"], deadline=10) == "acquired"
 
 
+class TestAResetThatCouldNotGetTheLock:
+    @pytest.mark.asyncio
+    async def test_the_same_token_still_works_after_the_holder_releases(
+        self, runtime, user, monkeypatch
+    ):
+        """Observation chooses the user's lock; only consumption authorizes.
+
+        SPEC §12.1 permits observing a one-time token and says explicitly that
+        observation grants nothing. If lock acquisition times out before the
+        consuming read, the token must therefore still be live. This is the
+        regression Bugbot found in the first bounded-lock patch: it consumed
+        the token first, returned a transient failure, and made the retry
+        impossible.
+        """
+        account = runtime.store.get_user(user["id"])
+        assert account is not None
+        token = await runtime.auth.initiate_password_reset(account)
+        assert token
+
+        store = runtime.store
+        monkeypatch.setattr(store, "_AUTH_STATE_LOCK_TIMEOUT_SECONDS", 0.25)
+        holder, release = await _held_by_someone_else(store, user["id"])
+        try:
+            with pytest.raises(AuthStateLockTimeout):
+                await asyncio.wait_for(
+                    runtime.auth.complete_password_reset_with_revocation(
+                        token, NEW_PASSWORD
+                    ),
+                    timeout=3,
+                )
+        finally:
+            release.set()
+            await holder
+
+        completed = await asyncio.wait_for(
+            runtime.auth.complete_password_reset_with_revocation(
+                token, NEW_PASSWORD
+            ),
+            timeout=5,
+        )
+        assert completed == (True, True), (
+            "the timeout spent the one-time token even though no reset action "
+            f"was authorized: {completed}"
+        )
+        assert runtime.auth.verify_password(user["id"], NEW_PASSWORD)
+        assert not runtime.auth.verify_password(user["id"], PASSWORD)
+
+
 class TestTheUncontendedPathIsUnchanged:
     """Controls. A change that always timed out, or always refused, would
     satisfy the class above and break every authentication in the product."""
@@ -188,12 +237,14 @@ class TestTheUncontendedPathIsUnchanged:
 
 
 class TestARefusalReachesTheCaller:
-    def test_the_timeout_is_served_as_a_retryable_failure(
+    def test_the_timeout_is_served_as_a_conflict(
         self, client, runtime, user, monkeypatch
     ):
-        """Handled centrally, because all six callers want the same answer
-        and one of them forgetting to catch it is how a request gets served
-        without the serialization it asked for."""
+        """Handled centrally, with the code/status pair SPEC §13.0 defines.
+
+        The request conflicts with another authentication-state operation.
+        It is not a made-up 503/server_error pairing, and the handler never
+        falls through to execute the protected mutation unlocked."""
         import contextlib
 
         @contextlib.asynccontextmanager
@@ -208,12 +259,12 @@ class TestARefusalReachesTheCaller:
         resp = client.post(
             "/v1/auth/password/change",
             headers=user["headers"],
-            json={"current_password": PASSWORD, "new_password": "Another-1234!"},
+            json={"current_password": PASSWORD, "new_password": NEW_PASSWORD},
         )
 
-        assert resp.status_code == 503, resp.text
+        assert resp.status_code == 409, resp.text
         body = resp.json()
-        assert (body.get("error") or {}).get("code") == "server_error", body
+        assert (body.get("error") or {}).get("code") == "conflict", body
 
     def test_the_password_was_not_changed_by_a_refused_request(
         self, client, runtime, user, monkeypatch
