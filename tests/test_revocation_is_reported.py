@@ -162,7 +162,8 @@ class TestWhenRevocationFails:
         )
 
         assert resp.status_code == 503, resp.text
-        assert resp.json()["error"]["code"] == "reset_incomplete"
+        assert resp.json()["error"]["code"] == "server_error"
+        assert "revoke existing sessions" in resp.json()["error"]["message"]
         assert runtime.auth.verify_password(account["user_id"], PASSWORD)
         assert not runtime.auth.verify_password(account["user_id"], NEW_PASSWORD)
         assert _alive(client, account["stolen"]), (
