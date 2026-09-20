@@ -977,6 +977,7 @@ class WorkflowStreamingMixin:
                 max_canonical_chars=(
                     MAX_CANONICAL_CHARS if invocation.citations else None
                 ),
+                verify_reported=bool(invocation.citations),
             )
             streamed["stream"] = filtered
             return filtered
@@ -1460,6 +1461,7 @@ class WorkflowStreamingMixin:
                         max_canonical_chars=(
                             MAX_CANONICAL_CHARS if invocation.citations else None
                         ),
+                        verify_reported=bool(invocation.citations),
                     )
                     streamed["stream"] = filtered
                     return filtered
