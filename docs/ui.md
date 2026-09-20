@@ -79,6 +79,10 @@ layout, styling, and client implementation patterns. The frontend source
 
 ## settings panel
 
+- fourteen sections under a sticky index: nine for every reader, and five
+  more (admin settings, users, adapters, storage objects, config patches)
+  that appear with the admin role, along with their index entries. Each
+  section is a `.setting-group` under a `.section-band`.
 - session information: user ID, role, tenant, truncated session ID, as
   hairline-divided `.detail-row` pairs rather than filled boxes.
 - local storage management: draft count, clear-drafts, export-drafts (JSON
@@ -143,6 +147,22 @@ layout, styling, and client implementation patterns. The frontend source
   a capsule), `.table`, `.code-block`, `.detail-row` with `.detail-label`
   (a label and its value, divided by a hairline), `.factline` (a
   dot-separated line of facts), `.chip`, `.figures`, `.icon-btn`.
+- long-page classes: `.section-band` is a section's header - a 16px line
+  glyph (`.section-icon`), a 13px semibold title, and a `.section-description`
+  that carries either what the section is for or how much is in it. It spans
+  its column and has no radius, because it marks a boundary rather than
+  holding anything. `.setting-group` is everything under one band.
+  `.settings-layout` puts a sticky `.settings-index` beside the sections
+  rather than above them; the index marks the section being read with the
+  rail's selection language, and `trackSections` in `common.js` keeps that
+  mark current. `.sticky-actions` pins a decision bar to the foot of a long
+  form. `.setting-editor` is the one enclosure this vocabulary still uses: a
+  form that opens in answer to a choice and ends in a decision.
 - utility classes: `.hidden`, `.flex-row`, `.pill-row`, `.divider`, `.mb-14`,
   `.monospace`.
+- the page scrolls as a document. `.topbar` and `.settings-index` are sticky
+  against it, so nothing between them and the viewport may set `overflow`:
+  that would make itself the scroll container those two resolve against, and
+  an unbounded scroll container never scrolls. `.main-content` had exactly
+  that and the index scrolled away with the page.
 - media queries at 1080px (hide sidebar) and 640px (single-column layout).

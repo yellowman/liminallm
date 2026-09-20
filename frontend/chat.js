@@ -627,6 +627,16 @@ const initTabs = () => {
       const tabId = btn.dataset.tab;
       showSection(tabId);
 
+      // Wired here rather than at start-up because the tab is
+      // `display: none` until it is opened, and an IntersectionObserver on a
+      // subtree with no boxes reports every section as off screen. Repeat
+      // calls are safe: `trackSections` disconnects the observer it replaces.
+      if (tabId === 'settings-tab') {
+        trackSections(document.getElementById('settings-index'), [
+          ...document.querySelectorAll('#settings-tab .setting-group'),
+        ]);
+      }
+
       // Lazy-load the data behind the section; login only preloads a subset.
       if (state.accessToken) {
         if (tabId === 'notes-tab') fetchNotes();

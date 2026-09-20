@@ -794,19 +794,38 @@ const renderField = (field) => {
 
 const groupId = (group) => `settings-group-${group.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`;
 
-// Seventeen groups is more than fits on a screen, so give them a jump list
-// rather than making an operator scroll to find one.
+// Seventeen groups is more than fits on a screen, so give them an index and
+// keep it beside the form. `trackSections` marks the one being read.
 const renderGroupNav = () => {
   const nav = document.getElementById('settings-nav');
   if (!nav) return;
   nav.textContent = '';
-  settingsFormEl.querySelectorAll('.setting-group').forEach((section) => {
+  const sections = [...settingsFormEl.querySelectorAll('.setting-group')];
+  sections.forEach((section) => {
     const link = document.createElement('a');
     link.href = `#${section.id}`;
-    link.textContent = section.querySelector('h4').textContent;
-    link.className = 'group-chip';
+    link.textContent = section.querySelector('.section-band h4').textContent;
     nav.appendChild(link);
   });
+  trackSections(nav, sections);
+};
+
+// The band above a group: what the group is called, and how much is in it.
+// A count is what an operator wants from a heading on a page this long -
+// more than a glyph would say, and the filter changes it.
+const renderGroupBand = (group, count, changed) => {
+  const band = document.createElement('div');
+  band.className = 'section-band';
+  const heading = document.createElement('h4');
+  heading.textContent = group;
+  band.appendChild(heading);
+  const description = document.createElement('span');
+  description.className = 'section-description';
+  description.textContent =
+    `${count} setting${count === 1 ? '' : 's'}` +
+    (changed ? `, ${changed} changed` : '');
+  band.appendChild(description);
+  return band;
 };
 
 const renderSettingsForm = () => {
@@ -817,28 +836,36 @@ const renderSettingsForm = () => {
 
   // One section per group, each a grid. Grouping is the point: rate limits
   // read as a block of related numbers, not eighteen unrelated rows.
-  let shown = 0;
-  let grid = null;
-  let lastGroup = null;
+  //
+  // Grouped before anything is built, because the band states how many
+  // settings a group holds and how many of them differ from their default.
+  // A streaming pass cannot write a count it has not finished counting.
+  const groups = [];
   settingsSchema.forEach((field) => {
     if (needle && !field.name.includes(needle) &&
         !field.description.toLowerCase().includes(needle)) return;
     if (changedOnly && !field.overridden && !settingsEdits.has(field.name)) return;
-    if (field.group !== lastGroup) {
-      const section = document.createElement('section');
-      section.className = 'setting-group';
-      section.id = groupId(field.group);
-      const heading = document.createElement('h4');
-      heading.textContent = field.group;
-      section.appendChild(heading);
-      grid = document.createElement('div');
-      grid.className = 'setting-grid';
-      section.appendChild(grid);
-      settingsFormEl.appendChild(section);
-      lastGroup = field.group;
+    if (!groups.length || groups[groups.length - 1].name !== field.group) {
+      groups.push({ name: field.group, fields: [] });
     }
-    grid.appendChild(renderField(field));
-    shown += 1;
+    groups[groups.length - 1].fields.push(field);
+  });
+
+  let shown = 0;
+  groups.forEach((group) => {
+    const section = document.createElement('section');
+    section.className = 'setting-group';
+    section.id = groupId(group.name);
+    const changed = group.fields.filter(
+      (field) => field.overridden || settingsEdits.has(field.name)
+    ).length;
+    section.appendChild(renderGroupBand(group.name, group.fields.length, changed));
+    const grid = document.createElement('div');
+    grid.className = 'setting-grid';
+    group.fields.forEach((field) => grid.appendChild(renderField(field)));
+    section.appendChild(grid);
+    settingsFormEl.appendChild(section);
+    shown += group.fields.length;
   });
 
   if (!shown) {

@@ -199,6 +199,62 @@ const randomIdempotencyKey = () => {
 }
 
 // --------------------------------------------------------------------------
+// Long pages
+// --------------------------------------------------------------------------
+
+//: How far down the viewport a section has to reach before it counts as the
+//: one being read. Near the top, because that is where a reader's attention
+//: is on a page they are scrolling through.
+const SECTION_MARK_OFFSET = 140;
+
+// Marks the index link for whichever section is being read. Shared by the
+// Settings tab and the admin console, which both run a page long enough that
+// "where am I" is a real question.
+//
+// Position is read from `getBoundingClientRect` rather than from the
+// observer's entries: an entry says a section crossed a boundary, which is
+// not the same as which section is topmost now. The observer is the trigger;
+// the rectangles are the answer. Both surfaces scroll inside an element
+// rather than the document, so the root stays the viewport - a section's
+// visual position is what is being asked about either way.
+const trackSections = (nav, sections) => {
+  if (!nav || !sections.length) return;
+  // A re-render builds a new nav and new sections; the observer watching the
+  // old ones would go on firing against elements no longer in the document.
+  nav._sectionObserver?.disconnect();
+  if (typeof IntersectionObserver !== 'function') return;
+
+  const links = new Map(
+    [...nav.querySelectorAll('a')].map((link) => [link.getAttribute('href'), link])
+  );
+
+  const mark = () => {
+    // A hidden section has no box, and its rect reads as zero - above every
+    // threshold. Counting those would mark whichever hidden section comes
+    // last in the document instead of what is on screen, which is what the
+    // admin block does to this page for every reader who is not an admin.
+    const visible = sections.filter((section) => section.getClientRects().length);
+    if (!visible.length) return;
+    let current = visible[0];
+    visible.forEach((section) => {
+      if (section.getBoundingClientRect().top <= SECTION_MARK_OFFSET) {
+        current = section;
+      }
+    });
+    links.forEach((link, href) => {
+      link.classList.toggle('current', href === `#${current.id}`);
+    });
+  };
+
+  const observer = new IntersectionObserver(mark, {
+    threshold: [0, 0.25, 0.5, 0.75, 1],
+  });
+  sections.forEach((section) => observer.observe(section));
+  nav._sectionObserver = observer;
+  mark();
+};
+
+// --------------------------------------------------------------------------
 // Requests
 // --------------------------------------------------------------------------
 

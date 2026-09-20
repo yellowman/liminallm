@@ -108,15 +108,19 @@
             </label>
           </div>
 
-          <nav id="settings-nav" class="settings-nav" aria-label="Setting groups"></nav>
-          <div id="settings-form"></div>
+          <div class="settings-layout">
+            <nav id="settings-nav" class="settings-index" aria-label="Setting groups"></nav>
+            <div>
+              <div id="settings-form"></div>
 
-          <div class="settings-actions">
-            <button class="primary" id="save-settings" disabled>Save settings</button>
-            <button class="minor" id="revert-settings" disabled>Discard changes</button>
-            <span id="settings-dirty-count" class="subtext"></span>
+              <div class="sticky-actions">
+                <button class="primary" id="save-settings" disabled>Save settings</button>
+                <button class="minor" id="revert-settings" disabled>Discard changes</button>
+                <span id="settings-dirty-count" class="subtext"></span>
+              </div>
+              <div id="settings-feedback" role="status" class="subtext"></div>
+            </div>
           </div>
-          <div id="settings-feedback" role="status" class="subtext"></div>
 
           <div class="divider"></div>
 

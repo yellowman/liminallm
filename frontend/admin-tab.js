@@ -81,11 +81,18 @@ const saveAdminSettings = async () => {
 };
 
 const renderAdminSettingsSection = () => {
+  const isAdmin = state.role === 'admin';
   const section = $('admin-settings-section');
   if (section) {
-    section.classList.toggle('hidden', state.role !== 'admin');
+    section.classList.toggle('hidden', !isAdmin);
   }
-  if (state.role === 'admin') {
+  // The index has an entry per section, so the admin sections' entries hide
+  // with the sections themselves. Leaving them would offer a reader four
+  // links that scroll nowhere.
+  document.querySelectorAll('#settings-index [data-admin-only]').forEach((link) => {
+    link.classList.toggle('hidden', !isAdmin);
+  });
+  if (isAdmin) {
     fetchAdminSettings();
     fetchAdminUsers();
     fetchAdminAdapters();
