@@ -241,6 +241,29 @@ const trackSections = (nav, sections) => {
         current = section;
       }
     });
+
+    // The foot of the page is the case an offset cannot express. The last
+    // sections are short, so the scroll runs out before their tops ever
+    // reach the line, and the mark stays on whichever section last crossed
+    // it - measured at the end of Settings, the index said "Users" while
+    // Config patches filled the screen. Once the page has stopped
+    // scrolling, the last section on screen is the one being read.
+    const doc = document.documentElement;
+    // Not redundant with the line below: a page short enough to fit is
+    // already at its end at rest, and marking its last section rather than
+    // its first would be wrong rather than merely unhelpful.
+    const scrollable = doc.scrollHeight > window.innerHeight + 2;
+    const atEnd = doc.scrollHeight - (window.scrollY + window.innerHeight) <= 2;
+    if (scrollable && atEnd) {
+      const onScreen = visible.filter((section) => {
+        const box = section.getBoundingClientRect();
+        // Both edges: a section scrolled entirely above the viewport also
+        // has a top below its bottom edge, and is not on screen.
+        return box.top < window.innerHeight && box.bottom > 0;
+      });
+      if (onScreen.length) current = onScreen[onScreen.length - 1];
+    }
+
     links.forEach((link, href) => {
       link.classList.toggle('current', href === `#${current.id}`);
     });

@@ -3524,8 +3524,6 @@ button.minor:hover {
   background: var(--panel-muted);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
-  /* Clears the index's own sticky offset when a jump link lands here. */
-  scroll-margin-top: 14px;
 }
 
 .section-band:first-child {
@@ -3566,10 +3564,15 @@ button.minor:hover {
 }
 
 /* Everything under one band, to the next band. Named so the index can find
-   its sections and a jump link has something to land on. */
+   its sections and a jump link has something to land on.
+
+   The scroll margin clears the sticky bar for the same reason the index's
+   offset does. Without it a jump scrolls the section to the top of the
+   viewport, which is behind the bar: measured at 34px of a 48px bar over
+   the band the jump exists to reveal. */
 .setting-group {
   margin: 0 0 22px;
-  scroll-margin-top: 14px;
+  scroll-margin-top: calc(var(--topbar-h) + 12px);
 }
 
 /* The index beside the sections, not above them. Above meant it scrolled
@@ -3581,21 +3584,18 @@ button.minor:hover {
   align-items: start;
 }
 
+/* `.topbar` is sticky at the top of the page, so anything else sticky has
+   to start below it or spend its first rows behind it. Both pages carrying
+   this pattern wear that same bar - scoping the offset to the workspace
+   left the admin console's index sitting at 12px under a 48px bar. */
 .settings-index {
   position: sticky;
-  top: 12px;
+  top: calc(var(--topbar-h) + 12px);
   display: flex;
   flex-direction: column;
   gap: 1px;
   max-height: calc(100vh - var(--topbar-h) - 40px);
   overflow-y: auto;
-}
-
-/* The workspace's bar is itself sticky at the top of the page, so an index
-   under it has to start below it or its first links sit behind the bar. The
-   admin console has no such bar and keeps the plain offset. */
-.app-shell.banded .settings-index {
-  top: calc(var(--topbar-h) + 12px);
 }
 
 /* The rail's grammar again, at the rail's scale: nothing at rest, a faint
