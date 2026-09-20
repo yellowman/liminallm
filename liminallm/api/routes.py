@@ -1117,26 +1117,43 @@ async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(
         runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
-    mfa_cfg = runtime.store.get_user_mfa_secret(principal.user_id)
-    if not mfa_cfg or not mfa_cfg.enabled:
-        raise http_error("validation_error", "MFA not enabled", status_code=400)
-    # Verify the code before disabling
-    if not runtime.auth._verify_totp(mfa_cfg.secret, body.code):
-        raise http_error("unauthorized", "invalid MFA code", status_code=401)
-    # Disable MFA by setting enabled=False
-    runtime.store.set_user_mfa_secret(principal.user_id, mfa_cfg.secret, enabled=False)
-
-    # SECURITY: Revoke all other sessions to force re-authentication.
+    # Second-factor proof, the MFA write and the revocation share one
+    # cross-replica order with login, credential rotation and session
+    # rotation - the same reason the password change below takes this lock.
     #
-    # Reported, not assumed. `auth_session` is the revocation mechanism -
-    # `_authenticate_access_token` reads the row and refuses the token when
-    # it is gone, and no token version stands behind it - so a failed delete
-    # leaves every other session working. This answered "disabled" either
-    # way, which tells somebody who disabled MFA because a session was stolen
-    # that the stolen one is gone when it is not.
-    revoked = await runtime.auth.revoke_all_user_sessions(
-        principal.user_id, except_session_id=principal.session_id
-    )
+    # `_maybe_rotate_session` creates a successor under this lock, after
+    # re-reading the predecessor to check it still exists. That re-read is
+    # the rotation side's whole defence, and a revocation running outside
+    # the lock walks past it: rotation reads session S and finds it live,
+    # this call deletes S and answers "revoked", rotation then publishes S'.
+    # Somebody who disabled MFA because a session was stolen is told the
+    # stolen session is gone while a descendant of it is live.
+    async with runtime.store.hold_user_auth_state(principal.user_id):
+        mfa_cfg = runtime.store.get_user_mfa_secret(principal.user_id)
+        if not mfa_cfg or not mfa_cfg.enabled:
+            raise http_error(
+                "validation_error", "MFA not enabled", status_code=400
+            )
+        # Verify the code before disabling
+        if not runtime.auth._verify_totp(mfa_cfg.secret, body.code):
+            raise http_error("unauthorized", "invalid MFA code", status_code=401)
+        # Disable MFA by setting enabled=False
+        runtime.store.set_user_mfa_secret(
+            principal.user_id, mfa_cfg.secret, enabled=False
+        )
+
+        # SECURITY: Revoke all other sessions to force re-authentication.
+        #
+        # Reported, not assumed. `auth_session` is the revocation mechanism -
+        # `_authenticate_access_token` reads the row and refuses the token
+        # when it is gone, and no token version stands behind it - so a
+        # failed delete leaves every other session working. This answered
+        # "disabled" either way, which tells somebody who disabled MFA
+        # because a session was stolen that the stolen one is gone when it
+        # is not.
+        revoked = await runtime.auth.revoke_all_user_sessions(
+            principal.user_id, except_session_id=principal.session_id
+        )
 
     return Envelope(
         status="ok",
