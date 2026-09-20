@@ -341,7 +341,7 @@ class PostgresStore:
     def _connect(self):
         held = self._auth_state_connection.get()
         if held is not None:
-            return self._reuse_auth_state_connection(held)
+            return self._reuse_auth_state_connection(held[0])
         attempt = 0
         last_exc: Exception | None = None
         while attempt < self._connect_max_retries:
@@ -3479,14 +3479,29 @@ class PostgresStore:
         not reserve one pool slot while each nested operation waits for
         another. Session advisory locks survive the per-operation commits.
         """
-        key = (self._USER_AUTH_STATE_LOCK, str(user_id))
-        # Deliberately bypass _connect here: this is the operation that creates
-        # the task-local reuse scope and therefore must start with a real pool
-        # checkout even if a caller accidentally nests a lock.
+        identity = str(user_id)
+        held = self._auth_state_connection.get()
+        if held is not None:
+            _conn, held_identity = held
+            if held_identity != identity:
+                raise RuntimeError(
+                    "cannot nest authentication-state locks for different users"
+                )
+            # pg_advisory_lock is session-reentrant, but acquiring it again on
+            # another pooled connection is not: that second session waits on
+            # the first forever. The task already owns exactly the lock this
+            # nested operation needs, so reuse it without incrementing the
+            # server-side lock count.
+            yield
+            return
+
+        key = (self._USER_AUTH_STATE_LOCK, identity)
+        # Deliberately use a real pool checkout here; _connect() becomes a
+        # same-connection view only after the task-local scope is installed.
         with self.pool.connection() as conn:
             conn.execute("SELECT pg_advisory_lock(%s, hashtext(%s))", key)
             conn.commit()
-            token = self._auth_state_connection.set(conn)
+            token = self._auth_state_connection.set((conn, identity))
             try:
                 yield
             finally:
