@@ -378,6 +378,26 @@ class TestTheBlockingReaderGetsTheSameCleanup:
         assert answer.citations == []
 
 
+    @pytest.mark.parametrize("offset", [-1, 999])
+    def test_reader_cleanup_does_not_repair_an_invalid_citation_offset(
+        self, offset
+    ):
+        """Out-of-range authority metadata stays out of range.
+
+        Mapping it with bisect would silently turn a bad negative or oversized
+        offset into 0 or len(content), making a later durability check accept
+        a citation it should refuse.
+        """
+        answer = replaced_answer(
+            "Alpha [cite:,].",
+            [],
+            [{"source_id": "src_1", "public_offset": offset}],
+        )
+        assert answer is not None
+        assert answer.content == "Alpha."
+        assert answer.citations[0]["public_offset"] == offset
+
+
 class TestTheMarkersCanBeTakenBackOut:
     """Until citations are rendered, a handle reaching a reader is an internal
     token in their chat. Stripping is what keeps the offer machinery dormant
