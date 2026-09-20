@@ -333,6 +333,54 @@ class TestTheNoteEditorSaysWhatStateItIsIn:
             context.close()
 
 
+    def test_the_question_names_the_note_that_will_be_deleted(
+        self, browser, server
+    ):
+        """The dialog must name the object the DELETE will destroy.
+
+        The confirmation read the live `#note-title` input while the request
+        used the persisted `notesState.currentId`. Type a new title without
+        saving and the two disagree: the reader is asked about the title on
+        their screen and the saved note is what goes. A confirmation that
+        names the wrong object is worse than none, because it tells the
+        reader they have checked.
+
+        The existing refusal test cannot see this. It clicks Delete without
+        ever touching the title, so the editor's identity and the persisted
+        identity happen to agree and the wrong collaborator is exercised
+        while the test passes.
+        """
+        context, page = self._with_a_note(browser, server)
+        try:
+            asked = {}
+
+            def on_dialog(dialog):
+                asked["message"] = dialog.message
+                dialog.dismiss()
+
+            page.on("dialog", on_dialog)
+
+            # The editor now holds a title that was never saved.
+            page.fill("#note-title", "Scratch draft")
+            page.wait_for_timeout(400)
+            assert page.eval_on_selector("#note-title", "el => el.value") == (
+                "Scratch draft"
+            )
+
+            page.click("#note-delete-btn")
+            page.wait_for_timeout(1000)
+
+            assert "message" in asked, "deleting asked nothing"
+            assert "A note to edit" in asked["message"], (
+                "the question named the unsaved title from the editor, but "
+                "the request deletes the saved note: "
+                f"{asked['message']!r}"
+            )
+            assert "Scratch draft" not in asked["message"], asked["message"]
+        finally:
+            context.close()
+
+
 class TestEveryControlWearsTheDesignLanguage:
     """The vault search field was the only control in the app that did not.
 
