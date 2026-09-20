@@ -72,8 +72,10 @@
       .map(
         (c) => `
         <a class="conversation-item share-dir-item" href="/share/${encodeURIComponent(c.id)}">
-          <div class="title">${escapeHtml(c.title)}</div>
-          <div class="meta">${c.updated_at ? new Date(c.updated_at).toLocaleDateString() : ''}</div>
+          <span class="row-main">
+            <span class="title">${escapeHtml(c.title)}</span>
+            <span class="meta">${c.updated_at ? new Date(c.updated_at).toLocaleDateString() : ''}</span>
+          </span>
         </a>`
       )
       .join('');

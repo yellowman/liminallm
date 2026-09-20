@@ -20,6 +20,7 @@ control that feeds it the defect and requires it to report.
 from __future__ import annotations
 
 import pathlib
+import re
 
 import pytest
 
@@ -231,3 +232,77 @@ class TestTheCheckSeesInsideAtRules:
             "}\n"
         )
         assert [name for name, _ in found] == ["__dead_desc__"]
+
+
+#: Class names no file in `frontend/` spells out, because they are built at
+#: runtime. `admin.js` writes `setting-row is-${field.type}`, so the type
+#: names only ever exist as a template. A text search cannot see them, and a
+#: check that deleted what it could not see would have taken live code - it
+#: nearly did.
+BUILT_AT_RUNTIME = frozenset({"is-bool", "is-text"})
+
+FRONTEND = STYLESHEET.parent
+
+
+def defined_class_names(css: str) -> set:
+    """Every class name the stylesheet styles, comments excluded.
+
+    Excluded because this file names retired classes in the comments that
+    record their retirement, and counting those as definitions reports every
+    one of them as an orphan.
+    """
+    body = re.sub(r"/\*.*?\*/", " ", css, flags=re.S)
+    return set(re.findall(r"\.([a-zA-Z][\w-]*)", body))
+
+
+def names_frontend_can_produce() -> set:
+    """Every word in the markup and scripts, which is deliberately coarse.
+
+    A precise reading of `class="..."` would miss a name assembled from
+    parts, and missing one here means deleting a rule that is in use. The
+    error this must not make is the destructive one.
+    """
+    words: set = set()
+    for path in sorted(FRONTEND.iterdir()):
+        if path.suffix in {".html", ".js"}:
+            words |= set(re.findall(r"[\w-]+", path.read_text(encoding="utf-8")))
+    return words
+
+
+class TestNoRuleStylesSomethingThatCannotAppear:
+    """The sibling of the dead-selector check above.
+
+    `.header-ctl` styled the context and workflow controls on the
+    conversation header. They moved behind the bar's menu and the rules
+    stayed, styling nothing, until a sweep went looking. Four more -
+    `.deflist`, `.hairline-table`, `.section-bar`, `.input-quiet` - were
+    added with the design foundation for a use that never arrived.
+    """
+
+    def test_every_class_the_stylesheet_styles_can_be_produced(self, stylesheet):
+        orphans = sorted(
+            defined_class_names(stylesheet)
+            - names_frontend_can_produce()
+            - BUILT_AT_RUNTIME
+        )
+        assert not orphans, (
+            "these classes are styled and nothing in frontend/ can produce "
+            "them, so the rules are dead weight: " + ", ".join(orphans)
+        )
+
+    def test_a_class_nothing_produces_is_reported(self):
+        """The control. Passing on a clean stylesheet is what a check that
+        reads nothing also does."""
+        orphans = (
+            defined_class_names(".ghost-town { color: red }")
+            - names_frontend_can_produce()
+            - BUILT_AT_RUNTIME
+        )
+        assert orphans == {"ghost-town"}
+
+    def test_a_name_only_a_comment_mentions_is_not_a_definition(self):
+        """Retirement comments name what they retired. Counting those would
+        report every retired class as an orphan for ever."""
+        assert defined_class_names(
+            "/* `.stat-card` was retired here. */\n.row { color: red }"
+        ) == {"row"}
