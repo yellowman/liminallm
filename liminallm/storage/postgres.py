@@ -3529,10 +3529,40 @@ class PostgresStore:
         state = None
         delay = 0.005
         while state is None:
-            state = await asyncio.to_thread(
-                self._try_acquire_user_auth_state_connection,
-                identity,
+            attempt = asyncio.create_task(
+                asyncio.to_thread(
+                    self._try_acquire_user_auth_state_connection,
+                    identity,
+                )
             )
+            try:
+                # Shield the worker task from caller cancellation. A cancelled
+                # await does not stop the underlying thread; without shielding,
+                # it can acquire the advisory lock after its result has become
+                # unreachable and leak both the lock and pool connection.
+                state = await asyncio.shield(attempt)
+            except asyncio.CancelledError:
+                def release_late_acquisition(done) -> None:
+                    try:
+                        acquired = done.result()
+                    except Exception:
+                        return
+                    if acquired is None:
+                        return
+                    late_cm, late_conn = acquired
+                    try:
+                        self._release_user_auth_state_connection(
+                            late_cm, late_conn, identity
+                        )
+                    except Exception as exc:  # pragma: no cover - cleanup path
+                        self.logger.error(
+                            "auth_state_late_lock_release_failed",
+                            user_id=identity,
+                            error=str(exc),
+                        )
+
+                attempt.add_done_callback(release_late_acquisition)
+                raise
             if state is None:
                 await asyncio.sleep(delay)
                 delay = min(0.05, delay * 2)
