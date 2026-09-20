@@ -866,11 +866,10 @@ class ScrubbedTokenStream:
         self._limit = max_canonical_chars
         self._verify_reported = verify_reported
         self._pending: List[Dict[str, Any]] = []
-        #: A provider exception/exhaustion whose final safe reader suffix had
-        #: to be emitted first. The next pull replays the original termination
+        #: A provider exception whose final safe reader suffix had to be
+        #: emitted first. The next pull replays the original exception
         #: exactly; the wrapper never converts failure into completion.
         self._terminal_error: Optional[Exception] = None
-        self._terminal_stop = False
         #: Set when the consumer explicitly aborts this stream. Cancellation
         #: is not provider failure or natural exhaustion: bytes still held
         #: because they might become citation syntax were never shown, and
@@ -918,20 +917,14 @@ class ScrubbedTokenStream:
                 return self._pending.pop(0)
             if self._terminal_error is not None:
                 raise self._terminal_error
-            if self._terminal_stop:
-                raise StopIteration
             try:
                 event = next(self._events)
             except StopIteration:
-                if self._aborted:
-                    # The caller walked away. Held bytes were never public and
-                    # stay that way; flushing them would leak a partial marker
-                    # during cancellation cleanup.
-                    raise
-                tail = self.reader.fail()
-                if tail:
-                    self._terminal_stop = True
-                    return {"event": "token", "data": tail}
+                # Exhaustion without message_done is not a completed answer
+                # and not an explicit provider failure. The reader's held
+                # suffix was never public, so it stays private. This is also
+                # the shape a cancellation can collapse into when an in-memory
+                # provider simply returns instead of raising from abort.
                 raise
             except Exception as exc:
                 if self._aborted:
