@@ -233,7 +233,26 @@ class TestTheMarkFollowsTheReaderToTheEnd:
         context, page = _signed_in_page(browser, server, admin=True)
         try:
             _open_settings(page)
-            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            # Stop just short of the end, let it settle, then take the last
+            # few pixels. That last move is the whole test: nothing's visible
+            # fraction changes across it, so it crosses no observer
+            # threshold, and a mark that only the observer can update stays
+            # on whichever section was right four pixels ago.
+            #
+            # One jump to the bottom does not test this. It crosses every
+            # threshold at once, so the observer's last callback happens to
+            # see the final position and the test passes whether or not the
+            # mark follows a scroll at all - which is what the first two
+            # versions of this test did, both of them green against the
+            # defect.
+            page.evaluate(
+                """() => window.scrollTo(
+                     0,
+                     document.documentElement.scrollHeight
+                       - window.innerHeight - 4)"""
+            )
+            page.wait_for_timeout(700)
+            page.evaluate("() => window.scrollBy(0, 4)")
             page.wait_for_timeout(700)
 
             state = page.evaluate(

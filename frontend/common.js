@@ -219,10 +219,10 @@ const SECTION_MARK_OFFSET = 140;
 // visual position is what is being asked about either way.
 const trackSections = (nav, sections) => {
   if (!nav || !sections.length) return;
-  // A re-render builds a new nav and new sections; the observer watching the
-  // old ones would go on firing against elements no longer in the document.
+  // A re-render builds a new nav and new sections; the watchers on the old
+  // ones would go on firing against elements no longer in the document.
   nav._sectionObserver?.disconnect();
-  if (typeof IntersectionObserver !== 'function') return;
+  if (nav._sectionScroll) window.removeEventListener('scroll', nav._sectionScroll);
 
   const links = new Map(
     [...nav.querySelectorAll('a')].map((link) => [link.getAttribute('href'), link])
@@ -269,11 +269,44 @@ const trackSections = (nav, sections) => {
     });
   };
 
-  const observer = new IntersectionObserver(mark, {
-    threshold: [0, 0.25, 0.5, 0.75, 1],
-  });
-  sections.forEach((section) => observer.observe(section));
-  nav._sectionObserver = observer;
+  /* Scrolling is what the mark follows, so scrolling is what it listens to.
+     An observer entry says a section crossed a threshold, and in the last
+     stretch of a page no section's visible fraction is changing any more -
+     the tail is margin and padding. Measured on Settings before this
+     listener existed: walking to the foot in steps left the mark on the
+     previous section at 60, 40, 24, 12, 6, 3 and 0 pixels from the end,
+     while the section it should have named filled the screen.
+
+     A single jump to the bottom hid that, because it crosses every
+     threshold at once and the observer's last callback happens to see the
+     final position. The test that covers this scrolls in steps for the same
+     reason.
+
+     Throttled to one frame: `mark` reads a rectangle per section, and a
+     scroll event can arrive more often than the page is painted. */
+  let queued = false;
+  const onScroll = () => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      mark();
+    });
+  };
+  window.addEventListener('scroll', onScroll, { passive: true });
+  nav._sectionScroll = onScroll;
+
+  // The observer stays for the moves scrolling does not cause: a section
+  // unhiding when the admin role arrives, or the form re-rendering under a
+  // filter. It is no longer the only thing that can update the mark, so a
+  // browser without it still tracks.
+  if (typeof IntersectionObserver === 'function') {
+    const observer = new IntersectionObserver(mark, {
+      threshold: [0, 0.25, 0.5, 0.75, 1],
+    });
+    sections.forEach((section) => observer.observe(section));
+    nav._sectionObserver = observer;
+  }
   mark();
 };
 
