@@ -58,6 +58,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from liminallm.service.citations import (
     MAX_CITATION_MARKER_BODY,
     reader_positions,
+    strip_citation_positions,
 )
 
 #: The keyword a bracketed marker is written with, between `[` and the handle.
@@ -570,8 +571,9 @@ class CanonicalCitationStream:
     bracketed prose and unclosed `[cite:` text are left as written.
     """
 
-    def __init__(self, nonce: str) -> None:
+    def __init__(self, nonce: str, *, scrub_namespace: bool = True) -> None:
         self.nonce = nonce
+        self._scrub_namespace = scrub_namespace
         self._alphabet = _Alphabet(nonce)
         self._failure = self._alphabet.failure()
         self._canonical: List[str] = []
@@ -585,7 +587,7 @@ class CanonicalCitationStream:
         #: The passes, top first. One is enough for an answer with nothing to
         #: remove; a pass is added when the one above it removes something,
         #: exactly as `_scrub_text` repeats only when a pass found a match.
-        self._passes: List[_Pass] = [_Pass(self)]
+        self._passes: List[_Pass] = [_Pass(self)] if scrub_namespace else []
         self._marker_stripper = _ClosedMarkerStripper(self)
         self._finished = False
         self._verdict: Optional[bool] = None
@@ -646,8 +648,14 @@ class CanonicalCitationStream:
         self._fresh = fresh
         try:
             self._work += len(chunk)
-            self._passes[0].queue.extend(chunk)
-            self._drive()
+            if self._scrub_namespace:
+                self._passes[0].queue.extend(chunk)
+                self._drive()
+            else:
+                # No citation handle was offered, so this invocation's random
+                # nonce is not model syntax and a coincidental spelling must
+                # survive. Broad reader cleanup is still unconditional.
+                self._marker_stripper.push(chunk)
         finally:
             self._fresh = None
         return "".join(fresh)
@@ -699,18 +707,22 @@ class CanonicalCitationStream:
         fresh: List[str] = []
         self._fresh = fresh
         try:
-            # Top down, over a list that grows while it is walked: closing a
-            # pass can settle a handle, which is a removal, which adds the
-            # pass below it. Indexed rather than iterated for exactly that.
-            index = 0
-            while index < len(self._passes):
-                self._passes[index].close()
-                index += 1
+            if self._scrub_namespace:
+                # Top down, over a list that grows while it is walked: closing
+                # a pass can settle a handle, which is a removal, which adds
+                # the pass below it. Indexed rather than iterated.
+                index = 0
+                while index < len(self._passes):
+                    self._passes[index].close()
+                    index += 1
             self._marker_stripper.finish()
         finally:
             self._fresh = None
         tail = "".join(fresh)
-        public, origins = reader_positions(self.canonical, self.nonce)
+        if self._scrub_namespace:
+            public, origins = reader_positions(self.canonical, self.nonce)
+        else:
+            public, origins = strip_citation_positions(self.canonical)
         self._finished = True
         released = self.released
         if released != public:
@@ -802,9 +814,12 @@ class ScrubbedTokenStream:
         nonce: str,
         *,
         max_canonical_chars: int = MAX_CANONICAL_CHARS,
+        scrub_namespace: bool = True,
     ) -> None:
         self._events = iter(events)
-        self.reader = CanonicalCitationStream(nonce)
+        self.reader = CanonicalCitationStream(
+            nonce, scrub_namespace=scrub_namespace
+        )
         self._limit = max_canonical_chars
         self._pending: List[Dict[str, Any]] = []
         #: Set when the provider's own final content did not match the tokens
