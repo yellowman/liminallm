@@ -755,3 +755,118 @@ class TestAnInheritedTableIsCheckedWhole:
         )
         with pytest.raises(ProvenanceError):
             extend_citation_table(registry, table, [])
+
+
+class TestAMarkerCarryingSeveralHandles:
+    """Gemini merges two offered handles into one marker.
+
+    The system's own convention is the opposite: `citation_offers` joins
+    several markers with a space, so two handles are meant to be written
+    `[cite:H1] [cite:H2]`. A model that writes `[cite:H1,H2]` instead was
+    producing a form nothing understood, and it failed twice over.
+
+    The parser looked the whole inner string up as one key, so neither
+    source resolved and both citations were dropped. Then the namespace
+    scrub, whose bracketed alternatives require a `]` straight after the
+    handle, missed the merged bracket but matched each handle *inside* it
+    as a bare nonce - deleting the content and leaving the punctuation.
+    What reached the reader was `[cite:,]`, with one comma per handle
+    beyond the first. That is where the marker in the screenshots came
+    from: it is not something a model wrote, it is the wreckage of
+    something it wrote.
+    """
+
+    def test_both_sources_resolve(self):
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        found = validate_citations(f"Both agree [cite:{first},{second}].", table)
+        assert [o.source_id for o in found] == ["src_1", "src_2"], found
+
+    def test_the_span_is_the_whole_marker_for_each(self):
+        """Two citations at one insertion point, which the payload allows:
+        the occurrence list is a list precisely so positions are not
+        collapsed, and here the position is shared rather than repeated."""
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        answer = f"Both agree [cite:{first},{second}]."
+        found = validate_citations(answer, table)
+        assert len(found) == 2
+        assert {(o.start, o.end) for o in found} == {
+            (answer.index("[cite:"), answer.index("].") + 1)
+        }
+
+    def test_spaces_after_the_comma_are_accepted(self):
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        found = validate_citations(f"Both [cite:{first}, {second}].", table)
+        assert [o.source_id for o in found] == ["src_1", "src_2"]
+
+    def test_the_scrub_still_leaves_the_wreckage_and_says_so(self):
+        """Half of this defect is deliberately not fixed here, and pinning
+        that is the point: a reader of this file should not have to run the
+        code to find out how far the repair went.
+
+        The namespace scrub removes each handle as a bare nonce and leaves
+        the punctuation, so `[cite:,]` still reaches the reader. Teaching it
+        to take the whole marker is one line, and it is the wrong line on its
+        own: `CanonicalCitationStream` implements the same language by hand,
+        over a character at a time, and `finish` raises when the two
+        disagree. Measured - with the scrub taught and the stream not, a
+        merged marker made the turn fail *and* still showed the wreckage.
+
+        The stream cannot simply be taught to match. Holding a handle past
+        the comma needs the held text not to be handed on, and an abandoned
+        run like `[cite:H1,xyz` then leaves the first handle on the tape with
+        nothing to remove it - a live nonce released to the reader, which is
+        the one thing this module exists to prevent.
+
+        No nonce leaks today: both handles are removed, and what is left is
+        punctuation. See `_namespace_pattern`.
+        """
+        from liminallm.service.citations import scrub_positions
+
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        public, _origins = scrub_positions(
+            f"Both agree [cite:{first},{second}].", table.nonce
+        )
+        assert public == "Both agree [cite:,].", repr(public)
+        assert table.nonce not in public, "a live handle reached the reader"
+
+    def test_three_handles(self):
+        from liminallm.service.citations import scrub_positions
+
+        _registry, _bindings, table = _turn("a.md", "b.md", "c.md")
+        handles = [table.handle_for(f"src_{n}") for n in (1, 2, 3)]
+        answer = "All three [cite:" + ",".join(handles) + "]."
+        assert [o.source_id for o in validate_citations(answer, table)] == [
+            "src_1",
+            "src_2",
+            "src_3",
+        ]
+        # One comma per handle beyond the first, which is how the marker in
+        # the screenshots could be read back as "this cited two sources".
+        public, _ = scrub_positions(answer, table.nonce)
+        assert public == "All three [cite:,,].", repr(public)
+        assert table.nonce not in public
+
+    def test_an_unresolvable_component_does_not_carry_the_others(self):
+        """A merged marker is not a licence to repair. Each component is
+        looked up on its own, and one that names nothing this turn ground on
+        is dropped exactly as it would be alone."""
+        _registry, _bindings, table = _turn("alpha.md")
+        first = table.handle_for("src_1")
+        found = validate_citations(f"Mixed [cite:{first},{NONCE}-9].", table)
+        assert [o.source_id for o in found] == ["src_1"], found
+
+    def test_a_single_handle_is_unchanged(self):
+        """The control. If this stopped working the tests above would still
+        pass while the ordinary path was broken."""
+        _registry, _bindings, table = _turn("alpha.md")
+        handle = table.handle_for("src_1")
+        found = validate_citations(f"One [cite:{handle}].", table)
+        assert [o.source_id for o in found] == ["src_1"]
