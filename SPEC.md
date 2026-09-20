@@ -237,12 +237,17 @@ trail.
   Storage enforces this: a segment whose coordinates are not positions in
   the content is dropped, since a span is what several segment types are
   for and one that indexes nothing is a record of nothing.
-- a citation segment is an anchor rather than a span: the model's marker is
-  removed from `content` before it is stored, so what survives is the
-  position it was written at and `start == end`. A citation on an assistant
-  message is produced only by validating the model's own markers against the
-  handles that turn issued (§17); a citation segment arriving from anywhere
-  else is dropped rather than stored.
+- a citation segment is an anchor rather than a span: citation marker syntax
+  is never reader content. Every **closed** bounded `[cite:...]` token is
+  removed before it is streamed to a reader or stored, whether it resolves or
+  is malformed/stale; an unclosed `[cite:` remains ordinary prose because
+  there is no safe closing boundary to remove. Validation decides only whether
+  a removed marker leaves an anchor: a valid model marker becomes the position
+  it was written at with `start == end`; a marker that does not validate
+  leaves no segment. A citation on an assistant message is produced only by
+  validating the model's own markers against the handles that turn issued
+  (§17); a citation segment arriving from anywhere else is dropped rather
+  than stored.
 - a citation's `source_id`, `locator` and `meta` are public: `content_struct`
   is an API field, so what is stored is what a client may read. A source's
   internal identity is published only where it names something the reader

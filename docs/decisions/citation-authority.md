@@ -92,33 +92,43 @@ Once an execution has issued a handle, that namespace is removed from
 everything that crosses to the worker or the client, for the rest of that
 execution.
 
-The rule is keyed on `invocation.citations` alone - on whether a handle was
-actually issued - and on nothing else:
+The **namespace** rule is keyed on `invocation.citations` alone - on whether a
+handle was actually issued - and on nothing else:
 
 - Not on whether the feature is enabled now. It can be turned off mid-turn
   (#213) and the handles remain in the model's context.
-- Not on the namespace existing. Every turn mints a nonce whether or not
-  anything is offered, so an execution that issued nothing is not filtered,
-  and an answer that happens to contain its unused nonce survives byte for
-  byte. Filtering it would be editing prose on the strength of a
-  coincidence.
+- Not on the nonce merely existing. Every turn mints one whether or not
+  anything is offered. If an execution issued nothing, its unused nonce is
+  not scrubbed and a coincidental spelling survives byte for byte. Removing
+  it would edit prose on the strength of information the model never saw.
 
-The blocking transport scrubs the whole serialized reply and asserts the
-result, deliberately unkillable by mutation: what that assertion guards is
-the next model-controlled field somebody adds, not today's.
+That is separate from the **reader** rule: every closed marker-shaped
+`[cite:...]` token is internal citation syntax and is removed before a
+reader sees or stores the answer, whether it resolves, is malformed, is stale,
+or came from a turn that issued no handles. The live `[cite:,]` leak is what
+made the distinction explicit. Worker/wire traffic keeps the narrower
+namespace rule; reader-facing text gets both rules.
+
+The blocking transport scrubs the whole serialized worker reply for namespace
+containment and asserts the result, deliberately unkillable by mutation: what
+that assertion guards is the next model-controlled field somebody adds, not
+today's. Reader cleanup happens later, at the answer boundary.
 
 ## the streamed answer and its oracle
 
-`scrub_positions` is the definition of what the public text is and where
-every character came from. A streamed answer has no finished string until it
-is over, so the reader performs the same transformation incrementally - it
-emits a prefix and holds a suffix, releasing only what can no longer change.
+`reader_positions` is the definition of what reader-visible text is and where
+every character came from. It composes the conditional namespace scrub with
+the unconditional closed-marker cleanup. A streamed answer has no finished
+string until it is over, so the reader performs the same transformation
+incrementally - it emits a prefix and holds a suffix, releasing only what can
+no longer change.
 
-The relationship between the two is fixed (#212):
+The relationship between the two is fixed (#212 and #252):
 
 - The incremental result is **never** authoritative for final coordinates.
-- `scrub_positions` is asked exactly once, at completion, for the finished
-  text and the origin map.
+- `reader_positions` is asked exactly once, at completion, for the finished
+  text and the origin map when a namespace was issued; broad-only streams use
+  the same closed-marker oracle without scrubbing the unused nonce.
 - What was released is compared to that answer as **equality, in both
   directions**. A reader that released text the scrub removes cannot take it
   back; a reader that released less than the scrub keeps would be completed

@@ -77,7 +77,15 @@ MIN_NONCE_BITS = 40
 #:
 #: Bounded, and stopping at the first `]` or newline, so an unclosed `[cite:`
 #: cannot swallow the rest of a sentence.
-CITATION_RE = re.compile(r"\[(?i:cite):([^\]\n]{0,64})\]")
+MAX_CITATION_MARKER_BODY = 64
+CITATION_RE = re.compile(
+    rf"\[(?i:cite):([^\]\n]{{0,{MAX_CITATION_MARKER_BODY}}})\]"
+)
+
+#: Reader-side cleanup includes the horizontal spacing immediately before a
+#: marker. Kept as one compiled expression so the finished-string helper and
+#: the incremental stream implement the same grammar.
+CITATION_STRIP_RE = re.compile(r"[ \t]*" + CITATION_RE.pattern)
 
 #: An empty table's mappings. Frozen like a built one's, so the default is not
 #: the one writable `CitationTable` in the system. Behind a factory because
@@ -567,6 +575,37 @@ class Answer(NamedTuple):
     citations: List[Dict[str, Any]]
 
 
+def reader_answer(
+    content: Any,
+    bindings: Optional[Sequence[Binding]],
+    citations: Optional[Sequence[Dict[str, Any]]],
+) -> Answer:
+    """Reader-clean content and the records whose coordinates index it.
+
+    Unlike `replaced_answer`, this always returns an Answer, including when
+    cleanup removes all text. Storage needs that shape: "[cite:,]" must become
+    the empty string rather than remain merely because an empty string is not
+    a workflow replacement.
+    """
+    text = str(content or "")
+    if not citations:
+        return Answer(strip_citations(text), list(bindings or []), [])
+
+    public, origins = strip_citation_positions(text)
+    moved: List[Dict[str, Any]] = []
+    for citation in citations:
+        item = dict(citation)
+        offset = item.get("public_offset")
+        if (
+            isinstance(offset, int)
+            and not isinstance(offset, bool)
+            and 0 <= offset <= len(text)
+        ):
+            item["public_offset"] = public_index(origins, offset)
+        moved.append(item)
+    return Answer(public, list(bindings or []), moved)
+
+
 def replaced_answer(
     content: Any,
     bindings: Optional[Sequence[Binding]],
@@ -594,7 +633,13 @@ def replaced_answer(
     """
     if not content:
         return None
-    return Answer(content, list(bindings or []), list(citations or []))
+
+    # Reader cleanup can turn marker-only model output into no answer at all.
+    # That is still "no replacement": returning an empty Answer here would
+    # replace the previous content and, worse, carry this node's bindings into
+    # the server-authored fallback sentence.
+    cleaned = reader_answer(content, bindings, citations)
+    return cleaned if cleaned.content else None
 
 
 #: Source kinds whose `locator` is a reference a reader can follow.
@@ -1016,6 +1061,52 @@ def scrub_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
     return _scrub_text(text, _namespace_pattern(nonce))
 
 
+def strip_citation_positions(text: str) -> Tuple[str, List[int]]:
+    """Broad reader cleanup, with origins in the string it was given.
+
+    This is `strip_citations` with its coordinate map made explicit. Every
+    closed marker-shaped token goes, resolved or not; an unclosed `[cite:`
+    stays literal. The map is what lets a blocking answer remove malformed
+    markers without leaving validated citation offsets indexing the old text.
+    """
+    kept: List[str] = []
+    kept_origins: List[int] = []
+    cursor = 0
+    found = False
+    for match in CITATION_STRIP_RE.finditer(text):
+        found = True
+        kept.append(text[cursor : match.start()])
+        kept_origins.extend(range(cursor, match.start()))
+        cursor = match.end()
+    if not found:
+        return text, list(range(len(text)))
+    kept.append(text[cursor:])
+    kept_origins.extend(range(cursor, len(text)))
+    return "".join(kept), kept_origins
+
+
+def reader_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
+    """The text a reader may see, and each surviving character's origin.
+
+    Reader cleanup is deliberately wider than the worker/wire scrub. First
+    this turn's namespace is removed with `scrub_positions`; then every
+    closed marker-shaped `[cite:...]` token is removed with the same grammar
+    as `strip_citations`, whether its handle resolves, is malformed, or
+    belongs to another turn.
+
+    Keeping the passes separate from `scrub_namespace` preserves that
+    narrower boundary: a worker asked to search for the literal
+    `[cite:OLDTURN-1]` must still receive what the model wrote, while a
+    reader should never see citation offer syntax.
+
+    The origin map is carried through both transformations so a validated
+    citation's public offset indexes the exact string the reader holds.
+    """
+    public, namespace_origins = scrub_positions(text, nonce)
+    reader, reader_origins = strip_citation_positions(public)
+    return reader, [namespace_origins[index] for index in reader_origins]
+
+
 def public_index(origins: Sequence[int], index: int) -> int:
     """Where position `index` of the original text landed after scrubbing.
 
@@ -1116,4 +1207,4 @@ def strip_citations(answer: str) -> str:
     closed up, so a sentence does not end with a gap where a handle used to
     be.
     """
-    return re.sub(r"[ \t]*" + CITATION_RE.pattern, "", answer or "")
+    return CITATION_STRIP_RE.sub("", answer or "")

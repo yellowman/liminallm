@@ -62,10 +62,16 @@ class NativeModel:
         else:
             calls = []
             # Answer with the first citation marker the prompt offered, as a
-            # model told to copy markers would.
+            # model told to copy markers would. The malformed script pins the
+            # accepted-answer fast path that bypasses ScrubbedTokenStream.
             prompt = "\n".join(str(m.get("content") or "") for m in messages)
             marker = re.search(r"\[cite:[^\]]+\]", prompt)
-            content = f"{ANSWER} {marker.group(0)}" if marker else ANSWER
+            if step == "malformed":
+                content = f"{ANSWER} [cite:,]"
+                if marker:
+                    content += f" {marker.group(0)}"
+            else:
+                content = f"{ANSWER} {marker.group(0)}" if marker else ANSWER
             output.append({"type": "message", "id": f"msg_{n}", "role": "assistant",
                            "content": [{"type": "output_text", "text": content}]})
         return {
@@ -162,6 +168,29 @@ class TestTheFinalAnswerRunsOnTheAcceptedState:
         assert context.continuation.strategy == OPENAI_RESPONSES_NATIVE_V1
         assert context.continuation.through_operation_seq == 1
         assert isinstance(context.transcript.entries[-1], ModelTurn)
+
+    def test_an_accepted_malformed_marker_is_cleaned_before_the_direct_token(
+        self, engine, store, monkeypatch
+    ):
+        """The native fast path emits ModelTurn.content without a new stream.
+
+        That content has only the narrow worker scrub. A malformed marker such
+        as the live `[cite:,]` defect therefore has to cross the shared reader
+        boundary before the direct token is yielded.
+        """
+        events, model, stream, _context = _run(
+            engine, store, monkeypatch, ["malformed"]
+        )
+
+        tokens = [e["data"] for e in events if e.get("event") == "token"]
+        done = [e for e in events if e.get("event") == "message_done"]
+        assert len(tokens) == 1
+        assert "[cite:,]" not in tokens[0]
+        assert "[cite:" not in tokens[0]
+        assert tokens[0] == ANSWER
+        assert done and done[-1]["data"]["content"] == ANSWER
+        assert stream.calls == [], "the accepted answer was regenerated"
+        assert len(model.calls) == 1
 
     def test_the_stream_consumes_the_accepted_state_and_only_the_tail(
         self, engine, store, monkeypatch

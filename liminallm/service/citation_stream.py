@@ -1,10 +1,10 @@
 """Taking a turn's citation namespace out of an answer as it is written.
 
-`scrub_positions` answers the question for a finished string: what crossed,
-and where every character came from. A streamed answer has no finished string
-until it is over, and the tokens have already reached the reader by then. So
-this is the same transformation performed incrementally, by a parent that
-holds the raw text and releases only what can no longer change.
+`reader_positions` answers the question for a finished string: what a reader
+may see, and where every surviving character came from. A streamed answer has
+no finished string until it is over, and the tokens have already reached the
+reader by then. So this is the same transformation performed incrementally,
+by a parent that holds raw text and releases only what can no longer change.
 
 The rule it exists to keep is that a marker never becomes observable. Emitting
 `[cite:K7Q2ABCD-1]` and cleaning it up at the end is not a boundary: once a
@@ -36,15 +36,19 @@ matched across a junction immediately found an occurrence overlapping the one
 the oracle takes, and released two characters the finished scrub does not
 contain.
 
-The transformation itself is unchanged. `scrub_positions` is still what
-defines it, still the only thing that produces the finished public text and
-the origin map, and `finish` asks it once and checks that what went out is
-what it says.
+The transformation has two deliberately different halves. The namespace
+scrub stays the narrow wire rule: this turn's nonce is removed, including its
+bare forms. The reader cleanup is wider and then removes every closed
+`[cite:...]` marker, including malformed and stale ones. `reader_positions`
+composes those rules for the finished string and origin map; `finish` asks it
+once and checks that what went out is exactly what it says.
 
-Whoever wires this owes it a ceiling anyway, because nothing else provides
-one: `MAX_GENERATION_TOKENS` is only ever subtracted from the context window
-to leave room for a reply, and no backend here sends a max-output parameter,
-so a reply's length is the provider's to choose.
+Citation-bearing streams keep the ceiling this reader historically supplied:
+`MAX_GENERATION_TOKENS` is only subtracted from the context window and no
+backend here sends a max-output parameter. Broad-only cleanup is also installed
+on ordinary uncited streams now, but passes no ceiling there - fixing internal
+syntax must not introduce a new reply-length policy on traffic that previously
+bypassed this wrapper.
 """
 
 from __future__ import annotations
@@ -53,7 +57,12 @@ import re
 from collections import deque
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-from liminallm.service.citations import scrub_positions
+from liminallm.service.citations import (
+    MAX_CITATION_MARKER_BODY,
+    reader_positions,
+    strip_citation_positions,
+    strip_citations,
+)
 
 #: The keyword a bracketed marker is written with, between `[` and the handle.
 _CITE = "[cite:"
@@ -447,6 +456,110 @@ class _Pass:
             self._reader._release(text)
 
 
+class _ClosedMarkerStripper:
+    """The reader-side `strip_citations` pass, incrementally.
+
+    The namespace automaton above is intentionally narrower: it protects the
+    turn's own handles on the wire. What a reader sees has a stronger cleanup
+    rule - every *closed* marker-shaped token goes, even `[cite:,]`, a stale
+    handle, or a case-variant keyword. An unclosed marker stays because there
+    is no safe boundary at which to delete the rest of a sentence.
+
+    This runs after the namespace passes. It holds only a possible marker and
+    the horizontal whitespace immediately before it. The marker body is
+    bounded by `MAX_CITATION_MARKER_BODY`, so a provider cannot make the hold
+    grow without limit. When the bound is exceeded the first `[` is settled
+    and the remainder is replayed, which lets a later marker inside the
+    overlong text still be recognized.
+    """
+
+    __slots__ = ("_reader", "_spaces", "_candidate")
+
+    def __init__(self, reader: "CanonicalCitationStream") -> None:
+        self._reader = reader
+        self._spaces: List[str] = []
+        self._candidate: Optional[List[str]] = None
+
+    def push(self, text: str) -> None:
+        queue: Deque[str] = deque(text)
+        while queue:
+            character = queue.popleft()
+            self._reader._work += 1
+
+            if self._candidate is None:
+                if self._reader._alphabet.is_space(character):
+                    self._spaces.append(character)
+                    continue
+                if self._reader._alphabet.cite_at(0, character):
+                    self._candidate = [character]
+                    continue
+                self._flush_spaces()
+                self._reader._release_public(character)
+                continue
+
+            candidate = self._candidate
+            if len(candidate) < len(_CITE):
+                if self._reader._alphabet.cite_at(len(candidate), character):
+                    candidate.append(character)
+                    continue
+                # A failed keyword prefix can contain no second `[`: every
+                # character after its first is fixed by "[cite:". So it is
+                # settled whole, and only the failing character needs another
+                # look in case *it* begins a marker.
+                self._flush_candidate()
+                queue.appendleft(character)
+                continue
+
+            body_len = len(candidate) - len(_CITE)
+            if character == "]":
+                # A complete closed marker. Drop its leading spaces too, the
+                # same rule `strip_citations` uses.
+                self._spaces.clear()
+                self._candidate = None
+                continue
+            if character == "\n":
+                # Newline ends the grammar without ending a marker. Everything
+                # held is literal prose, and the newline is reconsidered as
+                # ordinary text.
+                self._flush_candidate()
+                queue.appendleft(character)
+                continue
+            if body_len < MAX_CITATION_MARKER_BODY:
+                candidate.append(character)
+                continue
+
+            # This character would be body character 65, so the first `[`
+            # cannot start CITATION_RE. Settle that one character and replay
+            # the bounded remainder: a nested `[cite:` near the end may still
+            # become a real marker when future text arrives.
+            prefix = "".join(self._spaces) + candidate[0]
+            self._spaces.clear()
+            remainder = candidate[1:] + [character]
+            self._candidate = None
+            self._reader._release_public(prefix)
+            queue.extendleft(reversed(remainder))
+
+    def finish(self) -> None:
+        """No future character can close what remains."""
+        if self._candidate is not None:
+            self._flush_candidate()
+        else:
+            self._flush_spaces()
+
+    def _flush_spaces(self) -> None:
+        if self._spaces:
+            self._reader._release_public("".join(self._spaces))
+            self._spaces.clear()
+
+    def _flush_candidate(self) -> None:
+        candidate = self._candidate
+        assert candidate is not None
+        text = "".join(self._spaces) + "".join(candidate)
+        self._spaces.clear()
+        self._candidate = None
+        self._reader._release_public(text)
+
+
 class CanonicalCitationStream:
     """One streamed answer, in both representations at once.
 
@@ -454,20 +567,23 @@ class CanonicalCitationStream:
     never edited: it is what a citation is read out of, and the only text that
     can honestly say what the model wrote.
 
-    The public side is what has been released. `scrub_positions` remains the
-    definition of what that is - `finish` produces the finished text and the
-    origin map with it, and checks that what went out is exactly it - and the
-    passes above are how the same answer is reached one character at a time,
-    without rescanning what is already settled.
-
-    Not a general filter. It removes exactly this turn's namespace, in the
-    forms `scrub_positions` removes it, and leaves every other bracketed
-    thing - another turn's marker, prose about citations, an array index -
-    exactly as the model wrote it.
+    The public side is what has been released. `reader_positions` defines
+    that exact string and its origin map. The namespace passes above remove
+    this turn's handles; the bounded marker stripper then applies the broader
+    reader rule and removes every closed marker-shaped token. Ordinary
+    bracketed prose and unclosed `[cite:` text are left as written.
     """
 
-    def __init__(self, nonce: str) -> None:
+    def __init__(
+        self,
+        nonce: str,
+        *,
+        scrub_namespace: bool = True,
+        track_origins: bool = True,
+    ) -> None:
         self.nonce = nonce
+        self._scrub_namespace = scrub_namespace
+        self._track_origins = track_origins
         self._alphabet = _Alphabet(nonce)
         self._failure = self._alphabet.failure()
         self._canonical: List[str] = []
@@ -481,7 +597,8 @@ class CanonicalCitationStream:
         #: The passes, top first. One is enough for an answer with nothing to
         #: remove; a pass is added when the one above it removes something,
         #: exactly as `_scrub_text` repeats only when a pass found a match.
-        self._passes: List[_Pass] = [_Pass(self)]
+        self._passes: List[_Pass] = [_Pass(self)] if scrub_namespace else []
+        self._marker_stripper = _ClosedMarkerStripper(self)
         self._finished = False
         self._verdict: Optional[bool] = None
         #: Where a release lands while a call is collecting one. Set by
@@ -541,8 +658,14 @@ class CanonicalCitationStream:
         self._fresh = fresh
         try:
             self._work += len(chunk)
-            self._passes[0].queue.extend(chunk)
-            self._drive()
+            if self._scrub_namespace:
+                self._passes[0].queue.extend(chunk)
+                self._drive()
+            else:
+                # No citation handle was offered, so this invocation's random
+                # nonce is not model syntax and a coincidental spelling must
+                # survive. Broad reader cleanup is still unconditional.
+                self._marker_stripper.push(chunk)
         finally:
             self._fresh = None
         return "".join(fresh)
@@ -565,7 +688,12 @@ class CanonicalCitationStream:
             index += 1
 
     def _release(self, text: str) -> None:
-        """Text that has fallen out of the bottom pass."""
+        """Namespace-clean text entering the reader-side marker cleanup."""
+        if text:
+            self._marker_stripper.push(text)
+
+    def _release_public(self, text: str) -> None:
+        """Text that has cleared both citation cleanup stages."""
         if not text:
             return
         self._released_parts.append(text)
@@ -580,8 +708,8 @@ class CanonicalCitationStream:
         each pass settles the handle it was holding and hands the rest down.
 
         `origins[i]` is the index in the canonical text of the character at
-        `i` in the public text, the same map `scrub_positions` returns and
-        `citation_payload` reads. Both come from the whole-string scrub, which
+        `i` in the public text, the same map `reader_positions` returns and
+        `citation_payload` reads. Both come from the whole-string cleanup, which
         stays the authority on the finished answer: this is where the two are
         compared - as equality, in both directions - and a reader that
         disagreed with it has no answer anyone can vouch for.
@@ -589,17 +717,28 @@ class CanonicalCitationStream:
         fresh: List[str] = []
         self._fresh = fresh
         try:
-            # Top down, over a list that grows while it is walked: closing a
-            # pass can settle a handle, which is a removal, which adds the
-            # pass below it. Indexed rather than iterated for exactly that.
-            index = 0
-            while index < len(self._passes):
-                self._passes[index].close()
-                index += 1
+            if self._scrub_namespace:
+                # Top down, over a list that grows while it is walked: closing
+                # a pass can settle a handle, which is a removal, which adds
+                # the pass below it. Indexed rather than iterated.
+                index = 0
+                while index < len(self._passes):
+                    self._passes[index].close()
+                    index += 1
+            self._marker_stripper.finish()
         finally:
             self._fresh = None
         tail = "".join(fresh)
-        public, origins = scrub_positions(self.canonical, self.nonce)
+        if self._scrub_namespace:
+            public, origins = reader_positions(self.canonical, self.nonce)
+        elif self._track_origins:
+            public, origins = strip_citation_positions(self.canonical)
+        else:
+            # Empty citation tables cannot project an offset, so ordinary
+            # broad-only streams need the finished-string equality oracle but
+            # not one integer per surviving character.
+            public = strip_citations(self.canonical)
+            origins = []
         self._finished = True
         released = self.released
         if released != public:
@@ -622,6 +761,29 @@ class CanonicalCitationStream:
         self._verdict = True
         return tail, origins
 
+    def fail(self) -> str:
+        """Settle the reader-visible suffix of a stream that ended in error.
+
+        A backend error is terminal: no future character can turn trailing
+        spaces or an unclosed `[cite:` prefix into a closed marker. Those
+        bytes therefore become ordinary reader text at the instant of failure
+        and must be released before the error event. Dropping them would make
+        installing broad cleanup change an uncited partial answer byte-for-byte.
+
+        This deliberately does **not** make the stream authoritative. `finish`
+        is reused only as the finished-string oracle and to flush the held
+        suffix; the verdict is then forced false so no citation can be granted
+        from a failed/partial answer.
+        """
+        if self._finished:
+            # list(stream) necessarily probes once after message_done to see
+            # StopIteration. Completion already established the verdict;
+            # ordinary iterator exhaustion after it is not a new failure.
+            return ""
+        tail, _origins = self.finish()
+        self._verdict = False
+        return tail
+
     def intact(self) -> bool:
         """Whether this stream finished, and released what it should have.
 
@@ -639,12 +801,11 @@ class CanonicalCitationStream:
         return bool(self._verdict)
 
 
-#: How much canonical text one streamed answer may accumulate.
+#: Default ceiling for streams whose citation namespace is active.
 #:
-#: A ceiling is needed because nothing else supplies one. `MAX_GENERATION_TOKENS`
-#: is only ever subtracted from the context window to leave room for a reply,
-#: and no backend here sends a max-output parameter, so a provider decides how
-#: long an answer runs.
+#: This is the existing citation-stream bound, not a product-wide output cap.
+#: Broad-only cleanup of an uncited stream passes `None` and preserves the
+#: no-ceiling behavior that stream had before reader marker cleanup was added.
 #:
 #: Four characters per token against that same 4,096, which is the length the
 #: rest of the system already treats as a whole reply. Cutting it finer would
@@ -663,7 +824,7 @@ class CanonicalStreamTooLong(RuntimeError):
 
 
 class ScrubbedTokenStream:
-    """A provider's event iterator with this turn's namespace taken out.
+    """A provider stream cleaned for a reader as it is emitted.
 
     Wraps the iterator rather than the consumer, so the scrubbing happens on
     whichever thread pulls the provider - which is `StreamPump`'s own producer
@@ -690,12 +851,30 @@ class ScrubbedTokenStream:
         events: Any,
         nonce: str,
         *,
-        max_canonical_chars: int = MAX_CANONICAL_CHARS,
+        max_canonical_chars: Optional[int] = MAX_CANONICAL_CHARS,
+        scrub_namespace: bool = True,
+        verify_reported: bool = True,
     ) -> None:
         self._events = iter(events)
-        self.reader = CanonicalCitationStream(nonce)
+        self.reader = CanonicalCitationStream(
+            nonce,
+            scrub_namespace=scrub_namespace,
+            # No issued namespace means no valid citation can exist, so there
+            # is no downstream consumer for an origin map.
+            track_origins=scrub_namespace,
+        )
         self._limit = max_canonical_chars
+        self._verify_reported = verify_reported
         self._pending: List[Dict[str, Any]] = []
+        #: A provider exception whose final safe reader suffix had to be
+        #: emitted first. The next pull replays the original exception
+        #: exactly; the wrapper never converts failure into completion.
+        self._terminal_error: Optional[Exception] = None
+        #: Set when the consumer explicitly aborts this stream. Cancellation
+        #: is not provider failure or natural exhaustion: bytes still held
+        #: because they might become citation syntax were never shown, and
+        #: caller abandonment must not make them visible during teardown.
+        self._aborted = False
         #: Set when the provider's own final content did not match the tokens
         #: it sent. The completion is refused rather than believed, and the
         #: reader is left unfinished, which is what `intact` reports.
@@ -716,6 +895,11 @@ class ScrubbedTokenStream:
         return bool(getattr(self._events, "armed", False))
 
     def abort(self) -> None:
+        # StreamPump.stop() reaches this method before it interrupts the
+        # provider. Remember that the ensuing StopIteration/exception is
+        # teardown, not a natural/error terminal event whose held suffix may
+        # now be published.
+        self._aborted = True
         abort = getattr(self._events, "abort", None)
         if callable(abort):
             abort()
@@ -731,7 +915,28 @@ class ScrubbedTokenStream:
         while True:
             if self._pending:
                 return self._pending.pop(0)
-            event = next(self._events)
+            if self._terminal_error is not None:
+                raise self._terminal_error
+            try:
+                event = next(self._events)
+            except StopIteration:
+                # Exhaustion without message_done is not a completed answer
+                # and not an explicit provider failure. The reader's held
+                # suffix was never public, so it stays private. This is also
+                # the shape a cancellation can collapse into when an in-memory
+                # provider simply returns instead of raising from abort.
+                raise
+            except Exception as exc:
+                if self._aborted:
+                    # A backend abort commonly surfaces as an exception from
+                    # the read it interrupted. StreamPump already knows this
+                    # is cancellation and suppresses the provider error.
+                    raise
+                tail = self.reader.fail()
+                if tail:
+                    self._terminal_error = exc
+                    return {"event": "token", "data": tail}
+                raise
             if not isinstance(event, dict):
                 return event
             kind = event.get("event")
@@ -746,11 +951,31 @@ class ScrubbedTokenStream:
             if kind == "message_done":
                 self._pending.extend(self._complete(event))
                 continue
+            if kind == "error":
+                if self._aborted:
+                    # An abort-driven protocol error is cancellation cleanup,
+                    # not the provider choosing to end an answer. The pump
+                    # suppresses this event once its stop flag is set; the
+                    # wrapper still must not reinterpret privately held marker
+                    # syntax as reader-visible partial prose while producing
+                    # it.
+                    return event
+                # The provider has ended the answer. Anything the reader held
+                # only because a future character *might* have completed a
+                # marker is ordinary partial text now. Release that suffix
+                # before the error, but keep the stream non-authoritative.
+                tail = self.reader.fail()
+                if tail:
+                    self._pending.append(event)
+                    return {"event": "token", "data": tail}
             return event
 
     def _take(self, chunk: str) -> str:
         """One raw chunk in, whatever is safe to show out."""
-        if self.reader.canonical_length + len(chunk) > self._limit:
+        if (
+            self._limit is not None
+            and self.reader.canonical_length + len(chunk) > self._limit
+        ):
             # Past the ceiling. Not truncated: earlier public tokens have
             # already reached the client, so quietly stopping here would hand
             # them a shorter answer that looks finished. The provider is cut
@@ -765,10 +990,18 @@ class ScrubbedTokenStream:
     def _complete(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
         """The end of the stream, in public terms.
 
-        The provider's own `content` is checked against the tokens it sent
-        rather than trusted in place of them. They are two claims about one
-        answer, and a provider that contradicts itself has not given the
-        parent an answer it can read citations out of.
+        When citation authority is active, the provider's own `content` is
+        checked against the tokens it sent rather than trusted in place of
+        them. They are two claims about one answer, and disagreement means the
+        parent has no canonical answer it can safely read citations out of.
+
+        Broad-only cleanup on an uncited stream deliberately does not add that
+        failure mode: those streams bypassed this wrapper before marker cleanup
+        was installed. Their token text is filtered incrementally, while an
+        explicit provider-final `content` keeps its old precedence and is
+        filtered as a finished string. A mismatch alone does not newly fail the
+        turn, and a provider that reports its whole answer only at completion
+        still works.
 
         A contradiction becomes an error rather than a quieter completion.
         Refusing the citations is not enough on its own: `message_done` is
@@ -791,17 +1024,41 @@ class ScrubbedTokenStream:
         """
         data = dict(event.get("data") or {})
         reported = data.get("content")
-        if reported is not None and str(reported) != self.reader.canonical:
+        if (
+            self._verify_reported
+            and reported is not None
+            and str(reported) != self.reader.canonical
+        ):
             self.contradicted = True
-            return [{
+            # The contradiction is terminal just like a backend error. Settle
+            # any suffix the reader was holding *before* the error leaves:
+            # trailing whitespace or an unclosed marker prefix can no longer
+            # become part of a future closed marker. Returning the error first
+            # and relying on the iterator's later StopIteration probe emitted
+            # that suffix after the terminal event, which breaks consumers
+            # that correctly treat error as last.
+            tail = self.reader.fail()
+            error = {
                 "event": "error",
                 "data": {
                     "code": "server_error",
                     "message": "provider stream contradicted its own tokens",
                 },
-            }]
+            }
+            if tail:
+                return [{"event": "token", "data": tail}, error]
+            return [error]
         tail, self.origins = self.reader.finish()
-        data["content"] = self.reader.released
+        if self._verify_reported:
+            data["content"] = self.reader.released
+        elif reported is not None:
+            # Preserve the old uncited-stream precedence: message_done.content
+            # may be the provider's only complete answer, or may intentionally
+            # supersede the token accumulation. It still crosses the reader
+            # boundary, so clean marker syntax before forwarding it.
+            data["content"] = strip_citations(str(reported))
+        else:
+            data["content"] = self.reader.released
         done = {**event, "data": data}
         if tail:
             return [{"event": "token", "data": tail}, done]

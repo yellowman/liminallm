@@ -21,7 +21,11 @@ from liminallm.service.citation_stream import (
     CanonicalStreamTooLong,
     ScrubbedTokenStream,
 )
-from liminallm.service.citations import scrub_positions
+from liminallm.service.citations import (
+    public_index,
+    reader_positions,
+    strip_citation_positions,
+)
 from liminallm.service.node_attempt import StreamPump
 from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
 
@@ -64,6 +68,35 @@ class TestAMarkerNeverBecomesObservable:
         _reader, public, _origins = _read(NONCE, [f"400 hours {MARKER} exactly"])
         assert public == "400 hours exactly"
 
+    @pytest.mark.parametrize(
+        "marker",
+        [
+            "[cite:,]",
+            "[cite:]",
+            "[cite:OTHER-1]",
+            "[CITE:not-an-issued-handle]",
+            f"[cite:{NONCE[:4]}NOPE-1]",
+            f"[cite:{NONCE}-]",
+        ],
+    )
+    def test_a_closed_malformed_or_stale_marker_never_reaches_the_reader(
+        self, marker
+    ):
+        """Reader cleanup is wider than citation validation.
+
+        These all resolve to no source, which is exactly why leaving one in
+        the answer is visible internal syntax rather than a usable citation.
+        The live failure was `[cite:,]`; every split is included because a
+        provider may cut the marker anywhere.
+        """
+        text = f"Alpha {marker}. Beta."
+        expected, expected_origins = reader_positions(text, NONCE)
+        assert expected == "Alpha. Beta."
+        for chunks in _every_split(text):
+            _reader, public, origins = _read(NONCE, chunks)
+            assert public == expected, (marker, chunks, public)
+            assert origins == expected_origins, (marker, chunks)
+
     @pytest.mark.parametrize("text", [
         f"400 hours {MARKER} exactly",
         f"{MARKER} leads",
@@ -78,7 +111,7 @@ class TestAMarkerNeverBecomesObservable:
     def test_every_split_agrees_with_the_finished_scrub(self, text):
         """The split is the whole problem: a provider may cut anywhere, and
         the same text must scrub to the same thing however it arrives."""
-        expected, expected_origins = scrub_positions(text, NONCE)
+        expected, expected_origins = reader_positions(text, NONCE)
         for chunks in _every_split(text):
             _reader, public, origins = _read(NONCE, chunks)
             assert public == expected, (chunks, public, expected)
@@ -116,7 +149,7 @@ class TestAMarkerNeverBecomesObservable:
         not depend on a lottery.
         """
         text = "K7Q2K7Q2k7q2abcdABCD"
-        expected, _origins = scrub_positions(text, NONCE)
+        expected, _origins = reader_positions(text, NONCE)
         assert expected == "K7Q2", expected
         for chunks in [["K7Q2K7Q2k7q2ab", "cdABCD"], list(text),
                        ["K7Q2K7Q2k7q2", "abcd", "ABCD"]]:
@@ -171,7 +204,7 @@ class TestTheHoldAsksTheSameEngineTheScrubAsks:
         (S_NONCE, "K" + KELVIN.upper() + "7Q2" + LONG_S + "BCD"),
     ])
     def test_every_split_still_agrees_with_the_finished_scrub(self, nonce, text):
-        expected, expected_origins = scrub_positions(text, nonce)
+        expected, expected_origins = reader_positions(text, nonce)
         assert expected != text, "the fixture is not a namespace occurrence"
         for chunks in _every_split(text):
             _reader, public, origins = _read(nonce, chunks)
@@ -193,22 +226,21 @@ class TestTheHoldAsksTheSameEngineTheScrubAsks:
                 seen += reader.push(chunk)
             tail, _origins = reader.finish()
             seen += tail
-            assert seen == scrub_positions(text, nonce)[0], chunks
+            assert seen == reader_positions(text, nonce)[0], chunks
             assert reader.intact()
 
 
-class TestWhatIsNotThisTurnsNamespaceIsLeftAlone:
+class TestOrdinaryBracketedProseIsLeftAlone:
     @pytest.mark.parametrize("text", [
         "see [1] and [2]",
         "index a[b]c",
-        "[cite:OLDTURN-1] was another turn",
-        "[cite:] is not a handle",
         "brackets [ and ] alone",
         "a colon: and a dash - and 999",
-        f"[cite:{NONCE[:4]}NOPE-1] is not this turn",
+        "[cite:OLDTURN-1 is unclosed prose",
+        "[cite: is also unclosed prose",
     ])
     def test_it_survives_every_split(self, text):
-        expected, _origins = scrub_positions(text, NONCE)
+        expected, _origins = reader_positions(text, NONCE)
         assert expected == text, "the fixture is not testing what it says"
         for chunks in _every_split(text):
             _reader, public, _o = _read(NONCE, chunks)
@@ -221,7 +253,7 @@ class TestTheOriginMapIsTheOneCitationsAreReadWith:
         this map. A stream that produced its own would be a second
         implementation of the rule that decides where a citation points."""
         text = f"alpha {NONCE} beta {MARKER} gamma"
-        expected, expected_origins = scrub_positions(text, NONCE)
+        expected, expected_origins = reader_positions(text, NONCE)
         for chunks in _every_split(text):
             _reader, public, origins = _read(NONCE, chunks)
             assert public == expected
@@ -231,7 +263,7 @@ class TestTheOriginMapIsTheOneCitationsAreReadWith:
         """The second removal's offsets depend on the first having happened,
         which is the case a per-chunk map would get wrong."""
         text = f"one {NONCE} two {MARKER} three"
-        expected, expected_origins = scrub_positions(text, NONCE)
+        expected, expected_origins = reader_positions(text, NONCE)
         _reader, public, origins = _read(NONCE, list(text))
         assert public == expected == "one two three"
         assert origins == expected_origins
@@ -268,7 +300,7 @@ class TestTheStreamAgreesWithTheFinishedScrubOnAnythingAtAll:
             ))
             bounds = [0] + cuts + [len(text)]
             chunks = [text[a:b] for a, b in zip(bounds, bounds[1:]) if b > a]
-            expected, expected_origins = scrub_positions(text, NONCE)
+            expected, expected_origins = reader_positions(text, NONCE)
             reader, public, origins = _read(NONCE, chunks or [""])
             assert public == expected, (text, chunks)
             assert origins == expected_origins, (text, chunks)
@@ -279,7 +311,7 @@ class TestTheStreamAgreesWithTheFinishedScrubOnAnythingAtAll:
         rng = random.Random(451)
         for _ in range(300):
             text = "".join(rng.choice(self.PIECES) for _ in range(rng.randint(1, 6)))
-            expected, _origins = scrub_positions(text, NONCE)
+            expected, _origins = reader_positions(text, NONCE)
             _reader, public, _o = _read(NONCE, list(text) or [""])
             assert public == expected, text
 
@@ -357,7 +389,7 @@ class TestTheGuardsOnStateThatShouldNotHappen:
         # What a hold that never let go would have left behind.
         reader._released_parts = ["400 hours"]
         reader._released_len = len("400 hours")
-        assert scrub_positions(reader.canonical, NONCE)[0].startswith("400 hours")
+        assert reader_positions(reader.canonical, NONCE)[0].startswith("400 hours")
         with pytest.raises(ValueError):
             reader.finish()
         assert not reader.intact()
@@ -383,7 +415,7 @@ class TestTheGuardsOnStateThatShouldNotHappen:
         reader.push(f"400 hours {MARKER}")
         reader._released_parts = ["hours"]
         reader._released_len = len("hours")
-        assert "hours" in scrub_positions(reader.canonical, NONCE)[0]
+        assert "hours" in reader_positions(reader.canonical, NONCE)[0]
         with pytest.raises(ValueError):
             reader.finish()
         assert not reader.intact()
@@ -434,6 +466,49 @@ class TestTheFilterKeepsTheHandlesThePumpReachesFor:
         stream.abort()
         assert provider.aborted
 
+    def test_abort_does_not_flush_a_held_marker_fragment(self):
+        """Caller abandonment makes no new bytes public.
+
+        The reader has already withheld the marker-shaped suffix. An abort is
+        not a provider terminal event, so teardown must not reinterpret that
+        private hold as ordinary partial prose and emit it.
+        """
+        provider = self._Provider([])
+        stream = ScrubbedTokenStream(provider, NONCE)
+        assert stream.reader.push("answer [cite:") == "answer"
+        assert stream.reader.released == "answer"
+
+        stream.abort()
+
+        with pytest.raises(StopIteration):
+            next(stream)
+        assert stream.reader.released == "answer"
+        assert "[cite:" not in stream.reader.released
+        assert not stream.reader.intact()
+
+    def test_abort_error_event_does_not_flush_a_held_marker_fragment(self):
+        """An abort may surface in-band instead of as an exception/EOF.
+
+        StreamPump suppresses the event after stop, but the wrapper owns the
+        reader boundary and must not publish held syntax even when pulled
+        directly during teardown.
+        """
+        provider = iter([
+            {"event": "error", "data": {"message": "stream aborted"}},
+        ])
+        stream = ScrubbedTokenStream(provider, NONCE)
+        assert stream.reader.push("answer [cite:") == "answer"
+        assert stream.reader.released == "answer"
+
+        stream.abort()
+        event = next(stream)
+
+        assert event["event"] == "error"
+        assert stream.reader.released == "answer"
+        assert "[cite:" not in stream.reader.released
+        assert not stream.reader.intact()
+
+
     def test_armed_is_the_backends_answer(self):
         assert ScrubbedTokenStream(self._Provider([], armed=True), NONCE).armed
         assert not ScrubbedTokenStream(self._Provider([], armed=False), NONCE).armed
@@ -455,6 +530,188 @@ class TestTheFilterKeepsTheHandlesThePumpReachesFor:
         assert [event["data"] for event in stream] == ["plain"]
 
 
+class TestReaderCleanupWithoutAnIssuedNamespace:
+    def test_malformed_markers_are_removed_but_a_coincidental_nonce_survives(self):
+        """An empty citation table showed the model no namespace.
+
+        Reader marker cleanup is still unconditional, but removing this
+        invocation's random nonce would edit ordinary prose on information the
+        model never received.
+        """
+        text = f"Keep {NONCE} exactly. Remove [cite:,] please."
+        expected, expected_origins = strip_citation_positions(text)
+        reader = CanonicalCitationStream(NONCE, scrub_namespace=False)
+        emitted = []
+        for chunk in list(text):
+            emitted.append(reader.push(chunk))
+        tail, origins = reader.finish()
+        emitted.append(tail)
+
+        public = "".join(emitted)
+        assert public == expected == f"Keep {NONCE} exactly. Remove please."
+        assert origins == expected_origins
+        assert NONCE in public
+        assert "[cite:" not in public.lower()
+
+    def test_broad_only_cleanup_does_not_add_provider_contradiction_failure(self):
+        """Uncited streams bypassed the citation wrapper before this repair.
+
+        Marker cleanup may change their reader text, but merely disagreeing
+        with the provider's optional final content must not become a new
+        server_error on otherwise ordinary uncited traffic.
+        """
+        raw = "Alpha [cite:,] Beta."
+        stream = ScrubbedTokenStream(
+            TestWhatTheFilterLetsThrough._events(
+                raw, content="provider-final-differs"
+            ),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+        events = list(stream)
+        assert not any(event.get("event") == "error" for event in events)
+        tokens = "".join(
+            str(event.get("data") or "")
+            for event in events
+            if event.get("event") == "token"
+        )
+        assert tokens == "Alpha Beta."
+        assert events[-1]["event"] == "message_done"
+        assert events[-1]["data"]["content"] == "provider-final-differs"
+
+    def test_unfinished_exhaustion_does_not_flush_a_held_marker(self):
+        """No message_done means no completed answer.
+
+        Bare iterator exhaustion is neither an explicit provider failure nor a
+        success boundary. Text still held because it could be citation syntax
+        was never shown and must not become visible just because the provider
+        disappeared without a terminal event.
+        """
+        stream = ScrubbedTokenStream(
+            iter([
+                {"event": "token", "data": "answer"},
+                {"event": "token", "data": "[cite:"},
+            ]),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+        iterator = iter(stream)
+
+        assert next(iterator) == {"event": "token", "data": "answer"}
+        with pytest.raises(StopIteration):
+            next(iterator)
+        assert stream.reader.released == "answer"
+        assert "[cite:" not in stream.reader.released
+        assert not stream.reader.intact()
+
+    def test_a_terminal_error_releases_the_now_settled_suffix(self):
+        """A failed stream keeps the exact partial bytes already produced.
+
+        The broad reader has to hold trailing spaces and an unclosed marker
+        prefix while more text may arrive. Once an error terminates the
+        stream, those bytes can no longer become a closed citation marker and
+        must be released before the error. The stream remains non-authoritative.
+        """
+        events = iter([
+            {"event": "token", "data": "PARTIAL "},
+            {"event": "error", "data": {"message": "backend died"}},
+        ])
+        stream = ScrubbedTokenStream(
+            events,
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+
+        got = list(stream)
+        public = "".join(
+            str(event.get("data") or "")
+            for event in got
+            if event.get("event") == "token"
+        )
+        assert public == "PARTIAL "
+        assert got[-1]["event"] == "error"
+        assert stream.reader.intact() is False
+
+
+    def test_a_provider_exception_releases_the_suffix_then_re_raises(self):
+        """The production shape: the provider iterator raises, not an event."""
+        def events():
+            yield {"event": "token", "data": "PARTIAL "}
+            raise RuntimeError("backend died")
+
+        stream = ScrubbedTokenStream(
+            events(),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+        iterator = iter(stream)
+
+        first = next(iterator)
+        second = next(iterator)
+        assert first == {"event": "token", "data": "PARTIAL"}
+        assert second == {"event": "token", "data": " "}
+        with pytest.raises(RuntimeError, match="backend died"):
+            next(iterator)
+        assert stream.reader.intact() is False
+
+    def test_broad_only_cleanup_preserves_message_done_only_answers(self):
+        """Some backends report the whole answer only at completion."""
+        reported = "Alpha [cite:,] Beta."
+        stream = ScrubbedTokenStream(
+            TestWhatTheFilterLetsThrough._events(content=reported),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+        events = list(stream)
+        assert [event["event"] for event in events] == ["message_done"]
+        assert events[0]["data"]["content"] == "Alpha Beta."
+        assert stream.reader.intact()
+
+    def test_broad_only_cleanup_adds_no_reply_ceiling(self):
+        """Ordinary streams had no citation ceiling before this repair."""
+        text = ("ordinary prose " * 40) + "[cite:,] done"
+        stream = ScrubbedTokenStream(
+            TestWhatTheFilterLetsThrough._events(text, content=text),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+        )
+        events = list(stream)
+        done = [event for event in events if event.get("event") == "message_done"]
+        assert done
+        assert done[-1]["data"]["content"].endswith("done")
+        assert "[cite:" not in done[-1]["data"]["content"].lower()
+
+    def test_the_real_stream_wrapper_has_the_same_empty_table_mode(self):
+        text = f"{NONCE} [cite:,] remains prose around the marker"
+        stream = ScrubbedTokenStream(
+            TestWhatTheFilterLetsThrough._events(
+                text[:5], text[5:12], text[12:], content=text
+            ),
+            NONCE,
+            scrub_namespace=False,
+        )
+        events = list(stream)
+        tokens = "".join(
+            str(event.get("data") or "")
+            for event in events
+            if event.get("event") == "token"
+        )
+        assert tokens == f"{NONCE} remains prose around the marker"
+        assert events[-1]["data"]["content"] == tokens
+        assert stream.reader.intact()
+
+
 class TestWhatTheFilterLetsThrough:
     @staticmethod
     def _events(*chunks, content=None):
@@ -464,6 +721,37 @@ class TestWhatTheFilterLetsThrough:
             data["content"] = content
         out.append({"event": "message_done", "data": data})
         return out
+
+    def test_the_live_malformed_marker_never_leaves(self):
+        """The captured product defect: three live runs rendered `[cite:,]`.
+
+        Drive the same `ScrubbedTokenStream` the workflow hands to
+        `StreamPump`, with the malformed marker cut across provider tokens.
+        """
+        raw = ["Alpha ", "[ci", "te:,]", " Beta."]
+        stream = ScrubbedTokenStream(
+            self._events(*raw, content="".join(raw)), NONCE
+        )
+        events = list(stream)
+        tokens = "".join(
+            str(event.get("data") or "")
+            for event in events
+            if event.get("event") == "token"
+        )
+        assert tokens == "Alpha Beta."
+        assert "[cite:" not in tokens.lower()
+        assert events[-1]["data"]["content"] == tokens
+        assert stream.reader.intact()
+
+    def test_a_malformed_marker_before_a_real_citation_does_not_shift_it(self):
+        """Cleanup and citation coordinates describe the same public string."""
+        malformed = "[cite:,]"
+        text = f"Alpha {malformed}. Beta {MARKER}."
+        reader, public, origins = _read(NONCE, list(text))
+        assert public == "Alpha. Beta."
+        marker_start = text.index(MARKER)
+        assert public_index(origins, marker_start) == len("Alpha. Beta")
+        assert reader.intact()
 
     def test_a_marker_split_across_tokens_never_leaves(self):
         raw = ["400 hours ", "[ci", "te:" + NONCE, "-1]", " exactly"]
@@ -513,7 +801,7 @@ class TestWhatTheFilterLetsThrough:
         stream = ScrubbedTokenStream(self._events(*raw, content=text), NONCE)
         events = list(stream)
         tokens = "".join(e["data"] for e in events if e["event"] == "token")
-        assert tokens == scrub_positions(text, NONCE)[0] == "answer [cite:"
+        assert tokens == reader_positions(text, NONCE)[0] == "answer [cite:"
         assert NONCE not in tokens
         assert stream.reader.intact()
 
@@ -536,6 +824,32 @@ class TestWhatTheFilterLetsThrough:
         assert tokens == "400 hours"
         assert "800" not in json_dumps(events)
         assert NONCE not in json_dumps(events)
+        assert stream.contradicted
+        assert not stream.reader.intact()
+
+    def test_a_contradiction_releases_held_suffix_before_the_error(self):
+        """A terminal error is the end of the stream.
+
+        Trailing whitespace is held because a following citation marker could
+        still claim it. Once provider-final content contradicts the streamed
+        tokens there will be no following character, so the suffix is ordinary
+        partial text and must be emitted *before* the error. Emitting it on the
+        iterator's later StopIteration probe puts a token after a terminal
+        event, which clients are entitled to ignore.
+        """
+        stream = ScrubbedTokenStream(
+            self._events("answer", "   ", content="different"), NONCE
+        )
+        events = list(stream)
+
+        assert [event["event"] for event in events] == [
+            "token",
+            "token",
+            "error",
+        ], events
+        assert events[0]["data"] == "answer"
+        assert events[1]["data"] == "   "
+        assert events[2]["data"]["code"] == "server_error"
         assert stream.contradicted
         assert not stream.reader.intact()
 
@@ -672,6 +986,62 @@ class TestTheRealPumpCanStillStopABlockedProvider:
 
         def close(self):
             self.closed = True
+
+    class _CleanAbortBackend:
+        """A cancellable backend whose abort ends iteration normally.
+
+        Several SDK streams surface cancellation this way rather than by
+        raising. StreamPump must still classify the stop as interrupted:
+        the stop request, not the iterator's spelling of termination, owns
+        that verdict.
+        """
+
+        def __init__(self):
+            self._released = threading.Event()
+            self._sent = False
+            self.aborted = False
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if not self._sent:
+                self._sent = True
+                return {"event": "token", "data": "400 hours"}
+            self._released.wait(timeout=10)
+            if self.aborted:
+                raise StopIteration
+            raise StopIteration
+
+        @property
+        def armed(self):
+            return True
+
+        def abort(self):
+            self.aborted = True
+            self._released.set()
+
+        def close(self):
+            self.closed = True
+
+    @pytest.mark.asyncio
+    async def test_a_clean_eof_after_stop_is_still_interrupted(self):
+        backend = self._CleanAbortBackend()
+        wrapper = ScrubbedTokenStream(backend, NONCE)
+        pump = StreamPump(lambda: wrapper, label="citation-clean-abort").start()
+
+        events = pump.events()
+        first = await asyncio.wait_for(events.__anext__(), timeout=5)
+        assert first == {"event": "token", "data": "400 hours"}
+
+        assert await asyncio.wait_for(pump.wait_dead(2.0), timeout=5)
+        assert backend.aborted
+        assert backend.closed
+        assert pump.interrupted, (
+            "abort ended with StopIteration and was mistaken for natural "
+            "completion"
+        )
 
     @pytest.mark.asyncio
     async def test_stopping_the_pump_reaches_the_backend_through_the_wrapper(self):

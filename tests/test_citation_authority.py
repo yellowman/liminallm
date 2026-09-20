@@ -13,6 +13,7 @@ import asyncio
 import json
 import random
 import string
+import threading
 import uuid
 from copy import deepcopy
 from types import SimpleNamespace
@@ -2760,7 +2761,9 @@ class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:
     """
 
     @staticmethod
-    def _streaming(engine, monkeypatch, store, *, offers, contents=(ANSWER,)):
+    def _streaming(
+        engine, monkeypatch, store, *, offers, contents=(ANSWER,), answer=ANSWER
+    ):
         if offers is not None:
             engine.invocations.configure_citation_offers(offers)
         # No tools: the assembly falls through to the plain streamed node.
@@ -2788,8 +2791,8 @@ class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:
                              history=None, *, user_id=None, instruction=None):
             seen["snippets"] = list(context_snippets or [])
             seen["instruction"] = instruction
-            yield {"event": "token", "data": ANSWER}
-            yield {"event": "message_done", "data": {"content": ANSWER}}
+            yield {"event": "token", "data": answer}
+            yield {"event": "message_done", "data": {"content": answer}}
 
         monkeypatch.setattr(
             engine.llm, "generate_stream", _generate_stream, raising=False
@@ -2827,6 +2830,31 @@ class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:
         assert seen["snippets"] == [ANSWER]
         assert seen["instruction"] is None
         assert not any(inv.citations for inv in opened)
+
+    @pytest.mark.asyncio
+    async def test_gate_off_still_removes_closed_marker_syntax_from_the_reader(
+        self, store, monkeypatch
+    ):
+        """The live regression at the actual installation seam.
+
+        With citation offers off, the invocation table is empty. That used to
+        return the provider stream raw, which is exactly how `[cite:,]`
+        reached the UI. Broad reader cleanup must remain installed even though
+        namespace cleanup is correctly disabled.
+        """
+        engine = get_runtime().workflow
+        raw = "Alpha [cite:,] Beta."
+        user_id, _seen, opened = self._streaming(
+            engine, monkeypatch, store, offers=False, answer=raw
+        )
+
+        events = await self._run(engine, user_id)
+
+        assert not any(inv.citations for inv in opened)
+        blob = json.dumps(events)
+        assert "[cite:" not in blob.lower(), blob
+        assert "Alpha Beta." in blob, blob
+
 
     @pytest.mark.asyncio
     async def test_the_engine_as_it_ships_offers(self, store, monkeypatch):
@@ -3280,27 +3308,90 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
     async def test_a_stream_cancelled_mid_marker_shows_and_grants_nothing(
         self, store, monkeypatch
     ):
-        """The held fragment is never flushed by cleanup, and an unfinished
-        stream is authority for nothing.
+        """The actual cancel path makes no held citation bytes public.
 
-        The visible text ends on a full stop deliberately. This is the one
-        witness here that reads a stream mid-hold, and the hold reaches back
-        over any character a handle could start with - so a prefix ending in
-        `s` releases one character less whenever the turn's nonce happens to
-        begin with `S`, which is a real letter of the alphabet and about one
-        turn in thirty. Correct, and nondeterministic to assert against; a
-        full stop is in no marker of any nonce.
+        This used to simulate cancellation by returning from the provider
+        generator. That is natural EOF, not cancellation, and under SPEC §2.2
+        an unclosed `[cite:` at a natural end is ordinary prose. Drive the
+        real path instead: the provider blocks after the prefix has entered
+        the scrubber, `cancel_event` revokes the invocation, StreamPump calls
+        the scrubber's abort handle, and the provider's blocked read wakes.
         """
         engine = get_runtime().workflow
         user_id, opened = self._streamed(
             engine, monkeypatch, store,
-            chunks=["400 hours. ", "[cite:", "{H}", "]"],
-            cancel_after=2,
+            # Establish the real retrieval/offer/invocation fixture. The
+            # backend stream is replaced below with one that can actually be
+            # aborted while the scrubber is holding syntax.
+            chunks=["unused"],
         )
 
-        events = await self._run(engine, user_id)
+        blocked = threading.Event()
+        release = threading.Event()
+
+        class CancellableStream:
+            def __init__(self):
+                self.index = 0
+                self.aborted = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.index == 0:
+                    self.index += 1
+                    return {"event": "token", "data": "400 hours. "}
+                if self.index == 1:
+                    self.index += 1
+                    return {"event": "token", "data": "[cite:"}
+                blocked.set()
+                release.wait(5)
+                if self.aborted:
+                    raise ConnectionError("cancelled")
+                raise StopIteration
+
+            @property
+            def armed(self):
+                return True
+
+            def abort(self):
+                self.aborted = True
+                release.set()
+
+            def close(self):
+                release.set()
+
+        monkeypatch.setattr(
+            engine.llm.backend,
+            "generate_stream",
+            lambda *a, **k: CancellableStream(),
+            raising=False,
+        )
+
+        cancel_event = asyncio.Event()
+
+        async def collect():
+            return [
+                event
+                async for event in engine.run_streaming(
+                    None,
+                    None,
+                    "how long",
+                    "ctx",
+                    user_id,
+                    cancel_event=cancel_event,
+                )
+            ]
+
+        task = asyncio.create_task(collect())
+        assert await asyncio.to_thread(blocked.wait, 5), (
+            "the provider never blocked after the held marker prefix"
+        )
+        cancel_event.set()
+        events = await asyncio.wait_for(task, timeout=10)
 
         assert self._tokens(events) == "400 hours."
+        assert any(event.get("event") == "cancel_ack" for event in events), events
         assert "[cite:" not in json.dumps(events)
         assert self._cited(events) == []
         cited = [inv for inv in opened if inv.citations]
@@ -3394,20 +3485,16 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("agent", [False, True])
-    async def test_with_the_gate_off_the_provider_is_not_filtered_at_all(
+    async def test_with_the_gate_off_only_reader_cleanup_is_installed(
         self, store, monkeypatch, agent
     ):
-        """Production, and the difference is not cosmetic.
+        """Offers off disables namespace authority, not the reader boundary.
 
-        With offers off no marker is ever shown, so a filter in the path would
-        remove nothing - but it would still hold text, still scan the whole
-        answer per chunk, and still stop an answer at its ceiling. The gate is
-        what keeps a streamed turn the shape it was before any of this
-        existed: the transformation does not run, rather than running and
-        finding nothing to do.
-
-        Both call sites, because both consult the gate separately and a turn
-        that reaches production through the agent is the same turn.
+        A closed `[cite:...]` token is never reader prose under SPEC §2.2, so
+        the broad cleanup wrapper must still be present. What offers-off must
+        *not* add is namespace scrubbing for the invocation's unused nonce,
+        the citation-stream output ceiling, or provider contradiction
+        authority checks.
         """
         engine = get_runtime().workflow
         user_id, _opened = self._streamed(
@@ -3418,7 +3505,7 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         real = workflow_module_streaming.ScrubbedTokenStream
 
         def _counting(*args, **kwargs):
-            built.append(args)
+            built.append((args, kwargs))
             return real(*args, **kwargs)
 
         monkeypatch.setattr(
@@ -3428,24 +3515,23 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         events = await self._run(engine, user_id)
 
         assert self._tokens(events) == "plain answer"
-        assert built == [], "the filter was built with offers off"
+        assert built, "the reader cleanup boundary was bypassed with offers off"
+        for _args, kwargs in built:
+            assert kwargs.get("scrub_namespace") is False, kwargs
+            assert kwargs.get("max_canonical_chars") is None, kwargs
+            assert kwargs.get("verify_reported") is False, kwargs
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("agent", [False, True])
-    async def test_a_turn_that_committed_no_handle_is_not_filtered_either(
+    async def test_a_turn_with_no_handle_preserves_its_unused_nonce(
         self, store, monkeypatch, agent
     ):
-        """The feature being on is not the same fact as this turn offering
-        something.
+        """No handle means no namespace was shown, not no reader cleanup.
 
-        A conversation with nothing citable retrieves nothing, places no
-        marker and commits no handle, so the model is never shown this turn's
-        namespace. Filtering it anyway would edit prose on the strength of a
-        coincidence - the answer here contains the freshly minted nonce, which
-        the model cannot have been copying - and would make every ordinary
-        answer pay the scrub and the length ceiling once this is enabled.
-
-        Both call sites, because each decides this for itself.
+        Every invocation mints a random nonce. If nothing citable was offered,
+        that nonce is ordinary coincidental prose and must survive byte for
+        byte. The broad reader filter is still installed so a hallucinated
+        closed marker such as `[cite:,]` cannot leak.
         """
         engine = get_runtime().workflow
         user_id, opened = self._streamed(
@@ -3457,7 +3543,7 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         real = workflow_module_streaming.ScrubbedTokenStream
 
         def _counting(*args, **kwargs):
-            built.append(args)
+            built.append((args, kwargs))
             return real(*args, **kwargs)
 
         monkeypatch.setattr(
@@ -3469,10 +3555,15 @@ class TestAStreamedAnswerCarriesOnlyWhatItStreamed:
         assert not any(inv.citations for inv in opened), (
             "the fixture committed a handle, so nothing was being tested"
         )
-        assert built == [], "a turn with no handle still built the filter"
-        # The namespace reaches the client untouched. Matched against the
-        # turn's own nonces rather than one invocation's, because a turn opens
-        # several and the answer names the one that streamed.
+        assert built, "a no-handle turn bypassed reader marker cleanup"
+        for _args, kwargs in built:
+            assert kwargs.get("scrub_namespace") is False, kwargs
+            assert kwargs.get("max_canonical_chars") is None, kwargs
+            assert kwargs.get("verify_reported") is False, kwargs
+
+        # The unused nonce reaches the client untouched. Matched against the
+        # turn's own nonces because a turn opens several invocations and the
+        # answer names the one that actually streamed.
         public = self._tokens(events)
         prefix, suffix = "the token is ", " as it happens"
         assert public.startswith(prefix) and public.endswith(suffix), public

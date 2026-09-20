@@ -27,7 +27,10 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from liminallm.logging import log_routing_trace, log_workflow_trace
 from liminallm.service.broker import InvocationContext
-from liminallm.service.citation_stream import ScrubbedTokenStream
+from liminallm.service.citation_stream import (
+    MAX_CANONICAL_CHARS,
+    ScrubbedTokenStream,
+)
 from liminallm.service.citations import (
     citation_payload,
     replaced_answer,
@@ -948,12 +951,11 @@ class WorkflowStreamingMixin:
         # nothing here grants; it cannot withdraw the fact that a namespace
         # was issued, so containment outlives it.
         #
-        # And a turn with nothing citable still gets no filter: it offered the
-        # model no namespace, so there is nothing of it in the answer to
-        # remove, and removing anything would be editing prose on the strength
-        # of a coincidence - the same rule the two capability bodies follow.
-        # It also keeps the reader and the length ceiling off every ordinary
-        # conversation.
+        # A turn with nothing citable still preserves its random nonce: it
+        # offered no namespace, so removing a coincidental spelling would edit
+        # prose on the strength of something the model never saw. The reader
+        # filter still runs, in broad-marker-only mode, because malformed or
+        # stale closed `[cite:...]` syntax is never reader prose.
         streamed: Dict[str, ScrubbedTokenStream] = {}
 
         def produce():
@@ -965,9 +967,18 @@ class WorkflowStreamingMixin:
                 user_id=user_id,
                 **offer,
             )
-            if not invocation.citations:
-                return raw
-            filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
+            filtered = ScrubbedTokenStream(
+                raw,
+                invocation.citations.nonce,
+                # Empty means no nonce/handle was ever shown to the model.
+                # Preserve coincidental nonce text in that case, while still
+                # enforcing the unconditional reader rule for closed markers.
+                scrub_namespace=bool(invocation.citations),
+                max_canonical_chars=(
+                    MAX_CANONICAL_CHARS if invocation.citations else None
+                ),
+                verify_reported=bool(invocation.citations),
+            )
             streamed["stream"] = filtered
             return filtered
 
@@ -1268,6 +1279,9 @@ class WorkflowStreamingMixin:
         emitted_tokens = False
         #: The worker's own final answer, when the provider's state holds it.
         answer: Optional[ModelTurn] = None
+        #: Citations from that accepted answer, validated against its narrow
+        #: worker/public copy before reader cleanup changes its text.
+        accepted_citations: List[Dict[str, Any]] = []
         # Built and pulled on the producer thread, kept afterwards, and
         # built only for a turn that committed a handle - all three for
         # the reasons the plain node states.
@@ -1377,13 +1391,29 @@ class WorkflowStreamingMixin:
             native = accepted is not None and accepted.strategy in NATIVE_STRATEGIES
             answer = self._accepted_terminal_answer(stream_context) if native else None
             if answer is not None:
-                # The worker's last model call answered without tools and
-                # the parent accepted that answer into the provider's own
-                # state. Asking the provider again would rewind the state
-                # it just accepted for the sake of a token-by-token stream,
-                # so the accepted text goes to the client as it stands -
-                # one chunk rather than many.
-                content = answer.content
+                # The worker's last model call answered without tools and the
+                # parent accepted that answer into the provider's own state.
+                # Asking again would rewind that state, so deliver this turn -
+                # but not its internal citation syntax.
+                #
+                # ModelTurn.content is the *worker/public* copy: this turn's
+                # nonce has already been narrowly scrubbed, which is exactly
+                # the string transfer_citations must compare against. Validate
+                # there first. Then the shared answer boundary removes every
+                # closed marker-shaped token and moves citation offsets before
+                # the one-chunk answer can reach the reader.
+                accepted_public = answer.content
+                accepted_citations = self._recorded_citations(
+                    stream_context, invocation, accepted_public
+                )
+                cleaned = replaced_answer(
+                    accepted_public, [], accepted_citations
+                )
+                if cleaned is None:
+                    content = ""
+                    accepted_citations = []
+                else:
+                    content, _unused_bindings, accepted_citations = cleaned
                 if content:
                     emitted_tokens = True
                     yield {"event": "token", "data": content}
@@ -1420,13 +1450,19 @@ class WorkflowStreamingMixin:
                         messages, adapters, user_id=user_id,
                         **({"continuation": accepted} if native else {}),
                     )
-                    # Issued handles, and nothing else. A rollback that lands
-                    # mid-turn takes this execution's authority to grant more;
-                    # it does not unshow the ones the model already has, so
-                    # the filter stays on. See the plain node above.
-                    if not invocation.citations:
-                        return raw
-                    filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
+                    # Reader cleanup is unconditional. Namespace cleanup is
+                    # conditional on handles actually having been issued: a
+                    # rollback cannot unshow them, while an empty table means
+                    # the model never saw this invocation's random nonce.
+                    filtered = ScrubbedTokenStream(
+                        raw,
+                        invocation.citations.nonce,
+                        scrub_namespace=bool(invocation.citations),
+                        max_canonical_chars=(
+                            MAX_CANONICAL_CHARS if invocation.citations else None
+                        ),
+                        verify_reported=bool(invocation.citations),
+                    )
                     streamed["stream"] = filtered
                     return filtered
 
@@ -1596,7 +1632,7 @@ class WorkflowStreamingMixin:
         if substituted:
             citations = []
         elif answer is not None:
-            citations = self._recorded_citations(stream_context, invocation, content)
+            citations = accepted_citations
         else:
             citations = self._streamed_citations(
                 streamed.get("stream"), invocation,
