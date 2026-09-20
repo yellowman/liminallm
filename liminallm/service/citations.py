@@ -1207,4 +1207,4 @@ def strip_citations(answer: str) -> str:
     closed up, so a sentence does not end with a gap where a handle used to
     be.
     """
-    return strip_citation_positions(answer or "")[0]
+    return CITATION_STRIP_RE.sub("", answer or "")
