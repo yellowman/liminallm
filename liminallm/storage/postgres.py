@@ -3471,13 +3471,38 @@ class PostgresStore:
     #: operation spans several store transactions and Redis bookkeeping.
     _USER_AUTH_STATE_LOCK = 0x61757468  # "auth"
 
-    @contextlib.contextmanager
-    def hold_user_auth_state(self, user_id: str):
+    def _acquire_user_auth_state_connection(self, identity: str):
+        """Checkout a connection and wait for the advisory lock off-loop."""
+        cm = self.pool.connection()
+        conn = cm.__enter__()
+        key = (self._USER_AUTH_STATE_LOCK, identity)
+        try:
+            conn.execute("SELECT pg_advisory_lock(%s, hashtext(%s))", key)
+            conn.commit()
+        except Exception:
+            cm.__exit__(*sys.exc_info())
+            raise
+        return cm, conn
+
+    def _release_user_auth_state_connection(self, cm, conn, identity: str) -> None:
+        key = (self._USER_AUTH_STATE_LOCK, identity)
+        try:
+            conn.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))", key)
+            conn.commit()
+        finally:
+            cm.__exit__(None, None, None)
+
+    @contextlib.asynccontextmanager
+    async def hold_user_auth_state(self, user_id: str):
         """Hold one user's authentication/session state across an operation.
 
-        Store calls made by this task reuse this connection, so the lock does
-        not reserve one pool slot while each nested operation waits for
-        another. Session advisory locks survive the per-operation commits.
+        Advisory-lock acquisition can wait behind another request, so it runs
+        off the event loop. Once acquired, store calls made by this task reuse
+        the locked connection; that lets the holder keep making progress even
+        when other same-user requests occupy pool slots waiting for the lock.
+
+        Same-user nesting is reentrant in the task. Cross-user nesting is
+        refused rather than silently dropping one user's serialization.
         """
         identity = str(user_id)
         held = self._auth_state_connection.get()
@@ -3487,27 +3512,23 @@ class PostgresStore:
                 raise RuntimeError(
                     "cannot nest authentication-state locks for different users"
                 )
-            # pg_advisory_lock is session-reentrant, but acquiring it again on
-            # another pooled connection is not: that second session waits on
-            # the first forever. The task already owns exactly the lock this
-            # nested operation needs, so reuse it without incrementing the
-            # server-side lock count.
             yield
             return
 
-        key = (self._USER_AUTH_STATE_LOCK, identity)
-        # Deliberately use a real pool checkout here; _connect() becomes a
-        # same-connection view only after the task-local scope is installed.
-        with self.pool.connection() as conn:
-            conn.execute("SELECT pg_advisory_lock(%s, hashtext(%s))", key)
-            conn.commit()
-            token = self._auth_state_connection.set((conn, identity))
-            try:
-                yield
-            finally:
-                self._auth_state_connection.reset(token)
-                conn.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))", key)
-                conn.commit()
+        cm, conn = await asyncio.to_thread(
+            self._acquire_user_auth_state_connection, identity
+        )
+        token = self._auth_state_connection.set((conn, identity))
+        try:
+            yield
+        finally:
+            self._auth_state_connection.reset(token)
+            await asyncio.to_thread(
+                self._release_user_auth_state_connection,
+                cm,
+                conn,
+                identity,
+            )
 
     _USER_LIFETIME_LOCK = 0x6C696675  # "lifu"
 
