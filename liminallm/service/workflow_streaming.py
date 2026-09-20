@@ -948,12 +948,11 @@ class WorkflowStreamingMixin:
         # nothing here grants; it cannot withdraw the fact that a namespace
         # was issued, so containment outlives it.
         #
-        # And a turn with nothing citable still gets no filter: it offered the
-        # model no namespace, so there is nothing of it in the answer to
-        # remove, and removing anything would be editing prose on the strength
-        # of a coincidence - the same rule the two capability bodies follow.
-        # It also keeps the reader and the length ceiling off every ordinary
-        # conversation.
+        # A turn with nothing citable still preserves its random nonce: it
+        # offered no namespace, so removing a coincidental spelling would edit
+        # prose on the strength of something the model never saw. The reader
+        # filter still runs, in broad-marker-only mode, because malformed or
+        # stale closed `[cite:...]` syntax is never reader prose.
         streamed: Dict[str, ScrubbedTokenStream] = {}
 
         def produce():
@@ -965,9 +964,14 @@ class WorkflowStreamingMixin:
                 user_id=user_id,
                 **offer,
             )
-            if not invocation.citations:
-                return raw
-            filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
+            filtered = ScrubbedTokenStream(
+                raw,
+                invocation.citations.nonce,
+                # Empty means no nonce/handle was ever shown to the model.
+                # Preserve coincidental nonce text in that case, while still
+                # enforcing the unconditional reader rule for closed markers.
+                scrub_namespace=bool(invocation.citations),
+            )
             streamed["stream"] = filtered
             return filtered
 
@@ -1439,13 +1443,15 @@ class WorkflowStreamingMixin:
                         messages, adapters, user_id=user_id,
                         **({"continuation": accepted} if native else {}),
                     )
-                    # Issued handles, and nothing else. A rollback that lands
-                    # mid-turn takes this execution's authority to grant more;
-                    # it does not unshow the ones the model already has, so
-                    # the filter stays on. See the plain node above.
-                    if not invocation.citations:
-                        return raw
-                    filtered = ScrubbedTokenStream(raw, invocation.citations.nonce)
+                    # Reader cleanup is unconditional. Namespace cleanup is
+                    # conditional on handles actually having been issued: a
+                    # rollback cannot unshow them, while an empty table means
+                    # the model never saw this invocation's random nonce.
+                    filtered = ScrubbedTokenStream(
+                        raw,
+                        invocation.citations.nonce,
+                        scrub_namespace=bool(invocation.citations),
+                    )
                     streamed["stream"] = filtered
                     return filtered
 
