@@ -253,3 +253,61 @@ class TestTheTableSaysWhatTheResolverWouldSay:
                                    timeout=15000)
             row = page.inner_text("#mcp-table-wrapper")
             assert "inert" in row, row
+
+
+class TestDeletingAnAccountAsksFirst:
+    """The console erases an account; it has to ask before it does.
+
+    `AuthService.delete_user` removes the canonical record and then the
+    cached copies. There is no disable and no soft delete, so a mistake here
+    is not recoverable from the UI.
+
+    The control sat one click away, styled exactly like `Set role` beside it
+    and reading the same manually typed id, so a slip between the two was a
+    slip between changing a role and destroying an account. The in-app admin
+    surface already confirmed; this one did not, which left two collaborators
+    on one destructive endpoint with different safety.
+    """
+
+    def test_a_refused_confirmation_deletes_nobody(self, page, server):
+        import httpx
+
+        from liminallm.service.runtime import get_runtime
+
+        email, password = _admin(server)
+        victim = f"victim_{uuid.uuid4().hex[:8]}@example.com"
+        resp = httpx.post(
+            f"{server.base_url}/v1/auth/signup",
+            json={"email": victim, "password": PASSWORD},
+            timeout=30,
+        )
+        assert resp.status_code == 201, resp.text
+        victim_id = resp.json()["data"]["user_id"]
+
+        _sign_in(page, server, email, password)
+        page.wait_for_selector("#user-table-wrapper table", timeout=15000)
+
+        asked = {}
+
+        def on_dialog(dialog):
+            asked["message"] = dialog.message
+            dialog.dismiss()
+
+        page.on("dialog", on_dialog)
+        page.fill("#target-user-id", victim_id)
+        page.click("#delete-user")
+        page.wait_for_timeout(1200)
+
+        assert "message" in asked, (
+            "the console deleted an account without asking anything"
+        )
+        # The id is what gets mistyped, so repeating only the id back would
+        # repeat the mistake. The question names the account.
+        assert victim in asked["message"], (
+            f"the question did not name the account: {asked['message']!r}"
+        )
+
+        still_there = get_runtime().store.get_user(victim_id)
+        assert still_there is not None, (
+            "the account was erased although the confirmation was refused"
+        )

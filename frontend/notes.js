@@ -170,7 +170,13 @@ const deleteCurrentNote = async () => {
      not, and a note is the one thing here the reader wrote themselves. The
      control was an unlabelled tick away from the Save button, so the whole
      confirmation was a single click on a glyph. */
-  const title = $('note-title')?.value.trim();
+  /* The name comes from the saved record, not from the editor. `#note-title`
+     is editable, and the request deletes `currentId`: type a new title
+     without saving and the question names one note while the DELETE takes
+     another. A confirmation that names the wrong object is worse than no
+     confirmation, because it tells the reader they have checked. */
+  const saved = notesState.notes.find((n) => n.id === notesState.currentId);
+  const title = saved?.title?.trim();
   const named = title ? `"${title}"` : 'this note';
   if (!window.confirm(`Delete ${named}? This cannot be undone.`)) return;
   try {

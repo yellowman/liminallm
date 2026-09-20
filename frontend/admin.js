@@ -299,6 +299,12 @@ const applyPatch = async () => {
   }
 };
 
+//: The last page of users this console fetched, kept so a destructive
+//: action can name what it is about to destroy. The table has the email in
+//: a cell, but reading it back out of rendered markup would make the
+//: question depend on how the table is drawn.
+let knownUsers = [];
+
 const renderUsers = (users) => {
   if (!userTableWrapper) return;
   if (!users.length) {
@@ -335,7 +341,8 @@ const fetchUsers = async () => {
       { headers: headers() },
       'Unable to load users'
     );
-    renderUsers(envelope.data.items || []);
+    knownUsers = envelope.data.items || [];
+    renderUsers(knownUsers);
   } catch (err) {
     showError(err.message);
   }
@@ -407,6 +414,32 @@ const deleteUser = async () => {
   const userId = document.getElementById('target-user-id').value;
   if (!userId) {
     showError('User ID required');
+    return;
+  }
+  /* This erases the account. `AuthService.delete_user` removes the canonical
+     record and then the cached copies; there is no disable and no soft
+     delete to come back from.
+
+     It sat one click away, in a button styled exactly like `Set role` beside
+     it and reading the same manually typed id, so a mistake between the two
+     was a mistake between changing a role and destroying an account. The
+     in-app surface already asked; this one did not, which is two
+     collaborators on one destructive endpoint with different safety.
+
+     Named rather than "this user": an id is what was mistyped, so repeating
+     it back is repeating the mistake. The email comes from the last fetched
+     page, and when the id is not on it the question says so instead of
+     implying the account was found. */
+  const known = knownUsers.find((u) => u.id === userId);
+  const named = known?.email
+    ? `${known.email} (${userId})`
+    : `${userId}, which is not in the list below`;
+  if (
+    !window.confirm(
+      `Permanently delete ${named}? The account and its data are erased. `
+      + 'This cannot be undone.'
+    )
+  ) {
     return;
   }
   try {
