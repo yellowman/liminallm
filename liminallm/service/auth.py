@@ -1732,26 +1732,27 @@ class AuthService:
         if not user:
             self.logger.warning("password_reset_user_missing", user_id=user_id)
             return False, None
-        pwd_hash, algo = self._hash_password(new_password)
-        self.store.save_password(user.id, pwd_hash, algo)
-        try:
-            revoked = await self.revoke_all_user_sessions(user.id)
-        except Exception as exc:
-            revoked = False
-            self.logger.warning(
-                "revoke_sessions_failed", user_id=user.id, error=str(exc)
-            )
+        # SPEC §§12.1/13.2 define one completed reset as both credential
+        # rotation and session/refresh revocation. Revoke first so a failure
+        # leaves the credential unchanged rather than committing half of the
+        # contract and calling it a reset. The token remains consumed: it is
+        # one attempt, not one success, and the caller can request a new one.
+        revoked = await self.revoke_all_user_sessions(user.id)
         if not revoked:
             self.logger.warning(
-                "password_reset_sessions_survived",
+                "password_reset_session_revocation_failed",
                 user_id=user.id,
             )
+            return False, False
+
+        pwd_hash, algo = self._hash_password(new_password)
+        self.store.save_password(user.id, pwd_hash, algo)
         self.logger.info(
             "password_reset_completed",
             user_id=user.id,
-            other_sessions_revoked=revoked,
+            other_sessions_revoked=True,
         )
-        return True, revoked
+        return True, True
 
     async def request_email_verification(self, user: User) -> Optional[str]:
         """As above: the token is written under the account it names.
