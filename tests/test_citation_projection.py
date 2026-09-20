@@ -169,6 +169,20 @@ class TestReaderCitationCleanupIsDurable:
         assert "[cite:" not in message.content.lower()
 
     @pytest.mark.asyncio
+    async def test_marker_only_content_is_cleaned_all_the_way_to_empty(
+        self, store
+    ):
+        """Storage cleanup is not workflow replacement semantics.
+
+        A marker-only terminal result must not survive merely because the
+        cleaned string is empty.
+        """
+        message = await _finish(store, {"content": "[cite:,]", "usage": {}})
+        assert message.content == ""
+        assert _citations(message) == []
+
+
+    @pytest.mark.asyncio
     async def test_cleanup_moves_a_durable_citation_anchor_with_the_answer(
         self, store
     ):
