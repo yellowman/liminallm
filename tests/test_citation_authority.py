@@ -2760,7 +2760,9 @@ class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:
     """
 
     @staticmethod
-    def _streaming(engine, monkeypatch, store, *, offers, contents=(ANSWER,)):
+    def _streaming(
+        engine, monkeypatch, store, *, offers, contents=(ANSWER,), answer=ANSWER
+    ):
         if offers is not None:
             engine.invocations.configure_citation_offers(offers)
         # No tools: the assembly falls through to the plain streamed node.
@@ -2788,8 +2790,8 @@ class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:
                              history=None, *, user_id=None, instruction=None):
             seen["snippets"] = list(context_snippets or [])
             seen["instruction"] = instruction
-            yield {"event": "token", "data": ANSWER}
-            yield {"event": "message_done", "data": {"content": ANSWER}}
+            yield {"event": "token", "data": answer}
+            yield {"event": "message_done", "data": {"content": answer}}
 
         monkeypatch.setattr(
             engine.llm, "generate_stream", _generate_stream, raising=False
@@ -2827,6 +2829,31 @@ class TestTheStreamedPlainNodeOffersLikeItsBlockingTwin:
         assert seen["snippets"] == [ANSWER]
         assert seen["instruction"] is None
         assert not any(inv.citations for inv in opened)
+
+    @pytest.mark.asyncio
+    async def test_gate_off_still_removes_closed_marker_syntax_from_the_reader(
+        self, store, monkeypatch
+    ):
+        """The live regression at the actual installation seam.
+
+        With citation offers off, the invocation table is empty. That used to
+        return the provider stream raw, which is exactly how `[cite:,]`
+        reached the UI. Broad reader cleanup must remain installed even though
+        namespace cleanup is correctly disabled.
+        """
+        engine = get_runtime().workflow
+        raw = "Alpha [cite:,] Beta."
+        user_id, _seen, opened = self._streaming(
+            engine, monkeypatch, store, offers=False, answer=raw
+        )
+
+        events = await self._run(engine, user_id)
+
+        assert not any(inv.citations for inv in opened)
+        blob = json.dumps(events)
+        assert "[cite:" not in blob.lower(), blob
+        assert "Alpha Beta." in blob, blob
+
 
     @pytest.mark.asyncio
     async def test_the_engine_as_it_ships_offers(self, store, monkeypatch):
