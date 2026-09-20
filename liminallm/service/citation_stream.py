@@ -775,10 +775,7 @@ class CanonicalCitationStream:
         suffix; the verdict is then forced false so no citation can be granted
         from a failed/partial answer.
         """
-        if self._finished:
-            self._verdict = False
-            return ""
-        tail, _origins = self.finish()
+        if self._finished:\n            # list(stream) necessarily probes once after message_done to see\n            # StopIteration. Completion already established the verdict;\n            # ordinary iterator exhaustion after it is not a new failure.\n            return ""\n        tail, _origins = self.finish()
         self._verdict = False
         return tail
 
