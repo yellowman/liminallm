@@ -31,6 +31,12 @@ from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
 
 NONCE = "K7Q2ABCD"
 MARKER = f"[cite:{NONCE}-1]"
+#: Two handles in one marker, which is what Gemini writes when a claim
+#: rests on two passages. The offered form is two markers separated by a
+#: space, so nothing here had ever seen this one.
+MERGED = f"[cite:{NONCE}-1,{NONCE}-2]"
+MERGED_SPACED = f"[cite:{NONCE}-1, {NONCE}-2]"
+MERGED_THREE = f"[cite:{NONCE}-1,{NONCE}-2,{NONCE}-3]"
 
 #: A nonce holding the other letter Python folds a non-ASCII character into.
 #: `K` and `S` are both in the real nonce alphabet, so neither of these is a
@@ -107,6 +113,15 @@ class TestAMarkerNeverBecomesObservable:
         f"[cite:{NONCE}]",
         f"[CITE:{NONCE}-2]",
         f"a {NONCE.lower()} b",
+        f"both agree {MERGED} here",
+        f"both agree {MERGED_SPACED} here",
+        f"all three {MERGED_THREE} here",
+        f"{MERGED} leads",
+        f"trails {MERGED}",
+        f"a {MERGED}{MARKER} b",
+        # Never closed. The handles still have to go, and what is left has
+        # to be the same however the provider cut it.
+        f"abandoned [cite:{NONCE}-1,xyz",
     ])
     def test_every_split_agrees_with_the_finished_scrub(self, text):
         """The split is the whole problem: a provider may cut anywhere, and
@@ -122,6 +137,15 @@ class TestAMarkerNeverBecomesObservable:
         f"a {NONCE} b",
         f"[cite:{NONCE}-99]",
         f"  {NONCE}-3  ",
+        f"both agree {MERGED} here",
+        f"all three {MERGED_THREE} here",
+        # The abandoned run is the case worth naming. Holding a handle past
+        # the comma to keep a marker candidate alive is what would leave the
+        # first one on the tape with nothing to remove it, and a live nonce
+        # on a reader's screen is the failure this whole module exists to
+        # prevent.
+        f"abandoned [cite:{NONCE}-1,xyz",
+        f"abandoned [cite:{NONCE}-1,{NONCE}-2 no close",
     ])
     def test_no_split_ever_lets_the_namespace_out(self, text):
         """Not "it is gone by the end" - never present. A reader that renders

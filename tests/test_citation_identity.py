@@ -755,3 +755,144 @@ class TestAnInheritedTableIsCheckedWhole:
         )
         with pytest.raises(ProvenanceError):
             extend_citation_table(registry, table, [])
+
+
+class TestAMarkerCarryingSeveralHandles:
+    """Gemini merges two offered handles into one marker.
+
+    The system's own convention is the opposite: `citation_offers` joins
+    several markers with a space, so two handles are meant to be written
+    `[cite:H1] [cite:H2]`. A model that writes `[cite:H1,H2]` instead was
+    producing a form nothing understood, and it failed twice over.
+
+    The parser looked the whole inner string up as one key, so neither
+    source resolved and both citations were dropped. Then the namespace
+    scrub, whose bracketed alternatives require a `]` straight after the
+    handle, missed the merged bracket but matched each handle *inside* it
+    as a bare nonce - deleting the content and leaving the punctuation.
+    What reached the reader was `[cite:,]`, with one comma per handle
+    beyond the first. That is where the marker in the screenshots came
+    from: it is not something a model wrote, it is the wreckage of
+    something it wrote.
+    """
+
+    def test_both_sources_resolve(self):
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        found = validate_citations(f"Both agree [cite:{first},{second}].", table)
+        assert [o.source_id for o in found] == ["src_1", "src_2"], found
+
+    def test_the_span_is_the_whole_marker_for_each(self):
+        """Two citations at one insertion point, which the payload allows:
+        the occurrence list is a list precisely so positions are not
+        collapsed, and here the position is shared rather than repeated."""
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        answer = f"Both agree [cite:{first},{second}]."
+        found = validate_citations(answer, table)
+        assert len(found) == 2
+        assert {(o.start, o.end) for o in found} == {
+            (answer.index("[cite:"), answer.index("].") + 1)
+        }
+
+    def test_spaces_after_the_comma_are_accepted(self):
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        found = validate_citations(f"Both [cite:{first}, {second}].", table)
+        assert [o.source_id for o in found] == ["src_1", "src_2"]
+
+    def test_the_scrub_removes_the_whole_marker(self):
+        """No wreckage, and the reason it matters is the offsets below.
+
+        The namespace pattern's bracketed alternatives needed a `]` straight
+        after the handle, so a merged marker failed them and then matched the
+        bare-nonce alternative once per handle *inside* the brackets. That
+        removed the content and left the punctuation: `[cite:,]`, with one
+        comma per handle beyond the first.
+        """
+        from liminallm.service.citations import scrub_positions
+
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        public, _origins = scrub_positions(
+            f"Both agree [cite:{first},{second}].", table.nonce
+        )
+        assert public == "Both agree.", repr(public)
+        assert table.nonce not in public
+
+    def test_three_handles(self):
+        from liminallm.service.citations import scrub_positions
+
+        _registry, _bindings, table = _turn("a.md", "b.md", "c.md")
+        handles = [table.handle_for(f"src_{n}") for n in (1, 2, 3)]
+        answer = "All three [cite:" + ",".join(handles) + "]."
+        assert [o.source_id for o in validate_citations(answer, table)] == [
+            "src_1",
+            "src_2",
+            "src_3",
+        ]
+        public, _ = scrub_positions(answer, table.nonce)
+        assert public == "All three.", repr(public)
+
+    def test_the_citations_land_where_the_reader_sees_them(self):
+        """The half of this that a resolution test cannot see.
+
+        `transfer_citations` derives `public_offset` from the *narrow* scrub,
+        while a reader gets the broader projection. Those are the same string
+        for an ordinary marker, because the narrow scrub removes it whole -
+        and they were not the same for a merged one, because it left
+        `[cite:,]` behind.
+
+        So resolving the handles without also removing the marker produces
+        citations that anchor in a coordinate space nobody renders in.
+        Measured on this text before the scrub was fixed: the narrow scrub
+        gave `'Both agree [cite:,]. Next.'` against a reader's
+        `'Both agree. Next.'`, and both citations carried offset 11, which
+        falls *after* the full stop rather than before it. Every character
+        after the marker drifts by the width of the wreckage.
+        """
+        from liminallm.service.citations import scrub_positions, transfer_citations
+        from liminallm.service.citation_stream import reader_positions
+
+        _registry, _bindings, table = _turn("alpha.md", "beta.md")
+        first = table.handle_for("src_1")
+        second = table.handle_for("src_2")
+        text = f"Both agree [cite:{first},{second}]. Next."
+
+        worker, _ = scrub_positions(text, table.nonce)
+        reader, _ = reader_positions(text, table.nonce)
+        assert worker == reader, (
+            "the narrow scrub and the reader projection disagree, so any "
+            f"offset taken from one is wrong in the other: {worker!r} vs "
+            f"{reader!r}"
+        )
+
+        payload = transfer_citations({"content": text}, table, worker)
+        assert [c["source_id"] for c in payload] == ["src_1", "src_2"], payload
+        offsets = {c["public_offset"] for c in payload}
+        assert offsets == {len("Both agree")}, (
+            f"the citations do not anchor where the claim ends: {offsets}"
+        )
+        for c in payload:
+            assert reader[: c["public_offset"]] == "Both agree"
+
+    def test_an_unresolvable_component_does_not_carry_the_others(self):
+        """A merged marker is not a licence to repair. Each component is
+        looked up on its own, and one that names nothing this turn ground on
+        is dropped exactly as it would be alone."""
+        _registry, _bindings, table = _turn("alpha.md")
+        first = table.handle_for("src_1")
+        found = validate_citations(f"Mixed [cite:{first},{NONCE}-9].", table)
+        assert [o.source_id for o in found] == ["src_1"], found
+
+    def test_a_single_handle_is_unchanged(self):
+        """The control. If this stopped working the tests above would still
+        pass while the ordinary path was broken."""
+        _registry, _bindings, table = _turn("alpha.md")
+        handle = table.handle_for("src_1")
+        found = validate_citations(f"One [cite:{handle}].", table)
+        assert [o.source_id for o in found] == ["src_1"]

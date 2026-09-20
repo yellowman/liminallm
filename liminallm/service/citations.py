@@ -434,6 +434,26 @@ def extend_citation_table(
     )
 
 
+def marker_handles(inner: str) -> List[str]:
+    """The handles one marker carries, in the order it wrote them.
+
+    Usually one. A model offered two handles for a single claim may write
+    them into one marker instead of side by side, which is not the form
+    `citation_offers` demonstrates - that joins markers with a space - but is
+    unambiguous, since a handle is a nonce and a counter and can hold no
+    comma of its own.
+
+    Splitting is not repair. Each component is looked up on its own further
+    up, so one that names nothing this turn grounded on is dropped exactly as
+    it would be alone, and a marker is never completed from its neighbours.
+
+    Whitespace around a component is allowed here because the namespace
+    pattern allows it in the same places. Reading a marker the scrub would
+    not remove is what puts a live handle on a reader's screen.
+    """
+    return [part.strip(" \t") for part in (inner or "").split(",")]
+
+
 def validate_citations(answer: str, table: CitationTable) -> List[CitationOccurrence]:
     """The citations in this answer that this turn actually issued.
 
@@ -448,18 +468,24 @@ def validate_citations(answer: str, table: CitationTable) -> List[CitationOccurr
     """
     found: List[CitationOccurrence] = []
     for match in CITATION_RE.finditer(answer or ""):
-        source_id = table.source_for(match.group(1))
-        if source_id is None:
-            continue
-        found.append(
-            CitationOccurrence(
-                handle=match.group(1),
-                source_id=source_id,
-                start=match.start(),
-                end=match.end(),
-                evidence_ids=table.evidence_for(source_id),
+        for handle in marker_handles(match.group(1)):
+            source_id = table.source_for(handle)
+            if source_id is None:
+                continue
+            found.append(
+                CitationOccurrence(
+                    handle=handle,
+                    source_id=source_id,
+                    # The span of the marker, which several handles share
+                    # when they were written into one. Two citations at one
+                    # insertion point rather than two points: the list is a
+                    # list so positions are kept, and here the position is
+                    # genuinely the same for both.
+                    start=match.start(),
+                    end=match.end(),
+                    evidence_ids=table.evidence_for(source_id),
+                )
             )
-        )
     return found
 
 
@@ -1003,10 +1029,21 @@ def _namespace_pattern(nonce: str) -> "re.Pattern[str]":
 
     Only this nonce. Anything else shaped like a citation is left exactly as
     the model wrote it, including another turn's marker - see the caller.
+
+    This does not understand a marker carrying several comma-separated
+    handles. `validate_citations` does, and resolves them, but teaching this
+    to remove one whole would put it out of step with the streaming reader,
+    which implements the same language by hand and cannot be changed to match
+    without risking a live handle reaching a reader. The two must agree -
+    `CanonicalCitationStream.finish` raises when they do not - so this stays
+    as it is until both move together. See `marker_handles`.
     """
     token = re.escape(nonce)
+    handle = rf"{token}(?:-\d+)?"
     return re.compile(
-        rf"[ \t]*(?:\[cite:{token}(?:-\d+)?\]|{token}(?:-\d+)?)",
+        rf"[ \t]*(?:"
+        rf"\[cite:[ \t]*{handle}(?:[ \t]*,[ \t]*{handle})*[ \t]*\]"
+        rf"|{handle})",
         re.IGNORECASE,
     )
 
