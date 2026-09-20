@@ -757,6 +757,32 @@ class TestWhatTheFilterLetsThrough:
         assert stream.contradicted
         assert not stream.reader.intact()
 
+    def test_a_contradiction_releases_held_suffix_before_the_error(self):
+        """A terminal error is the end of the stream.
+
+        Trailing whitespace is held because a following citation marker could
+        still claim it. Once provider-final content contradicts the streamed
+        tokens there will be no following character, so the suffix is ordinary
+        partial text and must be emitted *before* the error. Emitting it on the
+        iterator's later StopIteration probe puts a token after a terminal
+        event, which clients are entitled to ignore.
+        """
+        stream = ScrubbedTokenStream(
+            self._events("answer", "   ", content="different"), NONCE
+        )
+        events = list(stream)
+
+        assert [event["event"] for event in events] == [
+            "token",
+            "token",
+            "error",
+        ], events
+        assert events[0]["data"] == "answer"
+        assert events[1]["data"] == "   "
+        assert events[2]["data"]["code"] == "server_error"
+        assert stream.contradicted
+        assert not stream.reader.intact()
+
     def test_a_contradiction_is_not_a_completion(self):
         """Zero citations is not the whole of it.
 
