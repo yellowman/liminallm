@@ -294,3 +294,116 @@ class TestARefusalReachesTheCaller:
         assert still_works.status_code == 200, (
             "the refused request changed the password anyway"
         )
+
+
+class TestAPoolThatCannotGiveAConnection:
+    """The deadline covers waiting for a pool slot, and must end the same way.
+
+    Every holder keeps one Postgres connection for the whole protected
+    operation and the pool holds ten, so contention on this lock is also
+    contention on the pool - the two arrive together, not separately. An
+    attempt can therefore spend its entire remaining budget waiting for a
+    slot and never reach `pg_try_advisory_lock` at all.
+
+    That path used to end differently from every other way of running out of
+    time. `pool.connection(...)` was entered outside the `try` that converts
+    failures, and the retry loop only handles cancellation, so
+    `psycopg_pool.PoolTimeout` travelled out of the store untouched and the
+    API's catch-all served 500/server_error - where the contention this
+    feature exists to bound is specified as 409/conflict.
+
+    The distinction matters to a caller: a conflict says try again, a server
+    error says something is broken. Nothing in the existing file could see
+    it, because every witness either contends on the advisory lock, which
+    needs a connection to do at all, or injects `AuthStateLockTimeout`
+    directly - which is the outcome under test, not the cause.
+    """
+
+    @staticmethod
+    def _pool_is_exhausted(monkeypatch, store):
+        """Make only the lock path's acquisition time out.
+
+        `timeout=` is passed by nothing else in the store, so this leaves
+        ordinary queries working - the request under test still has to reach
+        the endpoint and authenticate.
+        """
+        from psycopg_pool import PoolTimeout
+
+        calls = {"n": 0}
+        original = store.pool.connection
+
+        class _TimesOutOnEnter:
+            """Where psycopg actually raises.
+
+            `pool.connection(...)` returns its context manager at once and
+            the wait happens inside `__enter__`, so an injection that raised
+            from the call would exercise a line that cannot fail in
+            production - and a fix written against it would guard nothing.
+            """
+
+            def __enter__(self):
+                calls["n"] += 1
+                raise PoolTimeout("pool exhausted")
+
+            def __exit__(self, *_exc):
+                return False
+
+        def connection(*args, **kwargs):
+            if "timeout" in kwargs:
+                return _TimesOutOnEnter()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(store.pool, "connection", connection)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_it_is_a_lock_timeout_and_not_a_raw_pool_error(
+        self, runtime, user, monkeypatch
+    ):
+        store = runtime.store
+        calls = self._pool_is_exhausted(monkeypatch, store)
+        ran = []
+
+        with pytest.raises(AuthStateLockTimeout):
+            await _attempt(
+                store, user["id"], deadline=0.3, body=lambda: ran.append(1)
+            )
+
+        # The control. If the injection never fired, the assertion above
+        # would be satisfied by ordinary lock contention and this test would
+        # prove nothing about the pool at all.
+        assert calls["n"] > 0, "the pool injection never ran"
+        assert ran == [], "the protected body ran without the lock"
+
+    def test_the_wire_says_conflict_and_not_server_error(
+        self, client, runtime, user, monkeypatch
+    ):
+        store = runtime.store
+        calls = self._pool_is_exhausted(monkeypatch, store)
+        # The default deadline is fifteen seconds and this path now spends
+        # all of it retrying. The bound under test is the outcome, not its
+        # length.
+        monkeypatch.setattr(
+            store, "_AUTH_STATE_LOCK_TIMEOUT_SECONDS", 0.3, raising=False
+        )
+
+        resp = client.post(
+            "/v1/auth/password/change",
+            headers=user["headers"],
+            json={"current_password": PASSWORD, "new_password": NEW_PASSWORD},
+        )
+
+        assert calls["n"] > 0, "the pool injection never ran"
+        assert resp.status_code == 409, resp.text
+        body = resp.json()
+        assert (body.get("error") or {}).get("code") == "conflict", body
+
+        # Failing closed: the credential the refused request would have
+        # changed is untouched. The injection comes off first - it is not
+        # specific to the lock path's caller, so leaving it on would refuse
+        # the login too and the check would pass without meaning anything.
+        monkeypatch.undo()
+        again = client.post(
+            "/v1/auth/login", json={"email": user["email"], "password": PASSWORD}
+        )
+        assert again.status_code == 200, again.text

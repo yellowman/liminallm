@@ -17,7 +17,7 @@ from psycopg import errors
 from psycopg.abc import Buffer
 from psycopg.adapt import Loader
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, redact_secrets
 from liminallm.content_struct import normalize_content_struct
@@ -3497,7 +3497,24 @@ class PostgresStore:
         narrow override this path needs.
         """
         cm = self.pool.connection(timeout=max(0.0, pool_timeout))
-        conn = cm.__enter__()
+        try:
+            conn = cm.__enter__()
+        except PoolTimeout:
+            # Running out of time waiting for a slot is running out of time,
+            # and this returns what every other exhausted attempt returns:
+            # nothing acquired. The caller's loop then re-reads its deadline
+            # and raises `AuthStateLockTimeout`, so contention is served as
+            # 409/conflict whether it was the advisory lock or the pool that
+            # the attempt could not get.
+            #
+            # These arrive together rather than separately. Every holder
+            # keeps one connection for the whole protected operation, so a
+            # lock under contention is a pool under contention, and this
+            # entry was outside the `try` below - the one place where the
+            # failure escaped as itself and reached the catch-all as
+            # 500/server_error. A conflict tells a caller to try again; a
+            # server error tells them something is broken.
+            return None
         key = (self._USER_AUTH_STATE_LOCK, identity)
         try:
             row = conn.execute(
