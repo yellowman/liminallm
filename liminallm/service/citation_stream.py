@@ -922,8 +922,11 @@ class ScrubbedTokenStream:
 
         Broad-only cleanup on an uncited stream deliberately does not add that
         failure mode: those streams bypassed this wrapper before marker cleanup
-        was installed. Their reader text is still built from the tokens, but a
-        provider-final mismatch alone does not newly fail the turn.
+        was installed. Their token text is filtered incrementally, while an
+        explicit provider-final `content` keeps its old precedence and is
+        filtered as a finished string. A mismatch alone does not newly fail the
+        turn, and a provider that reports its whole answer only at completion
+        still works.
 
         A contradiction becomes an error rather than a quieter completion.
         Refusing the citations is not enough on its own: `message_done` is
@@ -960,7 +963,16 @@ class ScrubbedTokenStream:
                 },
             }]
         tail, self.origins = self.reader.finish()
-        data["content"] = self.reader.released
+        if self._verify_reported:
+            data["content"] = self.reader.released
+        elif reported is not None:
+            # Preserve the old uncited-stream precedence: message_done.content
+            # may be the provider's only complete answer, or may intentionally
+            # supersede the token accumulation. It still crosses the reader
+            # boundary, so clean marker syntax before forwarding it.
+            data["content"] = strip_citations(str(reported))
+        else:
+            data["content"] = self.reader.released
         done = {**event, "data": data}
         if tail:
             return [{"event": "token", "data": tail}, done]
