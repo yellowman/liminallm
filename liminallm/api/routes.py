@@ -70,6 +70,7 @@ from liminallm.api.schemas import (
     ConfigPatchDecisionRequest,
     ConfigPatchListResponse,
     ConfigPatchRequest,
+    ContextSourceCreatedResponse,
     ContextSourceListResponse,
     ContextSourceRequest,
     ContextSourceResponse,
@@ -1125,12 +1126,22 @@ async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(
     # Disable MFA by setting enabled=False
     runtime.store.set_user_mfa_secret(principal.user_id, mfa_cfg.secret, enabled=False)
 
-    # SECURITY: Revoke all other sessions to force re-authentication
-    await runtime.auth.revoke_all_user_sessions(
+    # SECURITY: Revoke all other sessions to force re-authentication.
+    #
+    # Reported, not assumed. `auth_session` is the revocation mechanism -
+    # `_authenticate_access_token` reads the row and refuses the token when
+    # it is gone, and no token version stands behind it - so a failed delete
+    # leaves every other session working. This answered "disabled" either
+    # way, which tells somebody who disabled MFA because a session was stolen
+    # that the stolen one is gone when it is not.
+    revoked = await runtime.auth.revoke_all_user_sessions(
         principal.user_id, except_session_id=principal.session_id
     )
 
-    return Envelope(status="ok", data={"status": "disabled"})
+    return Envelope(
+        status="ok",
+        data={"status": "disabled", "other_sessions_revoked": revoked},
+    )
 
 
 @router.post("/auth/reset/request", response_model=Envelope, tags=["auth"])
@@ -1164,10 +1175,24 @@ async def confirm_reset(body: PasswordResetConfirm, request: Request):
         limit=5,
         window_seconds=300,
     )
-    ok = await runtime.auth.complete_password_reset(body.token, body.new_password)
+    ok, revoked = await runtime.auth.complete_password_reset_with_revocation(
+        body.token, body.new_password
+    )
     if not ok:
+        if revoked is False:
+            # SPEC §18 exposes only the stable public error-code set.
+            # The 503 and message describe the incomplete operation; the
+            # stable code for a server-side failure is `server_error`.
+            raise http_error(
+                "server_error",
+                "password reset could not revoke existing sessions",
+                status_code=503,
+            )
         raise http_error("validation_error", "invalid token", status_code=400)
-    return Envelope(status="ok", data={"status": "reset"})
+    return Envelope(
+        status="ok",
+        data={"status": "reset", "other_sessions_revoked": True},
+    )
 
 
 @router.get("/me", response_model=Envelope, tags=["auth"])
@@ -1307,25 +1332,42 @@ async def change_password(
         window_seconds=300,
     )
 
-    # Verify current password
-    if not runtime.auth.verify_password(principal.user_id, body.current_password):
-        raise http_error("unauthorized", "current password is incorrect", status_code=401)
+    # Password proof, credential rotation, and publication/revocation of
+    # sessions share one cross-replica order with login and password reset.
+    # Otherwise a concurrent login can prove the old password before this
+    # write, pause, and publish a new session after the revocation below.
+    async with runtime.store.hold_user_auth_state(principal.user_id):
+        if not runtime.auth.verify_password(
+            principal.user_id, body.current_password
+        ):
+            raise http_error(
+                "unauthorized",
+                "current password is incorrect",
+                status_code=401,
+            )
 
-    # Save new password
-    runtime.auth.save_password(principal.user_id, body.new_password)
+        runtime.auth.save_password(principal.user_id, body.new_password)
 
-    # SECURITY: Revoke all other sessions to force re-authentication
-    await runtime.auth.revoke_all_user_sessions(
-        principal.user_id, except_session_id=principal.session_id
-    )
+        # The password is already committed if revocation fails, so unlike a
+        # reset this operation reports the two outcomes separately rather
+        # than pretending the password change itself did not happen.
+        revoked = await runtime.auth.revoke_all_user_sessions(
+            principal.user_id, except_session_id=principal.session_id
+        )
 
     # Issue 51.6: Audit logging for password change (GDPR/SOC2 compliance)
+    # The outcome is in the audit line too: a change whose revocation failed
+    # is the one an operator most needs to find afterwards.
     logger.info(
         "user_password_changed",
         user_id=principal.user_id,
         session_id=principal.session_id,
+        other_sessions_revoked=revoked,
     )
-    return Envelope(status="ok", data={"status": "changed"})
+    return Envelope(
+        status="ok",
+        data={"status": "changed", "other_sessions_revoked": revoked},
+    )
 
 
 @router.post("/auth/logout", response_model=Envelope, tags=["auth"])
@@ -5444,6 +5486,19 @@ async def create_context(
     ) as idem:
         if idem.cached:
             return idem.cached
+        # Before the context is written, so a refusal leaves nothing behind.
+        # `ingest_text` answers 0 for text that is blank once stripped, and
+        # this route discarded that count - so `text: "   "` created a
+        # context, indexed nothing, and reported success. `text: ""` is
+        # already no text at all, because the truthiness check below skips
+        # ingestion for it; whitespace was the one input that claimed to be
+        # content and became none.
+        if body.text and not body.text.strip():
+            raise http_error(
+                "validation_error",
+                "the text supplied holds nothing to index",
+                status_code=400,
+            )
         ctx_meta = {"embedding_model_id": runtime.rag.embedding_model_id}
         ctx = runtime.store.upsert_context(
             owner_user_id=principal.user_id,
@@ -5733,8 +5788,10 @@ async def add_context_source(
 
         # Trigger indexing via RAG service with validated path
         # Pass allowed_base for defense-in-depth path traversal protection
-        def _ingest() -> None:
+        def _ingest() -> int:
             """Read each file and commit what was read, without letting go.
+
+            Answers how many chunks were created, which the caller is told.
 
             Reading and committing are two moments. Upload, extraction and
             deletion all treat a pathname as one critical section, and this
@@ -5775,7 +5832,7 @@ async def add_context_source(
                     namespace_key(files_dir, relative.as_posix()),
                 )
 
-            runtime.rag.ingest_path(
+            return runtime.rag.ingest_path(
                 context_id=context_id,
                 fs_path=str(validated_path),
                 recursive=body.recursive,
@@ -5786,7 +5843,7 @@ async def add_context_source(
         try:
             # In a thread, both because the lock must not be taken on the
             # event loop and because walking a tree was already blocking it.
-            await asyncio.to_thread(_ingest)
+            indexed = await asyncio.to_thread(_ingest)
         except PathLockTimeout as exc:
             try:
                 runtime.store.delete_context_source(source.id)
@@ -5832,9 +5889,34 @@ async def add_context_source(
                 status_code=409,
             )
 
+        # Zero chunks is reported, not refused. A source row is the statement
+        # "this context covers this path" - `contexts_covering_path` reads
+        # that table alone and says why: coverage must not evaporate because
+        # a cleanup removed the index. Every upload consults it to decide
+        # which contexts a new file belongs in, so covering a directory that
+        # is empty today is a normal thing to do, and deleting the row would
+        # silently break "point a context at my files, then upload into it".
+        #
+        # What was missing was any way for the caller to tell that from a
+        # mistyped path. Both answered 201 with a source record that looked
+        # identical, and the only trace of the difference was a log line on
+        # the server. Measured: a mistyped relative path produced a knowledge
+        # context reporting "0 chunks loaded" with no error anywhere. The
+        # count is in the response now, so the two are distinguishable.
+        if not indexed:
+            logger.warning(
+                "context_source_indexed_nothing",
+                context_id=context_id,
+                user_id=principal.user_id,
+                fs_path=body.fs_path,
+            )
+
         envelope = Envelope(
             status="ok",
-            data=ContextSourceResponse.model_validate(source),
+            data=ContextSourceCreatedResponse(
+                **ContextSourceResponse.model_validate(source).model_dump(),
+                chunk_count=indexed,
+            ),
             request_id=idem.request_id,
         )
         await idem.store_result(envelope)

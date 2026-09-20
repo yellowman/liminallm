@@ -1417,7 +1417,15 @@ class ApiAdapterBackend:
                 )
                 content = ""
             else:
-                content = first_choice.message.content or ""
+                # A refusal arrives with `content` None and the words in
+                # `refusal`; it is the answer, not the absence of one. Read
+                # with getattr so the test doubles built from plain
+                # namespaces, which carry no such attribute, keep working.
+                content = (
+                    first_choice.message.content
+                    or getattr(first_choice.message, "refusal", None)
+                    or ""
+                )
             usage = self._chat_usage(getattr(completion, "usage", None))
             return {
                 "content": content,
@@ -1849,7 +1857,14 @@ class ApiAdapterBackend:
                 ]
         assistant_message.setdefault("role", "assistant")
         result = {
-            "content": (getattr(message, "content", None) if message else None) or "",
+            # As above: a refusal is this turn's content. The transcript
+            # keeps it either way, because `assistant_message` is the
+            # provider's own dump, but the user-facing field dropped it.
+            "content": (
+                (getattr(message, "content", None) if message else None)
+                or (getattr(message, "refusal", None) if message else None)
+                or ""
+            ),
             "tool_calls": tool_calls,
             "assistant_message": assistant_message,
             "usage": self._chat_usage(getattr(completion, "usage", None)),
@@ -1910,7 +1925,23 @@ class ApiAdapterBackend:
                 )
             for event in stream:
                 etype = getattr(event, "type", "") or ""
-                if etype == "response.output_text.delta":
+                # A refusal is delivered on its own event type and is still
+                # the answer. `responses_compat.output_text` says so and
+                # counts refusal parts, because flattening one to "" made
+                # the turn fabricate "No response generated." over the
+                # model's actual words - but that fix landed on the blocking
+                # readers only, and this is their streaming sibling.
+                #
+                # Read through `delta`, which both events carry, rather than
+                # through a `refusal` attribute: an AttributeError inside
+                # this try is what `responses_compat.is_unsupported` reads as
+                # "this provider has no /responses", which would set
+                # `_responses_ok` False and silently move the whole process
+                # to chat completions.
+                if etype in (
+                    "response.output_text.delta",
+                    "response.refusal.delta",
+                ):
                     delta = getattr(event, "delta", "") or ""
                     if delta:
                         full_content += delta
@@ -2070,8 +2101,13 @@ class ApiAdapterBackend:
                     if not choices:
                         continue
                     delta = choices[0].delta
-                    if delta and delta.content:
-                        token_text = delta.content
+                    # `delta.refusal` carries a streamed refusal, which is
+                    # still the answer. getattr for the same reason as the
+                    # blocking readers above.
+                    token_text = delta and (
+                        delta.content or getattr(delta, "refusal", None)
+                    )
+                    if token_text:
                         full_content += token_text
                         completion_tokens += 1
                         yield {"event": "token", "data": token_text}

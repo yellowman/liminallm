@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
@@ -181,6 +183,13 @@ class PostgresStore:
         self._connect_max_retries = 3
         self._connect_retry_backoff = 0.25
         self._last_pool_metrics_log = 0.0
+        # While a per-user auth-state advisory lock is held, store calls in
+        # that async task reuse the lock's own Postgres connection. Holding a
+        # pool connection and borrowing a second one for each store method
+        # lets N concurrent users consume all N pool slots and deadlock.
+        self._auth_state_connection: ContextVar[Any] = ContextVar(
+            f"auth_state_connection_{id(self)}", default=None
+        )
 
         try:
             self.fs_root.mkdir(parents=True, exist_ok=True)
@@ -319,7 +328,21 @@ class PostgresStore:
                 setattr(sess, field, value)
             self.sessions[session_id] = sess
 
+    @contextlib.contextmanager
+    def _reuse_auth_state_connection(self, conn):
+        """Give a store method the auth lock's connection, with normal commits."""
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+
     def _connect(self):
+        held = self._auth_state_connection.get()
+        if held is not None:
+            return self._reuse_auth_state_connection(held[0])
         attempt = 0
         last_exc: Exception | None = None
         while attempt < self._connect_max_retries:
@@ -3439,6 +3462,121 @@ class PostgresStore:
     # subordinate sweep skips the user, so a live account's generations would
     # accumulate forever. Filtering on read makes the mistake self-healing
     # rather than permanent, and costs an index probe.
+
+    #: Serializes one user's authentication state across replicas. Password
+    #: proof, session creation/rotation, credential rotation, session revocation,
+    #: and role changes must have one linear order: otherwise a login can prove
+    #: an old password, pause while a reset revokes every session and changes
+    #: the credential, then publish a fresh session after the reset completed.
+    #: Session-scoped rather than transaction-scoped because the service
+    #: operation spans several store transactions and Redis bookkeeping.
+    _USER_AUTH_STATE_LOCK = 0x61757468  # "auth"
+
+    def _try_acquire_user_auth_state_connection(self, identity: str):
+        """Try once for the advisory lock without parking a worker on it."""
+        cm = self.pool.connection()
+        conn = cm.__enter__()
+        key = (self._USER_AUTH_STATE_LOCK, identity)
+        try:
+            row = conn.execute(
+                "SELECT pg_try_advisory_lock(%s, hashtext(%s)) AS acquired",
+                key,
+            ).fetchone()
+            acquired = bool(row and row.get("acquired"))
+            if not acquired:
+                conn.rollback()
+                cm.__exit__(None, None, None)
+                return None
+            conn.commit()
+            return cm, conn
+        except Exception:
+            cm.__exit__(*sys.exc_info())
+            raise
+
+    def _release_user_auth_state_connection(self, cm, conn, identity: str) -> None:
+        key = (self._USER_AUTH_STATE_LOCK, identity)
+        try:
+            conn.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))", key)
+            conn.commit()
+        finally:
+            cm.__exit__(None, None, None)
+
+    @contextlib.asynccontextmanager
+    async def hold_user_auth_state(self, user_id: str):
+        """Hold one user's authentication/session state across an operation.
+
+        A blocking advisory wait cannot run on the request thread, and parking
+        many executor workers on it creates the same deadlock one layer over.
+        Each failed attempt therefore uses `pg_try_advisory_lock`, returns its
+        pool connection immediately, and backs off asynchronously. Only the
+        holder keeps a connection.
+
+        Once acquired, store calls made by this task reuse that connection.
+        Same-user nesting is reentrant in the task. Cross-user nesting is
+        refused rather than silently dropping one user's serialization.
+        """
+        identity = str(user_id)
+        held = self._auth_state_connection.get()
+        if held is not None:
+            _conn, held_identity = held
+            if held_identity != identity:
+                raise RuntimeError(
+                    "cannot nest authentication-state locks for different users"
+                )
+            yield
+            return
+
+        state = None
+        delay = 0.005
+        while state is None:
+            attempt = asyncio.create_task(
+                asyncio.to_thread(
+                    self._try_acquire_user_auth_state_connection,
+                    identity,
+                )
+            )
+            try:
+                # Shield the worker task from caller cancellation. A cancelled
+                # await does not stop the underlying thread; without shielding,
+                # it can acquire the advisory lock after its result has become
+                # unreachable and leak both the lock and pool connection.
+                state = await asyncio.shield(attempt)
+            except asyncio.CancelledError:
+                def release_late_acquisition(done) -> None:
+                    try:
+                        acquired = done.result()
+                    except Exception:
+                        return
+                    if acquired is None:
+                        return
+                    late_cm, late_conn = acquired
+                    try:
+                        self._release_user_auth_state_connection(
+                            late_cm, late_conn, identity
+                        )
+                    except Exception as exc:  # pragma: no cover - cleanup path
+                        self.logger.error(
+                            "auth_state_late_lock_release_failed",
+                            user_id=identity,
+                            error=str(exc),
+                        )
+
+                attempt.add_done_callback(release_late_acquisition)
+                raise
+            if state is None:
+                await asyncio.sleep(delay)
+                delay = min(0.05, delay * 2)
+
+        cm, conn = state
+        token = self._auth_state_connection.set((conn, identity))
+        try:
+            yield
+        finally:
+            self._auth_state_connection.reset(token)
+            # Unlock cannot wait on another holder: this session owns the
+            # lock. Keep release independent of the executor so a saturated
+            # worker pool can never prevent the holder from making progress.
+            self._release_user_auth_state_connection(cm, conn, identity)
 
     _USER_LIFETIME_LOCK = 0x6C696675  # "lifu"
 

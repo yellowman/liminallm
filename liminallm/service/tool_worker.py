@@ -386,6 +386,13 @@ def _body_python(
     }
 
 
+#: What the turn says when the rounds ran and produced no prose. Named
+#: rather than written twice: the streamed path finishes its own turn in the
+#: parent and needs the same sentence, and two copies of a sentence the
+#: reader sees is one copy that drifts.
+NO_ANSWER_FALLBACK = "I could not derive an answer from the available sources."
+
+
 def _body_agent_loop(
     broker: BrokerClient, _tool: str, plan: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -473,7 +480,7 @@ def _body_agent_loop(
             )
 
     result = {
-        "content": content or "I could not derive an answer from the available sources.",
+        "content": content or NO_ANSWER_FALLBACK,
         "usage": usage,
         "context_snippets": snippets,
         "tool_calls": trace,
