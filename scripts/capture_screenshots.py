@@ -290,10 +290,16 @@ def seed(client, token: str) -> None:
         )
 
     # The admin console is a screen too, so the demo account needs the role.
-    if user_id:
-        from liminallm.service.runtime import get_runtime
+    if not user_id:
+        # The admin console is the last screenshot, and without this role it
+        # photographs the sign-in gate instead. Skipping quietly is what
+        # produces a capture that looks deliberate and documents the wrong
+        # screen - the same rule the context id above already follows.
+        raise SystemExit(f"no user id, so the account cannot be promoted: {user_id!r}")
 
-        get_runtime().store.update_user_role(user_id, "admin")
+    from liminallm.service.runtime import get_runtime
+
+    get_runtime().store.update_user_role(user_id, "admin")
 
 
 def capture(args: argparse.Namespace, base: str) -> list[pathlib.Path]:
@@ -429,7 +435,15 @@ def capture(args: argparse.Namespace, base: str) -> list[pathlib.Path]:
             shot(name)
 
         page.goto(f"{base}/admin", wait_until="domcontentloaded")
-        time.sleep(2.5)
+        # Wait for the console itself, not for a length of time. A sleep
+        # photographs whatever is on screen when it expires, so an account
+        # that was never promoted, a console that failed to load and a
+        # console that loaded slowly all produce an image and none of them
+        # say which happened. `#admin-console` is hidden until the role
+        # check passes, so this is the same question the screen answers.
+        page.wait_for_selector("#admin-console:not(.hidden)", timeout=20000)
+        page.wait_for_selector("#user-table-wrapper table", timeout=20000)
+        time.sleep(0.8)
         shot("10-admin")
 
         browser.close()

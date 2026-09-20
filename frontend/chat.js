@@ -790,12 +790,12 @@ const renderConversationList = () => {
       const apiTag = c.source === 'responses'
         ? '<span class="fact-sep"></span><span>api</span>' : '';
       return `
-        <div class="conversation-item ${isActive ? 'active' : ''}" data-id="${escapeHtml(c.id)}">
+        <button type="button" class="conversation-item ${isActive ? 'active' : ''}" data-id="${escapeHtml(c.id)}">
           <span class="row-main">
             <span class="title">${title}</span>
             <span class="meta factline">${date ? `<span>${date}</span>` : ''}${apiTag}</span>
           </span>
-        </div>
+        </button>
       `;
     })
     .join('');
