@@ -121,10 +121,15 @@ class StreamPump:
                     break
                 self._emit(event)
             else:
-                # The producer returned on its own; only this path is a
-                # natural end of stream. A break on the stop flag, an
-                # exception, and a refusal to start all leave it unset.
-                self._completed = True
+                # Exhausting the iterator is a natural end only when nobody
+                # asked it to stop. Some cancellable backends answer abort by
+                # returning cleanly instead of raising; in that case the
+                # for-loop also reaches its else, but the stop flag is the
+                # authoritative reason it ended. Marking that completed would
+                # turn caller abandonment into a successful partial answer and
+                # suppress the cancel acknowledgement.
+                if not self._stop.is_set():
+                    self._completed = True
         except BaseException as exc:  # noqa: BLE001 - reported as an event
             # After a stop this is the abort surfacing - the shutdown socket
             # raises out of the read - not a result anyone may act on.
