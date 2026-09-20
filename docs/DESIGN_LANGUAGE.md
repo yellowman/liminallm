@@ -345,14 +345,14 @@ any `var(--name)` without a fallback that nothing defines.
 |---|---|
 | `.row` | The one flat list primitive, with `.row-icon`, `.row-name`, `.row-meta`, `.row-actions` |
 | `.factline`, `.fact-dot` | A fact line, and a status dot |
-| `.chip` | An enclosure that is part of the behaviour |
+| `.chip` | An enclosure that is part of the behaviour. Defined and not yet called - see part three |
 | `.figures` | Numbers without tiles |
 | `.detail-row`, `.detail-label` | A label and its value, divided by a hairline |
 | `.section-band`, `.section-icon`, `.section-description` | A major section's landmark |
 | `.setting-group` | Everything under one band |
 | `.settings-layout`, `.settings-index` | A sticky index beside its sections |
 | `.setting-row`, `.setting-grid`, `.setting-help` | The dense settings form |
-| `.setting-editor` | The isolated editing surface that still earns an enclosure |
+| `.setting-editor` | The isolated editing surface that still earns an enclosure. Currently a full card rather than part one's accent marker - see part three |
 | `.sticky-actions` | A decision bar pinned to the foot of a long form |
 | `.utility-strip` | Compact controls that decide what a list shows |
 | `.summary-line` | The fact about a list, under it, with any pager at the far end |
@@ -409,25 +409,159 @@ else, and the list would go on looking like a list.
 
 # Part three: specified and not yet built
 
-Measured against the current `frontend/styles.css`.
+Every number here was read off a rendered page or counted in the source.
+Where something is inferred rather than measured, it says so.
 
-**One focus vocabulary is not in place.** Seventeen rules use `:focus` and
-four use `:focus-visible`, so most focus rings fire on a mouse click as well
-as on keyboard navigation. Part one asks for `:focus-visible` only.
+An earlier version of this section carried two wrong counts, both from one
+bad command: `grep -c ':focus'` also matches `:focus-visible` and
+`:focus-within`, which turned six selectors into seventeen. The substance
+survived the correction and got worse, which is the argument for measuring
+rather than counting lines.
 
-**`prefers-reduced-motion` is not honoured.** There is no such block in the
-stylesheet, and four `animation` rules run indefinitely without one: the
-streaming pulse, the caret, the typing indicator and the turn-rail flash.
-One of them, `typing-bounce`, is a bounce, which part one says to avoid.
+## Defects that reach the reader
 
-Transitions themselves are close to the rule: twenty at 0.15s, four at
-130ms, and the rest between 0.12s and 0.18s.
+These are not matters of taste. Each one costs somebody the use of
+something.
 
-**The type scale is not a scale.** Nineteen distinct `font-size` values are
-in use where part one names about ten. The largest groups - 13px, 12px, 11px
-- already match; the miscellany around them does not.
+**An account is deleted without being asked.** `admin.js:406` sends
+`DELETE /admin/users/{id}` the moment the button is pressed. The same action
+on the settings tab does ask (`admin-tab.js:175`). The button is
+`class="ghost"`, so it is also pixel-identical to the "Set role" button
+beside it: part one says destructive is red at rest and confirms with
+explicit words, and this does neither.
 
-**The rest of the migration.** Insights, Notes, Files and the settings pages
-carry the vocabulary above. The remaining work is a pass over what is left:
-leftover pills and bordered buttons that should be ghost or icon buttons,
-and the type scale.
+**The note list cannot be reached by keyboard.** Each `.note-item` is an
+`<li>` with no `tabindex`, no `role` and no `href`; forty tab presses never
+land on one. Opening a note is the pane's primary action and it is available
+only to a pointer. `.conversation-item` has the same shape - a `<div>` at
+`chat.js:733` - though that one is read from the source rather than
+measured. The same class is a real `<a>` on the share page
+(`share.js:74`), so the primitive already has a correct form.
+
+**The focus ring is invisible.** Where the project styles focus at all it
+sets `outline: none` and draws `box-shadow: 0 0 0 2px rgba(14, 138, 109,
+0.10)` - the accent at one tenth alpha, which computes to **1.13:1**
+against every surface token. WCAG 2.2 asks for 3.0:1. The same declaration
+appears on `.icon-btn:focus-visible`, so a keyboard reader crossing a file
+row's four actions cannot see which one is focused; that instance is
+inferred from the identical declaration rather than measured. Everything
+else falls back to the browser's own outline, which is visible but is not
+this vocabulary and differs between browsers.
+
+The consequence is worth stating plainly: on the controls the project
+styles, it removed a working indicator and replaced it with one that cannot
+be seen.
+
+**Status carried in colour alone.** `.note-item.contradicted` and
+`.note-item.evolved` change only the title's colour - no dot, no word, no
+`title` attribute. `.voice-btn.playing` does the same. Five lines away,
+`notes.js:34` does it correctly for unsaved state, with a dot and a word.
+
+**`prefers-reduced-motion` is not honoured.** There is no such block, and
+**three** animations run indefinitely without one: the streaming pulse, the
+caret and the typing indicator. `typing-bounce` is a bounce, which part one
+says to avoid. The turn-rail flash runs once.
+
+## Rules that fixed nothing
+
+Each of these was written to do a job and does not reach the page. They
+matter more than the drift below, because a reader of the file believes
+them.
+
+| Rule | What it does |
+|---|---|
+| `.delete-user-btn`, `.view-patch-btn` at 28px | **Dead.** Renders 30px. `button.ghost` is element-plus-class and outranks a bare class - the same defect as `button.ghost` over `.voice-btn`, in a sibling the fix never reached. |
+| `bar-primary` on "New thread" | **Defined nowhere.** The one primary the chat view declares renders as a bordered secondary, so Chat has no primary at all. |
+| `.table tr.clickable.selected` | **Never applied.** No code sets the class. The patch list, where clicking opens a detail panel, has no selection state. |
+| `.patch-status.pending` | **Missing.** `admin-tab.js:396` computes `pending`; no rule matches, so it falls to neutral grey where part one assigns amber. |
+| `.chip` | **No caller.** The sanctioned chip vocabulary is unused, while four ad-hoc enclosures exist beside it. |
+| `.bar-actions` at 32px | **Dead for buttons, live for anchors** - a tier part one does not have. |
+| `.table th` 13px | **Dead.** A later rule at equal specificity sets 11.5px. |
+
+`.chip` also passes `tests/test_css_hygiene.py`, which should have reported
+it. That check strips comments from the stylesheet but not from the scripts,
+so the word "chip" inside a code comment counts as markup that can produce
+the class. The guard has a hole.
+
+## Vocabulary that does not exist as specified
+
+**There is no ghost tier.** Rendered side by side, `primary` is black,
+`ghost` is white with a visible border and `minor` is a grey fill. Ghost and
+minor are both part one's *secondary*, so forty-six buttons share one level
+where the standard has two. Part one says ghost is the default for
+lower-priority actions; nothing is ghost.
+
+**Four icon-button geometries.** `.icon-btn` 28px, `.icon-btn.compact`
+**24px**, `.pane-toggle` 30px, `.modal-close` no declared size at all. Part
+one names one, at 28px.
+
+**Three expansion vocabularies.** A `+` rotated 45° into an `×` on
+`.panel-section`, a triangle rotated 90° on `.advanced`, and nothing on the
+settings sections. Part one asks for one chevron.
+
+**Eleven refresh buttons at the standard tier**, where the same action is
+already an icon button in five other places.
+
+**Four buttons labelled with a typographic glyph** rather than a line icon
+or a word, and the two that do the same job - new chat, new note - disagree
+with each other about which class to wear.
+
+## Drift in the numbers
+
+**The type scale is not a scale.** Twenty distinct `font-size` values -
+nineteen in pixels plus one percentage - where part one names seven sizes
+across ten roles. The three largest groups (13px, 12px, 11px) are on scale.
+Measured against the role each one serves: the page title renders 17px for
+16, the metadata label 13px for 11.5, the row title 12px for 13, body text
+13px for 13.5, and the settings index 12.5px for 12. `12.5px` alone has ten
+call sites and no role at all.
+
+**`.bubble code { font-size: 82% }`** is the only relative size in the
+file, so one role renders at five sizes: 12.3px in prose, 12.5px in a fenced
+block, 11.89px in a user bubble, 16.4px inside an `h2` and **19.68px inside
+an `h1`**, because the markdown renderer can place a code span inside a
+heading.
+
+**Reading prose has two sizes.** Chat is 15px/1.65, which is right. The note
+editor and its preview are 16px/1.7.
+
+**The major-section gap is two numbers, neither on the scale.** 26px before
+a band on Files and Insights, 22px on Settings - where part one says 28-32.
+The Settings figure comes from `.setting-group`'s own margin, because the
+`:first-child` reset means the band's 26px never applies there.
+
+**Uppercase outside the small-label window**, at 13px on `.panel h4` and
+10.5px on `.message .meta`. The same role is set in sentence case by
+`.section-band h4`, 2,700 lines away.
+
+**Six bare `:focus` selectors** in four rule blocks. Three style text-entry
+controls, where the two selectors behave alike; `.field select:focus` is a
+real difference, and fires on a mouse click.
+
+Transitions are otherwise close to the rule: twenty at 0.15s, four at
+130ms, two at 0.18s.
+
+## Where five of eight screens have no level two
+
+Files, Insights and Settings carry bands. **Chat, Notes, Contexts, Artifacts
+and Tools do not**, and neither does the admin console's own markup. On
+Contexts, Artifacts and Tools the major-section level is an `<h3>` over a
+`.divider` - a hairline with no fill, no icon and no count, which is
+invisible when the page is scanned rather than read. Twenty `.divider`
+elements still carry a boundary that the band is now the vocabulary for.
+
+The Tools pane also inverts the spacing rule: **4px between two different
+lists and 8px between two rows inside one**, so the boundary is half the gap
+it separates.
+
+## A departure this project made and did not record
+
+`.setting-editor` is a full card: a 1px border on all four sides and a 6px
+radius. Part one's expanded editor is "a faint neutral background, a 2px
+accent left marker, 10-12px padding, no independent card". Three of its five
+call sites also put a second bordered box inside it with the same fill, so
+the reader sees three nested rectangles.
+
+Either the rule wins and the border becomes an accent marker, or this is a
+deliberate departure and belongs in part two with its reason. It is
+currently neither.
