@@ -3485,9 +3485,18 @@ class PostgresStore:
     #: means something is wrong rather than busy.
     _AUTH_STATE_LOCK_TIMEOUT_SECONDS = 15.0
 
-    def _try_acquire_user_auth_state_connection(self, identity: str):
-        """Try once for the advisory lock without parking a worker on it."""
-        cm = self.pool.connection()
+    def _try_acquire_user_auth_state_connection(
+        self, identity: str, pool_timeout: float
+    ):
+        """Try once, with the pool wait inside the caller's deadline.
+
+        The pool's ordinary wait is 30 seconds. Using that default here would
+        make a 15-second auth-lock deadline fictional under pool pressure:
+        one attempt could spend twice the entire budget before it ever issued
+        `pg_try_advisory_lock`. Psycopg's per-acquisition timeout is the
+        narrow override this path needs.
+        """
+        cm = self.pool.connection(timeout=max(0.0, pool_timeout))
         conn = cm.__enter__()
         key = (self._USER_AUTH_STATE_LOCK, identity)
         try:
@@ -3559,10 +3568,22 @@ class PostgresStore:
         # host's clock does, and this one decides whether to refuse a login.
         deadline = time.monotonic() + limit
         while state is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.logger.warning(
+                    "auth_state_lock_timeout",
+                    user_id=identity,
+                    waited_seconds=round(limit, 3),
+                )
+                raise AuthStateLockTimeout(
+                    "another operation is holding this account's "
+                    "authentication state"
+                )
             attempt = asyncio.create_task(
                 asyncio.to_thread(
                     self._try_acquire_user_auth_state_connection,
                     identity,
+                    remaining,
                 )
             )
             try:
@@ -3593,6 +3614,24 @@ class PostgresStore:
 
                 attempt.add_done_callback(release_late_acquisition)
                 raise
+            # A pool wait or network round-trip can finish just after the
+            # deadline. An acquisition that arrives late is not a licence to
+            # run the protected body: release it and fail closed.
+            if state is not None and time.monotonic() > deadline:
+                late_cm, late_conn = state
+                self._release_user_auth_state_connection(
+                    late_cm, late_conn, identity
+                )
+                state = None
+                self.logger.warning(
+                    "auth_state_lock_timeout",
+                    user_id=identity,
+                    waited_seconds=round(limit, 3),
+                )
+                raise AuthStateLockTimeout(
+                    "another operation is holding this account's "
+                    "authentication state"
+                )
             if state is None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
