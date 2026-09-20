@@ -154,6 +154,43 @@ def _citations(message):
     return [s for s in _segments(message) if s.get("type") == "citation"]
 
 
+class TestReaderCitationCleanupIsDurable:
+    @pytest.mark.asyncio
+    async def test_a_closed_malformed_marker_is_never_stored_as_assistant_prose(
+        self, store
+    ):
+        """The durable backstop covers results that bypass normal answer state."""
+        message = await _finish(
+            store,
+            {"content": "Alpha [cite:,]. Beta.", "usage": {}},
+        )
+
+        assert message.content == "Alpha. Beta."
+        assert "[cite:" not in message.content.lower()
+
+    @pytest.mark.asyncio
+    async def test_cleanup_moves_a_durable_citation_anchor_with_the_answer(
+        self, store
+    ):
+        before = "Alpha [cite:,]. Beta."
+        after = "Alpha. Beta."
+        message = await _finish(
+            store,
+            {
+                "content": before,
+                "validated_citations": [
+                    {**CITED[0], "public_offset": len(before)}
+                ],
+                "provenance_snapshot": SNAPSHOT,
+            },
+        )
+
+        assert message.content == after
+        cited = _citations(message)
+        assert len(cited) == 1, _segments(message)
+        assert cited[0]["start"] == cited[0]["end"] == len(after)
+
+
 class TestACitationOutlivesItsTurnAsAnAnchor:
     @pytest.mark.asyncio
     async def test_the_stored_offset_indexes_the_stored_answer(self, store):
