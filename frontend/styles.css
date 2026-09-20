@@ -1,3 +1,58 @@
+/* The interface families, served from this repository.
+
+   The tokens below named Inter and JetBrains Mono and nothing shipped them,
+   so both were requests to whatever the reader's machine happened to have.
+   On Linux that usually means neither, and the typography one of the
+   reasons for this work was a face most readers never saw.
+
+   Latin subset, the weights the interface actually uses - 400, 500 and 600
+   for the interface family, 400 and 500 for the monospace - and no more.
+   `swap` renders immediately in the fallback and changes over when the file
+   arrives, which is the right trade for an interface nobody is reading
+   before it loads.
+
+   Files and licences are in `frontend/fonts/`. Served from `/static`, which
+   mounts this directory, so nothing reaches a third party at render time. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/fonts/inter-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/static/fonts/inter-latin-500-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/static/fonts/inter-latin-600-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/fonts/jetbrains-mono-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/static/fonts/jetbrains-mono-latin-500-normal.woff2") format("woff2");
+}
+
 :root {
   --bg: #f7f7f8;
   --panel: #ffffff;
@@ -957,16 +1012,29 @@ body {
   color: var(--accent-strong);
 }
 
-.toggle-icon {
-  font-size: 13px;
-  font-weight: 600;
+/* One disclosure vocabulary: a chevron, right when closed and down when
+   open. There were three - a `+` that rotated into a `\00D7`, a CSS
+   triangle, and nothing at all - so the same question looked like three
+   different controls depending on which screen asked it.
+
+   Drawn rather than set in type: a glyph depends on the face, and the
+   monospace and interface families draw these at different weights. */
+.toggle-icon,
+.advanced summary::before {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
   margin-left: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
   color: var(--text-muted);
+  transform: rotate(-45deg);
+  transition: transform 130ms ease;
 }
 
-.panel-section:not(.collapsed) .toggle-icon {
+.panel-section:not(.collapsed) .toggle-icon,
+.advanced[open] summary::before {
   transform: rotate(45deg);
-  display: inline-block;
 }
 
 /* Form fields */
@@ -3104,7 +3172,11 @@ button.minor:hover {
 .witness-row.agrees { border-left-color: var(--accent); }
 
 .witness-verdict {
-  font-weight: 700;
+  /* 600, not 700. Three weights ship - 400, 500 and 600 - and the one rule
+     that asked for a fourth would have been drawn by the browser rather
+     than by the typeface, which is a different letterform beside every
+     other bold in the interface. */
+  font-weight: 600;
   font-size: 11px;
   letter-spacing: 0.06em;
   margin-right: 8px;
@@ -4032,16 +4104,9 @@ button.minor:hover {
 
 .advanced summary::before {
   content: "";
-  width: 0;
-  height: 0;
-  border-left: 4px solid currentColor;
-  border-top: 3.5px solid transparent;
-  border-bottom: 3.5px solid transparent;
-  transition: transform 130ms ease;
-}
-
-.advanced[open] summary::before {
-  transform: rotate(90deg);
+  /* Geometry above, with `.toggle-icon`. The chevron sits before the word
+     here and after it there, so only the margin differs. */
+  margin: 0 8px 0 0;
 }
 
 .advanced summary:hover {

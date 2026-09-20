@@ -376,7 +376,7 @@
                 </div>
                 <div id="chat-actions">
                   <button type="button" class="prefs-toggle" id="preferences-toggle"
-                          aria-expanded="false" aria-controls="preferences-section">Preferences <span class="toggle-icon">+</span></button>
+                          aria-expanded="false" aria-controls="preferences-section">Preferences <span class="toggle-icon" aria-hidden="true"></span></button>
                   <div class="pill-row">
                     <a href="/admin" class="ghost hidden" id="approve-patches">Approve patches</a>
                     <button type="button" class="icon-btn voice-btn" id="voice-input-btn" aria-label="Voice input" title="Hold to record">
@@ -529,9 +529,11 @@
               </div>
               <p class="subtext">Create and manage knowledge contexts for RAG-powered conversations.</p>
 
-              <div class="divider"></div>
-
-              <h3>Create new context</h3>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 4.2v11.6M4.2 10h11.6"/></svg>
+                <h3>Create new context</h3>
+                <span class="section-description">Name a context and describe what belongs in it</span>
+              </div>
               <div class="input-grid">
                 <div class="field">
                   <label for="new-context-name">Name</label>
@@ -547,25 +549,30 @@
               </div>
               <div id="context-create-status" class="small" role="status"></div>
 
-              <div class="divider"></div>
-
-              <h3>Context details</h3>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7.2"/><path d="M10 9.2v4.2M10 6.6h.01"/></svg>
+                <h3>Context details</h3>
+                <span class="section-description">What this context holds and how it was built</span>
+              </div>
               <div id="context-details" class="context-details">
                 <div class="empty">Select a context to view details</div>
               </div>
 
-              <div class="divider"></div>
-
-              <h3>Context Sources</h3>
-              <p class="subtext">Filesystem paths that have been ingested into this context.</p>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.8 5.6a1 1 0 0 1 1-1h3.1l1.5 2h7.8a1 1 0 0 1 1 1v6.8a1 1 0 0 1-1 1H3.8a1 1 0 0 1-1-1Z"/></svg>
+                <h3>Sources</h3>
+                <span class="section-description">Filesystem paths ingested into this context</span>
+              </div>
               <div id="context-sources-list" class="context-sources">
                 <div class="empty">Select a context to view sources</div>
               </div>
 
               <div id="add-source-section" class="hidden">
-                <div class="divider"></div>
-                <h3>Add Source</h3>
-                <p class="subtext">Add a filesystem path to ingest into this context.</p>
+                <div class="section-band">
+                  <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8.4 11.6a2.8 2.8 0 0 0 4 0l2.4-2.4a2.8 2.8 0 1 0-4-4l-.7.7"/><path d="M11.6 8.4a2.8 2.8 0 0 0-4 0L5.2 10.8a2.8 2.8 0 1 0 4 4l.7-.7"/></svg>
+                  <h3>Add a source</h3>
+                  <span class="section-description">Ingest another filesystem path into this context</span>
+                </div>
                 <form id="add-source-form">
                   <div class="input-grid">
                     <div class="field">
@@ -599,16 +606,20 @@
               </div>
               <p class="subtext">Browse and inspect system artifacts: workflows, policies, adapters, and tools.</p>
 
-              <div class="divider"></div>
-
-              <h3>Artifact details</h3>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 2.8 2.8 6.4 10 10l7.2-3.6Z"/><path d="M2.8 10 10 13.6 17.2 10"/></svg>
+                <h3>Artifact details</h3>
+                <span class="section-description">Identity, ownership and the schema it declares</span>
+              </div>
               <div id="artifact-details" class="artifact-details">
                 <div class="empty">Select an artifact to view details</div>
               </div>
 
-              <div class="divider"></div>
-
-              <h3>Version history</h3>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="7.2"/><path d="M10 5.8V10l2.8 1.7"/></svg>
+                <h3>Version history</h3>
+                <span class="section-description">Every published version of this artifact</span>
+              </div>
               <div id="artifact-versions" class="artifact-versions">
                 <div class="empty">Select an artifact to view version history</div>
               </div>
@@ -626,16 +637,20 @@
               </div>
               <p class="subtext">Browse available tools and workflows. Invoke tools directly or manage workflow configurations.</p>
 
-              <div class="divider"></div>
-
-              <h3>Tool Details</h3>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12.6 3.4a3.8 3.8 0 0 0-4.7 4.9l-4.3 4.3a1.4 1.4 0 0 0 2 2l4.3-4.3a3.8 3.8 0 0 0 4.9-4.7l-2.2 2.2-2-2Z"/></svg>
+                <h3>Tool details</h3>
+                <span class="section-description">Inputs, schema and execution contract</span>
+              </div>
               <div id="tool-details" class="tool-details">
                 <div class="empty">Select a tool to view details and invoke it</div>
               </div>
 
-              <div class="divider"></div>
-
-              <h3>Invoke Tool</h3>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7.4 5.2 14.6 10l-7.2 4.8Z"/></svg>
+                <h3>Invoke tool</h3>
+                <span class="section-description">Run the selected tool directly</span>
+              </div>
               <div id="tool-invoke-section" class="hidden">
                 <form id="tool-invoke-form">
                   <div class="field">
@@ -651,9 +666,11 @@
               </div>
               <div id="tool-invoke-placeholder" class="empty">Select a tool above to invoke it</div>
 
-              <div class="divider"></div>
-
-              <h3>Workflow Details</h3>
+              <div class="section-band">
+                <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="5.2" cy="5.6" r="2"/><circle cx="14.8" cy="14.4" r="2"/><path d="M7.2 5.6h5a2.4 2.4 0 0 1 2.4 2.4v4.4"/></svg>
+                <h3>Workflow details</h3>
+                <span class="section-description">Configuration for the selected workflow</span>
+              </div>
               <div id="workflow-details" class="workflow-details">
                 <div class="empty">Select a workflow to view its configuration</div>
               </div>

@@ -250,9 +250,22 @@ def defined_class_names(css: str) -> set:
     Excluded because this file names retired classes in the comments that
     record their retirement, and counting those as definitions reports every
     one of them as an orphan.
+
+    Declaration values are excluded for the same reason, and one of them
+    bites: `url("…/inter-latin-400-normal.woff2")` has a dot followed by a
+    word, so a `@font-face` rule reported `woff2` as a styled class that
+    nothing produces. A selector is what precedes a `{`, so only that is
+    read.
     """
     body = re.sub(r"/\*.*?\*/", " ", css, flags=re.S)
-    return set(re.findall(r"\.([a-zA-Z][\w-]*)", body))
+    # Everything up to each `{`, back to the previous `}` or `;` - which is
+    # the prelude, and the only place a class name can be a selector.
+    preludes = re.findall(r"(?:^|[};])([^{};]*)\{", body, flags=re.S)
+    return {
+        name
+        for prelude in preludes
+        for name in re.findall(r"\.([a-zA-Z][\w-]*)", prelude)
+    }
 
 
 def without_comments(text: str, suffix: str) -> str:
@@ -368,6 +381,21 @@ class TestNoRuleStylesSomethingThatCannotAppear:
             )
         )
         assert "kept" in kept, kept
+
+    def test_a_dotted_filename_in_a_value_is_not_a_class(self):
+        """`url("…/inter-latin-400-normal.woff2")` has a dot followed by a
+        word, so reading class names from the whole stylesheet reported
+        `woff2` as a styled class nothing can produce. A selector is what
+        precedes a brace; a declaration value is not one."""
+        css = (
+            '@font-face {\n'
+            '  font-family: "Inter";\n'
+            '  src: url("/static/fonts/inter-latin-400-normal.woff2")'
+            ' format("woff2");\n'
+            '}\n'
+            '.real { color: red }\n'
+        )
+        assert defined_class_names(css) == {"real"}
 
     def test_a_name_only_a_comment_mentions_is_not_a_definition(self):
         """Retirement comments name what they retired. Counting those would

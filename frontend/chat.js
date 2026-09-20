@@ -4100,8 +4100,8 @@ const initEventListeners = () => {
     if (!section) return;
     const open = section.classList.toggle('collapsed') === false;
     $('preferences-toggle').setAttribute('aria-expanded', String(open));
-    const icon = $('preferences-toggle').querySelector('.toggle-icon');
-    if (icon) icon.textContent = open ? '\u2212' : '+';
+    // The chevron is drawn by the stylesheet from `.collapsed`, so there is
+    // no character to swap here any more.
   });
 
   $('thumbs-up')?.addEventListener('click', () => sendPreference(true));

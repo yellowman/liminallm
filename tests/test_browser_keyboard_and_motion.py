@@ -429,3 +429,84 @@ class TestAnIconControlIsOneSize:
             )
         finally:
             context.close()
+
+
+class TestTheInterfaceShipsItsOwnTypefaces:
+    """The tokens named Inter and JetBrains Mono and nothing shipped them.
+
+    A `font-family` is a request, not a guarantee. With no `@font-face` and
+    no files in the repository, both names were asking the reader's own
+    machine - and on Linux that usually means neither is there, so the
+    typography this work was partly about was one most readers never saw.
+    """
+
+    def test_both_families_load_from_this_repository(self, browser, server):
+        email, _token = _account(server)
+        context, page = _signed_in(browser, server, email)
+        try:
+            page.wait_for_timeout(1200)
+            state = page.evaluate(
+                """async () => {
+                  // A face is fetched on first use, so asking whether the
+                  // monospace has loaded before anything is set in it
+                  // measures the render, not the stylesheet. Put both on the
+                  // page, then wait.
+                  const probe = document.createElement('div');
+                  probe.innerHTML =
+                    '<span style="font-family:Inter;font-weight:600">Aa</span>' +
+                    '<code class="monospace">Aa</code>';
+                  document.body.appendChild(probe);
+                  await document.fonts.load('500 14px Inter');
+                  await document.fonts.load('400 12px "JetBrains Mono"');
+                  await document.fonts.ready;
+                  probe.remove();
+                  const faces = [...document.fonts].map(
+                    f => `${f.family}|${f.weight}|${f.status}`);
+                  return {
+                    faces,
+                    interLoaded: document.fonts.check('500 14px Inter'),
+                    monoLoaded: document.fonts.check('400 12px "JetBrains Mono"'),
+                    body: getComputedStyle(document.body).fontFamily.split(',')[0],
+                  };
+                }"""
+            )
+            assert state["interLoaded"], (
+                f"Inter is named by the tokens and not loaded: {state}"
+            )
+            assert state["monoLoaded"], (
+                f"JetBrains Mono is named by the tokens and not loaded: {state}"
+            )
+            assert state["body"].strip('"') == "Inter", state
+
+            # Every weight the stylesheet asks for has a file behind it, so
+            # nothing is synthesised into a letterform the typeface does not
+            # have.
+            inter = {f.split("|")[1] for f in state["faces"] if "Inter" in f}
+            assert {"400", "500", "600"} <= inter, state["faces"]
+        finally:
+            context.close()
+
+    def test_no_font_is_fetched_from_a_third_party(self, browser, server):
+        """Self-hosted is the point. A CDN link would work and would also
+        tell someone else's server who is reading, on every page load."""
+        email, _token = _account(server)
+        context = browser.new_context(viewport=DESKTOP)
+        page = context.new_page()
+        external = []
+        page.on(
+            "request",
+            lambda r: external.append(r.url)
+            if r.resource_type == "font" and "127.0.0.1" not in r.url
+            and "localhost" not in r.url
+            else None,
+        )
+        try:
+            page.goto(f"{server.base_url}/", wait_until="domcontentloaded")
+            page.fill("#email", email)
+            page.fill("#password", PASSWORD)
+            page.click("#auth-form button[type=submit]")
+            page.wait_for_selector("#main-tabs", state="visible")
+            page.wait_for_timeout(1500)
+            assert not external, f"fonts fetched from elsewhere: {external}"
+        finally:
+            context.close()
