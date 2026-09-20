@@ -26,7 +26,7 @@ from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service import turn_effects
 from liminallm.service.auth import AuthContext
-from liminallm.service.citations import durable_citations, replaced_answer
+from liminallm.service.citations import durable_citations, reader_answer
 
 logger = get_logger(__name__)
 
@@ -261,12 +261,11 @@ async def finish(
     # has to scrub incrementally before tokens leave; this is the durable
     # backstop that guarantees stored assistant prose contains no closed
     # citation marker. Content and offered citation offsets move together.
-    cleaned = replaced_answer(assistant_content, [], offered)
-    if cleaned is not None:
-        assistant_content = cleaned.content
-        offered = cleaned.citations
-        turn.orchestration["content"] = assistant_content
-        turn.orchestration["validated_citations"] = offered
+    cleaned = reader_answer(assistant_content, [], offered)
+    assistant_content = cleaned.content
+    offered = cleaned.citations
+    turn.orchestration["content"] = assistant_content
+    turn.orchestration["validated_citations"] = offered
 
     citations = durable_citations(
         offered, turn.orchestration.get("provenance_snapshot"), assistant_content
