@@ -510,6 +510,35 @@ class TestReaderCleanupWithoutAnIssuedNamespace:
         assert NONCE in public
         assert "[cite:" not in public.lower()
 
+    def test_broad_only_cleanup_does_not_add_provider_contradiction_failure(self):
+        """Uncited streams bypassed the citation wrapper before this repair.
+
+        Marker cleanup may change their reader text, but merely disagreeing
+        with the provider's optional final content must not become a new
+        server_error on otherwise ordinary uncited traffic.
+        """
+        raw = "Alpha [cite:,] Beta."
+        stream = ScrubbedTokenStream(
+            TestWhatTheFilterLetsThrough._events(
+                raw, content="provider-final-differs"
+            ),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+        events = list(stream)
+        assert not any(event.get("event") == "error" for event in events)
+        tokens = "".join(
+            str(event.get("data") or "")
+            for event in events
+            if event.get("event") == "token"
+        )
+        assert tokens == "Alpha Beta."
+        assert events[-1]["event"] == "message_done"
+        assert events[-1]["data"]["content"] == tokens
+
+
     def test_broad_only_cleanup_adds_no_reply_ceiling(self):
         """Ordinary streams had no citation ceiling before this repair."""
         text = ("ordinary prose " * 40) + "[cite:,] done"
