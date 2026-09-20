@@ -2704,11 +2704,16 @@ button.minor:hover {
 }
 
 /* Files list */
+/* No top margin. It was here to clear a Refresh strip that sat above the
+   list; the refresh moved into the band and a column heading took its
+   place, so the margin fell between the heading and the rows it labels and
+   left the heading equidistant from the band above and the table below -
+   measured at 12px to each. A heading belongs to its columns.
+   Rows still get their own gap. */
 .files-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-top: 12px;
 }
 
 /* The files library is `.row` now: a type glyph, the name, size and age on
@@ -2877,9 +2882,23 @@ button.minor:hover {
   white-space: nowrap;
 }
 
-/* Compact tier, and no wrapping: these act on the note beside them rather
-   than being the page's own actions. */
-.note-toolbar {
+/* Empty when the note is saved, and then it must not take a gap. A flex
+   item with no content is still an item, so `.note-editor-head`'s 12px
+   gap was counted twice and the title lost 12px for ever - measured at
+   24px between the title and the toolbar with nothing in between. */
+.note-state:empty {
+  display: none;
+}
+
+/* `.utility-strip.note-toolbar`, not `.note-toolbar`. A bare class ties
+   with `.utility-strip` and the later rule wins, which is source order -
+   and `.utility-strip` is declared later in this file, so `flex-wrap:
+   nowrap` and `margin: 0` here never applied and the editor's actions
+   wrapped on a narrow editor. The same trap as `button.ghost` outranking
+   `.voice-btn`: two names on the element beat one.
+   Compact tier and no wrapping, because these act on the note beside them
+   rather than being the page's own actions. */
+.utility-strip.note-toolbar {
   flex: none;
   flex-wrap: nowrap;
   margin: 0;

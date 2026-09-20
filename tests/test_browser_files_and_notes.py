@@ -234,6 +234,72 @@ class TestTheNoteEditorSaysWhatStateItIsIn:
         finally:
             context.close()
 
+    def test_the_toolbar_keeps_its_own_geometry_and_the_cue_costs_nothing(
+        self, browser, server
+    ):
+        """Two overrides a bare class name loses, and a gap nothing fills.
+
+        `.note-toolbar` sets `flex-wrap: nowrap` and `margin: 0` over
+        `.utility-strip`'s wrap and bottom margin. Written as a bare class
+        it ties on specificity with `.utility-strip`, which is declared
+        later in the stylesheet and therefore wins - the same trap as
+        `button.ghost` outranking `.voice-btn`, and the reason the rule is
+        `.utility-strip.note-toolbar`. Nothing about that is visible from
+        either rule on its own.
+
+        The cue beside the title is a flex item whether or not it has
+        content, so while it was empty the head's gap was counted twice and
+        the title lost 12px for ever.
+        """
+        context, page = self._with_a_note(browser, server)
+        try:
+            measured = page.evaluate(
+                """() => {
+                  const bar = document.querySelector('.note-toolbar');
+                  const head = document.querySelector('.note-editor-head');
+                  const title = document.querySelector('#note-title');
+                  const cs = getComputedStyle(bar);
+                  return {
+                    wrap: cs.flexWrap,
+                    marginBottom: cs.marginBottom,
+                    headGap: Math.round(parseFloat(getComputedStyle(head).gap)),
+                    titleToToolbar: Math.round(
+                      bar.getBoundingClientRect().left
+                      - title.getBoundingClientRect().right),
+                  };
+                }"""
+            )
+            assert measured["wrap"] == "nowrap", (
+                "the toolbar wraps, so `.utility-strip` is winning the "
+                f"cascade: {measured}"
+            )
+            assert measured["marginBottom"] == "0px", measured
+            assert measured["titleToToolbar"] == measured["headGap"], (
+                "an empty cue is costing a gap: the title is "
+                f"{measured['titleToToolbar']}px from the toolbar where the "
+                f"head's gap is {measured['headGap']}px"
+            )
+
+            # The control for that last one: the measurement has to be able
+            # to see a difference, or equality above means nothing.
+            page.fill("#note-content", "something, so the cue appears")
+            page.wait_for_timeout(300)
+            dirty = page.evaluate(
+                """() => {
+                  const bar = document.querySelector('.note-toolbar');
+                  const title = document.querySelector('#note-title');
+                  return Math.round(bar.getBoundingClientRect().left
+                    - title.getBoundingClientRect().right);
+                }"""
+            )
+            assert dirty > measured["titleToToolbar"], (
+                "the gap did not grow when the cue appeared, so this probe "
+                f"cannot tell the two states apart: {dirty} against "
+                f"{measured['titleToToolbar']}"
+            )
+        finally:
+            context.close()
+
     def test_deleting_a_note_asks_first_and_a_refusal_keeps_it(
         self, browser, server
     ):
