@@ -536,8 +536,22 @@ class TestReaderCleanupWithoutAnIssuedNamespace:
         )
         assert tokens == "Alpha Beta."
         assert events[-1]["event"] == "message_done"
-        assert events[-1]["data"]["content"] == tokens
+        assert events[-1]["data"]["content"] == "provider-final-differs"
 
+    def test_broad_only_cleanup_preserves_message_done_only_answers(self):
+        """Some backends report the whole answer only at completion."""
+        reported = "Alpha [cite:,] Beta."
+        stream = ScrubbedTokenStream(
+            TestWhatTheFilterLetsThrough._events(content=reported),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+            verify_reported=False,
+        )
+        events = list(stream)
+        assert [event["event"] for event in events] == ["message_done"]
+        assert events[0]["data"]["content"] == "Alpha Beta."
+        assert stream.reader.intact()
 
     def test_broad_only_cleanup_adds_no_reply_ceiling(self):
         """Ordinary streams had no citation ceiling before this repair."""
