@@ -77,7 +77,10 @@ MIN_NONCE_BITS = 40
 #:
 #: Bounded, and stopping at the first `]` or newline, so an unclosed `[cite:`
 #: cannot swallow the rest of a sentence.
-MAX_CITATION_MARKER_BODY = 64\nCITATION_RE = re.compile(\n    rf"\\[(?i:cite):([^\\]\\n]{{0,{MAX_CITATION_MARKER_BODY}}})\\]"\n)
+MAX_CITATION_MARKER_BODY = 64
+CITATION_RE = re.compile(
+    rf"\[(?i:cite):([^\]\n]{{0,{MAX_CITATION_MARKER_BODY}}})\]"
+)
 
 #: Reader-side cleanup includes the horizontal spacing immediately before a
 #: marker. Kept as one compiled expression so the finished-string helper and
