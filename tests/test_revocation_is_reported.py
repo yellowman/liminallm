@@ -23,6 +23,8 @@ password really did change, and the caller is told the revocation did not.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+import threading
 import uuid
 
 import psycopg
@@ -255,3 +257,98 @@ class TestWhenRevocationFails:
             json={"email": account["email"], "password": PASSWORD},
         )
         assert stale.status_code == 401, "the old password still works"
+
+
+class TestResetAndLoginHaveOneOrder:
+    def test_a_login_that_proved_the_old_password_cannot_outlive_reset(
+        self, runtime, account, monkeypatch
+    ):
+        """Password proof and reset completion have one linear order.
+
+        The login is paused after successful Argon2 verification but before it
+        can publish a session. Reset then attempts to enter the same
+        cross-replica auth-state lock. It must block there. Once the login is
+        released, it may publish its session, but reset runs next and must
+        remove that session before changing the password and reporting
+        completion.
+
+        Without the login-side lock, reset acquires immediately and the stale
+        proof publishes a live session after reset. Without the reset-side
+        lock, the reset never attempts the observed lock at all.
+        """
+        user = runtime.store.get_user(account["user_id"])
+        assert user is not None
+        token = asyncio.run(runtime.auth.initiate_password_reset(user))
+        assert token
+
+        original_verify = runtime.auth.verify_password
+        original_hold = runtime.store.hold_user_auth_state
+        proof_complete = threading.Event()
+        release_login = threading.Event()
+        reset_attempted = threading.Event()
+        reset_acquired = threading.Event()
+        result: dict = {}
+
+        @contextmanager
+        def observed_hold(user_id):
+            is_reset = threading.current_thread().name == "reset-race"
+            if is_reset:
+                reset_attempted.set()
+            with original_hold(user_id):
+                if is_reset:
+                    reset_acquired.set()
+                yield
+
+        def paused_verify(user_id, password):
+            ok = original_verify(user_id, password)
+            if (
+                ok
+                and password == PASSWORD
+                and threading.current_thread().name == "login-race"
+            ):
+                proof_complete.set()
+                if not release_login.wait(5):
+                    raise AssertionError("fixture never released the paused login")
+            return ok
+
+        monkeypatch.setattr(runtime.store, "hold_user_auth_state", observed_hold)
+        monkeypatch.setattr(runtime.auth, "verify_password", paused_verify)
+
+        def do_login():
+            result["login"] = asyncio.run(
+                runtime.auth.login(account["email"], PASSWORD)
+            )
+
+        def do_reset():
+            result["reset"] = asyncio.run(
+                runtime.auth.complete_password_reset_with_revocation(
+                    token, NEW_PASSWORD
+                )
+            )
+
+        login_thread = threading.Thread(target=do_login, name="login-race")
+        reset_thread = threading.Thread(target=do_reset, name="reset-race")
+        login_thread.start()
+        assert proof_complete.wait(5), "login never reached the paused proof"
+
+        reset_thread.start()
+        assert reset_attempted.wait(5), "reset never attempted the auth-state lock"
+        assert not reset_acquired.is_set(), (
+            "reset crossed password proof before the login published its "
+            "session; the two operations do not share one order"
+        )
+
+        release_login.set()
+        login_thread.join(5)
+        reset_thread.join(5)
+        assert not login_thread.is_alive() and not reset_thread.is_alive()
+
+        login_user, login_session, login_tokens = result["login"]
+        assert login_user is not None and login_session is not None and login_tokens
+        assert result["reset"] == (True, True)
+        assert runtime.store.get_session(login_session.id) is None, (
+            "a session authenticated with the old password survived the "
+            "completed reset"
+        )
+        assert runtime.auth.verify_password(account["user_id"], NEW_PASSWORD)
+        assert not runtime.auth.verify_password(account["user_id"], PASSWORD)
