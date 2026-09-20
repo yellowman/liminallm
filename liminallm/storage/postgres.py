@@ -6,6 +6,7 @@ import json
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
@@ -181,6 +182,13 @@ class PostgresStore:
         self._connect_max_retries = 3
         self._connect_retry_backoff = 0.25
         self._last_pool_metrics_log = 0.0
+        # While a per-user auth-state advisory lock is held, store calls in
+        # that async task reuse the lock's own Postgres connection. Holding a
+        # pool connection and borrowing a second one for each store method
+        # lets N concurrent users consume all N pool slots and deadlock.
+        self._auth_state_connection: ContextVar[Any] = ContextVar(
+            f"auth_state_connection_{id(self)}", default=None
+        )
 
         try:
             self.fs_root.mkdir(parents=True, exist_ok=True)
@@ -319,7 +327,21 @@ class PostgresStore:
                 setattr(sess, field, value)
             self.sessions[session_id] = sess
 
+    @contextlib.contextmanager
+    def _reuse_auth_state_connection(self, conn):
+        """Give a store method the auth lock's connection, with normal commits."""
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+
     def _connect(self):
+        held = self._auth_state_connection.get()
+        if held is not None:
+            return self._reuse_auth_state_connection(held)
         attempt = 0
         last_exc: Exception | None = None
         while attempt < self._connect_max_retries:
@@ -3451,14 +3473,26 @@ class PostgresStore:
 
     @contextlib.contextmanager
     def hold_user_auth_state(self, user_id: str):
-        """Hold one user's authentication/session state across an operation."""
+        """Hold one user's authentication/session state across an operation.
+
+        Store calls made by this task reuse this connection, so the lock does
+        not reserve one pool slot while each nested operation waits for
+        another. Session advisory locks survive the per-operation commits.
+        """
         key = (self._USER_AUTH_STATE_LOCK, str(user_id))
-        with self._connect() as conn:
+        # Deliberately bypass _connect here: this is the operation that creates
+        # the task-local reuse scope and therefore must start with a real pool
+        # checkout even if a caller accidentally nests a lock.
+        with self.pool.connection() as conn:
             conn.execute("SELECT pg_advisory_lock(%s, hashtext(%s))", key)
+            conn.commit()
+            token = self._auth_state_connection.set(conn)
             try:
                 yield
             finally:
+                self._auth_state_connection.reset(token)
                 conn.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))", key)
+                conn.commit()
 
     _USER_LIFETIME_LOCK = 0x6C696675  # "lifu"
 
