@@ -955,21 +955,39 @@ class AuthService:
             self.logger.info(
                 "oauth_email_verified", provider=provider, user_id=user.id
             )
-        # After the provider proof, for the same reason the password path
-        # checks after the password: the answer names the account's
-        # verification state, and only a caller who has proven the identity
-        # may be told it.
-        await self._require_verification_grace(user)
-        session = self.store.create_session(
-            user.id,
-            tenant_id=user.tenant_id,
-            ttl_minutes=self._get_session_ttl("web", user=user),
-            meta={"device_type": "web"},
-        )
-        tokens = self._issue_tokens(user, session, device_type="web")
-        if self.cache:
-            await self.cache.cache_session(session.id, user.id, session.expires_at)
-        return user, session, tokens
+        # Publish the authenticated session in the same per-user order as
+        # password login, reset, role changes and rotation. If reset wins the
+        # lock first this is a genuinely post-reset login; if OAuth wins first,
+        # reset sees and revokes the session it created.
+        with self.store.hold_user_auth_state(user.id):
+            fresh = self.store.get_user(user.id)
+            if fresh is None:
+                return None, None, {}
+            user = fresh
+            await self._require_verification_grace(user)
+
+            if (user.meta or {}).get("single_session"):
+                revoked = await self.revoke_all_user_sessions(user.id)
+                if not revoked:
+                    self.logger.warning(
+                        "single_session_prior_revocation_failed",
+                        user_id=user.id,
+                        provider=provider,
+                    )
+                    return None, None, {}
+
+            session = self.store.create_session(
+                user.id,
+                tenant_id=user.tenant_id,
+                ttl_minutes=self._get_session_ttl("web", user=user),
+                meta={"device_type": "web"},
+            )
+            tokens = self._issue_tokens(user, session, device_type="web")
+            if self.cache:
+                await self.cache.cache_session(
+                    session.id, user.id, session.expires_at
+                )
+            return user, session, tokens
 
     def list_users(
         self, tenant_id: Optional[str] = None, limit: int = 100
@@ -977,37 +995,34 @@ class AuthService:
         return self.store.list_users(tenant_id=tenant_id, limit=limit)
 
     async def set_user_role(self, user_id: str, role: str) -> Optional[User]:
-        """Update a user's role only after their existing sessions are gone.
+        """Revoke existing sessions before changing a user's role.
 
-        A surviving refresh token is not pinned to the role in the token: the
-        refresh path reloads the user and issues credentials for the role the
-        account has *now*. Updating first and then failing revocation therefore
-        lets an old session inherit an upgrade.
-
-        Revoke first. If revocation fails, the role is unchanged and the
-        operation can truthfully fail. If revocation succeeds and the later
-        role write fails, the only side effect is an extra logout, which is
-        the safe direction.
+        The whole decision is serialized with login, OAuth session creation,
+        session rotation, and credential rotation. Without that shared order,
+        a session could be published in the gap between revocation and the
+        role write and immediately observe the new privilege through session
+        authentication.
         """
-        user = self.store.get_user(user_id)
-        if not user:
-            return None
-        revoked = await self.revoke_all_user_sessions(user_id)
-        if not revoked:
-            self.logger.warning(
-                "user_role_change_revocation_failed",
-                user_id=user_id,
-                requested_role=role,
-            )
-            raise RuntimeError("existing sessions could not be revoked")
-        updated = self.store.update_user_role(user_id, role)
-        if updated:
-            self.logger.info(
-                "user_role_updated_sessions_revoked",
-                user_id=user_id,
-                new_role=role,
-            )
-        return updated
+        with self.store.hold_user_auth_state(user_id):
+            user = self.store.get_user(user_id)
+            if not user:
+                return None
+            revoked = await self.revoke_all_user_sessions(user_id)
+            if not revoked:
+                self.logger.warning(
+                    "user_role_change_revocation_failed",
+                    user_id=user_id,
+                    requested_role=role,
+                )
+                raise RuntimeError("existing sessions could not be revoked")
+            updated = self.store.update_user_role(user_id, role)
+            if updated:
+                self.logger.info(
+                    "user_role_updated_sessions_revoked",
+                    user_id=user_id,
+                    new_role=role,
+                )
+            return updated
 
     async def delete_user(self, user_id: str) -> bool:
         """Erase the account, then the copies of it that live outside Postgres.
@@ -1078,73 +1093,73 @@ class AuthService:
         ip_addr: Optional[str] = None,
         device_type: str = "web",
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
+        # The email lookup only discovers the identity to serialize. Password
+        # proof and session publication happen under the same cross-replica
+        # auth-state lock as password reset and role/session revocation. A
+        # reset can therefore linearize before this login (the old password
+        # then fails) or after it (the session is then revoked), never between
+        # proof and publication.
         user = self.store.get_user_by_email(email)
-        if not user or not self.verify_password(user.id, password):
+        if not user:
             return None, None, {}
-        if not self._site_matches(user, tenant_id):
-            return None, None, {}
-        # Only now, with the password proven, and against a freshly read row.
-        #
-        # Freshly read because the snapshot above was taken before the password
-        # check, and a verification committing during that check would
-        # otherwise be judged from a stale `email_verified=False` - issuing
-        # credentials calculated from a state that no longer exists, or
-        # refusing an account that had just become verified.
-        #
-        # After the credential check because the answer names the account's
-        # verification state. Before it, the same answer would tell anyone
-        # which addresses have unverified accounts. A wrong password on an
-        # expired account is still an ordinary failure.
-        user = self.store.get_user(user.id) or user
-        await self._require_verification_grace(user)
-
-        # SPEC §18: Single-session mode - invalidate prior sessions if enabled
-        user_meta = user.meta or {}
-        if user_meta.get("single_session"):
-            self.logger.info(
-                "single_session_mode_active",
-                user_id=user.id,
-                action="revoking_prior_sessions",
-            )
-            revoked = await self.revoke_all_user_sessions(user.id)
-            if not revoked:
-                # Single-session is a constraint, not a best-effort cleanup.
-                # No new session exists yet, so this path can fail closed
-                # without rolling back any successful authentication state.
-                self.logger.warning(
-                    "single_session_prior_revocation_failed",
-                    user_id=user.id,
-                )
+        with self.store.hold_user_auth_state(user.id):
+            user = self.store.get_user(user.id)
+            if not user or not self.verify_password(user.id, password):
                 return None, None, {}
+            if not self._site_matches(user, tenant_id):
+                return None, None, {}
+            await self._require_verification_grace(user)
 
-        mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
-        require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
-        device = (device_type or "web").lower()
-        session_ttl = self._get_session_ttl(device, user=user)
-        session = self.store.create_session(
-            user.id,
-            mfa_required=require_mfa,
-            tenant_id=user.tenant_id,
-            user_agent=user_agent,
-            ip_addr=ip_addr,
-            ttl_minutes=session_ttl,
-            meta={"device_type": device},
-        )
-        tokens: dict[str, str] = {}
-        if require_mfa and mfa_cfg:
-            if mfa_code and self._verify_totp(mfa_cfg.secret, mfa_code):
-                self._mark_session_verified(session.id)
-                session.mfa_verified = True
-                tokens = self._issue_tokens(user, session, device_type=device)
+            # SPEC §12.1: single-session mode is a constraint, not cleanup.
+            # The auth-state lock also serializes two simultaneous logins, so
+            # they cannot both revoke the same predecessor and then publish
+            # two successors.
+            user_meta = user.meta or {}
+            if user_meta.get("single_session"):
+                self.logger.info(
+                    "single_session_mode_active",
+                    user_id=user.id,
+                    action="revoking_prior_sessions",
+                )
+                revoked = await self.revoke_all_user_sessions(user.id)
+                if not revoked:
+                    self.logger.warning(
+                        "single_session_prior_revocation_failed",
+                        user_id=user.id,
+                    )
+                    return None, None, {}
+
+            mfa_cfg = (
+                self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
+            )
+            require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
+            device = (device_type or "web").lower()
+            session_ttl = self._get_session_ttl(device, user=user)
+            session = self.store.create_session(
+                user.id,
+                mfa_required=require_mfa,
+                tenant_id=user.tenant_id,
+                user_agent=user_agent,
+                ip_addr=ip_addr,
+                ttl_minutes=session_ttl,
+                meta={"device_type": device},
+            )
+            tokens: dict[str, str] = {}
+            if require_mfa and mfa_cfg:
+                if mfa_code and self._verify_totp(mfa_cfg.secret, mfa_code):
+                    self._mark_session_verified(session.id)
+                    session.mfa_verified = True
+                    tokens = self._issue_tokens(user, session, device_type=device)
+                else:
+                    session.mfa_verified = False
             else:
-                session.mfa_verified = False
-        else:
-            tokens = self._issue_tokens(user, session, device_type=device)
-        if self.cache and (not require_mfa or session.mfa_verified):
-            await self.cache.cache_session(session.id, user.id, session.expires_at)
-            # Initialize session activity tracking
-            await self.cache.update_session_activity(session.id)
-        return user, session, tokens
+                tokens = self._issue_tokens(user, session, device_type=device)
+            if self.cache and (not require_mfa or session.mfa_verified):
+                await self.cache.cache_session(
+                    session.id, user.id, session.expires_at
+                )
+                await self.cache.update_session_activity(session.id)
+            return user, session, tokens
 
     async def refresh_tokens(
         self, refresh_token: str, tenant_hint: Optional[str] = None
@@ -1328,17 +1343,16 @@ class AuthService:
     ) -> Optional[Session]:
         """Rotate session if 24h of activity has passed (SPEC §12.1).
 
-        Returns the new session if rotated, None otherwise.
-
-        Bug fix: Uses Redis SETNX lock to prevent race condition where concurrent
-        requests with the same session could both trigger rotation.
+        The Redis lock prevents two requests from rotating the same session.
+        The per-user Postgres auth-state lock is a different boundary: it
+        prevents rotation from resurrecting a session while password reset or
+        a role change is revoking that user's authentication state.
         """
         if not self.cache:
             return None
 
         last_activity = await self.cache.get_session_activity(sess.id)
         if not last_activity:
-            # No activity record - initialize it
             await self.cache.update_session_activity(sess.id)
             return None
 
@@ -1347,69 +1361,71 @@ class AuthService:
         if self._now() - last_activity < rotation_threshold:
             return None
 
-        # Bug fix: Acquire rotation lock to prevent duplicate rotations
         lock_key = f"session:rotation_lock:{sess.id}"
         acquired = await self.cache.client.set(lock_key, "1", nx=True, ex=30)
         if not acquired:
-            # Another request is already rotating this session
             return None
 
         try:
-            # Double-check the session hasn't been rotated while waiting
             rotated_to = await self.cache.get_rotated_session(sess.id)
             if rotated_to:
-                # Session was already rotated by another request
                 return None
 
-            # Time to rotate - create new session
-            self.logger.info(
-                "session_rotation",
-                old_session=sess.id,
-                user_id=sess.user_id,
-                last_activity=last_activity.isoformat(),
-            )
+            with self.store.hold_user_auth_state(sess.user_id):
+                # A reset may have deleted the session while this request was
+                # waiting for the user's auth-state lock. Never create a
+                # successor from a session that no longer exists.
+                current = self.store.get_session(sess.id)
+                if current is None:
+                    return None
+                current_user = self.store.get_user(current.user_id)
+                if current_user is None:
+                    return None
 
-            # Bug fix: Don't copy refresh_jti/refresh_exp from old session meta
-            # to prevent the new session from referencing the wrong refresh token
-            new_meta = None
-            if sess.meta:
-                new_meta = {k: v for k, v in sess.meta.items()
-                           if k not in ("refresh_jti", "refresh_exp")}
+                self.logger.info(
+                    "session_rotation",
+                    old_session=current.id,
+                    user_id=current.user_id,
+                    last_activity=last_activity.isoformat(),
+                )
 
-            device_type = self._get_session_device(sess)
-            new_session = self.store.create_session(
-                sess.user_id,
-                mfa_required=sess.mfa_required,
-                tenant_id=sess.tenant_id,
-                user_agent=sess.user_agent,
-                ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
-                ttl_minutes=self._get_session_ttl(device_type, user=user),
-                meta=new_meta,
-            )
+                new_meta = None
+                if current.meta:
+                    new_meta = {
+                        k: v
+                        for k, v in current.meta.items()
+                        if k not in ("refresh_jti", "refresh_exp")
+                    }
 
-            # Mark new session as MFA verified if old one was
-            if sess.mfa_verified:
-                self._mark_session_verified(new_session.id)
-                new_session.mfa_verified = True
+                device_type = self._get_session_device(current)
+                new_session = self.store.create_session(
+                    current.user_id,
+                    mfa_required=current.mfa_required,
+                    tenant_id=current.tenant_id,
+                    user_agent=current.user_agent,
+                    ip_addr=str(current.ip_addr) if current.ip_addr else None,
+                    ttl_minutes=self._get_session_ttl(
+                        device_type, user=current_user
+                    ),
+                    meta=new_meta,
+                )
 
-            # Set up grace period mapping
-            grace_seconds = self.settings.session_rotation_grace_seconds
-            await self.cache.set_session_rotation_grace(
-                sess.id,
-                new_session.id,
-                grace_seconds,
-            )
+                if current.mfa_verified:
+                    self._mark_session_verified(new_session.id)
+                    new_session.mfa_verified = True
 
-            # Revoke old session
-            self.store.revoke_session(sess.id)
-            await self.cache.revoke_session(sess.id)
+                grace_seconds = self.settings.session_rotation_grace_seconds
+                await self.cache.set_session_rotation_grace(
+                    current.id,
+                    new_session.id,
+                    grace_seconds,
+                )
 
-            # Initialize activity for new session
-            await self.cache.update_session_activity(new_session.id)
-
-            return new_session
+                self.store.revoke_session(current.id)
+                await self.cache.revoke_session(current.id)
+                await self.cache.update_session_activity(new_session.id)
+                return new_session
         finally:
-            # Release the lock
             await self.cache.client.delete(lock_key)
 
     async def authenticate(
@@ -1728,31 +1744,34 @@ class AuthService:
         # By id. `get_user_by_email` would resolve to whichever account owns
         # the address now, which after an erasure need not be the one that
         # asked for the reset.
-        user = self.store.get_user(user_id)
-        if not user:
-            self.logger.warning("password_reset_user_missing", user_id=user_id)
-            return False, None
+        #
         # SPEC §§12.1/13.2 define one completed reset as both credential
-        # rotation and session/refresh revocation. Revoke first so a failure
-        # leaves the credential unchanged rather than committing half of the
-        # contract and calling it a reset. The token remains consumed: it is
-        # one attempt, not one success, and the caller can request a new one.
-        revoked = await self.revoke_all_user_sessions(user.id)
-        if not revoked:
-            self.logger.warning(
-                "password_reset_session_revocation_failed",
-                user_id=user.id,
-            )
-            return False, False
+        # rotation and session/refresh revocation. One cross-replica lock
+        # gives those acts, password login, OAuth session publication, and
+        # session rotation a single order. A login that proved the old
+        # password cannot publish a session after this reset completes.
+        with self.store.hold_user_auth_state(user_id):
+            user = self.store.get_user(user_id)
+            if not user:
+                self.logger.warning("password_reset_user_missing", user_id=user_id)
+                return False, None
 
-        pwd_hash, algo = self._hash_password(new_password)
-        self.store.save_password(user.id, pwd_hash, algo)
-        self.logger.info(
-            "password_reset_completed",
-            user_id=user.id,
-            other_sessions_revoked=True,
-        )
-        return True, True
+            revoked = await self.revoke_all_user_sessions(user.id)
+            if not revoked:
+                self.logger.warning(
+                    "password_reset_session_revocation_failed",
+                    user_id=user.id,
+                )
+                return False, False
+
+            pwd_hash, algo = self._hash_password(new_password)
+            self.store.save_password(user.id, pwd_hash, algo)
+            self.logger.info(
+                "password_reset_completed",
+                user_id=user.id,
+                other_sessions_revoked=True,
+            )
+            return True, True
 
     async def request_email_verification(self, user: User) -> Optional[str]:
         """As above: the token is written under the account it names.
