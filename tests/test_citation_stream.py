@@ -21,7 +21,11 @@ from liminallm.service.citation_stream import (
     CanonicalStreamTooLong,
     ScrubbedTokenStream,
 )
-from liminallm.service.citations import (\n    public_index,\n    reader_positions,\n    strip_citation_positions,\n)
+from liminallm.service.citations import (
+    public_index,
+    reader_positions,
+    strip_citation_positions,
+)
 from liminallm.service.node_attempt import StreamPump
 from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
 
