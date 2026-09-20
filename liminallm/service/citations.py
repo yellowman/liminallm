@@ -614,7 +614,11 @@ def replaced_answer(
     for citation in citations or []:
         item = dict(citation)
         offset = item.get("public_offset")
-        if isinstance(offset, int) and not isinstance(offset, bool):
+        if (
+            isinstance(offset, int)
+            and not isinstance(offset, bool)
+            and 0 <= offset <= len(text)
+        ):
             item["public_offset"] = public_index(origins, offset)
         moved.append(item)
     return Answer(public, list(bindings or []), moved)
