@@ -21,7 +21,7 @@ from liminallm.service.citation_stream import (
     CanonicalStreamTooLong,
     ScrubbedTokenStream,
 )
-from liminallm.service.citations import public_index, reader_positions
+from liminallm.service.citations import (\n    public_index,\n    reader_positions,\n    strip_citation_positions,\n)
 from liminallm.service.node_attempt import StreamPump
 from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
 
@@ -481,6 +481,49 @@ class TestTheFilterKeepsTheHandlesThePumpReachesFor:
         stream.abort()
         stream.close()
         assert [event["data"] for event in stream] == ["plain"]
+
+
+class TestReaderCleanupWithoutAnIssuedNamespace:
+    def test_malformed_markers_are_removed_but_a_coincidental_nonce_survives(self):
+        """An empty citation table showed the model no namespace.
+
+        Reader marker cleanup is still unconditional, but removing this
+        invocation's random nonce would edit ordinary prose on information the
+        model never received.
+        """
+        text = f"Keep {NONCE} exactly. Remove [cite:,] please."
+        expected, expected_origins = strip_citation_positions(text)
+        reader = CanonicalCitationStream(NONCE, scrub_namespace=False)
+        emitted = []
+        for chunk in list(text):
+            emitted.append(reader.push(chunk))
+        tail, origins = reader.finish()
+        emitted.append(tail)
+
+        public = "".join(emitted)
+        assert public == expected == f"Keep {NONCE} exactly. Remove please."
+        assert origins == expected_origins
+        assert NONCE in public
+        assert "[cite:" not in public.lower()
+
+    def test_the_real_stream_wrapper_has_the_same_empty_table_mode(self):
+        text = f"{NONCE} [cite:,] remains prose around the marker"
+        stream = ScrubbedTokenStream(
+            TestWhatTheFilterLetsThrough._events(
+                text[:5], text[5:12], text[12:], content=text
+            ),
+            NONCE,
+            scrub_namespace=False,
+        )
+        events = list(stream)
+        tokens = "".join(
+            str(event.get("data") or "")
+            for event in events
+            if event.get("event") == "token"
+        )
+        assert tokens == f"{NONCE} remains prose around the marker"
+        assert events[-1]["data"]["content"] == tokens
+        assert stream.reader.intact()
 
 
 class TestWhatTheFilterLetsThrough:
