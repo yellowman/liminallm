@@ -588,9 +588,12 @@ def reader_answer(
     a workflow replacement.
     """
     text = str(content or "")
+    if not citations:
+        return Answer(strip_citations(text), list(bindings or []), [])
+
     public, origins = strip_citation_positions(text)
     moved: List[Dict[str, Any]] = []
-    for citation in citations or []:
+    for citation in citations:
         item = dict(citation)
         offset = item.get("public_offset")
         if (
@@ -1066,20 +1069,19 @@ def strip_citation_positions(text: str) -> Tuple[str, List[int]]:
     stays literal. The map is what lets a blocking answer remove malformed
     markers without leaving validated citation offsets indexing the old text.
     """
-    origins = list(range(len(text)))
-    matches = list(CITATION_STRIP_RE.finditer(text))
-    if not matches:
-        return text, origins
-
     kept: List[str] = []
     kept_origins: List[int] = []
     cursor = 0
-    for match in matches:
+    found = False
+    for match in CITATION_STRIP_RE.finditer(text):
+        found = True
         kept.append(text[cursor : match.start()])
-        kept_origins.extend(origins[cursor : match.start()])
+        kept_origins.extend(range(cursor, match.start()))
         cursor = match.end()
+    if not found:
+        return text, list(range(len(text)))
     kept.append(text[cursor:])
-    kept_origins.extend(origins[cursor:])
+    kept_origins.extend(range(cursor, len(text)))
     return "".join(kept), kept_origins
 
 
