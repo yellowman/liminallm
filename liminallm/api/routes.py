@@ -1179,10 +1179,16 @@ async def confirm_reset(body: PasswordResetConfirm, request: Request):
         body.token, body.new_password
     )
     if not ok:
+        if revoked is False:
+            raise http_error(
+                "reset_incomplete",
+                "password reset could not revoke existing sessions",
+                status_code=503,
+            )
         raise http_error("validation_error", "invalid token", status_code=400)
     return Envelope(
         status="ok",
-        data={"status": "reset", "other_sessions_revoked": revoked},
+        data={"status": "reset", "other_sessions_revoked": True},
     )
 
 
