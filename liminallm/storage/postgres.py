@@ -3440,6 +3440,26 @@ class PostgresStore:
     # accumulate forever. Filtering on read makes the mistake self-healing
     # rather than permanent, and costs an index probe.
 
+    #: Serializes one user's authentication state across replicas. Password
+    #: proof, session creation/rotation, credential rotation, session revocation,
+    #: and role changes must have one linear order: otherwise a login can prove
+    #: an old password, pause while a reset revokes every session and changes
+    #: the credential, then publish a fresh session after the reset completed.
+    #: Session-scoped rather than transaction-scoped because the service
+    #: operation spans several store transactions and Redis bookkeeping.
+    _USER_AUTH_STATE_LOCK = 0x61757468  # "auth"
+
+    @contextlib.contextmanager
+    def hold_user_auth_state(self, user_id: str):
+        """Hold one user's authentication/session state across an operation."""
+        key = (self._USER_AUTH_STATE_LOCK, str(user_id))
+        with self._connect() as conn:
+            conn.execute("SELECT pg_advisory_lock(%s, hashtext(%s))", key)
+            try:
+                yield
+            finally:
+                conn.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))", key)
+
     _USER_LIFETIME_LOCK = 0x6C696675  # "lifu"
 
     def _lock_user_lifetime(self, conn, user_id: str) -> None:
