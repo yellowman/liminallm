@@ -602,7 +602,22 @@ def replaced_answer(
     """
     if not content:
         return None
-    return Answer(content, list(bindings or []), list(citations or []))
+
+    # This is the common reader boundary for blocking and streamed workflow
+    # results. Streaming has already applied the same cleanup incrementally,
+    # so this is an identity there; blocking answers arrive with only the
+    # narrower worker/wire namespace scrub and need the broad marker cleanup
+    # here. Content and citation coordinates move together.
+    text = str(content)
+    public, origins = strip_citation_positions(text)
+    moved: List[Dict[str, Any]] = []
+    for citation in citations or []:
+        item = dict(citation)
+        offset = item.get("public_offset")
+        if isinstance(offset, int) and not isinstance(offset, bool):
+            item["public_offset"] = public_index(origins, offset)
+        moved.append(item)
+    return Answer(public, list(bindings or []), moved)
 
 
 #: Source kinds whose `locator` is a reference a reader can follow.
@@ -1024,6 +1039,31 @@ def scrub_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
     return _scrub_text(text, _namespace_pattern(nonce))
 
 
+def strip_citation_positions(text: str) -> Tuple[str, List[int]]:
+    """Broad reader cleanup, with origins in the string it was given.
+
+    This is `strip_citations` with its coordinate map made explicit. Every
+    closed marker-shaped token goes, resolved or not; an unclosed `[cite:`
+    stays literal. The map is what lets a blocking answer remove malformed
+    markers without leaving validated citation offsets indexing the old text.
+    """
+    origins = list(range(len(text)))
+    matches = list(CITATION_STRIP_RE.finditer(text))
+    if not matches:
+        return text, origins
+
+    kept: List[str] = []
+    kept_origins: List[int] = []
+    cursor = 0
+    for match in matches:
+        kept.append(text[cursor : match.start()])
+        kept_origins.extend(origins[cursor : match.start()])
+        cursor = match.end()
+    kept.append(text[cursor:])
+    kept_origins.extend(origins[cursor:])
+    return "".join(kept), kept_origins
+
+
 def reader_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
     """The text a reader may see, and each surviving character's origin.
 
@@ -1033,30 +1073,17 @@ def reader_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
     as `strip_citations`, whether its handle resolves, is malformed, or
     belongs to another turn.
 
-    The second pass is intentionally one pass, like `strip_citations`.
-    Keeping it separate from `scrub_namespace` preserves that narrower
-    boundary: a worker asked to search for the literal `[cite:OLDTURN-1]`
-    must still receive what the model wrote, while a reader should never see
-    citation offer syntax.
+    Keeping the passes separate from `scrub_namespace` preserves that
+    narrower boundary: a worker asked to search for the literal
+    `[cite:OLDTURN-1]` must still receive what the model wrote, while a
+    reader should never see citation offer syntax.
 
     The origin map is carried through both transformations so a validated
     citation's public offset indexes the exact string the reader holds.
     """
-    public, origins = scrub_positions(text, nonce)
-    matches = list(CITATION_STRIP_RE.finditer(public))
-    if not matches:
-        return public, origins
-
-    kept: List[str] = []
-    kept_origins: List[int] = []
-    cursor = 0
-    for match in matches:
-        kept.append(public[cursor : match.start()])
-        kept_origins.extend(origins[cursor : match.start()])
-        cursor = match.end()
-    kept.append(public[cursor:])
-    kept_origins.extend(origins[cursor:])
-    return "".join(kept), kept_origins
+    public, namespace_origins = scrub_positions(text, nonce)
+    reader, reader_origins = strip_citation_positions(public)
+    return reader, [namespace_origins[index] for index in reader_origins]
 
 
 def public_index(origins: Sequence[int], index: int) -> int:
@@ -1159,4 +1186,4 @@ def strip_citations(answer: str) -> str:
     closed up, so a sentence does not end with a gap where a handle used to
     be.
     """
-    return CITATION_STRIP_RE.sub("", answer or "")
+    return strip_citation_positions(answer or "")[0]
