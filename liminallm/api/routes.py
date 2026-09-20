@@ -1333,7 +1333,7 @@ async def change_password(
     # sessions share one cross-replica order with login and password reset.
     # Otherwise a concurrent login can prove the old password before this
     # write, pause, and publish a new session after the revocation below.
-    with runtime.store.hold_user_auth_state(principal.user_id):
+    async with runtime.store.hold_user_auth_state(principal.user_id):
         if not runtime.auth.verify_password(
             principal.user_id, body.current_password
         ):
