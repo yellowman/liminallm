@@ -3686,10 +3686,18 @@ button.minor:hover {
 }
 
 /* One column once the index would take a third of the width. Sticky goes
-   with it: a narrow screen has no room to spare for a fixed column. */
+   with it: a narrow screen has no room to spare for a fixed column.
+
+   `minmax(0, 1fr)` rather than `1fr`, for the same reason the two-column
+   rule above says it: a plain `1fr` track takes `auto` as its minimum, so
+   it grows to the min-content width of its contents instead of holding the
+   width it was given. The widest thing in Settings is the admin users
+   table, and this column collapsing to one track is what put it in charge
+   of the page - 300px of sideways scroll on a 390px screen, with the
+   table's own scrolling wrapper stretched wide rather than scrolling. */
 @media (max-width: 860px) {
   .settings-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 14px;
   }
 

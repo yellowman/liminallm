@@ -311,6 +311,30 @@ Respect `prefers-reduced-motion`.
 14. Every file list gets aligned columns, or equivalent stable alignment.
 15. One obvious primary action per immediate scope.
 
+## Acceptance tests
+
+A screen meets the standard when it passes all six. The first is a judgment
+and the other five are measurements, so run them rather than reading the
+code and deciding it must be fine.
+
+1. **Five-second scan.** Open the screen and look away after five seconds.
+   You should be able to name its major sections. If it reads as one
+   undifferentiated page, it needs landmarks, not smaller controls.
+2. **Density.** Count the rows visible without scrolling at 1440x900, and
+   ask what the space between them is buying. A list that shows few rows on
+   a large screen is spending its room on decoration.
+3. **Keyboard.** Reach every action with `Tab` alone. Nothing interactive may
+   be unreachable, and no row action may sit inside the control that opens
+   the row, which makes one keystroke do two things.
+4. **Touch.** Anything that appears on hover must also be present without
+   hover, under `@media (hover: none)`.
+5. **Overflow.** No screen may scroll sideways at 390px. Long names and
+   identifiers truncate. A grid track that holds a wide table needs
+   `minmax(0, 1fr)`; a plain `1fr` takes its contents' min-content width as
+   its minimum and hands the page's width to whatever is widest.
+6. **Dark mode.** Contrast and borders survive the theme. Especially for
+   `liminal`.
+
 ---
 
 # Part two: how this project expresses it
@@ -418,6 +442,39 @@ bad command: `grep -c ':focus'` also matches `:focus-visible` and
 survived the correction and got worse, which is the argument for measuring
 rather than counting lines.
 
+## What the acceptance tests say
+
+The checklist in part one had never been run against this project, because
+this document had never carried it. Running it found one defect and cleared
+three areas that had only been assumed.
+
+| Test | Result |
+|---|---|
+| Density | Passes. Rows are 35-43px, so 20-26 fit a 1440x900 screen. |
+| Keyboard, nested actions | Passes on rows. A contexts row is a `<button>` with no button inside it. |
+| Touch | Passes. `@media (hover: none)` at `styles.css:3426` restores `.row-actions`. |
+| Overflow | **Failed on Settings**, since fixed. The other seven tabs pass at 390px and all eight pass at 1440px. |
+| Keyboard, reachability | Fails. See the note list and the note search results. |
+| Dark mode | Not applicable. The stylesheet has no `prefers-color-scheme`, `[data-theme]` or `.dark` rule. |
+
+The overflow failure was in code this work added. The two-column settings
+rule writes its content column as `minmax(0, 1fr)`; the narrow-screen
+override collapsed the layout to one column and wrote that track as plain
+`1fr`. A `1fr` track takes `auto` as its minimum, which is the min-content
+width of its contents, so the widest thing in Settings - the admin users
+table - decided the width of the page. Measured at 300px of sideways scroll
+on a 390px viewport, with the table's own `overflow-x: auto` wrapper
+stretched wide instead of scrolling. `tests/test_browser_narrow_viewport.py`
+pins it, and failed against the defect before the fix.
+
+Two attempts at that measurement were worthless before one worked, in the
+same way and for a reason worth recording: this app sends a
+Content-Security-Policy that refuses inline styles, so an injected
+`<style>` element attaches to the document and stays inert. Three states
+compared, one answer for all three, and nothing in the result says the
+mutation never applied. Read the marker back, or bypass the policy
+deliberately.
+
 ## Defects that reach the reader
 
 These are not matters of taste. Each one costs somebody the use of
@@ -451,6 +508,27 @@ this vocabulary and differs between browsers.
 The consequence is worth stating plainly: on the controls the project
 styles, it removed a working indicator and replaced it with one that cannot
 be seen.
+
+**Search results are the one list part one describes in detail, and the
+only list nothing was checked against.** Part one asks for an index or icon,
+the name, a score, a source and type line, an excerpt, and actions, with a
+hairline between results. The vault search renders two of those:
+`notes.js:285` emits a `<div class="note-search-hit">` holding a title and
+an excerpt. There is no hairline - `.note-search-hit` sets padding and a
+hover fill and no border, so eight results are eight unseparated blocks in
+one tinted box. There are no actions and no source line.
+
+The index is the part worth singling out, because the work was already
+done. `routes.py:2834` sends a `rank` field that is the result's 1-based
+position, with a comment explaining that it is deliberately a position
+rather than the raw fused score, since that score "tops out near 0.016 and
+packs the whole result set into a hair's breadth of itself". The backend
+solved exactly the problem part one's "a score" raises, and the frontend
+never reads the field.
+
+The same element is also a `<div>` with `cursor: pointer`, so opening a
+result is available only to a pointer - the note list defect again, in the
+list a reader reaches by typing.
 
 **Status carried in colour alone.** `.note-item.contradicted` and
 `.note-item.evolved` change only the title's colour - no dot, no word, no
