@@ -284,7 +284,7 @@ class TestARefusalReachesTheCaller:
         client.post(
             "/v1/auth/password/change",
             headers=user["headers"],
-            json={"current_password": PASSWORD, "new_password": "Another-1234!"},
+            json={"current_password": PASSWORD, "new_password": NEW_PASSWORD},
         )
 
         monkeypatch.undo()
