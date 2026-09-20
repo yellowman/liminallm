@@ -952,6 +952,14 @@ class ScrubbedTokenStream:
                 self._pending.extend(self._complete(event))
                 continue
             if kind == "error":
+                if self._aborted:
+                    # An abort-driven protocol error is cancellation cleanup,
+                    # not the provider choosing to end an answer. The pump
+                    # suppresses this event once its stop flag is set; the
+                    # wrapper still must not reinterpret privately held marker
+                    # syntax as reader-visible partial prose while producing
+                    # it.
+                    return event
                 # The provider has ended the answer. Anything the reader held
                 # only because a future character *might* have completed a
                 # marker is ordinary partial text now. Release that suffix
