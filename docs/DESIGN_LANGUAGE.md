@@ -475,6 +475,33 @@ compared, one answer for all three, and nothing in the result says the
 mutation never applied. Read the marker back, or bypass the policy
 deliberately.
 
+## The enclosure rule, measured
+
+Part one's headline rule is that a thing earns a rounded rectangle only if
+it is a primary destination, a floating object, a semantic notice, a
+decision requiring containment, or an isolated editing surface. Counting
+rules in the stylesheet answers a different question, since a rule can be
+dead, overridden, or attached to markup that never renders. This is a walk
+of the rendered tree on each tab, counting the enclosures actually painted:
+a non-zero radius together with either a visible border or a fill differing
+from the parent.
+
+**One content enclosure per tab, and it is `.panel` every time** - seven in
+total, chat having none. **No card inside a card anywhere.** Two radius
+values across every content surface, 6px and 8px, both tokens.
+
+The probe carries a positive control, because every reading here is a
+negative one: it builds a known enclosure inside the active panel and
+requires the census to report it, which took the count from 1 to 2 and back
+to 1 on removal. Without that, "the app draws no cards" and "the probe
+cannot see cards" are the same output.
+
+One gap: chat bubbles are not in this census. The stub backend returned no
+assistant turn, so the screen whose main content is a rounded filled shape
+had nothing in it. The bubble radii are known from the stylesheet - 12px and
+`16px 16px 4px 16px` - but whether chat nests enclosures at depth is not
+measured.
+
 ## Defects that reach the reader
 
 These are not matters of taste. Each one costs somebody the use of
@@ -529,6 +556,20 @@ never reads the field.
 The same element is also a `<div>` with `cursor: pointer`, so opening a
 result is available only to a pointer - the note list defect again, in the
 list a reader reaches by typing.
+
+**The vault search field wears no part of this design language.** It renders
+in Arial at 13.33px, with square corners and the browser's own 2px inset
+grey border, against Inter at 13.5px with 6px corners and a 1px
+`rgb(227, 228, 232)` border on every other input. Its padding is 1px 2px
+where a styled control has 0 10px.
+
+Two rules reach it, `styles.css:370` and `styles.css:2761`, and between them
+they set `flex`, `min-width` and `max-width`. Nothing sets appearance, so
+the control falls back to the user agent's. It is the only control in the
+app in that state, and it is the one §16 is about: the field a reader types
+into to search their own notes. The conversation search field in the pane
+beside it is styled but renders at 32px, so the two search fields do not
+match each other either. Present since #193; no later change touched it.
 
 **Status carried in colour alone.** `.note-item.contradicted` and
 `.note-item.evolved` change only the title's colour - no dot, no word, no
@@ -611,6 +652,29 @@ The Settings figure comes from `.setting-group`'s own margin, because the
 **Uppercase outside the small-label window**, at 13px on `.panel h4` and
 10.5px on `.message .meta`. The same role is set in sentence case by
 `.section-band h4`, 2,700 lines away.
+
+**The radius scale has the same shape as the type scale.** Sixteen distinct
+`border-radius` forms are declared where part one names four bands and a
+pill. Ten of them are literals that bypass the two tokens, and eight of
+those simply restate a token: `6px` appears six times and `8px` twice,
+alongside `var(--radius-sm)` twenty-four times and `var(--radius)` five.
+Part two's rule is to change the token rather than the call site, and these
+are the call sites that would not move.
+
+The literals that are not on any band: `9px` on `.rail-btn` and
+`.rail-mark`, where a control is specified at 6px; `12px` and
+`16px 16px 4px 16px` on the chat bubbles; `4px` on `.msg-warning` and
+`.draft-indicator`; `2px` on `.brand .spark` and the streaming caret; `1px`
+on `.tick-mark`. The last three are marks a few pixels across rather than
+surfaces, so they are the defensible end of the list. The rail is not: it is
+the app's primary navigation and it is the one control tier at 9px.
+
+**No filter is in the compact tier.** Part one puts a filter at 28px.
+Measured on all five: the artifact type and visibility filters and the patch
+status filter render at 30px, and the conversation search at **32px**, which
+is not a height the standard defines. `--ctl-h-sm` is declared once and
+referenced twice - by `.setting-row input, .setting-row select` and by
+`.utility-strip button, select, input` - and no filter is inside either.
 
 **Six bare `:focus` selectors** in four rule blocks. Three style text-entry
 controls, where the two selectors behave alike; `.field select:focus` is a
