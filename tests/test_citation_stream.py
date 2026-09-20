@@ -510,6 +510,21 @@ class TestReaderCleanupWithoutAnIssuedNamespace:
         assert NONCE in public
         assert "[cite:" not in public.lower()
 
+    def test_broad_only_cleanup_adds_no_reply_ceiling(self):
+        """Ordinary streams had no citation ceiling before this repair."""
+        text = ("ordinary prose " * 40) + "[cite:,] done"
+        stream = ScrubbedTokenStream(
+            TestWhatTheFilterLetsThrough._events(text, content=text),
+            NONCE,
+            scrub_namespace=False,
+            max_canonical_chars=None,
+        )
+        events = list(stream)
+        done = [event for event in events if event.get("event") == "message_done"]
+        assert done
+        assert done[-1]["data"]["content"].endswith("done")
+        assert "[cite:" not in done[-1]["data"]["content"].lower()
+
     def test_the_real_stream_wrapper_has_the_same_empty_table_mode(self):
         text = f"{NONCE} [cite:,] remains prose around the marker"
         stream = ScrubbedTokenStream(
