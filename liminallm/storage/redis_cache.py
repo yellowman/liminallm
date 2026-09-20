@@ -433,6 +433,23 @@ return {1, tokens, 0}
         )
         await self.client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
 
+    async def inspect_identity_token(self, prefix: str, token: str) -> Optional[str]:
+        """Read a one-time token's subject without authorizing anything.
+
+        SPEC §12.1 explicitly distinguishes observation from consumption:
+        an observed token authorizes nothing until it is atomically consumed.
+        This exists for operations that need the subject in order to acquire a
+        per-user serialization lock *before* spending the token. The caller
+        must later use `consume_identity_token` and accept only the subject
+        returned by that consuming read.
+
+        Returns the stored subject, or None when the token is absent.
+        """
+        value = await self.client.get(f"{prefix}:{token}")
+        if isinstance(value, bytes):
+            value = value.decode()
+        return value
+
     async def consume_identity_token(self, prefix: str, token: str) -> Optional[str]:
         """Hand out a one-time token's subject, and only once.
 

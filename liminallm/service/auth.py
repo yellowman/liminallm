@@ -1716,40 +1716,49 @@ class AuthService:
     async def complete_password_reset_with_revocation(
         self, token: str, new_password: str
     ) -> tuple[bool, Optional[bool]]:
-        """Consume the token, then act on what it named.
+        """Observe the token to choose the lock, then consume it before acting.
 
-        In that order. Reading the token and deleting it after the password
-        was written left it valid for the length of the reset, so two requests
-        holding it both resolved a subject and both wrote - the password
-        ending up as whichever arrived last. Consumed first, the second
-        request finds nothing.
+        SPEC §12.1 makes the distinction explicit: an observed one-time token
+        authorizes nothing; consumption is the atomic authorization step.
+        The per-user auth lock needs the account id before that step, so this
+        first reads only the subject, acquires the lock, then consumes the
+        token *inside* the lock before any credential or session mutation.
 
-        One-time means one attempt, not one success: nothing below puts the
-        token back when the reset fails. Restoring it would be replayability
-        under a friendlier name.
+        That ordering preserves both properties. Two requests may observe the
+        same token, but only the one whose consuming read wins may act. And if
+        lock acquisition times out, no authority was spent: the caller can
+        retry the reset instead of receiving a transient error for a token the
+        server has already destroyed.
+
+        Once consumption succeeds, one-time still means one attempt rather
+        than one success. Nothing below restores the token if revocation or a
+        later mutation fails.
         """
-        user_id = None
+        observed_user_id = None
         if self.cache:
-            user_id = await self.cache.consume_identity_token("reset", token)
+            observed_user_id = await self.cache.inspect_identity_token(
+                "reset", token
+            )
         else:
-            # Issue 11.2: In-memory fallback for password reset tokens. Hold the
-            # state lock once for the whole read-modify-write (nesting
-            # _with_state_lock inside would re-acquire the same lock and hang).
+            # Observation only. Expired state may be cleaned up, but a live
+            # token stays present until the consuming read under the auth lock.
             with self._with_state_lock():
                 stored = self._password_reset_tokens.get(token)
                 if stored:
                     stored_user_id, expires_at = stored
                     if expires_at <= self._now() - self._clock_skew_leeway:
-                        # Remove expired token to prevent memory leak
                         self._password_reset_tokens.pop(token, None)
                     else:
-                        user_id = stored_user_id
-                        self._password_reset_tokens.pop(token, None)
-        if not user_id:
-            self.logger.warning("password_reset_invalid_token", token_prefix=token[:8])
+                        observed_user_id = stored_user_id
+
+        if isinstance(observed_user_id, bytes):
+            observed_user_id = observed_user_id.decode()
+        if not observed_user_id:
+            self.logger.warning(
+                "password_reset_invalid_token", token_prefix=token[:8]
+            )
             return False, None
-        if isinstance(user_id, bytes):
-            user_id = user_id.decode()
+
         # By id. `get_user_by_email` would resolve to whichever account owns
         # the address now, which after an erasure need not be the one that
         # asked for the reset.
@@ -1759,10 +1768,48 @@ class AuthService:
         # gives those acts, password login, OAuth session publication, and
         # session rotation a single order. A login that proved the old
         # password cannot publish a session after this reset completes.
-        async with self.store.hold_user_auth_state(user_id):
+        async with self.store.hold_user_auth_state(str(observed_user_id)):
+            consumed_user_id = None
+            if self.cache:
+                consumed_user_id = await self.cache.consume_identity_token(
+                    "reset", token
+                )
+            else:
+                with self._with_state_lock():
+                    stored = self._password_reset_tokens.get(token)
+                    if stored:
+                        stored_user_id, expires_at = stored
+                        # The token may have expired while this request waited
+                        # for the auth-state lock. Expiry grants no authority.
+                        if (
+                            expires_at
+                            <= self._now() - self._clock_skew_leeway
+                        ):
+                            self._password_reset_tokens.pop(token, None)
+                        else:
+                            consumed_user_id = stored_user_id
+                            self._password_reset_tokens.pop(token, None)
+
+            if isinstance(consumed_user_id, bytes):
+                consumed_user_id = consumed_user_id.decode()
+            if (
+                not consumed_user_id
+                or str(consumed_user_id) != str(observed_user_id)
+            ):
+                # Somebody else consumed it while this request waited, it
+                # expired, or the stored subject changed. Observation alone
+                # authorizes nothing, so this request performs no action.
+                self.logger.warning(
+                    "password_reset_invalid_token", token_prefix=token[:8]
+                )
+                return False, None
+
+            user_id = str(consumed_user_id)
             user = self.store.get_user(user_id)
             if not user:
-                self.logger.warning("password_reset_user_missing", user_id=user_id)
+                self.logger.warning(
+                    "password_reset_user_missing", user_id=user_id
+                )
                 return False, None
 
             revoked = await self.revoke_all_user_sessions(user.id)
