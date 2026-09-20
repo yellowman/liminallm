@@ -718,11 +718,17 @@ const renderConversationList = () => {
       const isActive = c.id === state.conversationId;
       const title = escapeHtml(c.title || 'Untitled conversation');
       const date = c.updated_at ? new Date(c.updated_at).toLocaleDateString() : '';
-      const apiTag = c.source === 'responses' ? '<span class="source-tag">api</span>' : '';
+      // An agent-created thread is a fact about the conversation, so it
+      // reads as one: a word on the meta line beside the date, rather than
+      // an uppercase capsule wedged after the title.
+      const apiTag = c.source === 'responses'
+        ? '<span class="fact-sep"></span><span>api</span>' : '';
       return `
         <div class="conversation-item ${isActive ? 'active' : ''}" data-id="${escapeHtml(c.id)}">
-          <div class="title">${title}${apiTag}</div>
-          <div class="meta">${date}</div>
+          <span class="row-main">
+            <span class="title">${title}</span>
+            <span class="meta factline">${date ? `<span>${date}</span>` : ''}${apiTag}</span>
+          </span>
         </div>
       `;
     })
@@ -3140,13 +3146,18 @@ const loadApiKeys = async () => {
           ? ''
           : `<button type="button" class="ghost api-key-revoke" data-id="${escapeHtml(k.id)}">Revoke</button>`;
         return `
-          <div class="api-key-item ${k.revoked_at ? 'revoked' : ''}">
-            <div class="api-key-info">
-              <span class="api-key-name">${escapeHtml(k.name || 'unnamed key')}</span>
-              <code class="api-key-prefix">${escapeHtml(k.prefix)}…</code>
-              <div class="meta">created ${created} · ${stateText}</div>
-            </div>
-            ${revokeBtn}
+          <div class="row api-key-item ${k.revoked_at ? 'revoked' : ''}">
+            <span class="row-main">
+              <span class="row-name">${escapeHtml(k.name || 'unnamed key')}</span>
+              <span class="row-meta factline">
+                <span class="monospace">${escapeHtml(k.prefix)}…</span>
+                <span class="fact-sep"></span>
+                <span>created ${created}</span>
+                <span class="fact-sep"></span>
+                <span>${stateText}</span>
+              </span>
+            </span>
+            <span class="row-actions">${revokeBtn}</span>
           </div>`;
       })
       .join('');
@@ -3759,12 +3770,19 @@ const renderInsights = (data) => {
       adaptersEl.innerHTML = '<div class="empty">No adapter data yet</div>';
     } else {
       adaptersEl.innerHTML = adapters
-        .map((a) => `
-          <div class="adapter-item">
-            <span class="adapter-name">${escapeHtml(a.name || a.id || 'Unknown')}</span>
-            <span class="adapter-score">${escapeHtml(a.base_model || a.description || '')}</span>
+        .map((a) => {
+          const name = a.name || a.id || 'Unknown';
+          const detail = a.base_model || a.description || '';
+          return `
+          <div class="row" title="${escapeAttr(name)}">
+            ${typeIcon('adapter')}
+            <span class="row-main">
+              <span class="row-name">${escapeHtml(name)}</span>
+              ${detail ? `<span class="row-meta">${escapeHtml(detail)}</span>` : ''}
+            </span>
           </div>
-        `)
+        `;
+        })
         .join('');
     }
   }
@@ -3780,12 +3798,23 @@ const renderInsights = (data) => {
         .map((e) => {
           const feedback = e.feedback || 'neutral';
           const date = e.created_at ? new Date(e.created_at).toLocaleDateString() : '-';
-          const icon = feedback === 'positive' ? '+1' : feedback === 'negative' ? '-1' : '·';
+          // The sentiment is the same dot the rest of the workspace uses for
+          // state, rather than a coloured left border and a "+1" glyph that
+          // meant nothing on their own.
+          const dot = feedback === 'positive' ? 'on'
+            : feedback === 'negative' ? 'off' : 'warn';
+          const text = (e.context_text || '').slice(0, 80)
+            + (e.context_text?.length > 80 ? '…' : '');
           return `
-            <div class="preference-item ${feedback}">
-              <span class="feedback-icon">${icon}</span>
-              <span class="preference-message">${escapeHtml((e.context_text || '').slice(0, 80))}${e.context_text?.length > 80 ? '...' : ''}</span>
-              <span class="preference-date">${date}</span>
+            <div class="row" title="${escapeAttr(e.context_text || '')}">
+              <span class="row-main">
+                <span class="row-name">${escapeHtml(text || '(no context recorded)')}</span>
+                <span class="row-meta factline">
+                  <span><span class="fact-dot ${dot}"></span>${escapeHtml(feedback)}</span>
+                  <span class="fact-sep"></span>
+                  <span>${escapeHtml(date)}</span>
+                </span>
+              </span>
             </div>
           `;
         })
@@ -3801,16 +3830,22 @@ const renderInsights = (data) => {
       clustersEl.innerHTML = '<div class="empty">No clusters identified yet</div>';
     } else {
       clustersEl.innerHTML = clusters
-        .map((c) => `
-          <div class="cluster-card">
-            <div class="cluster-label">${escapeHtml(c.label || 'Unlabeled')}</div>
-            <div class="cluster-description">${escapeHtml(c.similarity_hint || c.description || '-')}</div>
-            <div class="cluster-meta">
-              <span>${c.size || 0} events</span>
-              ${c.adapter_id ? `<span class="has-adapter">Has adapter</span>` : ''}
-            </div>
+        .map((c) => {
+          const label = c.label || 'Unlabeled';
+          const detail = c.similarity_hint || c.description || '';
+          return `
+          <div class="row" title="${escapeAttr(label)}">
+            <span class="row-main">
+              <span class="row-name">${escapeHtml(label)}</span>
+              <span class="row-meta factline">
+                <span>${c.size || 0} events</span>
+                ${detail ? `<span class="fact-sep"></span><span>${escapeHtml(detail)}</span>` : ''}
+                ${c.adapter_id ? '<span class="fact-sep"></span><span><span class="fact-dot on"></span>has adapter</span>' : ''}
+              </span>
+            </span>
           </div>
-        `)
+        `;
+        })
         .join('');
     }
   }

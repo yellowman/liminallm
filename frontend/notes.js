@@ -45,8 +45,10 @@ const renderNoteList = () => {
   if (!list) return;
   list.innerHTML = notesState.notes.map((n) => `
     <li class="note-item${n.id === notesState.currentId ? ' active' : ''}${notesState.contradicted.has(n.id) ? ' contradicted' : notesState.evolved.has(n.id) ? ' evolved' : ''}" data-id="${escapeAttr(n.id)}">
-      <span class="note-item-title">${escapeHtml(n.title)}</span>
-      <span class="note-item-date">${new Date(n.updated_at).toLocaleDateString()}</span>
+      <span class="row-main">
+        <span class="note-item-title">${escapeHtml(n.title)}</span>
+        <span class="note-item-date">${new Date(n.updated_at).toLocaleDateString()}</span>
+      </span>
     </li>`).join('');
   const count = $('note-count');
   if (count) count.textContent = notesState.notes.length ? `${notesState.notes.length} notes` : '';

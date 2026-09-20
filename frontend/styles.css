@@ -656,85 +656,44 @@ body {
   padding: 8px;
 }
 
-.conversation-item {
-  padding: 9px 10px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-  margin-bottom: 2px;
-  transition: background 0.15s ease;
-}
-
-.conversation-item:hover {
-  background: var(--panel-muted);
-}
-
-/* Active conversation: quiet light-gray pill, one step past hover */
-.conversation-item.active {
-  background: #eceef1;
-}
-
-.conversation-item.active .title {
-  font-weight: 600;
-}
-
+/* The conversation list is the same row as every pane list, so its shape
+   is the `.row` rule above rather than a second copy here. What is left is
+   what is genuinely its own: the title and date it puts inside one, and the
+   tag an agent-created thread carries. Selection was a light-grey pill; it
+   is now the faint fill and 2px marker the rail uses, like everything else
+   that can be selected in this application. */
+/* Blocks, because they sit inside the row's `.row-main` now and have to
+   stack there the way every other row's two lines do. */
 .conversation-item .title {
+  display: block;
   font-weight: 500;
   font-size: 13px;
-  margin-bottom: 2px;
+  line-height: 1.35;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .conversation-item .meta {
-  font-size: 12px;
+  margin-top: 1px;
+  font-size: 11.5px;
+  line-height: 1.3;
   color: var(--text-muted);
 }
 
-/* API key rows on the settings tab */
-.api-key-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 8px 0;
-  border-bottom: 1px solid var(--panel-muted);
-}
-
-.api-key-item.revoked .api-key-name,
-.api-key-item.revoked .api-key-prefix {
+/* API key rows are rows. `.api-key-name`, `.api-key-prefix` and the `.meta`
+   line under them are retired with their callers; what survives is the one
+   state a key has that a row does not know about. */
+.api-key-item.revoked .row-name,
+.api-key-item.revoked .row-meta {
   text-decoration: line-through;
   color: var(--text-muted);
 }
 
-.api-key-item .api-key-name {
-  font-weight: 500;
-  margin-right: 8px;
-}
 
-.api-key-item .api-key-prefix {
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.api-key-item .meta {
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-/* Conversations created by agents over the served Responses API */
-.conversation-item .source-tag {
-  margin-left: 6px;
-  padding: 1px 5px;
-  border-radius: var(--radius-sm);
-  background: var(--panel-muted);
-  color: var(--text-muted);
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.4px;
-  vertical-align: 1px;
-}
+/* `.source-tag` retired with its caller: an agent-created thread now says
+   so as a word on the meta line, which is how every other fact in this
+   application reads. */
 
 /* Main content area */
 .main-content {
@@ -1121,16 +1080,19 @@ button.minor:hover {
   flex-wrap: nowrap;
 }
 
+/* The bar's title, on all three pages that have a bar: the conversation's
+   name in chat, "System controls" in the admin console, the shared thread's
+   name on a share page. A title is not a destination, a primary action, a
+   floating object or an editing surface, so it does not get a rounded
+   rectangle - it is text with a status dot in front of it. */
 .badge {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  background: var(--panel-muted);
   color: var(--text);
-  border-radius: var(--radius-sm);
-  padding: 5px 10px;
   font-size: 13px;
-  font-weight: 500;
+  font-weight: 600;
+  min-width: 0;
 }
 
 .badge .dot {
@@ -1853,28 +1815,23 @@ button.minor:hover {
   overflow-y: auto;
 }
 
-/* Voice buttons */
-.voice-btn {
-  width: var(--ctl-h);
-  height: var(--ctl-h);
-  padding: 0;
-}
-
-.voice-btn svg {
-  width: 15px;
-  height: 15px;
-}
-
+/* Voice buttons are icon buttons, and say so.
+   They wore `.ghost` with their own width, height and `padding: 0`. That
+   last one never applied: `button.ghost` is element-plus-class and beats a
+   bare class, so `padding: 0 14px` survived inside a 30px button, leaving a
+   2px content box that shrank the 15px glyph to nothing. Both buttons
+   rendered as empty outlines, and had for as long as the control height has
+   been 30px. Measured in the DOM: the svg box was 0x15.
+   `.icon-btn` carries the size, the hit area and the glyph sizing, so what
+   is left here is the two states a voice button has. */
 .voice-btn.recording {
   background: var(--danger);
-  border-color: var(--danger);
   color: white;
   animation: pulse 1s ease-in-out infinite;
 }
 
 .voice-btn.playing {
   background: var(--accent);
-  border-color: var(--accent);
   color: white;
 }
 
@@ -2055,12 +2012,19 @@ button.minor:hover {
   margin-top: 10px;
 }
 
-/* Status banners */
+/* Status lines, and the two of them that are exceptional enough to be a
+   box. "Loaded 0 patches" is ordinary feedback and reads as a line of text;
+   an error is state the reader has to act on, and keeps its fill. */
 #status,
+#admin-feedback {
+  margin-top: 10px;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  display: none;
+}
+
 #admin-error,
-#admin-feedback,
 #error-banner {
-  background: var(--panel-muted);
   border: 1px solid var(--border);
   color: var(--text);
   padding: 9px 12px;
@@ -2198,10 +2162,11 @@ button.minor:hover {
   font-size: 15px;
 }
 
-.context-details .detail-row,
-.tool-details .detail-row,
-.workflow-details .detail-row,
-.patch-details .detail-row {
+/* A label and its value, divided by a hairline. Written four times over,
+   once per detail view, for a shape that is not specific to any of them -
+   so it is one rule now, and Settings uses it rather than carrying a
+   fifth copy under its own names. */
+.detail-row {
   display: flex;
   justify-content: space-between;
   gap: 12px;
@@ -2210,18 +2175,21 @@ button.minor:hover {
   font-size: 13px;
 }
 
-.context-details .detail-row:last-child,
-.tool-details .detail-row:last-child,
-.workflow-details .detail-row:last-child,
-.patch-details .detail-row:last-of-type {
+.detail-row:last-child,
+.detail-row:last-of-type {
   border-bottom: none;
 }
 
-.context-details .detail-label,
-.tool-details .detail-label,
-.workflow-details .detail-label,
-.patch-details .detail-label {
+.detail-label {
   color: var(--text-muted);
+}
+
+/* An id or a key fingerprint has no spaces to break at, and would otherwise
+   push the row wider than the panel holding it. */
+.detail-row > :not(.detail-label) {
+  min-width: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
 }
 
 /* Context sources */
@@ -2244,38 +2212,9 @@ button.minor:hover {
   max-height: 400px;
 }
 
-/* Settings grid */
-.settings-grid {
-  display: grid;
-  gap: 6px;
-}
-
-.setting-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  padding: 9px 12px;
-  background: var(--panel-muted);
-  border-radius: var(--radius-sm);
-}
-
-.setting-label {
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
-.setting-value {
-  font-weight: 600;
-  font-size: 13px;
-  text-align: right;
-  word-break: break-all;
-}
-
-.setting-value.monospace {
-  font-family: var(--font-mono);
-  font-size: 12px;
-}
+/* `.settings-grid`, `.setting-item`, `.setting-label` and `.setting-value`
+   were a fifth copy of the label-and-value shape above, in filled rounded
+   boxes. Retired with their callers; Settings uses `.detail-row`. */
 
 /* Utility classes */
 .flex-row {
@@ -2324,27 +2263,10 @@ button.minor:hover {
   flex-wrap: wrap;
 }
 
-/* Context and workflow ride the conversation header as compact pills: they
-   parameterize the next turn, so they sit beside the thread actions instead
-   of costing the chat column a row of labelled form fields. */
-.conversation-header .header-ctl {
-  height: var(--ctl-h);
-  padding: 0 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--panel);
-  color: var(--text);
-  font: inherit;
-  font-size: 12.5px;
-}
+/* `.header-ctl` removed. Its own comment described the context and workflow
+   controls riding the conversation header; they moved behind the bar's menu
+   and the rules stayed, styling nothing. */
 
-.conversation-header select.header-ctl {
-  max-width: 170px;
-}
-
-.conversation-header input.header-ctl {
-  max-width: 150px;
-}
 
 .form-actions {
   display: flex;
@@ -2501,150 +2423,21 @@ button.minor:hover {
 
 
 /* Insights stats grid */
-.stats-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 10px;
-}
-
-.stat-card {
-  background: var(--panel-muted);
-  border-radius: var(--radius-sm);
-  padding: 14px;
-  text-align: center;
-}
-
-.stat-value {
-  font-size: 26px;
-  font-weight: 600;
-  color: var(--text);
-  letter-spacing: -0.02em;
-  margin-bottom: 2px;
-}
-
-.stat-label {
-  font-size: 11.5px;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-}
-
-/* Insights adapters */
-.insights-adapters {
-  display: grid;
-  gap: 6px;
-}
-
-.adapter-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 9px 12px;
-  background: var(--panel-muted);
-  border-radius: var(--radius-sm);
-}
-
-.adapter-name {
-  font-weight: 600;
-  font-size: 13px;
-}
-
-.adapter-score {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-/* Insights recent */
-.insights-recent {
-  display: grid;
-  gap: 4px;
-}
-
-.preference-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
-  background: var(--panel-muted);
-  border-radius: var(--radius-sm);
-  border-left: 2px solid var(--border-strong);
-}
-
-.preference-item.positive {
-  border-left-color: var(--accent);
-}
-
-.preference-item.negative {
-  border-left-color: var(--danger);
-}
-
-.feedback-icon {
-  font-weight: 600;
-  font-size: 13px;
-  width: 24px;
-  text-align: center;
-}
-
-.preference-item.positive .feedback-icon {
-  color: var(--accent-strong);
-}
-
-.preference-item.negative .feedback-icon {
-  color: var(--danger);
-}
-
-.preference-message {
-  flex: 1;
-  font-size: 13px;
-  color: var(--text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.preference-date {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-/* Insights clusters */
+/* Insights lists are rows and figures now. `.stats-grid`, `.stat-card`,
+   `.stat-value`, `.stat-label`, `.adapter-item`, `.adapter-name`,
+   `.adapter-score`, `.preference-item`, `.feedback-icon`,
+   `.preference-message`, `.preference-date`, `.cluster-card`,
+   `.cluster-label`, `.cluster-description`, `.cluster-meta` and
+   `.has-adapter` were retired with their last callers: four filled boxes for
+   four numbers, and three list shapes for what the rest of the workspace
+   already says with one. The sentiment a preference carried in a coloured
+   left border is a `.fact-dot`, which is what state looks like everywhere
+   else here. */
+.insights-adapters,
+.insights-recent,
 .insights-clusters {
   display: grid;
-  gap: 8px;
-}
-
-.cluster-card {
-  padding: 12px 14px;
-  background: var(--panel-muted);
-  border-radius: var(--radius-sm);
-  border-left: 2px solid var(--accent);
-}
-
-.cluster-label {
-  font-weight: 600;
-  margin-bottom: 2px;
-}
-
-.cluster-description {
-  font-size: 13px;
-  color: var(--text-muted);
-  margin-bottom: 6px;
-}
-
-.cluster-meta {
-  display: flex;
-  gap: 12px;
-  font-size: 11.5px;
-  color: var(--text-muted);
-}
-
-.cluster-meta .has-adapter {
-  background: var(--panel);
-  border: 1px solid var(--border-strong);
-  color: var(--text-muted);
-  padding: 1px 6px;
-  border-radius: 999px;
+  gap: 1px;
 }
 
 /* Form group for admin settings */
@@ -2981,14 +2774,7 @@ button.minor:hover {
    took what was left, so in a 240px pane three notes all dated 8/30/2026
    read "Fear and Loathi...", "The reporter is ...", "Gonzo starts at...":
    the identifying field truncated to pay for one that never varies. */
-.note-item {
-  padding: 8px 10px;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-
-.note-item:hover { background: var(--panel-muted); }
-.note-item.active { background: var(--accent-light); }
+/* Shape from `.row` above. Only the state a note can be in is its own. */
 .note-item.contradicted .note-item-title { color: var(--danger); }
 
 .note-item-title {
@@ -3498,7 +3284,9 @@ button.minor:hover {
    precise. The minimum here keeps a one-line row comfortable, and a row with
    a metadata line grows past it on its own. What stays compact is the
    controls inside the row, not the row. */
-.row {
+.row,
+.conversation-item,
+.note-item {
   position: relative;
   display: flex;
   align-items: center;
@@ -3519,16 +3307,22 @@ button.minor:hover {
   cursor: pointer;
 }
 
-.row:hover {
+.row:hover,
+.conversation-item:hover,
+.note-item:hover {
   background: var(--panel-muted);
 }
 
 /* Selection, said the way the rail says it. */
-.row.selected {
+.row.selected,
+.conversation-item.active,
+.note-item.active {
   background: var(--accent-light);
 }
 
-.row.selected::before {
+.row.selected::before,
+.conversation-item.active::before,
+.note-item.active::before {
   content: "";
   position: absolute;
   left: 0;
@@ -3539,7 +3333,9 @@ button.minor:hover {
   background: var(--accent);
 }
 
-.row.selected .row-name {
+.row.selected .row-name,
+.conversation-item.active .title,
+.note-item.active .note-item-title {
   color: var(--accent-strong);
 }
 
@@ -3717,94 +3513,13 @@ button.minor:hover {
   color: var(--text-muted);
 }
 
-/* Aligned facts, where a list of them used to be a grid of boxes. */
-.deflist {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 4px 14px;
-  font-size: 12.5px;
-}
+/* `.deflist`, `.hairline-table`, `.section-bar` and `.input-quiet` were
+   added with the foundation and never called. Vocabulary invented for a use
+   that did not arrive is a cost with no reader: it has to be understood by
+   whoever reads this file next, and kept working by whoever changes the
+   tokens under it. Removed; the shapes they described are available again
+   the day something needs them. */
 
-.deflist dt {
-  color: var(--text-muted);
-}
-
-.deflist dd {
-  margin: 0;
-}
-
-/* A table that is structure rather than an object: rules between rows, no
-   frame around the whole. Version history is the case this exists for. */
-.hairline-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12.5px;
-}
-
-.hairline-table th {
-  text-align: left;
-  font-weight: 500;
-  color: var(--text-muted);
-  font-size: 11.5px;
-  padding: 0 10px 5px 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.hairline-table td {
-  padding: 6px 10px 6px 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.hairline-table tr:last-child td {
-  border-bottom: 0;
-}
-
-.hairline-table tbody tr:hover {
-  background: var(--panel-muted);
-}
-
-/* A heading for a division of an open surface. The action sits on the same
-   line because a section that needs a button does not need a toolbar. */
-.section-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 0 0 6px;
-}
-
-.section-bar h3 {
-  margin: 0;
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-  color: var(--text-muted);
-}
-
-/* A quiet input: no perimeter until the perimeter is useful. */
-.input-quiet {
-  height: var(--ctl-h);
-  width: 100%;
-  padding: 0 10px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: var(--panel-muted);
-  color: var(--text);
-  font: inherit;
-  font-size: 13px;
-}
-
-.input-quiet:hover {
-  border-color: var(--border);
-}
-
-.input-quiet:focus {
-  outline: none;
-  background: var(--panel);
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(14, 138, 109, 0.10);
-}
 
 /* Upload is one line, not a stack of labelled fields. The file input is the
    wide part because the filename is the long part. */
