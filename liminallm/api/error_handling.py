@@ -98,23 +98,21 @@ def register_exception_handlers(app: FastAPI) -> None:
     ):
         """Refused, never served unlocked.
 
-        Handled centrally because all six callers of
-        `hold_user_auth_state` - login, OAuth session publication, session
-        rotation, credential rotation, reset and role change - want the same
-        answer, and one of them forgetting to catch it is how a request would
-        end up served without the serialization it asked for.
-
-        503 rather than 409: nothing about the caller's request is wrong and
-        retrying is the right move, which is what the code says. SPEC §18
-        exposes only the stable public codes, so this is `server_error`.
+        Handled centrally because all callers of `hold_user_auth_state` need
+        the same serialization boundary. The failure is a conflict with an
+        authentication-state operation already in progress, not a server
+        crash. SPEC §13.0 makes the wire mapping normative: `conflict` is
+        HTTP 409, while `server_error` is HTTP 500. A 503/server_error pair
+        would invent an eighth mapping and, worse, imply a generic retry even
+        on flows such as OAuth whose provider code may already be spent.
         """
-        logger.error(
+        logger.warning(
             "auth_state_lock_timeout",
             path=request.url.path,
             method=request.method,
             error=str(exc),
         )
-        return _error_response(503, str(exc), code="server_error")
+        return _error_response(409, str(exc), code="conflict")
 
     @app.exception_handler(ArtifactValidationError)
     async def handle_validation_error(request: Request, exc: ArtifactValidationError):
