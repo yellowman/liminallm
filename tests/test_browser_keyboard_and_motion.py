@@ -458,6 +458,7 @@ class TestTheInterfaceShipsItsOwnTypefaces:
                   document.body.appendChild(probe);
                   await document.fonts.load('500 14px Inter');
                   await document.fonts.load('400 12px "JetBrains Mono"');
+                  await document.fonts.load('500 12px "JetBrains Mono"');
                   await document.fonts.ready;
                   probe.remove();
                   const faces = [...document.fonts].map(
@@ -466,6 +467,7 @@ class TestTheInterfaceShipsItsOwnTypefaces:
                     faces,
                     interLoaded: document.fonts.check('500 14px Inter'),
                     monoLoaded: document.fonts.check('400 12px "JetBrains Mono"'),
+                    monoBoldLoaded: document.fonts.check('500 12px "JetBrains Mono"'),
                     body: getComputedStyle(document.body).fontFamily.split(',')[0],
                   };
                 }"""
@@ -483,6 +485,19 @@ class TestTheInterfaceShipsItsOwnTypefaces:
             # have.
             inter = {f.split("|")[1] for f in state["faces"] if "Inter" in f}
             assert {"400", "500", "600"} <= inter, state["faces"]
+
+            # Both monospace weights, not just the one the check above
+            # happens to name. `document.fonts.check` was asked about 400
+            # only, so a stylesheet declaring a 500 with no file behind it
+            # would have passed - the weight a reader gets is then drawn by
+            # the browser rather than by the typeface.
+            mono = {
+                f.split("|")[1] for f in state["faces"] if "JetBrains" in f
+            }
+            assert {"400", "500"} <= mono, state["faces"]
+            assert state["monoBoldLoaded"], (
+                f"JetBrains Mono 500 is declared and not loaded: {state}"
+            )
         finally:
             context.close()
 
