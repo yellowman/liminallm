@@ -353,8 +353,8 @@ token, not the call site.
 | `--radius` / `--radius-sm` | 8px / 6px | Surface and control |
 | `--topbar-h` | 48px | The workspace bar, which is sticky |
 | `--accent` | green | State, in this project |
-| `--font` | Inter, system sans | Interface and prose |
-| `--font-mono` | JetBrains Mono, then Fira Code, Consolas | Literal content |
+| `--font` | Inter, system sans | Interface and prose. Served from `frontend/fonts/`, weights 400/500/600 |
+| `--font-mono` | JetBrains Mono, then Fira Code, Consolas | Literal content. Served from `frontend/fonts/`, weights 400/500 |
 
 A token that is read and never defined does not fail loudly. The declaration
 becomes invalid at computed-value time and an inherited property quietly
@@ -515,68 +515,23 @@ measured.
 
 ## Defects that reach the reader
 
-These are not matters of taste. Each one costs somebody the use of
-something.
+None outstanding. Every entry this section held has been repaired and has a
+browser witness that fails against the defect it describes:
 
-**An account is deleted without being asked.** `admin.js:406` sends
-`DELETE /admin/users/{id}` the moment the button is pressed. The same action
-on the settings tab does ask (`admin-tab.js:175`). The button is
-`class="ghost"`, so it is also pixel-identical to the "Set role" button
-beside it: part one says destructive is red at rest and confirms with
-explicit words, and this does neither.
+| Was | Now |
+|---|---|
+| An account erased on one click, from a button styled like `Set role` beside it | Confirms, naming the account by email rather than by the id that gets mistyped |
+| Deleting a note named the title being typed while deleting the one that was saved | Names the saved record |
+| The note list, the conversation list and the vault search unreachable by keyboard | All three are buttons; Tab reaches them and Enter opens them |
+| A focus ring at 1.13:1, drawn after `outline: none` removed a working one | One `:focus-visible` rule at 4.02:1, and no live `outline: none` anywhere |
+| Contradicted and evolved notes said so in colour alone | A dot and a word beside the date |
+| Nothing answered `prefers-reduced-motion` while three animations ran for ever | Those three stop; the typing dots fade rather than bounce |
+| Search results were a title and an excerpt in a clickable `div` | Rank, kind, date, excerpt, hairlines - and the `rank` the server was already sending |
 
-**The note list cannot be reached by keyboard.** Each `.note-item` is an
-`<li>` with no `tabindex`, no `role` and no `href`; forty tab presses never
-land on one. Opening a note is the pane's primary action and it is available
-only to a pointer. `.conversation-item` has the same shape - a `<div>` at
-`chat.js:733` - though that one is read from the source rather than
-measured. The same class is a real `<a>` on the share page
-(`share.js:74`), so the primitive already has a correct form.
-
-**The focus ring is invisible.** Where the project styles focus at all it
-sets `outline: none` and draws `box-shadow: 0 0 0 2px rgba(14, 138, 109,
-0.10)` - the accent at one tenth alpha, which computes to **1.13:1**
-against every surface token. WCAG 2.2 asks for 3.0:1. The same declaration
-appears on `.icon-btn:focus-visible`, so a keyboard reader crossing a file
-row's four actions cannot see which one is focused; that instance is
-inferred from the identical declaration rather than measured. Everything
-else falls back to the browser's own outline, which is visible but is not
-this vocabulary and differs between browsers.
-
-The consequence is worth stating plainly: on the controls the project
-styles, it removed a working indicator and replaced it with one that cannot
-be seen.
-
-**Search results are the one list part one describes in detail, and the
-only list nothing was checked against.** Part one asks for an index or icon,
-the name, a score, a source and type line, an excerpt, and actions, with a
-hairline between results. The vault search renders two of those:
-`notes.js:285` emits a `<div class="note-search-hit">` holding a title and
-an excerpt. There is no hairline - `.note-search-hit` sets padding and a
-hover fill and no border, so eight results are eight unseparated blocks in
-one tinted box. There are no actions and no source line.
-
-The index is the part worth singling out, because the work was already
-done. `routes.py:2834` sends a `rank` field that is the result's 1-based
-position, with a comment explaining that it is deliberately a position
-rather than the raw fused score, since that score "tops out near 0.016 and
-packs the whole result set into a hair's breadth of itself". The backend
-solved exactly the problem part one's "a score" raises, and the frontend
-never reads the field.
-
-The same element is also a `<div>` with `cursor: pointer`, so opening a
-result is available only to a pointer - the note list defect again, in the
-list a reader reaches by typing.
-
-**Status carried in colour alone.** `.note-item.contradicted` and
-`.note-item.evolved` change only the title's colour - no dot, no word, no
-`title` attribute. `.voice-btn.playing` does the same. Five lines away,
-`notes.js:34` does it correctly for unsaved state, with a dot and a word.
-
-**`prefers-reduced-motion` is not honoured.** There is no such block, and
-**three** animations run indefinitely without one: the streaming pulse, the
-caret and the typing indicator. `typing-bounce` is a bounce, which part one
-says to avoid. The turn-rail flash runs once.
+The repairs are not the interesting part; the measurements are. The focus
+ring was the one worth stating plainly, because the project had taken a
+working indicator away and replaced it with one that cannot be seen, and
+nothing failed while that was true.
 
 ## Rules that fixed nothing
 
@@ -587,7 +542,6 @@ them.
 | Rule | What it does |
 |---|---|
 | `.delete-user-btn`, `.view-patch-btn` at 28px | **Dead.** Renders 30px. `button.ghost` is element-plus-class and outranks a bare class - the same defect as `button.ghost` over `.voice-btn`, in a sibling the fix never reached. |
-| `bar-primary` on "New thread" | **Defined nowhere.** The one primary the chat view declares renders as a bordered secondary, so Chat has no primary at all. |
 | `.table tr.clickable.selected` | **Never applied.** No code sets the class. The patch list, where clicking opens a detail panel, has no selection state. |
 | `.patch-status.pending` | **Missing.** `admin-tab.js:396` computes `pending`; no rule matches, so it falls to neutral grey where part one assigns amber. |
 | `.bar-actions` at 32px | **Dead for buttons, live for anchors** - a tier part one does not have. |
@@ -610,13 +564,7 @@ expression here at all.
 
 ## Vocabulary that does not exist as specified
 
-**There is no ghost tier.** Rendered side by side, `primary` is black,
-`ghost` is white with a visible border and `minor` is a grey fill. Ghost and
-minor are both part one's *secondary*, so forty-six buttons share one level
-where the standard has two. Part one says ghost is the default for
-lower-priority actions; nothing is ghost.
-
-**Four icon-button geometries.** `.icon-btn` 28px, `.icon-btn.compact`
+** `.icon-btn` 28px, `.icon-btn.compact`
 **24px**, `.pane-toggle` 30px, `.modal-close` no declared size at all. Part
 one names one, at 28px.
 
@@ -641,14 +589,11 @@ Measured against the role each one serves: the page title renders 17px for
 13px for 13.5, and the settings index 12.5px for 12. `12.5px` alone has ten
 call sites and no role at all.
 
-**`.bubble code { font-size: 82% }`** is the only relative size in the
-file, so one role renders at five sizes: 12.3px in prose, 12.5px in a fenced
-block, 11.89px in a user bubble, 16.4px inside an `h2` and **19.68px inside
-an `h1`**, because the markdown renderer can place a code span inside a
-heading.
-
-**Reading prose has two sizes.** Chat is 15px/1.65, which is right. The note
-editor and its preview are 16px/1.7.
+**Reading prose had two sizes** and now has one: chat, the note editor and
+its preview are all 15px/1.65. Inline code was `font-size: 82%`, the only
+relative size in the file, so one role rendered at five sizes - up to
+19.68px inside an `h1`, because the markdown renderer can put a code span in
+a heading. It is 12px.
 
 **The major-section gap is two numbers, neither on the scale.** 26px before
 a band on Files and Insights, 22px on Settings - where part one says 28-32.

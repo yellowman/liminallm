@@ -59,13 +59,29 @@ const linkifyWikiLinks = (html) =>
 const renderNoteList = () => {
   const list = $('note-list');
   if (!list) return;
-  list.innerHTML = notesState.notes.map((n) => `
-    <li class="note-item${n.id === notesState.currentId ? ' active' : ''}${notesState.contradicted.has(n.id) ? ' contradicted' : notesState.evolved.has(n.id) ? ' evolved' : ''}" data-id="${escapeAttr(n.id)}">
-      <span class="row-main">
-        <span class="note-item-title">${escapeHtml(n.title)}</span>
-        <span class="note-item-date">${new Date(n.updated_at).toLocaleDateString()}</span>
-      </span>
-    </li>`).join('');
+  list.innerHTML = notesState.notes.map((n) => {
+    // The witness's verdict as a word, not only as a colour. The title used
+    // to turn red or amber and say nothing, which reaches nobody who cannot
+    // see the difference and nobody who has not learned what it means.
+    const flag = notesState.contradicted.has(n.id)
+      ? { cls: 'contradicted', word: 'Contradiction' }
+      : notesState.evolved.has(n.id)
+        ? { cls: 'evolved', word: 'Position moved' }
+        : null;
+    const state = flag
+      ? `<span class="fact-sep"></span><span class="note-flag">`
+        + `<span class="fact-dot on"></span>${flag.word}</span>`
+      : '';
+    return `
+    <li>
+      <button type="button" class="note-item${n.id === notesState.currentId ? ' active' : ''}${flag ? ' ' + flag.cls : ''}" data-id="${escapeAttr(n.id)}">
+        <span class="row-main">
+          <span class="note-item-title">${escapeHtml(n.title)}</span>
+          <span class="note-item-date factline"><span>${new Date(n.updated_at).toLocaleDateString()}</span>${state}</span>
+        </span>
+      </button>
+    </li>`;
+  }).join('');
   const count = $('note-count');
   if (count) count.textContent = notesState.notes.length ? `${notesState.notes.length} notes` : '';
 };
@@ -287,12 +303,22 @@ const runNoteSearch = async (query) => {
     const data = await notesApi('/notes/search', { method: 'POST', body: JSON.stringify({ query, limit: 8 }) });
     const results = data.results || [];
     box.classList.remove('hidden');
+    // The shape part one asks a result list for: an index, the name, what
+    // kind of thing it is, and an excerpt, with a hairline between results.
+    // `rank` is the server's 1-based position, sent precisely because the
+    // fused score behind it packs every result into a hair's breadth of
+    // itself and is not a number anything should render. The frontend used
+    // to drop it.
     box.innerHTML = results.length
-      ? results.map((r) => `<div class="note-search-hit" data-id="${escapeAttr(r.id)}">
-          <span class="note-item-title">${escapeHtml(r.title)}</span>
-          <span class="note-search-excerpt">${escapeHtml(r.excerpt || '')}</span>
-        </div>`).join('')
-      : '<div class="muted" style="padding:8px 10px">No matches.</div>';
+      ? results.map((r, i) => `<button type="button" class="note-search-hit" data-id="${escapeAttr(r.id)}">
+          <span class="hit-rank">${String(r.rank ?? i + 1).padStart(2, '0')}</span>
+          <span class="row-main">
+            <span class="note-item-title">${escapeHtml(r.title)}</span>
+            <span class="hit-facts factline"><span>Note</span><span class="fact-sep"></span><span>${escapeHtml(new Date(r.updated_at).toLocaleDateString())}</span></span>
+            <span class="note-search-excerpt">${escapeHtml(r.excerpt || '')}</span>
+          </span>
+        </button>`).join('')
+      : '<p class="note-search-empty subtext">No matches.</p>';
   } catch (err) {
     console.warn('note search failed', err);
   }

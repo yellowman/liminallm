@@ -1,3 +1,58 @@
+/* The interface families, served from this repository.
+
+   The tokens below named Inter and JetBrains Mono and nothing shipped them,
+   so both were requests to whatever the reader's machine happened to have.
+   On Linux that usually means neither, and the typography one of the
+   reasons for this work was a face most readers never saw.
+
+   Latin subset, the weights the interface actually uses - 400, 500 and 600
+   for the interface family, 400 and 500 for the monospace - and no more.
+   `swap` renders immediately in the fallback and changes over when the file
+   arrives, which is the right trade for an interface nobody is reading
+   before it loads.
+
+   Files and licences are in `frontend/fonts/`. Served from `/static`, which
+   mounts this directory, so nothing reaches a third party at render time. */
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/fonts/inter-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/static/fonts/inter-latin-500-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/static/fonts/inter-latin-600-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/fonts/jetbrains-mono-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url("/static/fonts/jetbrains-mono-latin-500-normal.woff2") format("woff2");
+}
+
 :root {
   --bg: #f7f7f8;
   --panel: #ffffff;
@@ -8,6 +63,9 @@
   --accent-strong: #0a6e55;
   --accent-light: #eaf5f1;
   --danger: #b42318;
+  /* Amber, which part one assigns to warning and pending. It was a
+     literal on the one rule that used it. */
+  --warning: #c07d10;
   --danger-light: #fef1f0;
   --text: #191c20;
   --text-muted: #626872;
@@ -59,6 +117,24 @@
 
 * {
   box-sizing: border-box;
+}
+
+/* One focus indicator for the whole interface, and the only one.
+
+   What was here before was worse than leaving the browser alone: four
+   places set `outline: none` and drew `box-shadow: 0 0 0 2px rgba(14, 138,
+   109, 0.10)` instead - the accent at a tenth alpha, which computes to
+   1.13:1 against every surface token in this file where WCAG 2.2 asks for
+   3.0:1. So the interface removed a working indicator and replaced it with
+   one that cannot be seen.
+
+   `:focus-visible` rather than `:focus`, so it answers a keyboard and not a
+   mouse click. A component may still change its border or its fill on
+   focus; what it may not do is turn this off, because then that change is
+   the only cue and it has to carry a job it was not measured for. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 body {
@@ -614,9 +690,7 @@ body {
 }
 
 .icon-btn:focus-visible {
-  outline: none;
   color: var(--text);
-  box-shadow: 0 0 0 2px rgba(14, 138, 109, 0.10);
 }
 
 /* Red at rest, not only on hover. Among four identical grey glyphs the one
@@ -637,9 +711,13 @@ body {
   display: block;
 }
 
+/* Compact is a smaller glyph in a tighter context, not a smaller target.
+   It was 24px, which is a fourth control geometry the standard does not
+   have and a hit area below what a finger can reliably find. The glyph
+   below is what carries the difference. */
 .icon-btn.compact {
-  width: 24px;
-  height: 24px;
+  width: var(--icon-hit);
+  height: var(--icon-hit);
 }
 
 .icon-btn.compact svg {
@@ -934,16 +1012,29 @@ body {
   color: var(--accent-strong);
 }
 
-.toggle-icon {
-  font-size: 13px;
-  font-weight: 600;
+/* One disclosure vocabulary: a chevron, right when closed and down when
+   open. There were three - a `+` that rotated into a `\00D7`, a CSS
+   triangle, and nothing at all - so the same question looked like three
+   different controls depending on which screen asked it.
+
+   Drawn rather than set in type: a glyph depends on the face, and the
+   monospace and interface families draw these at different weights. */
+.toggle-icon,
+.advanced summary::before {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
   margin-left: 6px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
   color: var(--text-muted);
+  transform: rotate(-45deg);
+  transition: transform 130ms ease;
 }
 
-.panel-section:not(.collapsed) .toggle-icon {
+.panel-section:not(.collapsed) .toggle-icon,
+.advanced[open] summary::before {
   transform: rotate(45deg);
-  display: inline-block;
 }
 
 /* Form fields */
@@ -1007,9 +1098,7 @@ body {
 .field input:focus,
 .field textarea:focus,
 .field select:focus {
-  outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(14, 138, 109, 0.10);
 }
 
 textarea {
@@ -1068,15 +1157,26 @@ a.ghost:hover {
   border-color: var(--border-strong);
 }
 
+/* The low-chrome tier: nothing at rest, a faint fill on hover.
+
+   There were two secondaries and no ghost. `ghost` is white with a visible
+   border and `minor` was a grey fill, so both read as part one's
+   *secondary* and forty-six controls shared one level where the standard
+   has two. With this transparent, the four roles are distinct: black
+   primary, bordered secondary (`ghost`), low-chrome (`minor`), and the
+   transparent 28px icon button.
+
+   Renaming the classes to match the standard's words is a separate change
+   and a large one; what matters first is that the hierarchy exists. */
 button.minor {
-  background: var(--panel-muted);
-  border-color: var(--panel-muted);
-  color: var(--text);
+  background: none;
+  border-color: transparent;
+  color: var(--text-muted);
 }
 
 button.minor:hover {
-  background: var(--border);
-  border-color: var(--border);
+  background: var(--panel-muted);
+  color: var(--text);
 }
 
 /* Chat panel - a single reading column, measured like a magazine page */
@@ -1338,7 +1438,12 @@ button.minor:hover {
   border-radius: 5px;
   padding: 2px 5px;
   font-family: var(--font-mono);
-  font-size: 82%;
+  /* 12px, not 82%. A percentage resolves against whatever contains it, and
+     the markdown renderer can put a code span inside a heading - so one
+     role rendered at five sizes, up to 19.68px inside an `h1`. A literal
+     size is the same everywhere the role appears, which is the point of
+     having the role. */
+  font-size: 12px;
 }
 
 /* Fenced code: a card with a language bar, copy button, and highlighting */
@@ -2510,9 +2615,7 @@ button.minor:hover {
 }
 
 .form-group input:focus {
-  outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(14, 138, 109, 0.10);
 }
 
 .form-group .small {
@@ -2796,15 +2899,65 @@ button.minor:hover {
   background: var(--panel-muted);
 }
 
+/* A result list, in the shape part one asks for: an index, the name, what
+   kind of thing it is and when, an excerpt - with a hairline between
+   results. It was a title and an excerpt in a clickable `div`, so it was
+   also the one list a keyboard could not reach, in the pane a reader gets
+   to by typing. */
 .note-search-hit {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  width: 100%;
   padding: 8px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
 }
 
+.note-search-hit:last-child { border-bottom: 0; }
+
 .note-search-hit:hover { background: var(--accent-light); }
+
+/* The server's 1-based position. Tabular so a two-digit rank does not move
+   the column, muted because it orders the list rather than saying anything
+   about the note. */
+.hit-rank {
+  padding-top: 1px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.hit-facts {
+  margin: 1px 0 2px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.note-search-empty {
+  margin: 0;
+  padding: 8px 12px;
+}
+
+/* The witness's verdict as a word beside the date. The title used to carry
+   it as a colour and nothing else. */
+.note-flag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.note-item.contradicted .note-flag { color: var(--danger); }
+.note-item.evolved .note-flag { color: var(--warning); }
+.note-item.contradicted .note-flag .fact-dot { background: var(--danger); }
+.note-item.evolved .note-flag .fact-dot { background: var(--warning); }
 
 .note-search-excerpt {
   font-size: 12px;
@@ -2936,17 +3089,19 @@ button.minor:hover {
 }
 
 #note-title:focus {
-  outline: none;
   border-bottom-color: var(--accent);
 }
 
+/* One reading role, so prose is the same size wherever it is read. Chat
+   was 15px/1.65 and the note editor and its preview were 16px/1.7, which
+   is two densities for the same act with nothing distinguishing them. */
 #note-content {
   flex: 1;
   min-height: 300px;
   resize: vertical;
   font-family: var(--font);
-  font-size: 16px;
-  line-height: 1.7;
+  font-size: 15px;
+  line-height: 1.65;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 14px 16px;
@@ -2960,8 +3115,8 @@ button.minor:hover {
   border-radius: var(--radius);
   padding: 14px 16px;
   font-family: var(--font);
-  font-size: 16px;
-  line-height: 1.7;
+  font-size: 15px;
+  line-height: 1.65;
 }
 
 .wikilink {
@@ -3017,7 +3172,11 @@ button.minor:hover {
 .witness-row.agrees { border-left-color: var(--accent); }
 
 .witness-verdict {
-  font-weight: 700;
+  /* 600, not 700. Three weights ship - 400, 500 and 600 - and the one rule
+     that asked for a fourth would have been drawn by the browser rather
+     than by the typeface, which is a different letterform beside every
+     other bold in the interface. */
+  font-weight: 600;
   font-size: 11px;
   letter-spacing: 0.06em;
   margin-right: 8px;
@@ -3069,14 +3228,14 @@ button.minor:hover {
 }
 
 /* Witness reframe: movement, not just contradiction */
-.note-item.evolved .note-item-title { color: #c07d10; }
+.note-item.evolved .note-item-title { color: var(--warning); }
 
 .witness-row.evolves {
-  border-left-color: #c07d10;
+  border-left-color: var(--warning);
   background: #fdf6e8;
 }
 
-.witness-row.evolves .witness-verdict { color: #c07d10; }
+.witness-row.evolves .witness-verdict { color: var(--warning); }
 
 .note-sweep-wrap {
   flex: 1;
@@ -3711,11 +3870,17 @@ button.minor:hover {
    isolated from the page around it. It appears in answer to a choice, it
    ends in a decision, and while it is open it is the only thing on the page
    a reader should be acting on - which is what the border is saying. */
+/* A marker and a fill, not a card. Part one asks an expanded editor for a
+   faint neutral surface and a 2px accent edge, and says explicitly that it
+   does not get a full perimeter - this sat inside `.panel` with a border of
+   its own, and in places contained another bordered surface. The accent
+   edge says which thing is open; the fill says how far it reaches. */
 .setting-editor {
   margin: 10px 0 14px;
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  border: 0;
+  border-left: 2px solid var(--accent);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   background: var(--panel-muted);
 }
 
@@ -3939,16 +4104,9 @@ button.minor:hover {
 
 .advanced summary::before {
   content: "";
-  width: 0;
-  height: 0;
-  border-left: 4px solid currentColor;
-  border-top: 3.5px solid transparent;
-  border-bottom: 3.5px solid transparent;
-  transition: transform 130ms ease;
-}
-
-.advanced[open] summary::before {
-  transform: rotate(90deg);
+  /* Geometry above, with `.toggle-icon`. The chevron sits before the word
+     here and after it there, so only the margin differs. */
+  margin: 0 8px 0 0;
 }
 
 .advanced summary:hover {
@@ -3958,4 +4116,28 @@ button.minor:hover {
 .advanced > .field {
   margin: 8px 0 0;
   max-width: 220px;
+}
+
+/* Three animations run for ever: the streaming pulse, the caret and the
+   typing indicator. A reader who asks the system for less motion is asking
+   about exactly those, and nothing here answered.
+
+   Named rather than a blanket `*` reset. The turn-rail flash runs once and
+   says something when it does; ordinary transitions at 120-150ms are what
+   part one asks for and are not what this setting is about. Stopping the
+   three that never stop is the whole request.
+
+   The typing indicator loses its bounce rather than its life: part one says
+   not to bounce anyway, so the dots fade in place, which communicates the
+   same thing and is calmer while doing it. */
+@media (prefers-reduced-motion: reduce) {
+  .voice-btn.recording,
+  .message.streaming .bubble::after,
+  .typing-dots span {
+    animation: none;
+  }
+
+  .typing-dots span {
+    opacity: 0.55;
+  }
 }

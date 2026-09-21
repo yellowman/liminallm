@@ -106,6 +106,7 @@ class TestEveryStartedServiceIsStopped:
         """
         monkeypatch.setattr(script.os, "environ", dict(script.os.environ))
         stopped: list[str] = []
+        promoted: list[bool] = []
 
         class FakePostgres:
             def start(self):
@@ -165,9 +166,12 @@ class TestEveryStartedServiceIsStopped:
             def get(self, url, *_args, **_kwargs):
                 if "/chunks" in url:
                     return FakeResponse({"items": [{"id": "chunk-1"}]})
-                # No id, so seeding stops before the role promotion: that
-                # step reaches the runtime, which this test never boots.
-                return FakeResponse({})
+                # A real id. This returned nothing, so seeding skipped the
+                # role promotion quietly and never reached the runtime -
+                # which was the capture harness's own silent path, relied on
+                # here. Promotion is fatal now, so the stub carries an id and
+                # the runtime call is stubbed below rather than avoided.
+                return FakeResponse({"id": "user-1"})
 
             def close(self):
                 stopped.append("client")
@@ -183,6 +187,19 @@ class TestEveryStartedServiceIsStopped:
         monkeypatch.setattr(harness_mod, "apply_schema", lambda *a, **k: None)
         monkeypatch.setattr(browser_mod, "LiveServer", FakeServer)
         monkeypatch.setattr(script, "assert_isolated", lambda url: None)
+
+        # Promotion reaches `get_runtime()`, which this test never boots.
+        import liminallm.service.runtime as runtime_mod
+
+        class FakeStore:
+            def update_user_role(self, *_args, **_kwargs):
+                promoted.append(True)
+
+        monkeypatch.setattr(
+            runtime_mod,
+            "get_runtime",
+            lambda: type("R", (), {"store": FakeStore()})(),
+        )
 
         def boom(*_args, **_kwargs):
             raise RuntimeError("the browser died mid-capture")

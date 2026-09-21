@@ -245,14 +245,36 @@ FRONTEND = STYLESHEET.parent
 
 
 def defined_class_names(css: str) -> set:
-    """Every class name the stylesheet styles, comments excluded.
+    """Every class name the stylesheet styles.
 
-    Excluded because this file names retired classes in the comments that
-    record their retirement, and counting those as definitions reports every
-    one of them as an orphan.
+    Read from the parser's qualified rules rather than by scanning the text.
+    Two defects came from scanning, in opposite directions, and the second
+    was introduced while fixing the first:
+
+    * Reading the whole file counted declaration values, and
+      `url("…/inter-latin-400-normal.woff2")` is a dot followed by a word -
+      so a `@font-face` rule reported `woff2` as a styled class nothing can
+      produce.
+    * Reading only what precedes a brace, back to the previous `}` or `;`,
+      missed the *first* rule inside any at-rule block: after `@media (…) {`
+      the next selector is preceded by `{`, which that pattern does not
+      accept. A class defined only inside a media query was invisible to the
+      orphan check.
+
+    `qualified_rules` already walks into at-rule content, because
+    `type_selectors` needed the same thing, and a prelude is the only place
+    a class name can be a selector. Comments are skipped by the parser, which
+    matters because this file names retired classes in the comments that
+    record their retirement.
     """
-    body = re.sub(r"/\*.*?\*/", " ", css, flags=re.S)
-    return set(re.findall(r"\.([a-zA-Z][\w-]*)", body))
+    top = tinycss2.parse_stylesheet(css, skip_whitespace=True, skip_comments=True)
+    return {
+        name
+        for rule in qualified_rules(top)
+        for name in re.findall(
+            r"\.([a-zA-Z][\w-]*)", tinycss2.serialize(rule.prelude)
+        )
+    }
 
 
 def without_comments(text: str, suffix: str) -> str:
@@ -368,6 +390,62 @@ class TestNoRuleStylesSomethingThatCannotAppear:
             )
         )
         assert "kept" in kept, kept
+
+    def test_a_class_defined_only_inside_an_at_rule_is_seen(self):
+        """The blind spot the previous fix introduced.
+
+        Reading back from each `{` to the previous `}` or `;` misses the
+        first rule inside an at-rule block, because what precedes it is `{`.
+        A class defined only inside a media query was therefore invisible to
+        the orphan check - it could be dead, or a typo, and nothing asked.
+
+        Both positions are tested. The second rule inside the block was
+        always found, so a control that only checked that one would pass
+        against the defect.
+        """
+        first = defined_class_names(
+            "@media (max-width: 860px) {\n  .only-here { color: red }\n}"
+        )
+        assert first == {"only-here"}, first
+
+        both = defined_class_names(
+            "@media (max-width: 860px) {\n"
+            "  .first-in-block { color: red }\n"
+            "  .second-in-block { color: red }\n"
+            "}"
+        )
+        assert both == {"first-in-block", "second-in-block"}, both
+
+        nested = defined_class_names(
+            "@supports (display: grid) {\n  .supported { color: red }\n}"
+        )
+        assert nested == {"supported"}, nested
+
+    def test_an_orphan_inside_an_at_rule_is_reported(self):
+        """And the check that uses it says so, not just the extractor."""
+        orphans = (
+            defined_class_names(
+                "@media (max-width: 860px) {\n  .ghost-town { color: red }\n}"
+            )
+            - names_frontend_can_produce()
+            - BUILT_AT_RUNTIME
+        )
+        assert orphans == {"ghost-town"}, orphans
+
+    def test_a_dotted_filename_in_a_value_is_not_a_class(self):
+        """`url("…/inter-latin-400-normal.woff2")` has a dot followed by a
+        word, so reading class names from the whole stylesheet reported
+        `woff2` as a styled class nothing can produce. A selector is what
+        precedes a brace; a declaration value is not one."""
+        css = (
+            '@font-face {\n'
+            '  font-family: "Inter";\n'
+            '  src: url("/static/fonts/inter-latin-400-normal.woff2")'
+            ' format("woff2");\n'
+            '}\n'
+            '.real { color: red }\n'
+        )
+        assert defined_class_names(css) == {"real"}
 
     def test_a_name_only_a_comment_mentions_is_not_a_definition(self):
         """Retirement comments name what they retired. Counting those would

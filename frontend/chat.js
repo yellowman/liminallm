@@ -790,12 +790,12 @@ const renderConversationList = () => {
       const apiTag = c.source === 'responses'
         ? '<span class="fact-sep"></span><span>api</span>' : '';
       return `
-        <div class="conversation-item ${isActive ? 'active' : ''}" data-id="${escapeHtml(c.id)}">
+        <button type="button" class="conversation-item ${isActive ? 'active' : ''}" data-id="${escapeHtml(c.id)}">
           <span class="row-main">
             <span class="title">${title}</span>
             <span class="meta factline">${date ? `<span>${date}</span>` : ''}${apiTag}</span>
           </span>
-        </div>
+        </button>
       `;
     })
     .join('');
@@ -4100,8 +4100,8 @@ const initEventListeners = () => {
     if (!section) return;
     const open = section.classList.toggle('collapsed') === false;
     $('preferences-toggle').setAttribute('aria-expanded', String(open));
-    const icon = $('preferences-toggle').querySelector('.toggle-icon');
-    if (icon) icon.textContent = open ? '\u2212' : '+';
+    // The chevron is drawn by the stylesheet from `.collapsed`, so there is
+    // no character to swap here any more.
   });
 
   $('thumbs-up')?.addEventListener('click', () => sendPreference(true));
