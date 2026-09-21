@@ -112,7 +112,7 @@
             <div class="input-grid mb-14">
               <div class="field compact">
                 <label for="artifact-type-filter">Filter by type</label>
-                <select id="artifact-type-filter">
+                <select id="artifact-type-filter" class="filter">
                   <option value="">All types</option>
                   <option value="workflow">Workflows</option>
                   <option value="policy">Policies</option>
@@ -122,7 +122,7 @@
               </div>
               <div class="field compact">
                 <label for="artifact-visibility-filter">Visibility</label>
-                <select id="artifact-visibility-filter">
+                <select id="artifact-visibility-filter" class="filter">
                   <option value="">All</option>
                   <option value="private">Private</option>
                   <option value="shared">Shared</option>
@@ -1181,7 +1181,7 @@
 
                       <div class="pill-row mb-12">
                         <button class="ghost" id="refresh-patches-btn">Refresh</button>
-                        <select id="patches-status-filter">
+                        <select id="patches-status-filter" class="filter">
                           <option value="">All statuses</option>
                           <option value="pending">Pending</option>
                           <option value="approved">Approved</option>

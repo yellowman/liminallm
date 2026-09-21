@@ -452,7 +452,7 @@ three areas that had only been assumed.
 | Keyboard, nested actions | Passes on rows. A contexts row is a `<button>` with no button inside it. |
 | Touch | Passes. `@media (hover: none)` at `styles.css:3426` restores `.row-actions`. |
 | Overflow | **Failed on Settings**, since fixed. The other seven tabs pass at 390px and all eight pass at 1440px. |
-| Keyboard, reachability | Fails. See the note list and the note search results. |
+| Keyboard, reachability | **Failed on the note list and the note search results**, since fixed. Both render `<button>` now, as the conversation list does. |
 | Dark mode | Not applicable. The stylesheet has no `prefers-color-scheme`, `[data-theme]` or `.dark` rule. |
 
 The overflow failure was in code this work added. The two-column settings
@@ -581,13 +581,35 @@ with each other about which class to wear.
 
 ## Drift in the numbers
 
-**The type scale is not a scale.** Twenty distinct `font-size` values -
-nineteen in pixels plus one percentage - where part one names seven sizes
-across ten roles. The three largest groups (13px, 12px, 11px) are on scale.
-Measured against the role each one serves: the page title renders 17px for
-16, the metadata label 13px for 11.5, the row title 12px for 13, body text
-13px for 13.5, and the settings index 12.5px for 12. `12.5px` alone has ten
-call sites and no role at all.
+Both scales are now closed sets, and `tests/test_css_scale.py` keeps them
+that way: a value is allowed when it is on the scale, or when it is pinned
+in that file to the exact selector that may use it. A pin is a recorded
+departure rather than an escape, so adding a size means naming where it is
+allowed - which is the sentence this section asks for anyway. The guard was
+written before the repairs and failed on all twenty-nine call sites.
+
+**The type scale is a scale.** Nineteen distinct `font-size` values became
+thirteen. Seven of them are part one's, and they carry 109 of the 116 call
+sites. Each value that was off the scale moved to the size part one gives
+its role, and to the nearest size on the scale where the role does not
+decide - `12.5px`, which had ten call sites and no role at all, went to
+12px at every one of them. Four moves are the role rather than the nearest
+size: the page title to 16px from 17, the panel's section title to 13px
+from 14, the message fact line to 11.5px from 10.5, and the top bar title
+to 16px from 14.
+
+The six that remain are pinned, and are not interface text: the heading ramp
+inside rendered markdown (24px, 20px, 17.5px), which is a document's own
+typography; the glyph buttons `×` and `+` and the note title field (22px,
+18px), drawn at the optical size of a glyph rather than at the size of the
+words around them; and the dashboard figure (26px), read as a number.
+
+What this deliberately did not do is change which on-scale size a role uses.
+The metadata label at 13px for 11.5, the row title at 12px for 13 and body
+text at 13px for 13.5 are all on the scale and all arguably on the wrong
+step of it. Moving them is a decision about how the product looks, not the
+removal of a value that should not exist, so it wants an eye on the result
+rather than a guard.
 
 **Reading prose had two sizes** and now has one: chat, the note editor and
 its preview are all 15px/1.65. Inline code was `font-size: 82%`, the only
@@ -595,41 +617,85 @@ relative size in the file, so one role rendered at five sizes - up to
 19.68px inside an `h1`, because the markdown renderer can put a code span in
 a heading. It is 12px.
 
-**The major-section gap is two numbers, neither on the scale.** 26px before
-a band on Files and Insights, 22px on Settings - where part one says 28-32.
-The Settings figure comes from `.setting-group`'s own margin, because the
-`:first-child` reset means the band's 26px never applies there.
+**The major-section gap** was 26px before a band on Files and Insights and
+22px on Settings, where part one says 28-32. Both are 28px. The Settings
+figure came from `.setting-group`'s own margin, because the `:first-child`
+reset means the band's margin never applies there.
 
-**Uppercase outside the small-label window**, at 13px on `.panel h4` and
-10.5px on `.message .meta`. The same role is set in sentence case by
-`.section-band h4`, 2,700 lines away.
+**Uppercase is back inside the small-label window**, and the two rules got
+there by opposite routes, because the roles differ.
 
-**The radius scale has the same shape as the type scale.** Sixteen distinct
-`border-radius` forms are declared where part one names four bands and a
-pill. Ten of them are literals that bypass the two tokens, and eight of
-those simply restate a token: `6px` appears six times and `8px` twice,
-alongside `var(--radius-sm)` twenty-four times and `var(--radius)` five.
-Part two's rule is to change the token rather than the call site, and these
-are the call sites that would not move.
+`.panel h4` keeps its uppercase and moved to 11.5px. Its one call site that
+reaches it is "Patch details", introducing a block inside an expanded
+editor, which is a category label - the role the window exists for. The
+first attempt dropped the uppercase and left it at 13px, which made it
+identical to `.panel h3` directly above except for its colour; that was
+justified here by a comparison to `.section-band h4`, which turns out to
+match nothing at all. Every `<h4>` in the interface is either that one or
+inside a `-details` pane that sets its own size, and the bands title
+themselves with `h3`.
 
-The literals that are not on any band: `9px` on `.rail-btn` and
-`.rail-mark`, where a control is specified at 6px; `12px` and
-`16px 16px 4px 16px` on the chat bubbles; `4px` on `.msg-warning` and
-`.draft-indicator`; `2px` on `.brand .spark` and the streaming caret; `1px`
-on `.tick-mark`. The last three are marks a few pixels across rather than
-surfaces, so they are the defensible end of the list. The rail is not: it is
-the app's primary navigation and it is the one control tier at 9px.
+`.message .meta` lost its uppercase and moved to 11.5px from 10.5. It is a
+fact line - who spoke, when, which model - and not a category label, so the
+window does not cover it. Its positive tracking went with the uppercase,
+since that is what the tracking was for.
 
-**Three filters are still outside the compact tier.** Part one puts a filter
-at 28px. The artifact type and visibility filters and the patch status
-filter render at 30px. The two pane search fields were the other two and are
-now on the tier, which is what carried `--ctl-h-sm` from two call sites to
-three; the three that remain are `select` elements with no shared rule
-between them.
+Seven of the eight rules that set uppercase now sit at 11px or 11.5px. The
+eighth is `.bubble h6`, at 12px, and it is the bottom of the heading ramp
+inside rendered markdown rather than a label in the chrome - the same
+content typography the pinned sizes above cover.
 
-**Six bare `:focus` selectors** in four rule blocks. Three style text-entry
-controls, where the two selectors behave alike; `.field select:focus` is a
-real difference, and fires on a mouse click.
+**The radius scale is a closed set too.** Sixteen distinct `border-radius`
+forms became twelve, and no literal restates a token any more: the eight
+that did - `6px` six times and `8px` twice - use `var(--radius-sm)` and
+`var(--radius)`, which is what makes part two's rule enforceable. The tokens
+now carry 37 call sites rather than 26.
+
+`9px` on `.rail-btn` and `.rail-mark` is gone: the rail is the app's primary
+navigation and it was the one control tier off every band, so it is on the
+6px token with the rest of them. `5px` on `.bubble code` joined the same
+token. What is left is pinned: `12px` and `16px 16px 4px 16px` on the chat
+bubbles, which are content shapes rather than chrome surfaces and where the
+asymmetric corner says who spoke; and `4px`, `2px` and `1px` on
+`.msg-warning`, `.draft-indicator`, `.brand .spark`, the streaming caret and
+`.tick-mark`, which are marks a few pixels across rather than surfaces.
+
+**The three filters are on the compact tier.** Part one puts a filter at
+28px, and the artifact type and visibility filters and the patch status
+filter rendered at 30px because they had no rule in common. They have one
+now - `select.filter` - and the class says what the control is for, which is
+what decides its tier.
+
+Writing that rule was not enough for the third one, and the browser said so.
+`#patches-status-filter` is a bare `<select>` in a toolbar row rather than
+inside a `.field`, so it carried its own copy of every control property
+under an id - and an id outranks any class, so the new rule changed nothing
+there. This is the shape of the two entries below under "Rules that fixed
+nothing", found the same way they were: by measuring rather than by reading.
+The id rule is gone and `select.filter` is a whole control rather than a
+height. `tests/test_browser_control_tier.py` holds the measurement, and
+reports the rendered number rather than the intended one.
+
+**No bare `:focus` selector is left.** There were seven in four rule blocks,
+each adding a border tint beside the global `:focus-visible` ring. The tint
+stays, because the rule above the global ring already records that a
+component may add to it; what changed is the selector, so there is one focus
+vocabulary rather than two.
+
+A correction goes with that. This section used to say `.field select:focus`
+was "a real difference, and fires on a mouse click", on the reasoning that a
+`<select>` is not a text-entry control. That sentence was written from the
+specification and never run. Asked of the browser, it is not a difference:
+the user agent matches `:focus-visible` on a mouse-clicked `<select>`
+exactly as it does on a mouse-clicked text field, so both spellings fired in
+the same places. The change is a vocabulary the file can be read by, and
+nothing a user sees.
+
+That last statement is a claim about a user agent, so it is not left as a
+sentence here. `tests/test_browser_control_tier.py` clicks a `<select>` with
+the mouse and requires it to match `:focus-visible` and take the tint. If
+this browser ever stops doing that, the rules moved onto `:focus-visible`
+would drop their tint for every mouse user, and that test is what says so.
 
 Transitions are otherwise close to the rule: twenty at 0.15s, four at
 130ms, two at 0.18s.
@@ -643,18 +709,22 @@ Contexts, Artifacts and Tools the major-section level is an `<h3>` over a
 invisible when the page is scanned rather than read. Twenty `.divider`
 elements still carry a boundary that the band is now the vocabulary for.
 
-The Tools pane also inverts the spacing rule: **4px between two different
-lists and 8px between two rows inside one**, so the boundary is half the gap
-it separates.
+The Tools pane used to invert the spacing rule as well: 4px between two
+different lists and 8px between two rows inside one, so the boundary was
+half the gap it separated. The eyebrow that separates them now has 16px
+above it, which is part one's subsection step and twice the gap inside a
+list. The first eyebrow in a pane has the pane's own padding above it and
+takes none of its own.
 
 ## A departure this project made and did not record
 
-`.setting-editor` is a full card: a 1px border on all four sides and a 6px
-radius. Part one's expanded editor is "a faint neutral background, a 2px
-accent left marker, 10-12px padding, no independent card". Three of its five
-call sites also put a second bordered box inside it with the same fill, so
-the reader sees three nested rectangles.
+Resolved: the rule won. `.setting-editor` was a full card - a 1px border on
+all four sides and a 6px radius - where part one's expanded editor is "a
+faint neutral background, a 2px accent left marker, 10-12px padding, no
+independent card". It is now that: no border, a 2px accent left marker, and
+the radius only on the two corners away from the marker.
 
-Either the rule wins and the border becomes an accent marker, or this is a
-deliberate departure and belongs in part two with its reason. It is
-currently neither.
+Two of its five call sites still put a bordered box inside, both of them the
+`.mfa-secret` display, which is a value to be copied rather than a second
+card. With the outer card gone that is one rectangle inside a marked strip
+rather than three nested ones.

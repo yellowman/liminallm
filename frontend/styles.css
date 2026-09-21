@@ -143,7 +143,7 @@ body {
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
-  font-size: 14px;
+  font-size: 13.5px;
   line-height: 1.5;
 }
 
@@ -238,7 +238,7 @@ body {
   height: 30px;
   place-items: center;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: none;
   color: var(--text-muted);
   cursor: pointer;
@@ -277,7 +277,7 @@ body {
   width: 30px;
   height: 30px;
   margin-bottom: 10px;
-  border-radius: 9px;
+  border-radius: var(--radius-sm);
   background: var(--accent);
   color: #fff;
   font-size: 12px;
@@ -294,7 +294,7 @@ body {
   height: 36px;
   flex-shrink: 0;
   border: 0;
-  border-radius: 9px;
+  border-radius: var(--radius-sm);
   background: none;
   color: var(--text-muted);
   cursor: pointer;
@@ -337,7 +337,7 @@ body {
   top: 50%;
   transform: translateY(-50%);
   padding: 4px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--text);
   color: var(--panel);
   font-size: 12px;
@@ -416,13 +416,22 @@ body {
   padding: 10px;
 }
 
+/* More space between groups than within them. The rows inside one pane list
+   sit 8px apart and this eyebrow - which is the boundary between two lists -
+   had 4px above it, so the boundary was half the gap it separated. Part one
+   puts a subsection at 16px. The first eyebrow has the pane's own padding
+   above it and needs none of its own. */
 .pane-body h3 {
-  margin: 4px 0 6px;
+  margin: 16px 0 6px;
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-muted);
+}
+
+.pane-body > h3:first-child {
+  margin-top: 0;
 }
 
 .pane-body .subtext,
@@ -502,7 +511,7 @@ body {
   flex: 1;
   min-width: 0;
   font-weight: 600;
-  font-size: 14px;
+  font-size: 16px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -515,7 +524,7 @@ body {
   height: 30px;
   flex-shrink: 0;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: none;
   color: var(--text-muted);
   cursor: pointer;
@@ -756,8 +765,8 @@ body {
    field whose only focus cue is the browser's outline would have removed
    it. The border change is an addition to that outline, not a replacement
    for it. */
-.sidebar-search input:focus,
-.notes-side-head input[type="search"]:focus {
+.sidebar-search input:focus-visible,
+.notes-side-head input[type="search"]:focus-visible {
   border-color: var(--border-strong);
 }
 
@@ -944,20 +953,30 @@ body {
 
 .panel h2 {
   margin: 0 0 10px;
-  font-size: 17px;
+  font-size: 16px;
   font-weight: 600;
   letter-spacing: -0.01em;
 }
 
 .panel h3 {
   margin: 0 0 8px;
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
 }
 
+/* Uppercase at 13px was outside part one's small-label window. It moved
+   into the window rather than losing the uppercase: this has one call site
+   that reaches it - "Patch details", introducing a block inside an expanded
+   editor - and that is a category label, which is the role the window is
+   for. Dropping the uppercase instead left it 13px semibold like `.panel
+   h3` directly above, separated from the level above it by colour alone.
+
+   The other eight `<h4>` in the interface are inside `.context-details`,
+   `.artifact-details`, `.tool-details` and `.workflow-details`, which set
+   their own size and undo this. */
 .panel h4 {
   margin: 12px 0 4px;
-  font-size: 13px;
+  font-size: 11.5px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -1074,6 +1093,26 @@ body {
   padding-bottom: 0;
 }
 
+/* Part one puts a filter on the compact tier. Three were left on the
+   standard one - the two artifact filters and the patch status filter -
+   because they had no rule in common. This is that rule: the class says
+   what the control is for, which is what decides its tier.
+
+   A whole control rather than a height, because a filter is not always
+   inside a `.field`: the patch status filter is a bare `<select>` in a
+   toolbar row, and it carried its own copy of all of this under an id -
+   which then outranked any class anyone might write. */
+select.filter {
+  height: var(--ctl-h-sm);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 12px;
+}
+
 .field input[type="checkbox"] {
   height: auto;
   width: 15px;
@@ -1095,9 +1134,9 @@ body {
   font-weight: 500;
 }
 
-.field input:focus,
-.field textarea:focus,
-.field select:focus {
+.field input:focus-visible,
+.field textarea:focus-visible,
+.field select:focus-visible {
   border-color: var(--accent);
 }
 
@@ -1322,7 +1361,7 @@ button.minor:hover {
   border: none;
   border-radius: 16px 16px 4px 16px;
   padding: 10px 16px;
-  font-size: 14.5px;
+  font-size: 15px;
 }
 
 /* Assistant prose is an open column on the page rather than a bubble; the
@@ -1435,7 +1474,7 @@ button.minor:hover {
 
 .bubble code {
   background: rgba(129, 139, 152, 0.14);
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   padding: 2px 5px;
   font-family: var(--font-mono);
   /* 12px, not 82%. A percentage resolves against whatever contains it, and
@@ -1481,7 +1520,7 @@ button.minor:hover {
   font-size: 11.5px;
   font-weight: 600;
   padding: 3px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: background 0.15s ease, color 0.15s ease;
 }
@@ -1506,7 +1545,7 @@ button.minor:hover {
   border: none;
   border-radius: 0;
   padding: 0;
-  font-size: 12.5px;
+  font-size: 12px;
   line-height: 1.6;
 }
 
@@ -1581,16 +1620,17 @@ button.minor:hover {
   letter-spacing: 10px;
 }
 
+/* A fact line - who spoke, when, which model - at part one's metadata size
+   and weight. It was uppercase at 10.5px, which is below the small-label
+   window and is not a category label in any case. */
 .message .meta {
-  font-size: 10.5px;
+  font-size: 11.5px;
   color: var(--text-muted);
   padding: 0 2px;
   margin-top: 2px;
-  text-transform: uppercase;
   display: flex;
   align-items: center;
   gap: 6px;
-  letter-spacing: 0.06em;
 }
 
 /* =========================================================================
@@ -1633,7 +1673,7 @@ button.minor:hover {
   background: transparent;
   color: var(--text-muted);
   font-family: var(--font);
-  font-size: 12.5px;
+  font-size: 12px;
   text-align: right;
   cursor: pointer;
 }
@@ -1686,7 +1726,7 @@ button.minor:hover {
 .turn-rail:hover .turn-tick,
 .turn-rail:focus-within .turn-tick {
   padding: 5px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   text-align: left;
   justify-content: flex-start;
   /* The bars are the collapsed representation of the label - once the text is
@@ -1749,7 +1789,7 @@ button.minor:hover {
   background: var(--danger-light);
   border-radius: 4px;
   font-family: var(--font);
-  font-size: 12.5px;
+  font-size: 12px;
   line-height: 1.5;
   color: var(--danger);
 }
@@ -1773,7 +1813,7 @@ button.minor:hover {
   height: 26px;
   padding: 0;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
@@ -1954,7 +1994,7 @@ button.minor:hover {
   border: 1px solid var(--border);
   padding: 12px;
   border-radius: var(--radius-sm);
-  font-size: 12.5px;
+  font-size: 12px;
   font-family: var(--font-mono);
   overflow-x: auto;
   white-space: pre-wrap;
@@ -2021,7 +2061,7 @@ button.minor:hover {
 
 .typing-label {
   font-family: var(--font);
-  font-size: 12.5px;
+  font-size: 12px;
   color: var(--text-muted);
   letter-spacing: 0.01em;
 }
@@ -2080,7 +2120,7 @@ button.minor:hover {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 10px 42px 30px 12px;
-  font-size: 14px;
+  font-size: 13.5px;
   line-height: 1.5;
   background: var(--panel);
 }
@@ -2097,7 +2137,7 @@ button.minor:hover {
   justify-content: center;
   padding: 0;
   border: none;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
@@ -2167,7 +2207,7 @@ button.minor:hover {
 #admin-feedback {
   margin-top: 10px;
   color: var(--text-muted);
-  font-size: 12.5px;
+  font-size: 12px;
   display: none;
 }
 
@@ -2357,7 +2397,7 @@ button.minor:hover {
   color: var(--text);
   margin: 10px 0 0;
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 12px;
   overflow-x: auto;
   max-height: 400px;
 }
@@ -2477,7 +2517,7 @@ button.minor:hover {
   max-height: 320px;
   overflow: auto;
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 12px;
 }
 
 .code-block:empty {
@@ -2614,7 +2654,7 @@ button.minor:hover {
   color: var(--text);
 }
 
-.form-group input:focus {
+.form-group input:focus-visible {
   border-color: var(--accent);
 }
 
@@ -2628,7 +2668,7 @@ button.minor:hover {
   height: 28px;
   padding: 0 8px;
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--panel);
   font-family: var(--font);
   font-size: 12px;
@@ -2686,16 +2726,6 @@ button.minor:hover {
   font-weight: 500;
   font-size: 13px;
   margin-bottom: 6px;
-}
-
-#patches-status-filter {
-  height: var(--ctl-h);
-  padding: 0 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--panel);
-  font-family: var(--font);
-  font-size: 13px;
 }
 
 /* MFA setup */
@@ -3088,7 +3118,7 @@ button.minor:hover {
   padding: 4px 0;
 }
 
-#note-title:focus {
+#note-title:focus-visible {
   border-bottom-color: var(--accent);
 }
 
@@ -3351,7 +3381,7 @@ button.minor:hover {
   background: var(--panel);
   color: var(--text);
   font: inherit;
-  font-size: 12.5px;
+  font-size: 12px;
 }
 
 /* A checkbox on its own line wastes the cell; put it beside the label. */
@@ -3398,7 +3428,7 @@ button.minor:hover {
   padding: 0 5px;
   border-radius: 999px;
   border: 1px solid var(--border);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 400;
   color: var(--text-muted);
   vertical-align: middle;
@@ -3408,9 +3438,11 @@ button.minor:hover {
    Settings tab needed the same thing, so it is `.sticky-actions` in the
    shared vocabulary rather than a second copy under a second name. */
 
-/* The tools a turn used, as icons. `.meta` uppercases its text, which turned
-   a list of internal identifiers into a row of shouted underscores under
-   every answer; a name is still there on hover and for a screen reader. */
+/* The tools a turn used, as icons. `.meta` used to uppercase its text,
+   which turned a list of internal identifiers into a row of shouted
+   underscores under every answer. It is sentence case now, but an icon is
+   still the right shape for a tool id; a name is there on hover and for a
+   screen reader. */
 .tool-chip {
   display: inline-flex;
   align-items: center;
@@ -3713,7 +3745,7 @@ button.minor:hover {
   display: flex;
   align-items: center;
   gap: 9px;
-  margin: 26px 0 12px;
+  margin: 28px 0 12px;
   padding: 6px 10px;
   background: var(--panel-muted);
   border-top: 1px solid var(--border);
@@ -3778,7 +3810,7 @@ button.minor:hover {
    viewport, which is behind the bar: measured at 34px of a 48px bar over
    the band the jump exists to reveal. */
 .setting-group {
-  margin: 0 0 22px;
+  margin: 0 0 28px;
   scroll-margin-top: calc(var(--topbar-h) + 12px);
 }
 
@@ -3812,7 +3844,7 @@ button.minor:hover {
   padding: 4px 9px;
   border-left: 2px solid transparent;
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  font-size: 12.5px;
+  font-size: 12px;
   line-height: 1.35;
   color: var(--text-muted);
   text-decoration: none;
