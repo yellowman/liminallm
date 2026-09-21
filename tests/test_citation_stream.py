@@ -38,6 +38,12 @@ MERGED = f"[cite:{NONCE}-1,{NONCE}-2]"
 MERGED_SPACED = f"[cite:{NONCE}-1, {NONCE}-2]"
 MERGED_THREE = f"[cite:{NONCE}-1,{NONCE}-2,{NONCE}-3]"
 
+#: Handles enough that what the reader used to leave behind - one comma per
+#: handle - is longer than `MAX_CITATION_MARKER_BODY`. Sixty-six is the first
+#: count that does it, measured; the extra few are headroom for a reader who
+#: changes the bound and wants this to stay past it.
+LONG_MERGED = "[cite:" + ",".join(f"{NONCE}-1" for _ in range(70)) + "]"
+
 #: A nonce holding the other letter Python folds a non-ASCII character into.
 #: `K` and `S` are both in the real nonce alphabet, so neither of these is a
 #: contrived input.
@@ -313,6 +319,22 @@ class TestTheStreamAgreesWithTheFinishedScrubOnAnythingAtAll:
         f"[cite:{NONCE}]", f" {NONCE}-3", "attic bit tidier",
         KELVIN, LONG_S, DOTLESS_I, DOTTED_I, KELVIN + "7Q2ABCD",
         f"[c{DOTTED_I}te:", f"[C{DOTLESS_I}TE:{NONCE}-1]",
+        # No comma appeared above, so nothing this fuzz could build was a
+        # merged marker, and the reader implemented that form only by
+        # accident - it settled the handles one at a time and left the
+        # commas for the bounded reader-side stripper to sweep. The sweep
+        # failed once the comma run passed that bound. The pieces below are
+        # what reach it: the separators, the well-formed merged marker, the
+        # near-misses that must *not* be taken as one, and one long enough
+        # to have exceeded the bound.
+        ",", ", ", " , ", ",,", "\t,\t",
+        MERGED, MERGED_SPACED, MERGED_THREE,
+        f"[cite: {NONCE}-1 , {NONCE}-2 ]", f"[cite:{NONCE},{NONCE}]",
+        f"[cite:{NONCE}-1,]", f"[cite:, {NONCE}-1]",
+        f"[cite:{NONCE}-1, OTHER-2]", f"[cite:{NONCE}-1 {NONCE}-2]",
+        f"[CITE:{NONCE}-1, {NONCE}-2]", f"[cite:{NONCE}-1,{NONCE}",
+        LONG_MERGED, f"{LONG_MERGED[:-1]} ]", f"{LONG_MERGED[:-1]}, junk]",
+        LONG_MERGED[:-1],
     ]
 
     def test_random_texts_and_random_chunkings(self):

@@ -1030,13 +1030,18 @@ def _namespace_pattern(nonce: str) -> "re.Pattern[str]":
     Only this nonce. Anything else shaped like a citation is left exactly as
     the model wrote it, including another turn's marker - see the caller.
 
-    This does not understand a marker carrying several comma-separated
-    handles. `validate_citations` does, and resolves them, but teaching this
-    to remove one whole would put it out of step with the streaming reader,
-    which implements the same language by hand and cannot be changed to match
-    without risking a live handle reaching a reader. The two must agree -
-    `CanonicalCitationStream.finish` raises when they do not - so this stays
-    as it is until both move together. See `marker_handles`.
+    A marker carrying several comma-separated handles is one match, which is
+    what a model writes when a claim rests on two passages. `marker_handles`
+    splits it and `validate_citations` resolves each one.
+
+    The streaming reader implements this same language by hand and has to
+    agree with it exactly - `CanonicalCitationStream.finish` raises when it
+    does not, and a turn that raises there has no answer at all. Changing
+    either side alone is therefore a defect in the other. The merged form
+    was added here first, and the reader agreed only by accident: it removed
+    the handles one at a time and left the commas for the bounded reader-side
+    stripper, which could not reach a marker holding more than
+    `MAX_CITATION_MARKER_BODY` of them. See `tests/test_merged_marker_streams.py`.
     """
     token = re.escape(nonce)
     handle = rf"{token}(?:-\d+)?"

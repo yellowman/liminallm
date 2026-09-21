@@ -163,6 +163,13 @@ class _State:
       collected. Meaningful only while `handle` is set.
     * `handle` - the pending text ends with a complete handle, whose nonce
       starts at this index. Set exactly when `nonce` reached the full length.
+    * `marker` - a `[cite:` whose handles have been settled is still open,
+      and starts at this index. What is left of it between here and the
+      opening bracket is the keyword, horizontal space and commas: the
+      handles are gone, so an open marker holds no handle.
+    * `comma` - a comma has been read since the last settled handle.
+      Meaningful only while `marker` is set, where it is what makes
+      `h, h` legal and `h,, h`, `h h` and `h,]` not.
 
     "Clean" is the whole frontier rule. A clean state can begin no match and
     can be reached back through by none, so everything at or before it is
@@ -170,7 +177,9 @@ class _State:
     still has to start at a character that was already a candidate here.
     """
 
-    __slots__ = ("spaces", "cite", "nonce", "dash", "digits", "handle")
+    __slots__ = (
+        "spaces", "cite", "nonce", "dash", "digits", "handle", "marker", "comma"
+    )
 
     def __init__(
         self,
@@ -180,6 +189,8 @@ class _State:
         dash: bool = False,
         digits: int = 0,
         handle: Optional[int] = None,
+        marker: Optional[int] = None,
+        comma: bool = False,
     ) -> None:
         self.spaces = spaces
         self.cite = cite
@@ -187,6 +198,8 @@ class _State:
         self.dash = dash
         self.digits = digits
         self.handle = handle
+        self.marker = marker
+        self.comma = comma
 
     @property
     def clean(self) -> bool:
@@ -195,6 +208,7 @@ class _State:
             and self.cite == 0
             and self.nonce == 0
             and self.handle is None
+            and self.marker is None
         )
 
 
@@ -226,6 +240,12 @@ class _Pass:
     handed on: it hands text on only when clean, and a fresh pass reading
     that same text would be clean there too. That is what makes releasing
     from the bottom safe even though a new pass may be added later.
+
+    An open marker is the one thing handed on from a state that is not
+    clean, and it does not weaken that: a marker opens only when a handle is
+    settled, a settled handle is a removal, and a removal gives this pass a
+    successor. So what an abandoned marker hands on goes to another pass,
+    never straight to a reader.
     """
 
     __slots__ = ("_reader", "_successor", "_pending", "_states", "_state", "queue")
@@ -268,6 +288,24 @@ class _Pass:
                 if dash is not None:
                     rereads.append(dash)
                 continue
+            if state.marker is not None:
+                if current == "]" and not state.comma:
+                    # `[cite: h ]` and `[cite: h, h ]`: the bracket closes a
+                    # marker whose last handle was settled before a space.
+                    # A trailing comma is not a marker, so it is not closed.
+                    self._append(current, state)
+                    self._remove_from(state.marker)
+                    continue
+                marker_state = self._advance_in_marker(state, current)
+                if marker_state is not None:
+                    self._append(current, marker_state)
+                    continue
+                # The marker cannot close any more. Its remains hold no
+                # handle, so they become ordinary text and the character
+                # that ended it is read again without one.
+                self._give_up_marker()
+                rereads.append(current)
+                continue
             self._append(current, self._advance(state, current))
         if self._state.clean and self._pending:
             self._hand_on()
@@ -292,6 +330,8 @@ class _Pass:
                 self.queue.append(dash)
             while self.queue:
                 self.step()
+        if self._state.marker is not None:
+            self._give_up_marker()
         if self._pending:
             self._hand_on()
 
@@ -336,6 +376,53 @@ class _Pass:
             )
         return _State(cite=cite, nonce=nonce)
 
+    def _advance_in_marker(self, state: _State, character: str) -> Optional[_State]:
+        """The state after `character` inside an open marker, or `None`.
+
+        An open marker is a `[cite:` whose handles have been settled and
+        whose closing bracket has not arrived. What the grammar allows here
+        is `[ \\t]*,[ \\t]*` and then another handle, or `[ \\t]*` and the
+        bracket - which `step` takes before this is reached.
+
+        `None` means this is not a marker after all. It is deliberately
+        strict, because the alternative is not laxity but disagreement: the
+        whole-string pattern removes a merged marker in one match and leaves
+        anything else to the bounded reader-side stripper, so a stream that
+        removed more than the pattern does would release an answer the
+        finished scrub does not produce.
+        """
+        alphabet = self._reader._alphabet
+        if alphabet.is_space(character):
+            # Space runs are allowed around the comma and the bracket, but
+            # not inside a handle.
+            if state.nonce:
+                return None
+            return _State(
+                spaces=state.spaces + 1, marker=state.marker, comma=state.comma
+            )
+        if character == ",":
+            if state.comma or state.nonce:
+                return None
+            return _State(marker=state.marker, comma=True)
+        if not state.comma:
+            # Two handles with nothing between them is not the merged form.
+            return None
+        # The handle is anchored here rather than searched for: the pattern
+        # puts it immediately after `,[ \t]*`, so there is no earlier start
+        # for a failure function to fall back to.
+        self._reader._work += 1
+        if not alphabet.nonce_at(state.nonce, character):
+            return None
+        nonce = state.nonce + 1
+        if nonce < len(self._reader.nonce):
+            return _State(nonce=nonce, marker=state.marker, comma=state.comma)
+        return _State(
+            nonce=nonce,
+            marker=state.marker,
+            comma=state.comma,
+            handle=len(self._pending) - len(self._reader.nonce) + 1,
+        )
+
     def _extends_handle(self, character: str) -> bool:
         state = self._state
         if character == "-":
@@ -348,34 +435,48 @@ class _Pass:
             return _State(
                 cite=state.cite, nonce=state.nonce, dash=True,
                 digits=0, handle=state.handle,
+                marker=state.marker, comma=state.comma,
             )
         return _State(
             cite=state.cite, nonce=state.nonce, dash=True,
             digits=state.digits + 1, handle=state.handle,
+            marker=state.marker, comma=state.comma,
         )
 
-    def _closes_marker(self, state: _State) -> bool:
-        """Whether a `]` here closes `[cite:` + handle.
+    def _marker_opening(self, state: _State) -> Optional[int]:
+        """Where the `[cite:` holding this handle starts, if one does.
 
-        The keyword is read out of the pending text rather than tracked
-        alongside the handle: it sits immediately before the nonce, so this is
-        six characters at a known offset. `-` with no digits is not a marker -
-        `-\\d+` needs a digit - and the bare handle inside it is what the
-        finished scrub removes.
+        Two ways to be inside one. A marker already open says so - its
+        handles were settled and its keyword is still in the pending text.
+        Otherwise this is the first handle, and the keyword sits immediately
+        before the space run in front of it, which is six characters at a
+        known offset rather than a search.
         """
-        if state.dash and state.digits == 0:
-            return False
+        if state.marker is not None:
+            return state.marker
         start = state.handle
-        if start is None or start < len(_CITE):
-            return False
+        if start is None:
+            return None
+        spaces = self._states[start - 1].spaces if start else 0
+        opening = start - spaces - len(_CITE)
+        if opening < 0:
+            return None
         self._reader._work += len(_CITE)
         alphabet = self._reader._alphabet
         for offset in range(len(_CITE)):
-            if not alphabet.cite_at(
-                offset, self._pending[start - len(_CITE) + offset]
-            ):
-                return False
-        return True
+            if not alphabet.cite_at(offset, self._pending[opening + offset]):
+                return None
+        return opening
+
+    def _closes_marker(self, state: _State) -> bool:
+        """Whether a `]` here closes a marker ending in this handle.
+
+        `-` with no digits is not a marker - `-\\d+` needs a digit - and the
+        bare handle inside it is what the finished scrub removes.
+        """
+        if state.dash and state.digits == 0:
+            return False
+        return self._marker_opening(state) is not None
 
     # -- the tape -----------------------------------------------------------
 
@@ -391,6 +492,11 @@ class _Pass:
         dash with no digits after it is not part of the handle - `-\\d+`
         needs a digit - so it is handed back to be read again, after the
         removal, as the character following it.
+
+        A handle inside a `[cite:` leaves that marker open rather than
+        handing its keyword on, because the bracket that closes it can still
+        take the whole marker in one match, the way the pattern does. What
+        stays behind holds no handle: this removed it.
         """
         state = self._state
         start = state.handle
@@ -400,29 +506,66 @@ class _Pass:
             dash = self._pending[-1]
             self._drop(1)
         spaces = self._states[start - 1].spaces if start else 0
-        self._remove(start - spaces)
+        self._remove(start - spaces, marker=self._marker_opening(state))
         return dash
 
     def _remove_marker(self, state: _State) -> None:
-        """Remove `[ \t]*[cite:` + handle + `]`, ending at the pending tail."""
-        start = state.handle
-        assert start is not None
-        opening = start - len(_CITE)
+        """Remove `[ \t]*[cite:` + handles + `]`, ending at the pending tail."""
+        opening = self._marker_opening(state)
+        assert opening is not None
+        self._remove_from(opening)
+
+    def _remove_from(self, opening: int) -> None:
+        """Remove a whole marker whose `[` is at `opening`, plus its spaces."""
         spaces = self._states[opening - 1].spaces if opening else 0
         self._remove(opening - spaces)
 
-    def _remove(self, start: int) -> None:
+    def _give_up_marker(self) -> None:
+        """An open marker that cannot close: its remains go on as text.
+
+        They have to go on rather than stay. The handles inside them were
+        removed one at a time, so the scan pointer is already past the
+        keyword, and a pass remembers nothing before a match it has passed.
+        Holding the keyword back would let a later `]` claim it and remove a
+        marker the whole-string pattern does not - measured on
+        `[cite:[cite:H-1 H-2]`, where the pattern removes the two handles
+        and leaves both keywords for the reader-side stripper to take with
+        the bracket, and the stream took the bracket first and released a
+        `[cite:` with nothing to close it.
+
+        The trailing space run stays, because the next match begins with it.
+
+        Nothing reaches the reader directly here: an open marker implies a
+        settled handle, which implies a removal, which gives this pass a
+        successor. What goes down is the keyword, horizontal space, and the
+        commas between handles it no longer has, so a cancelled or failed
+        turn cannot flush a live handle out of this pass.
+        """
+        self._hand_on(self._state.spaces)
+
+    def _remove(self, start: int, marker: Optional[int] = None) -> None:
         """Drop `pending[start:]`, which is the match, and resume after it.
 
         Everything before it is settled *for this pass*: the scan pointer is
         past it and a pass never looks back. It is handed on rather than
         released, to a pass that reads it against what follows the removal -
         which is the splice, and the reason `_scrub_text` repeats.
+
+        `marker` is the exception, and the only text this pass holds across
+        a removal: an open `[cite:` is one match still being read, so its
+        keyword is not yet behind the scan pointer.
         """
         if self._successor is None:
             self._successor = _Pass(self._reader)
             self._reader._passes.append(self._successor)
         self._drop(len(self._pending) - start)
+        if marker is not None:
+            # The state after the keyword's last character *is* "inside a
+            # marker", so both records of it move together; they are read
+            # back by the next removal in this same marker.
+            self._state = _State(marker=marker)
+            self._states[-1] = self._state
+            return
         # `finditer` remembers nothing before the match it just passed, and
         # neither does this: handing the text on empties the tail and clears
         # the state, and a removal that emptied the tail already cleared it.
@@ -443,13 +586,26 @@ class _Pass:
         del self._states[len(self._states) - count:]
         self._state = self._states[-1] if self._states else _CLEAN
 
-    def _hand_on(self) -> None:
-        """Give the pending text to the pass below, or release it."""
+    def _hand_on(self, keep: int = 0) -> None:
+        """Give the pending text to the pass below, or release it.
+
+        `keep` holds that many characters back at the tail, which is only
+        ever the horizontal space run in front of a candidate that has just
+        ended. The next match begins with those spaces - the leading-space
+        rule is shared by all three forms - so handing them on would leave
+        behind a space the finished scrub removes along with what follows
+        it. What is held back is a space run starting over, which is what
+        its states are rewritten to say.
+        """
+        # Both halves: the text joined and the held-back run rewritten.
         self._reader._work += len(self._pending)
-        text = "".join(self._pending)
-        self._pending.clear()
-        self._states.clear()
-        self._state = _CLEAN
+        cut = len(self._pending) - keep
+        text = "".join(self._pending[:cut])
+        del self._pending[:cut]
+        del self._states[:cut]
+        for index in range(len(self._states)):
+            self._states[index] = _State(spaces=index + 1)
+        self._state = self._states[-1] if self._states else _CLEAN
         if self._successor is not None:
             self._successor.queue.extend(text)
         else:
