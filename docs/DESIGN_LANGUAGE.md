@@ -622,7 +622,7 @@ on the scale and simply on the wrong step of it.
 | Normal interface text | 13px | 13.5px | error banners, empty states, label-and-value rows, witness findings, link-styled buttons, table cells |
 | Field label | 13px | 12px | the three label rules |
 
-That moved 13px from 28 call sites to 12, and it is what the scale is for:
+That moved 13px from 26 call sites to 12, and it is what the scale is for:
 13px is the major-section title and the row title, and it had become the
 size everything else was too.
 
@@ -745,10 +745,27 @@ page to show all four levels, and inventing a band over a single stream of
 turns would be the decoration it also warns against. Recorded here so the
 next reader counts seven screens and not eight.
 
-Five `.divider` elements remain, not the twenty this section used to claim.
-Four sit directly above an `<h4>` in a detail pane, which is a hairline plus
-a muted 11.5px heading - part one's subsection, spelled correctly. The
-fifth separates the two halves of the password-reset form.
+**Eleven `.divider` elements remain**, not the twenty this section used to
+claim and not the five an earlier version of this paragraph claimed. That
+five came from counting `index.html` and `chat.js` and forgetting
+`admin.html`, which is the same mistake as the paragraph above it: a number
+asserted from a partial count reads exactly like one that was counted.
+
+Where they are, and what is still owed:
+
+* **Six in `admin.html`.** The admin console's own markup still has no
+  bands at all - an `<h3>` over a hairline, which is the shape this section
+  says the band replaced. Outstanding, and the previous text was right to
+  name it.
+* **Four in the detail panes**, each directly above an `<h4>`. Those are
+  *not* part one's subsection, which an earlier version of this paragraph
+  said they were: `.context-details h4` and its three siblings render at
+  15px in `var(--text)`, so what a reader gets is a hairline under a
+  full-strength heading at the prose size, where part one asks for 11-12px
+  muted. Recorded rather than changed here, because moving them is the
+  role-and-size work above and wants the same care.
+* **One in the password-reset form**, separating the request from the code
+  entry. A hairline between two forms is the one use this element was for.
 
 The Tools pane used to invert the spacing rule as well: 4px between two
 different lists and 8px between two rows inside one, so the boundary was

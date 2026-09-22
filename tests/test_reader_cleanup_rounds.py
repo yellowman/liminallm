@@ -34,7 +34,10 @@ from liminallm.service.citations import (
     CITATION_STRIP_RE,
     _namespace_pattern,
     _scrub_text,
+    reader_answer,
     reader_positions,
+    replaced_answer,
+    scrub_namespace,
     strip_citation_positions,
 )
 
@@ -152,15 +155,31 @@ class TestWhyTheMarkerCleanupIsNotRepeated:
         everything between them and a `te:]` has gone. Repeating the
         cleanup consumes the lot, and the first `[` is three characters
         further back every time the text grows by seven.
+
+        An earlier version of this computed `reach = 3 * depth` and then
+        asserted `reach[16] == 48`, which is `3 * 16 == 48` - true whatever
+        the grammar does, and therefore silent if the reach ever changed.
+        The distance is measured off the string instead: how far the first
+        `[` sits from the only marker in it, and that one pass leaves that
+        first `[` alone while repetition consumes it.
         """
         reach = {}
         for depth in (2, 4, 8, 16):
             text = "[ci" * depth + "[cite:]" + "te:]" * depth
+            marker = text.index("[cite:]")
+
+            once, _ = strip_citation_positions(text)
+            assert once.startswith("[ci"), (depth, once)
+
             repeated, _ = _scrub_text(text, CITATION_STRIP_RE)
             assert repeated == "", (depth, repeated)
-            reach[depth] = 3 * depth
+
+            # The first `[` survives one pass and does not survive repetition,
+            # so repetition reached back at least this far.
+            reach[depth] = marker - text.index("[")
+
+        assert reach == {2: 6, 4: 12, 8: 24, 16: 48}, reach
         assert reach[16] > reach[2], reach
-        assert reach[16] == 48, reach
 
     def test_one_pass_leaves_the_residue_and_no_handle(self):
         """What the reader actually gets, and what it does not."""
@@ -177,3 +196,84 @@ class TestWhyTheMarkerCleanupIsNotRepeated:
         assert released == expected
         assert origins == expected_origins
         assert reader.intact()
+
+
+class TestTheAnswerBoundaryTakesTheThirdStepToo:
+    """`reader_positions` is not the only place the two steps were performed.
+
+    `reader_answer` is the shared answer boundary: the workflow runners hand
+    it a node's content and it removes the markers before that content
+    becomes a token or a stored row. What it is handed is the worker/public
+    copy - already through the narrow scrub - so its marker removal splices
+    text the scrub has read past, and the pair can be a handle. The same
+    defect, on a live path, found by reviewing the commit that fixed the
+    other one.
+
+    It takes the nonce now and performs the same three steps. A caller that
+    cannot name the turn's namespace gets the old two, because removing a
+    namespace you cannot name is not a thing a function can do; those
+    callers sit downstream of one that can.
+    """
+
+    #: What the model wrote, as the worker copy would hold it. The narrow
+    #: scrub finds nothing in any of these - the handle is in halves.
+    HALVES = [
+        f"{NONCE[:4]}[cite:]{NONCE[4:]}",
+        f"{NONCE[:4]}[cite:x]{NONCE[4:]}",
+        f"{NONCE[:4]} [cite:OTHER-1]{NONCE[4:]}",
+        f"prose {NONCE[:2]}[cite:]{NONCE[2:]} and more",
+    ]
+
+    @pytest.mark.parametrize("raw", HALVES)
+    def test_without_the_nonce_the_boundary_still_hands_it_over(self, raw):
+        """The defect, executed rather than described.
+
+        This is what every caller got before, and what a caller that cannot
+        name the namespace still gets. If this stops finding the handle,
+        these inputs have stopped reaching the property below.
+        """
+        public = scrub_namespace(raw, NONCE)
+        assert public == raw, "the narrow scrub was supposed to find nothing"
+        assert NONCE.lower() in reader_answer(public, [], []).content.lower()
+
+    @pytest.mark.parametrize("raw", HALVES)
+    def test_with_the_nonce_it_does_not(self, raw):
+        public = scrub_namespace(raw, NONCE)
+        cleaned = reader_answer(public, [], [], NONCE)
+        assert NONCE.lower() not in cleaned.content.lower(), cleaned.content
+
+    @pytest.mark.parametrize("raw", HALVES)
+    def test_the_replacement_wrapper_carries_it_through(self, raw):
+        """`replaced_answer` is what the runners actually call."""
+        public = scrub_namespace(raw, NONCE)
+        answer = replaced_answer(public, [], [], NONCE)
+        content = answer.content if answer else ""
+        assert NONCE.lower() not in content.lower(), content
+
+    def test_the_boundary_agrees_with_the_finished_string_helper(self):
+        """Two implementations of one rule, so they are compared."""
+        for raw in self.HALVES + [
+            f"see [cite:{NONCE}-1] here",
+            f"bare {NONCE} here",
+            "ordinary prose with no markers",
+            "[ci[cite:]te:x]",
+        ]:
+            assert reader_answer(raw, [], [], NONCE).content == (
+                reader_positions(raw, NONCE)[0]
+            ), raw
+
+    def test_an_offset_still_indexes_the_string_it_is_returned_with(self):
+        """The third step moves text, so it has to move the coordinates."""
+        raw = f"see [cite:{NONCE}-1] here and {NONCE[:4]}[cite:]{NONCE[4:]}"
+        citations = [{"public_offset": len(raw), "source_id": "s1"}]
+        cleaned = reader_answer(raw, [], citations, NONCE)
+        assert NONCE.lower() not in cleaned.content.lower()
+        for citation in cleaned.citations:
+            assert 0 <= citation["public_offset"] <= len(cleaned.content)
+
+    def test_clean_content_is_untouched(self):
+        """The control: a cleanup that removed more would pass above too."""
+        for raw in ("nothing to remove here", "a [cite:OTHER-1] marker"):
+            assert reader_answer(raw, [], [], NONCE).content == (
+                reader_answer(raw, [], []).content
+            )

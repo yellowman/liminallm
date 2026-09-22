@@ -605,6 +605,7 @@ def reader_answer(
     content: Any,
     bindings: Optional[Sequence[Binding]],
     citations: Optional[Sequence[Dict[str, Any]]],
+    nonce: Optional[str] = None,
 ) -> Answer:
     """Reader-clean content and the records whose coordinates index it.
 
@@ -612,12 +613,32 @@ def reader_answer(
     cleanup removes all text. Storage needs that shape: "[cite:,]" must become
     the empty string rather than remain merely because an empty string is not
     a workflow replacement.
+
+    `nonce` is this turn's namespace, and giving it makes this the same three
+    steps as `reader_positions`. The content arriving here has already been
+    through the narrow scrub - it is the worker/public copy - so removing the
+    markers below splices text the scrub has already read past, and the pair
+    can be a handle that neither half was. Measured on this path:
+    `K7Q2[cite:]ABCD` leaves here as `K7Q2ABCD`, which is the live namespace
+    in a reader's token. The third step is what closes it, and a caller that
+    knows the nonce owes it here.
+
+    Without one this stays the two steps it was, because a caller that cannot
+    name the turn's namespace cannot remove it. Those callers are the ones
+    downstream of a caller that could - see `chat_turn`, which is a backstop
+    over text another boundary has already cleaned.
     """
     text = str(content or "")
     if not citations:
-        return Answer(strip_citations(text), list(bindings or []), [])
+        stripped = strip_citations(text)
+        if nonce:
+            stripped = _scrub_text(stripped, _namespace_pattern(nonce))[0]
+        return Answer(stripped, list(bindings or []), [])
 
     public, origins = strip_citation_positions(text)
+    if nonce:
+        public, after = _scrub_text(public, _namespace_pattern(nonce))
+        origins = [origins[index] for index in after]
     moved: List[Dict[str, Any]] = []
     for citation in citations:
         item = dict(citation)
@@ -636,6 +657,7 @@ def replaced_answer(
     content: Any,
     bindings: Optional[Sequence[Binding]],
     citations: Optional[Sequence[Dict[str, Any]]],
+    nonce: Optional[str] = None,
 ) -> Optional[Answer]:
     """One node's answer as a replacement, or nothing when it produced none.
 
@@ -664,7 +686,7 @@ def replaced_answer(
     # That is still "no replacement": returning an empty Answer here would
     # replace the previous content and, worse, carry this node's bindings into
     # the server-authored fallback sentence.
-    cleaned = reader_answer(content, bindings, citations)
+    cleaned = reader_answer(content, bindings, citations, nonce)
     return cleaned if cleaned.content else None
 
 

@@ -830,16 +830,16 @@ class CanonicalCitationStream:
         #: one of the growing-prefix costs this reader exists without.
         self._released_parts: List[str] = []
         self._released_len = 0
-        #: The stages, top first. A stage is one round of `reader_positions`:
-        #: the namespace scrub to its own fixed point, then the reader-side
-        #: marker cleanup. A stage is added when the one above it removes a
-        #: marker, exactly as a pass is added when the one above it removes a
-        #: handle - and for the same reason, which is that a removal splices
-        #: its neighbours and the pair can be something neither was.
-        #: Two, fixed, mirroring `reader_positions`: the namespace scrub and
-        #: the marker cleanup, then the namespace scrub again over what the
-        #: cleanup spliced. An uncited stream is the marker cleanup alone,
-        #: so it has no second stage to build.
+        #: The stages, top first, and there are exactly two: the namespace
+        #: scrub and the marker cleanup, then the namespace scrub again over
+        #: what that cleanup spliced. Both are built here and nothing ever
+        #: appends to this list - the count is the shape of
+        #: `reader_positions`, and a third round is not implementable in a
+        #: stream at all (see `_Stage`). An uncited stream is the marker
+        #: cleanup alone, so it has one stage and no second to build.
+        #:
+        #: Passes are the opposite and are added as an answer needs them,
+        #: which is why the loops below are indexed rather than iterated.
         self._stages: List[_Stage] = [
             _Stage(self, scrub_namespace, strip=True)
         ]
@@ -922,13 +922,15 @@ class CanonicalCitationStream:
         Text only ever moves downwards - a pass to the pass below it, the
         bottom pass to its stage's stripper, that stripper to the stage below
         - so one sweep in this order is enough, and every queue a sweep needs
-        is already filled by the time it arrives. A sweep stops at the first
-        pass in a stage with nothing waiting, so an answer with many stages
-        costs nothing per character in the ones it does not reach.
+        is already filled by the time it arrives. Within a stage the sweep
+        stops at the first pass with nothing waiting, so an answer with many
+        passes costs nothing per character in the ones it does not reach.
+        Both stages are visited either way, which costs one empty-queue test.
 
-        Indexed rather than iterated, over two lists that grow while they are
-        walked: driving a pass can add a pass, and driving a stripper can add
-        a stage.
+        The pass list is indexed rather than iterated because it grows while
+        it is walked: a removal appends the pass below it. The stage list
+        does not grow - it is built whole in `__init__` - and is indexed to
+        match.
         """
         stage_index = 0
         while stage_index < len(self._stages):
@@ -968,11 +970,10 @@ class CanonicalCitationStream:
         fresh: List[str] = []
         self._fresh = fresh
         try:
-            # Top down, over two lists that grow while they are walked:
-            # closing a pass can settle a handle, which is a removal, which
-            # adds the pass below it, and what that pass hands to its
-            # stripper can be a marker, which adds the stage below. Indexed
-            # rather than iterated.
+            # Top down. The pass list grows while it is walked - closing a
+            # pass can settle a handle, which is a removal, which adds the
+            # pass below it - so it is indexed rather than iterated. The
+            # stage list is fixed at two and walked in the same style.
             stage_index = 0
             while stage_index < len(self._stages):
                 stage = self._stages[stage_index]

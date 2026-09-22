@@ -357,7 +357,10 @@ class TestTheChainCanBeDeeperThanTheInterpretersStack:
         public = reader.push(text)
         tail, origins = reader.finish()
 
-        assert _pass_count(reader) > sys.getrecursionlimit()
+        # The chain the cascade built, not the total: the second stage
+        # carries one idle pass of its own, and counting it into a strict
+        # `>` would let a one-pass regression sit inside the margin.
+        assert _cascade_chain(reader) > sys.getrecursionlimit()
         assert public + tail == expected
         assert origins == expected_origins
         assert reader.intact()
@@ -384,11 +387,18 @@ LINEAR_FAMILIES = {
                            * (n // 44 + 1))[:n],
 }
 
-#: Measured worst case is 4.95 characters of work per character received, over
-#: every family and size below. The bound is loose enough not to be a
-#: tripwire for an ordinary change and tight enough that a rescan of anything
-#: growing breaks it: a reader that rescanned the unresolved run would be at
-#: N/2 per character on `spaces` alone.
+#: Measured worst case is 7.57 characters of work per character received, on
+#: `prefixes` at N=16,000, over every family and size below. It was 4.95
+#: before the reader grew its second stage - the namespace scrub that runs
+#: again over what the marker cleanup spliced - which reads every surviving
+#: character a second time. So the headroom under this bound is about 1.6x
+#: rather than the 2.4x the earlier figure implied, and a change that adds
+#: another full pass over the output will reach it.
+#:
+#: Still loose enough not to be a tripwire for an ordinary change and tight
+#: enough that a rescan of anything growing breaks it: a reader that
+#: rescanned the unresolved run would be at N/2 per character on `spaces`
+#: alone.
 WORK_PER_CHARACTER = 12
 WORK_CONSTANT = 512
 

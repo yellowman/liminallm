@@ -1406,8 +1406,13 @@ class WorkflowStreamingMixin:
                 accepted_citations = self._recorded_citations(
                     stream_context, invocation, accepted_public
                 )
+                # With the nonce, because the marker removal below splices
+                # text the narrow scrub has already read past and the pair can
+                # be a handle neither half was. Measured here before it was
+                # passed: `K7Q2[cite:]ABCD` reached the reader as `K7Q2ABCD`.
                 cleaned = replaced_answer(
-                    accepted_public, [], accepted_citations
+                    accepted_public, [], accepted_citations,
+                    invocation.citations.nonce,
                 )
                 if cleaned is None:
                     content = ""

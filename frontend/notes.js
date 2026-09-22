@@ -400,7 +400,11 @@ const drawNoteGraph = async () => {
         ctx.fillText(n.title.slice(0, 24), n.x + r + 3, n.y + 3);
       }
     }
-    if (ticks++ < 180 && !wrap.classList.contains('hidden')) requestAnimationFrame(step);
+    // `hidden` moved to the section that carries this view's band, so asking
+    // the wrapper stopped answering: the layout kept running its whole tick
+    // budget after the reader clicked away. `offsetParent` is null whenever
+    // any ancestor is display:none, which is the question this was asking.
+    if (ticks++ < 180 && wrap.offsetParent !== null) requestAnimationFrame(step);
   };
   requestAnimationFrame(step);
 
