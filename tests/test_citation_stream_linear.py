@@ -248,6 +248,25 @@ class TestAPassIsWhereASpliceIsReconsidered:
             assert problem is None, (chunks, problem)
 
 
+def _pass_count(reader):
+    """Every namespace pass, across every stage.
+
+    The passes used to be one flat list on the reader. They belong to a
+    stage now, because `reader_positions` scrubs the namespace, removes
+    markers, and scrubs again over what that removal spliced - so there are
+    two chains, and the second stage carries one idle pass of its own for an
+    answer whose markers splice nothing. What these tests pin is unchanged:
+    how many passes an answer needs is the model's choice, and closing them
+    must not cost a Python frame each.
+    """
+    return sum(len(stage.passes) for stage in reader._stages)
+
+
+def _cascade_chain(reader):
+    """The chain the cascade itself built, which is the first stage's."""
+    return len(reader._stages[0].passes)
+
+
 def _cascade(depth):
     """A text needing exactly `depth` passes, which is the most per character.
 
@@ -297,7 +316,7 @@ class TestTheChainCanBeDeeperThanTheInterpretersStack:
         text = _cascade(200)
         reader = CanonicalCitationStream(NONCE)
         public = reader.push(text) + reader.finish()[0]
-        assert len(reader._passes) == 201
+        assert _cascade_chain(reader) == 201
         assert deepest == 1, f"a pass closed another, {deepest} deep"
         assert public == reader_positions(text, NONCE)[0]
         assert reader.intact()
@@ -338,7 +357,7 @@ class TestTheChainCanBeDeeperThanTheInterpretersStack:
         public = reader.push(text)
         tail, origins = reader.finish()
 
-        assert len(reader._passes) > sys.getrecursionlimit()
+        assert _pass_count(reader) > sys.getrecursionlimit()
         assert public + tail == expected
         assert origins == expected_origins
         assert reader.intact()

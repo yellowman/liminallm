@@ -1110,6 +1110,17 @@ def strip_citation_positions(text: str) -> Tuple[str, List[int]]:
     closed marker-shaped token goes, resolved or not; an unclosed `[cite:`
     stays literal. The map is what lets a blocking answer remove malformed
     markers without leaving validated citation offsets indexing the old text.
+
+    One pass, deliberately, where the namespace scrub repeats. Removing a
+    marker splices its neighbours and the pair can be a marker neither was -
+    `[ci[cite:]te:x]` is the shape - but repeating this is not something the
+    streaming reader can follow. A later removal revives a match start the
+    reader has already released, and how far back it reaches is unbounded:
+    measured at 48 characters for `"[ci" * 16 + "[cite:]" + "te:]" * 16`,
+    growing with the text. A stream cannot hold every `[` it has ever seen,
+    so this stays a single pass and `CanonicalCitationStream` can implement
+    exactly it. What that leaves for a reader is marker syntax, never a live
+    handle - see `reader_positions`.
     """
     kept: List[str] = []
     kept_origins: List[int] = []
@@ -1143,10 +1154,37 @@ def reader_positions(text: str, nonce: str) -> Tuple[str, List[int]]:
 
     The origin map is carried through both transformations so a validated
     citation's public offset indexes the exact string the reader holds.
+
+    The namespace scrub runs again *after* the marker cleanup, and that
+    third step is the one that matters. Each pass repeats over its own
+    splices and neither used to reconsider the other's. `K7Q2[cite:]ABCD`
+    is what that cost: the namespace pass finds no handle in it, the marker
+    cleanup then takes `[cite:]` out and joins `K7Q2` to `ABCD`, and what
+    reaches the reader is this turn's live nonce. `[cite:OTHER-1]` and
+    `[cite:x]` do it too, so a model needs no access to the namespace to
+    arrange it - only to write its own handle in halves around any marker.
+
+    Three steps rather than a loop to a joint fixed point, and the reason is
+    that a fixed point is not implementable in a stream. Repeating the
+    marker cleanup revives match starts arbitrarily far back - see
+    `strip_citation_positions` - and a reader that has released them cannot
+    take them back. So the marker cleanup runs once and the namespace scrub
+    brackets it.
+
+    What that guarantees is the property this exists for: the last step runs
+    to its own fixed point, so no representation of this turn's namespace
+    survives it, and nothing after it removes anything that could splice one
+    back. What it does not guarantee is the absence of marker *syntax* - a
+    handle removed between `[cit` and `e:x]` leaves `[cite:x]` behind. That
+    is a stale bracket in the prose rather than a namespace leak.
     """
-    public, namespace_origins = scrub_positions(text, nonce)
-    reader, reader_origins = strip_citation_positions(public)
-    return reader, [namespace_origins[index] for index in reader_origins]
+    namespace = _namespace_pattern(nonce)
+    scrubbed, namespace_origins = _scrub_text(text, namespace)
+    stripped, reader_origins = strip_citation_positions(scrubbed)
+    final, final_origins = _scrub_text(stripped, namespace)
+    return final, [
+        namespace_origins[reader_origins[index]] for index in final_origins
+    ]
 
 
 def public_index(origins: Sequence[int], index: int) -> int:
@@ -1248,5 +1286,8 @@ def strip_citations(answer: str) -> str:
     that would otherwise be left behind. Spacing left by a removed marker is
     closed up, so a sentence does not end with a gap where a handle used to
     be.
+
+    One pass, the same as `strip_citation_positions`, which carries this
+    rule and the coordinate map for it.
     """
     return CITATION_STRIP_RE.sub("", answer or "")

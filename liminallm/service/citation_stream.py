@@ -248,10 +248,13 @@ class _Pass:
     never straight to a reader.
     """
 
-    __slots__ = ("_reader", "_successor", "_pending", "_states", "_state", "queue")
+    __slots__ = (
+        "_reader", "_stage", "_successor", "_pending", "_states", "_state", "queue"
+    )
 
-    def __init__(self, reader: "CanonicalCitationStream") -> None:
-        self._reader = reader
+    def __init__(self, stage: "_Stage") -> None:
+        self._stage = stage
+        self._reader = stage.reader
         self._successor: Optional["_Pass"] = None
         #: The characters this pass has not handed on, and the state after
         #: each. Both are emptied whole, so index 0 is always the first.
@@ -556,8 +559,8 @@ class _Pass:
         keyword is not yet behind the scan pointer.
         """
         if self._successor is None:
-            self._successor = _Pass(self._reader)
-            self._reader._passes.append(self._successor)
+            self._successor = _Pass(self._stage)
+            self._stage.passes.append(self._successor)
         self._drop(len(self._pending) - start)
         if marker is not None:
             # The state after the keyword's last character *is* "inside a
@@ -609,7 +612,7 @@ class _Pass:
         if self._successor is not None:
             self._successor.queue.extend(text)
         else:
-            self._reader._release(text)
+            self._stage.release(text)
 
 
 class _ClosedMarkerStripper:
@@ -629,10 +632,11 @@ class _ClosedMarkerStripper:
     overlong text still be recognized.
     """
 
-    __slots__ = ("_reader", "_spaces", "_candidate")
+    __slots__ = ("_reader", "_stage", "_spaces", "_candidate")
 
-    def __init__(self, reader: "CanonicalCitationStream") -> None:
-        self._reader = reader
+    def __init__(self, stage: "_Stage") -> None:
+        self._stage = stage
+        self._reader = stage.reader
         self._spaces: List[str] = []
         self._candidate: Optional[List[str]] = None
 
@@ -650,7 +654,7 @@ class _ClosedMarkerStripper:
                     self._candidate = [character]
                     continue
                 self._flush_spaces()
-                self._reader._release_public(character)
+                self._stage.release_public(character)
                 continue
 
             candidate = self._candidate
@@ -670,6 +674,11 @@ class _ClosedMarkerStripper:
             if character == "]":
                 # A complete closed marker. Drop its leading spaces too, the
                 # same rule `strip_citations` uses.
+                #
+                # The removal joins what came before to what comes after, and
+                # the pair can be a handle that neither was. Reconsidering
+                # that join is what the namespace chain in the stage below
+                # is for.
                 self._spaces.clear()
                 self._candidate = None
                 continue
@@ -692,7 +701,7 @@ class _ClosedMarkerStripper:
             self._spaces.clear()
             remainder = candidate[1:] + [character]
             self._candidate = None
-            self._reader._release_public(prefix)
+            self._stage.release_public(prefix)
             queue.extendleft(reversed(remainder))
 
     def finish(self) -> None:
@@ -704,7 +713,7 @@ class _ClosedMarkerStripper:
 
     def _flush_spaces(self) -> None:
         if self._spaces:
-            self._reader._release_public("".join(self._spaces))
+            self._stage.release_public("".join(self._spaces))
             self._spaces.clear()
 
     def _flush_candidate(self) -> None:
@@ -713,7 +722,78 @@ class _ClosedMarkerStripper:
         text = "".join(self._spaces) + "".join(candidate)
         self._spaces.clear()
         self._candidate = None
-        self._reader._release_public(text)
+        self._stage.release_public(text)
+
+
+class _Stage:
+    """One half of `reader_positions`, performed as text arrives.
+
+    That function runs the namespace scrub, then the marker cleanup, then
+    the namespace scrub again. The first two are this stage with a stripper;
+    the third is a second stage without one, and its passes release to the
+    reader.
+
+    Why the third step exists: each cleanup repeats over its own splices and
+    neither reconsidered the other's. A removed marker joins the text before
+    it to the text after, and that pair can be a handle. `K7Q2[cite:]ABCD`
+    is the whole argument - no handle for the namespace pass to find, then
+    the marker goes and the two halves are this turn's live nonce, on its
+    way to a reader.
+
+    Why there is no fourth: repeating the marker cleanup is not something a
+    stream can follow. A later removal revives a match start arbitrarily far
+    back, and a reader that has released it cannot take it back; the figure
+    is measured in `strip_citation_positions`. So the shape is fixed at two
+    stages and the finished-string helper is fixed at the same three steps.
+
+    Nothing is held here to bridge the join. A `_Pass` releases only from a
+    clean state, so the second stage's chain holds whatever could still be
+    part of a handle by itself, and text spliced by the stripper above
+    arrives as one continuous stream that knows nothing of the join.
+    """
+
+    __slots__ = ("reader", "passes", "stripper", "next")
+
+    def __init__(
+        self,
+        reader: "CanonicalCitationStream",
+        namespaced: bool,
+        *,
+        strip: bool,
+    ) -> None:
+        self.reader = reader
+        self.passes: List[_Pass] = [_Pass(self)] if namespaced else []
+        self.stripper = _ClosedMarkerStripper(self) if strip else None
+        self.next: Optional["_Stage"] = None
+
+    def accept(self, text: str) -> None:
+        """Text arriving at the top of this stage."""
+        if not text:
+            return
+        if self.passes:
+            self.passes[0].queue.extend(text)
+        elif self.stripper is not None:
+            self.stripper.push(text)
+        else:
+            self.release_public(text)
+
+    def release(self, text: str) -> None:
+        """Text this stage's passes are finished with."""
+        if not text:
+            return
+        if self.stripper is not None:
+            self.stripper.push(text)
+        else:
+            self.release_public(text)
+
+    def release_public(self, text: str) -> None:
+        """Text this stage is finished with: the stage below, or the reader."""
+        if not text:
+            return
+        if self.next is not None:
+            self.next.accept(text)
+        else:
+            self.reader._release_public(text)
 
 
 class CanonicalCitationStream:
@@ -750,11 +830,23 @@ class CanonicalCitationStream:
         #: one of the growing-prefix costs this reader exists without.
         self._released_parts: List[str] = []
         self._released_len = 0
-        #: The passes, top first. One is enough for an answer with nothing to
-        #: remove; a pass is added when the one above it removes something,
-        #: exactly as `_scrub_text` repeats only when a pass found a match.
-        self._passes: List[_Pass] = [_Pass(self)] if scrub_namespace else []
-        self._marker_stripper = _ClosedMarkerStripper(self)
+        #: The stages, top first. A stage is one round of `reader_positions`:
+        #: the namespace scrub to its own fixed point, then the reader-side
+        #: marker cleanup. A stage is added when the one above it removes a
+        #: marker, exactly as a pass is added when the one above it removes a
+        #: handle - and for the same reason, which is that a removal splices
+        #: its neighbours and the pair can be something neither was.
+        #: Two, fixed, mirroring `reader_positions`: the namespace scrub and
+        #: the marker cleanup, then the namespace scrub again over what the
+        #: cleanup spliced. An uncited stream is the marker cleanup alone,
+        #: so it has no second stage to build.
+        self._stages: List[_Stage] = [
+            _Stage(self, scrub_namespace, strip=True)
+        ]
+        if scrub_namespace:
+            first = self._stages[0]
+            first.next = _Stage(self, True, strip=False)
+            self._stages.append(first.next)
         self._finished = False
         self._verdict: Optional[bool] = None
         #: Where a release lands while a call is collecting one. Set by
@@ -814,42 +906,45 @@ class CanonicalCitationStream:
         self._fresh = fresh
         try:
             self._work += len(chunk)
-            if self._scrub_namespace:
-                self._passes[0].queue.extend(chunk)
-                self._drive()
-            else:
-                # No citation handle was offered, so this invocation's random
-                # nonce is not model syntax and a coincidental spelling must
-                # survive. Broad reader cleanup is still unconditional.
-                self._marker_stripper.push(chunk)
+            # A stage with no namespace passes is the uncited case: no
+            # citation handle was offered, so this invocation's random nonce
+            # is not model syntax and a coincidental spelling must survive.
+            # Broad reader cleanup is unconditional either way.
+            self._stages[0].accept(chunk)
+            self._drive()
         finally:
             self._fresh = None
         return "".join(fresh)
 
     def _drive(self) -> None:
-        """Read what is queued, one pass at a time, top to bottom.
+        """Read what is queued, one stage and one pass at a time, top down.
 
-        A pass only ever hands text downwards, so one sweep is enough - and a
-        sweep stops at the first pass with nothing waiting, so an answer with
-        many passes costs nothing per character in the ones it does not
-        reach.
+        Text only ever moves downwards - a pass to the pass below it, the
+        bottom pass to its stage's stripper, that stripper to the stage below
+        - so one sweep in this order is enough, and every queue a sweep needs
+        is already filled by the time it arrives. A sweep stops at the first
+        pass in a stage with nothing waiting, so an answer with many stages
+        costs nothing per character in the ones it does not reach.
+
+        Indexed rather than iterated, over two lists that grow while they are
+        walked: driving a pass can add a pass, and driving a stripper can add
+        a stage.
         """
-        index = 0
-        while index < len(self._passes):
-            current = self._passes[index]
-            if not current.queue:
-                break
-            while current.queue:
-                current.step()
-            index += 1
-
-    def _release(self, text: str) -> None:
-        """Namespace-clean text entering the reader-side marker cleanup."""
-        if text:
-            self._marker_stripper.push(text)
+        stage_index = 0
+        while stage_index < len(self._stages):
+            stage = self._stages[stage_index]
+            index = 0
+            while index < len(stage.passes):
+                current = stage.passes[index]
+                if not current.queue:
+                    break
+                while current.queue:
+                    current.step()
+                index += 1
+            stage_index += 1
 
     def _release_public(self, text: str) -> None:
-        """Text that has cleared both citation cleanup stages."""
+        """Text no stage has anything left to take out of."""
         if not text:
             return
         self._released_parts.append(text)
@@ -873,15 +968,21 @@ class CanonicalCitationStream:
         fresh: List[str] = []
         self._fresh = fresh
         try:
-            if self._scrub_namespace:
-                # Top down, over a list that grows while it is walked: closing
-                # a pass can settle a handle, which is a removal, which adds
-                # the pass below it. Indexed rather than iterated.
+            # Top down, over two lists that grow while they are walked:
+            # closing a pass can settle a handle, which is a removal, which
+            # adds the pass below it, and what that pass hands to its
+            # stripper can be a marker, which adds the stage below. Indexed
+            # rather than iterated.
+            stage_index = 0
+            while stage_index < len(self._stages):
+                stage = self._stages[stage_index]
                 index = 0
-                while index < len(self._passes):
-                    self._passes[index].close()
+                while index < len(stage.passes):
+                    stage.passes[index].close()
                     index += 1
-            self._marker_stripper.finish()
+                if stage.stripper is not None:
+                    stage.stripper.finish()
+                stage_index += 1
         finally:
             self._fresh = None
         tail = "".join(fresh)
