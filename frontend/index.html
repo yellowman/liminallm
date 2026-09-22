@@ -438,13 +438,34 @@
                   <textarea id="note-content" placeholder="Write. Link with [[Title]]." spellcheck="true"></textarea>
                   <div id="note-preview" class="note-preview markdown-body hidden"></div>
                   <div id="note-meta" class="note-meta"></div>
-                  <div id="note-witness-results" class="note-witness hidden"></div>
+                  <section id="note-witness-section" class="note-section hidden">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 10S5.5 4.5 10 4.5 17.5 10 17.5 10 14.5 15.5 10 15.5 2.5 10 2.5 10Z"/><circle cx="10" cy="10" r="2.25"/></svg>
+                      <h3>Witness</h3>
+                      <span class="section-description">How this note sits against the rest of the vault</span>
+                    </div>
+                    <div id="note-witness-results" class="note-witness"></div>
+                  </section>
                 </div>
-                <div id="note-graph-wrap" class="note-graph-wrap hidden">
-                  <canvas id="note-graph"></canvas>
-                  <div class="note-graph-hint muted">click a note to open it · red = contradiction, amber = a position that moved (this session)</div>
-                </div>
-                <div id="note-sweep-wrap" class="note-sweep-wrap hidden"></div>
+                <section id="note-graph-section" class="note-section hidden">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="5" cy="6" r="2"/><circle cx="15" cy="7.5" r="2"/><circle cx="9.5" cy="15" r="2"/><path d="M6.8 6.7 13 7.3M6.2 7.7 8.6 13.2"/></svg>
+                      <h3>Graph</h3>
+                      <span class="section-description">Every note as a node, every link as an edge</span>
+                    </div>
+                  <div id="note-graph-wrap" class="note-graph-wrap">
+                    <canvas id="note-graph"></canvas>
+                    <div class="note-graph-hint muted">click a note to open it · red = contradiction, amber = a position that moved (this session)</div>
+                  </div>
+                </section>
+                <section id="note-sweep-section" class="note-section hidden">
+                    <div class="section-band">
+                      <svg class="section-icon" viewBox="0 0 20 20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3v6.5"/><path d="M5.5 9.5h9l-1 7h-7z"/><path d="M7.5 12.5h5"/></svg>
+                      <h3>Vault sweep</h3>
+                      <span class="section-description">Every pair of notes close enough to compare</span>
+                    </div>
+                  <div id="note-sweep-wrap" class="note-sweep-wrap"></div>
+                </section>
                 <div id="notes-empty" class="notes-empty">
                   <p class="muted">A note becomes a node. <code>[[Links]]</code> become edges.<br/>The Witness compares your thoughts across time - wherever that process leads.</p>
                 </div>

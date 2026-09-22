@@ -97,33 +97,65 @@ def qualified_rules(nodes):
             )
 
 
-def declarations(css: str, name: str):
-    """Every `name` declaration, as (value, selector, line)."""
+#: A length in the `font` shorthand, which carries a size where a reader
+#: looking for `font-size` would not see one. `font: 700 14px/1.2 Inter` sets
+#: a size; `font: inherit` does not.
+_FONT_SIZE_IN_SHORTHAND = re.compile(r"(?<![\w.-])(\d*\.?\d+)(px|rem|em|%)")
+
+#: The four corners, written one at a time. A longhand sets a radius as much
+#: as the shorthand does, and neither guard used to read one.
+RADIUS_LONGHANDS = (
+    "border-top-left-radius",
+    "border-top-right-radius",
+    "border-bottom-right-radius",
+    "border-bottom-left-radius",
+)
+
+
+def declarations(css: str, *names: str):
+    """Every declaration of any of `names`, as (property, value, selector, line)."""
     top = tinycss2.parse_stylesheet(css, skip_whitespace=True, skip_comments=True)
+    wanted = set(names)
     for rule in qualified_rules(top):
         selector = " ".join(tinycss2.serialize(rule.prelude).split())
         for node in tinycss2.parse_declaration_list(
             rule.content, skip_whitespace=True, skip_comments=True
         ):
-            if isinstance(node, css_ast.Declaration) and node.lower_name == name:
+            if isinstance(node, css_ast.Declaration) and node.lower_name in wanted:
                 value = " ".join(tinycss2.serialize(node.value).split())
-                yield value, selector, node.source_line
+                yield node.lower_name, value, selector, node.source_line
 
 
 def off_scale_type(css: str):
-    """Type sizes that are neither on the scale nor pinned to this selector."""
-    return [
-        (value, selector, line)
-        for value, selector, line in declarations(css, "font-size")
-        if value not in TYPE_SCALE
-        and selector not in TYPE_DEPARTURES.get(value, ())
-    ]
+    """Type sizes that are neither on the scale nor pinned to this selector.
+
+    Both spellings. A size hidden in the `font` shorthand renders exactly as
+    one written out, and a guard that reads only `font-size` would let a
+    twentieth size in through a property it never looks at.
+    """
+    found = []
+    for prop, value, selector, line in declarations(css, "font-size", "font"):
+        if prop == "font":
+            sizes = _FONT_SIZE_IN_SHORTHAND.findall(value)
+            if not sizes:
+                continue
+            value = "".join(sizes[0])
+        if value in TYPE_SCALE or selector in TYPE_DEPARTURES.get(value, ()):
+            continue
+        found.append((value, selector, line))
+    return found
 
 
 def off_band_radius(css: str):
-    """Radius values that are neither built from the atoms nor pinned here."""
+    """Radius values that are neither built from the atoms nor pinned here.
+
+    The shorthand and the four longhands alike, for the same reason: a
+    literal is a literal whichever property carries it.
+    """
     found = []
-    for value, selector, line in declarations(css, "border-radius"):
+    for _prop, value, selector, line in declarations(
+        css, "border-radius", *RADIUS_LONGHANDS
+    ):
         if all(atom in RADIUS_ATOMS for atom in _ATOM_RE.findall(value)):
             continue
         if selector in RADIUS_DEPARTURES.get(value, ()):
@@ -172,6 +204,23 @@ class TestTheTypeScaleIsClosed:
         """The control. An unpinned off-scale value must be reported."""
         found = off_scale_type(".invented { font-size: 12.5px; }")
         assert found == [("12.5px", ".invented", 1)], found
+
+    def test_a_size_hidden_in_the_font_shorthand_is_reported(self):
+        """The spelling that used to be invisible.
+
+        `font` sets the size along with five other things, and a guard that
+        reads only `font-size` never sees it. Measured before this: the
+        check returned nothing at all for this rule.
+        """
+        found = off_scale_type(".x { font: 700 14px/1.2 Inter, sans-serif; }")
+        assert found == [("14px", ".x", 1)], found
+
+    def test_a_shorthand_on_the_scale_is_accepted(self):
+        assert not off_scale_type(".x { font: 500 13px/1.4 Inter; }")
+
+    def test_a_shorthand_with_no_size_is_not_invented(self):
+        """`font: inherit` sets no size, and the file's four all say that."""
+        assert not off_scale_type(".x { font: inherit; }")
 
     def test_a_pin_covers_only_the_selector_it_names(self):
         """A departure is pinned to a place, or it is not a departure.
@@ -242,6 +291,21 @@ class TestTheRadiusScaleIsClosed:
         assert not off_band_radius(
             ".settings-index a { border-radius: 0 var(--radius-sm)"
             " var(--radius-sm) 0; }"
+        )
+
+    def test_a_longhand_corner_is_reported(self):
+        """The other spelling that used to be invisible.
+
+        One corner at a time is still a radius. Measured before this: the
+        check returned nothing for each of the four.
+        """
+        for prop in RADIUS_LONGHANDS:
+            found = off_band_radius(f".x {{ {prop}: 9px; }}")
+            assert found == [("9px", ".x", 1)], (prop, found)
+
+    def test_a_longhand_using_a_token_is_accepted(self):
+        assert not off_band_radius(
+            ".x { border-top-left-radius: var(--radius-sm); }"
         )
 
     def test_a_composite_hiding_a_literal_is_still_reported(self):

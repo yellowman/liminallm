@@ -985,7 +985,7 @@ body {
 
 .subtext {
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: 11.5px;
   margin: 0 0 12px;
 }
 
@@ -1071,7 +1071,7 @@ body {
 .field label {
   font-weight: 500;
   color: var(--text);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .field input,
@@ -1977,7 +1977,7 @@ button.minor:hover {
 
 .citation-meta {
   margin-bottom: 8px;
-  font-size: 13px;
+  font-size: 11.5px;
   color: var(--text-muted);
 }
 
@@ -2218,7 +2218,7 @@ button.minor:hover {
   padding: 9px 12px;
   border-radius: var(--radius-sm);
   margin-top: 10px;
-  font-size: 13px;
+  font-size: 13.5px;
   display: none;
 }
 
@@ -2241,7 +2241,14 @@ button.minor:hover {
   border-bottom: 1px solid var(--border);
   padding: 8px 12px;
   text-align: left;
-  font-size: 13px;
+}
+
+/* Cells only. The size used to be on the rule above, where the header rule
+   below overrode it at equal specificity - so it reached `td` and nothing
+   else, while reading as though it set both. Part three listed it under
+   "Rules that fixed nothing"; now it says what it does. */
+.table td {
+  font-size: 13.5px;
 }
 
 .table th {
@@ -2360,7 +2367,7 @@ button.minor:hover {
   gap: 12px;
   padding: 7px 0;
   border-bottom: 1px solid var(--border);
-  font-size: 13px;
+  font-size: 13.5px;
 }
 
 .detail-row:last-child,
@@ -2475,7 +2482,7 @@ button.minor:hover {
   color: var(--text-muted);
   text-align: center;
   padding: 14px 12px;
-  font-size: 13px;
+  font-size: 13.5px;
 }
 
 .divider {
@@ -2541,7 +2548,7 @@ button.minor:hover {
   color: var(--accent-strong);
   cursor: pointer;
   font-family: var(--font);
-  font-size: 13px;
+  font-size: 13.5px;
   text-decoration: underline;
   text-underline-offset: 2px;
   padding: 4px 8px;
@@ -2639,7 +2646,7 @@ button.minor:hover {
   display: block;
   font-weight: 500;
   margin-bottom: 5px;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .form-group input {
@@ -2724,7 +2731,7 @@ button.minor:hover {
 .patch-code label {
   display: block;
   font-weight: 500;
-  font-size: 13px;
+  font-size: 12px;
   margin-bottom: 6px;
 }
 
@@ -3160,11 +3167,11 @@ button.minor:hover {
 .dangling {
   color: var(--text-muted);
   border-bottom: 1px dotted var(--border-strong);
-  font-size: 13px;
+  font-size: 11.5px;
 }
 
 .note-meta {
-  font-size: 13px;
+  font-size: 11.5px;
   color: var(--text-muted);
   line-height: 1.8;
 }
@@ -3191,7 +3198,7 @@ button.minor:hover {
   border-radius: var(--radius-sm);
   border-left: 3px solid var(--border-strong);
   background: var(--panel-muted);
-  font-size: 13px;
+  font-size: 13.5px;
 }
 
 .witness-row.contradicts {
@@ -3315,7 +3322,7 @@ button.minor:hover {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 13px;
+  font-size: 11.5px;
   color: var(--text-muted);
   white-space: nowrap;
 }

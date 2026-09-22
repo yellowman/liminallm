@@ -545,7 +545,7 @@ them.
 | `.table tr.clickable.selected` | **Never applied.** No code sets the class. The patch list, where clicking opens a detail panel, has no selection state. |
 | `.patch-status.pending` | **Missing.** `admin-tab.js:396` computes `pending`; no rule matches, so it falls to neutral grey where part one assigns amber. |
 | `.bar-actions` at 32px | **Dead for buttons, live for anchors** - a tier part one does not have. |
-| `.table th` 13px | **Dead.** A later rule at equal specificity sets 11.5px. |
+| `.table th` 13px | **Was dead**, and is gone. A later rule at equal specificity set 11.5px, so the size reached `td` and nothing else while reading as though it set both. It is on `.table td`, which is what it always meant. |
 
 `.chip` and the hole that hid it are both closed. The orphan-class guard
 read every word of every script including its comments, so a class counted as
@@ -588,6 +588,14 @@ departure rather than an escape, so adding a size means naming where it is
 allowed - which is the sentence this section asks for anyway. The guard was
 written before the repairs and failed on all twenty-nine call sites.
 
+It reads both spellings of each property. A size can hide in the `font`
+shorthand and a radius in the four `border-*-radius` longhands, and a check
+that read only `font-size` and `border-radius` would have let a twentieth
+size in through a property it never looked at. Neither spelling carries a
+value in this file today - all four `font:` declarations are `inherit` and
+there are no radius longhands - so this is a hole closed before anything
+fell through it, and the controls in that file feed it both.
+
 **The type scale is a scale.** Nineteen distinct `font-size` values became
 thirteen. Seven of them are part one's, and they carry 109 of the 116 call
 sites. Each value that was off the scale moved to the size part one gives
@@ -604,12 +612,26 @@ typography; the glyph buttons `×` and `+` and the note title field (22px,
 18px), drawn at the optical size of a glyph rather than at the size of the
 words around them; and the dashboard figure (26px), read as a number.
 
-What this deliberately did not do is change which on-scale size a role uses.
-The metadata label at 13px for 11.5, the row title at 12px for 13 and body
-text at 13px for 13.5 are all on the scale and all arguably on the wrong
-step of it. Moving them is a decision about how the product looks, not the
-removal of a value that should not exist, so it wants an eye on the result
-rather than a guard.
+**Each role now uses the size part one gives it**, which is the second half
+of the work and the half a guard cannot check: every value below was already
+on the scale and simply on the wrong step of it.
+
+| Role | Was | Now | Where |
+|---|---:|---:|---|
+| Metadata or fact line | 13px | 11.5px | citation meta, note meta, an unresolved wiki-link, an inline check, a description under a heading |
+| Normal interface text | 13px | 13.5px | error banners, empty states, label-and-value rows, witness findings, link-styled buttons, table cells |
+| Field label | 13px | 12px | the three label rules |
+
+That moved 13px from 28 call sites to 12, and it is what the scale is for:
+13px is the major-section title and the row title, and it had become the
+size everything else was too.
+
+One departure is recorded rather than repaired. `.context-pane .row-name` is
+a row title at 12px where part one says 13px, and the rule above it says
+why: the pane is secondary navigation with 219px to print a name in, and one
+step down is a few more characters before the ellipsis on every row. That is
+a measured reason, so it belongs here rather than being undone - the same
+treatment the chat bubble and the glyph buttons get above.
 
 **Reading prose had two sizes** and now has one: chat, the note editor and
 its preview are all 15px/1.65. Inline code was `font-size: 82%`, the only
@@ -700,14 +722,33 @@ would drop their tint for every mouse user, and that test is what says so.
 Transitions are otherwise close to the rule: twenty at 0.15s, four at
 130ms, two at 0.18s.
 
-## Where five of eight screens have no level two
+## Level two, on every screen that has a second section
 
-Files, Insights and Settings carry bands. **Chat, Notes, Contexts, Artifacts
-and Tools do not**, and neither does the admin console's own markup. On
-Contexts, Artifacts and Tools the major-section level is an `<h3>` over a
-`.divider` - a hairline with no fill, no icon and no count, which is
-invisible when the page is scanned rather than read. Twenty `.divider`
-elements still carry a boundary that the band is now the vocabulary for.
+This section used to read "where five of eight screens have no level two".
+Three of those five were banded by the work above without this being
+rewritten, which is the failure part two warns about: the file lagged the
+frontend, and a reader would have believed it.
+
+Counted rather than remembered: Settings carries fourteen bands, Contexts
+and Insights four each, Tools three, Files and Artifacts two.
+
+**Notes** was the one still missing them. Its workspace holds four things -
+the editor, the witness findings for the open note, the vault-wide sweep and
+the graph - and three of those appeared with no heading at all, so clicking
+Witness produced a block of verdicts with nothing naming it. Each now opens
+under a band, and the band is what the view's visibility is toggled on, so a
+pane cannot appear without its title.
+
+**Chat** has no level two because it has no second section: a conversation,
+a composer, and a disclosure for preferences. Part one asks a *substantial*
+page to show all four levels, and inventing a band over a single stream of
+turns would be the decoration it also warns against. Recorded here so the
+next reader counts seven screens and not eight.
+
+Five `.divider` elements remain, not the twenty this section used to claim.
+Four sit directly above an `<h4>` in a detail pane, which is a hairline plus
+a muted 11.5px heading - part one's subsection, spelled correctly. The
+fifth separates the two halves of the password-reset form.
 
 The Tools pane used to invert the spacing rule as well: 4px between two
 different lists and 8px between two rows inside one, so the boundary was

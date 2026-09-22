@@ -103,8 +103,8 @@ const fetchNotes = async () => {
 const showNoteEditor = (show) => {
   $('note-editor')?.classList.toggle('hidden', !show);
   $('notes-empty')?.classList.toggle('hidden', show || notesState.notes.length > 0);
-  $('note-graph-wrap')?.classList.add('hidden');
-  $('note-sweep-wrap')?.classList.add('hidden');
+  $('note-graph-section')?.classList.add('hidden');
+  $('note-sweep-section')?.classList.add('hidden');
 };
 
 const openNote = async (noteId) => {
@@ -116,7 +116,7 @@ const openNote = async (noteId) => {
     $('note-title').value = note.title;
     $('note-content').value = note.content;
     setNotePreview(false);
-    $('note-witness-results')?.classList.add('hidden');
+    $('note-witness-section')?.classList.add('hidden');
     const meta = $('note-meta');
     if (meta) {
       const backlinks = (note.backlinks || []).map((b) =>
@@ -213,7 +213,7 @@ const runWitness = async () => {
   if (!box || !btn) return;
   if (notesState.dirty) await saveCurrentNote();
   btn.disabled = true;
-  box.classList.remove('hidden');
+  $('note-witness-section')?.classList.remove('hidden');
   box.innerHTML = '<div class="muted">The witness is reading the vault…</div>';
   try {
     const report = await notesApi(`/notes/${encodeURIComponent(notesState.currentId)}/witness`, {
@@ -266,9 +266,9 @@ const runVaultSweep = async () => {
   const btn = $('note-sweep-btn');
   if (!wrap || !btn) return;
   $('note-editor')?.classList.add('hidden');
-  $('note-graph-wrap')?.classList.add('hidden');
+  $('note-graph-section')?.classList.add('hidden');
   $('notes-empty')?.classList.add('hidden');
-  wrap.classList.remove('hidden');
+  $('note-sweep-section')?.classList.remove('hidden');
   btn.disabled = true;
   wrap.innerHTML = '<div class="muted" style="padding:24px">The witness is reading the whole vault…</div>';
   try {
@@ -331,8 +331,8 @@ const drawNoteGraph = async () => {
   if (!wrap || !canvas) return;
   $('note-editor')?.classList.add('hidden');
   $('notes-empty')?.classList.add('hidden');
-  $('note-sweep-wrap')?.classList.add('hidden');
-  wrap.classList.remove('hidden');
+  $('note-sweep-section')?.classList.add('hidden');
+  $('note-graph-section')?.classList.remove('hidden');
   const data = await notesApi('/notes/graph').catch(() => null);
   if (!data) return;
   const dpr = window.devicePixelRatio || 1;
@@ -420,7 +420,7 @@ const initNotes = () => {
     $('note-title').value = '';
     $('note-content').value = '';
     $('note-meta').innerHTML = '';
-    $('note-witness-results')?.classList.add('hidden');
+    $('note-witness-section')?.classList.add('hidden');
     setNotePreview(false);
     $('note-title').focus();
   });
